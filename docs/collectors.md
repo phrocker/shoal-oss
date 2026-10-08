@@ -233,16 +233,31 @@ a deny-list, so these rules are an allowlist (`internal/importboundary/cgo.go`):
   fine. Allowing cgo in an extension later needs its own design.
 - **Core may use cgo only in `CgoPackages`**, which today is `cmd/shoal-capi`,
   the only cgo package in the tree. For that package:
-  - every path in a `#cgo` argument (after `${SRCDIR}` expansion and
-    cleaning) must resolve into the package directory or `CgoIncludeDirs`.
-    These are `capi/include` and `capi/tests`, exactly what `cmd/shoal-capi`
-    uses;
-  - every `#include`, `#include_next`, `#import` and `#embed` must be a plain
-    quoted literal that resolves to an existing file in those directories, or
-    `<name.h>` with no path separator or `..`;
-  - the preamble and all C-family files in those directories are scanned, as
-    is every repository file they include, transitively, along with any file
-    named by a flag (`-include`) and any angle include found through `-I`.
+  - `#cgo` directives are an exact allowlist. The only verbs are `CFLAGS` and
+    `CPPFLAGS`, and every argument must be either
+    `-I${SRCDIR}/<path>` resolving into the package directory or
+    `CgoIncludeDirs` (`capi/include`, `capi/tests`), or `-D<IDENT>` with an
+    optional value containing no path characters, quotes or spaces. Anything
+    else is a violation: `LDFLAGS`, `pkg-config`, `-include`, `-iquote`,
+    `-Wp,`, `-Xpreprocessor`, `@file`, a separate-argument form, or an `-I`
+    not anchored on `${SRCDIR}`. `cmd/shoal-capi` uses only
+    `-I${SRCDIR}/../../capi/include`, `-I${SRCDIR}/../../capi/tests` and
+    `-DSHOAL_CAPI_TEST`.
+  - Scanning follows what the compiler reads. That means the package's
+    preambles, the C-family files directly in its directory (the files the
+    go command compiles), and every repository file they include,
+    transitively, whatever its extension. With flags limited to `-I` and
+    `-D`, the compiler reads nothing else. A directory walk would also judge
+    files that other toolchains build with other search paths, such as the C
+    tests in `capi/tests`.
+  - A quoted include is searched beside the including file, then in the
+    package directory and the `-I` directories. An angle include is searched
+    in the package directory and the `-I` directories only. Every candidate
+    that exists, not just the first, must lie in the allowed directories and
+    is scanned, so the checker and the compiler cannot disagree about which
+    file is used. A quoted include found nowhere is a violation. An angle
+    include found nowhere is a system header and may not contain `/` or
+    `..`. `#include_next`, `#import` and `#embed` are treated the same way.
 - Before parsing, line continuations are spliced and comments removed, as the
   compiler does. So `#include \` followed by a new line, and `#/**/include`,
   read as the directive the compiler sees. Macros as include targets,

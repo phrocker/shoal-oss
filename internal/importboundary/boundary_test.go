@@ -102,23 +102,41 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 		// preprocessor probe that beat the old deny-list is caught.
 		"cgo-allowed": nil,
 		"cgo-probe-angle": {
-			{"A", "cmd/shoal-capi/probe.go", "cgo flag ${SRCDIR}/../.."},
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag -I${SRCDIR}/../.."},
 			{"A", "cmd/shoal-capi/probe.go", "include <extensions/e/leak.h> (system header with a path)"},
 		},
 		"cgo-probe-macro":        {{"A", "cmd/shoal-capi/probe.go", "include H (not a literal path)"}},
 		"cgo-probe-inc":          {{"A", "cmd/shoal-capi/p.inc", `include "../../extensions/e/leak.h" (not found in allowed directories)`}},
 		"cgo-probe-continuation": {{"A", "cmd/shoal-capi/probe.go", `include "../../extensions/e/leak.h" (not found in allowed directories)`}},
 		"cgo-probe-comment":      {{"A", "cmd/shoal-capi/probe.go", `include "../../extensions/e/leak.h" (not found in allowed directories)`}},
-		// A -include file and an angle include found through -I are scanned
-		// even without a C-family extension; #cgo lines cannot continue.
+		// #cgo arguments are an exact allowlist: -I${SRCDIR}/... into allowed
+		// directories and plain -D only. An angle include found through an
+		// allowed -I is scanned, so a header in a package subdirectory cannot
+		// pull in an extension's .txt file.
+		"cgo-probe-iinc-txt": {
+			{"A", "cmd/shoal-capi/inc/pwn.h", `include "../../../extensions/e/payload.txt" (resolves outside allowed directories)`},
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag -Iinc"},
+		},
+		// Every existing candidate is checked, so a benign decoy on a later
+		// search path cannot hide the file the compiler takes first.
+		"cgo-probe-decoy": {{"A", "cmd/shoal-capi/probe.go", `include "../tests/x.h" (resolves outside allowed directories)`}},
+		"cgo-probe-flagforms": {
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag -Wp,-include,${SRCDIR}/x.h"},
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag -Xpreprocessor"},
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag -iquote${SRCDIR}"},
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag @${SRCDIR}/flags.rsp"},
+		},
+		// -include with a separate argument; an angle include through -I
+		// ${SRCDIR} is scanned whatever its extension; no #cgo continuation.
 		"cgo-probe-forced": {
-			{"A", "cmd/shoal-capi/forced.inc", `include "../../extensions/e/leak.h" (not found in allowed directories)`},
 			{"A", "cmd/shoal-capi/hidden.inc", `include "../../extensions/e/leak.h" (not found in allowed directories)`},
 			{"A", "cmd/shoal-capi/probe.go", "(#cgo line continuation)"},
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag ${SRCDIR}/forced.inc"},
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag -include"},
 		},
 		"cgo-probe-flags": {
-			{"A", "cmd/shoal-capi/probe.go", "cgo flag ${SRCDIR}/../../extensions/e/x.a"},
-			{"A", "cmd/shoal-capi/probe.go", "cgo flag /usr/include"},
+			{"A", "cmd/shoal-capi/probe.go", "(#cgo LDFLAGS not allowed)"},
+			{"A", "cmd/shoal-capi/probe.go", "cgo flag -I/usr/include"},
 		},
 		"cgo-outside-allowlist": {
 			{"A", "pkg/asm/asm_amd64.s", "(non-Go source outside the cgo allowlist)"},

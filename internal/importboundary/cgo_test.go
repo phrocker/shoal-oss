@@ -41,24 +41,34 @@ func TestIncludeParsing(t *testing.T) {
 			t.Errorf("%s: includes %v problems %v", name, incs, problems)
 		}
 	}
-	for ref, want := range map[string]string{
-		"${SRCDIR}/inc":       "a/b/inc",
-		"${SRCDIR}":           "a/b",
-		"${SRCDIR}/../../x":   "x",
-		"../../../escape":     "",
-		"${SRCDIR}/../../../": "",
-		"${HOME}/lib":         "",
-		"${SRCDIR}x":          "",
-		"/usr/include":        "",
-		`..\x`:                "",
+	allowed := func(p string) bool { return within(p, "a/b") || within(p, "inc") }
+	for line, want := range map[string]struct {
+		dirs     []string
+		problems int
+	}{
+		"#cgo CFLAGS: -I${SRCDIR}/../../inc -I${SRCDIR} -DX -DY=1.2_z": {[]string{"inc", "a/b"}, 0},
+		"#cgo linux,!cgo_x CPPFLAGS: -DX":                              {nil, 0},
+		"#cgo CFLAGS: -Iinc":                                           {nil, 1},
+		"#cgo CFLAGS: -I inc":                                          {nil, 2},
+		"#cgo CFLAGS: -I${SRCDIR}/../../../x":                          {nil, 1},
+		"#cgo CFLAGS: -I${SRCDIR}/../../ext":                           {nil, 1},
+		"#cgo CFLAGS: -I${SRCDIR}x":                                    {nil, 1},
+		"#cgo CFLAGS: -include pwn.h":                                  {nil, 2},
+		"#cgo CFLAGS: -includepwn.h":                                   {nil, 1},
+		"#cgo CFLAGS: @flags.rsp":                                      {nil, 1},
+		"#cgo CFLAGS: -Wp,-include,pwn.h":                              {nil, 1},
+		"#cgo CFLAGS: -Xpreprocessor -include":                         {nil, 2},
+		"#cgo CFLAGS: -iquote${SRCDIR}":                                {nil, 1},
+		"#cgo CFLAGS: -DX=a/b":                                         {nil, 1},
+		"#cgo CFLAGS: -DX=\"a\"":                                       {nil, 1},
+		"#cgo LDFLAGS: -lm":                                            {nil, 1},
+		"#cgo pkg-config: png":                                         {nil, 1},
+		"#cgo noescape f":                                              {nil, 1},
 	} {
-		got, ok := resolveCgo("a/b", ref)
-		if (want == "") == ok || got != want {
-			t.Errorf("%q resolved to %q ok=%v, want %q", ref, got, ok, want)
+		dirs, problems := cgoDirective("a/b", line, allowed)
+		if !slices.Equal(dirs, want.dirs) || len(problems) != want.problems {
+			t.Errorf("%s: dirs %v problems %v", line, dirs, problems)
 		}
-	}
-	if got := cgoArgRefs("-Wl,-rpath,${SRCDIR}/lib"); !slices.Equal(got, []string{"${SRCDIR}/lib"}) {
-		t.Errorf("cgoArgRefs: %q", got)
 	}
 }
 

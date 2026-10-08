@@ -22,15 +22,15 @@ import (
 // source the go command builds besides .go files (extensionFileAllowed).
 // Allowing cgo in extensions needs its own design.
 //
-// Core (rule A) may use cgo only in CgoPackages. Every #cgo path in those
-// packages must resolve into the package directory or CgoIncludeDirs. Every
-// include in their preambles and C-family files must be a plain quoted
-// literal that resolves to an existing file in those directories, or a
-// <system.h> name with no path. Included repository files are scanned the
-// same way, transitively. All C-family files in the allowed directories are
-// scanned, so a -include flag cannot reach an unscanned file. Anything the
-// simple parser cannot read is a violation. Any other core package with
-// import "C" or a buildable non-Go source is a violation.
+// Core (rule A) may use cgo only in CgoPackages. Their #cgo directives are an
+// exact allowlist (cgoDirective): CFLAGS or CPPFLAGS whose every argument is
+// -I${SRCDIR}/<path> into the package directory or CgoIncludeDirs, or a plain
+// -D define. Every include the compiler would read, followed from the
+// package's preambles and C files in the compiler's search order, must be a
+// plain literal resolving inside those directories, or a <system.h> name with
+// no path that no repository search directory holds (checkCgoPackage).
+// Anything the simple parser cannot read is a violation. Any other core
+// package with import "C" or a buildable non-Go source is a violation.
 //
 // Residual: flags and search paths supplied by the build environment
 // (CGO_CFLAGS, CGO_LDFLAGS, pkg-config) are outside a source check.
@@ -141,6 +141,13 @@ type include struct {
 	kind, path string
 }
 
+func (i include) String() string {
+	if i.kind == "angle" {
+		return "<" + i.path + ">"
+	}
+	return `"` + i.path + `"`
+}
+
 // includes returns the inclusion directives of C source. A directive the
 // parser cannot read exactly yields a problem description.
 func includes(src []byte) ([]include, []string) {
@@ -222,45 +229,69 @@ func preamble(name string, src []byte) (string, bool, error) {
 	return b.String(), usesC, nil
 }
 
-var flagPrefix = regexp.MustCompile(`^-+[A-Za-z_]*`)
+// cgoDefine is the only -D form allowed: an identifier, optionally with a
+// value free of paths, quotes and spaces.
+var cgoDefine = regexp.MustCompile(`^-D[A-Za-z_][A-Za-z0-9_]*(=[A-Za-z0-9_.+-]*)?$`)
 
-// cgoArgRefs returns the path-like parts of one #cgo argument.
-func cgoArgRefs(arg string) []string {
-	var out []string
-	for _, piece := range strings.FieldsFunc(arg, func(r rune) bool { return r == ',' || r == '=' }) {
-		if !strings.HasPrefix(piece, "${") && !strings.HasPrefix(piece, "/") && !strings.HasPrefix(piece, ".") {
-			piece = flagPrefix.ReplaceAllString(piece, "")
-		}
-		if piece != "" && (strings.ContainsAny(piece, `/\$`) || strings.HasPrefix(piece, ".")) {
-			out = append(out, piece)
-		}
-	}
-	return out
-}
+// cgoConstraint matches the optional build-constraint words before a verb.
+var cgoConstraint = regexp.MustCompile(`^[A-Za-z0-9_,!]+$`)
 
-// resolveCgo resolves a #cgo path against the package directory dir. ok is
-// false for absolute paths, variables other than ${SRCDIR}, backslashes and
-// repository escapes.
-func resolveCgo(dir, ref string) (string, bool) {
-	if strings.Contains(ref, `\`) {
-		return "", false
+// cgoDirective checks one #cgo line against the exact allowlist and returns
+// the -I directories it adds, in order. Allowed: CFLAGS or CPPFLAGS whose
+// every argument is -I${SRCDIR}/<path> resolving into an allowed directory,
+// or -D<IDENT>[=<plain value>]. Everything else is refused: other verbs
+// (LDFLAGS, pkg-config, noescape), other flags (-include, -iquote, -Wp,
+// -Xpreprocessor, @file), separate-argument forms, and -I paths not anchored
+// on ${SRCDIR}.
+func cgoDirective(pkg, line string, inAllowed func(string) bool) ([]string, []string) {
+	var dirs, problems []string
+	head, args, ok := strings.Cut(strings.TrimSpace(strings.TrimPrefix(line, "#cgo")), ":")
+	words := strings.Fields(head)
+	if !ok || len(words) == 0 {
+		return nil, []string{"(#cgo directive not allowed: " + line + ")"}
 	}
-	if rest, ok := strings.CutPrefix(ref, "${SRCDIR}"); ok {
-		if strings.Contains(rest, "$") || (rest != "" && !strings.HasPrefix(rest, "/")) {
-			return "", false
+	verb := words[len(words)-1]
+	for _, w := range words[:len(words)-1] {
+		if !cgoConstraint.MatchString(w) {
+			return nil, []string{"(#cgo directive not allowed: " + line + ")"}
 		}
-		ref = "." + rest
-	} else if strings.Contains(ref, "$") || strings.HasPrefix(ref, "/") {
-		return "", false
 	}
-	p := path.Join(dir, ref)
-	if p == ".." || strings.HasPrefix(p, "../") {
-		return "", false
+	if verb != "CFLAGS" && verb != "CPPFLAGS" {
+		return nil, []string{"(#cgo " + verb + " not allowed)"}
 	}
-	return p, true
+	for _, arg := range strings.Fields(args) {
+		if cgoDefine.MatchString(arg) {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(arg, "-I${SRCDIR}"); ok && (rest == "" || strings.HasPrefix(rest, "/")) && !strings.ContainsAny(rest, `$\"'`) {
+			p := path.Join(pkg, "."+rest)
+			if p != ".." && !strings.HasPrefix(p, "../") && inAllowed(p) {
+				dirs = append(dirs, p)
+				continue
+			}
+		}
+		problems = append(problems, "cgo flag "+arg)
+	}
+	return dirs, problems
 }
 
 // checkCgoPackage applies the allowlist rules to one cgo package.
+//
+// Scanning follows what the compiler reads rather than walking directories.
+// The go command compiles the package's preambles and the C-family files
+// directly in its directory. With #cgo limited to -I and -D, the compiler
+// reads nothing else except what those files include, so every included
+// repository file is scanned too, transitively and whatever its extension.
+// (A directory walk would also judge files that other toolchains build with
+// other search paths, such as the C tests in capi/tests.)
+//
+// A quoted include is searched beside the including file, then in the
+// package directory and the -I directories; an angle include only in the
+// package directory and the -I directories. Every candidate that exists, not
+// just the first, must lie in the allowed directories and is scanned, so the
+// checker and the compiler cannot disagree about which one is used. A quoted
+// include found nowhere is a violation; an angle include found nowhere is a
+// system header and may not contain a path or "..".
 func checkCgoPackage(fsys fs.FS, pkg string) ([]Violation, error) {
 	var out []Violation
 	allowed := append([]string{pkg}, CgoIncludeDirs...)
@@ -272,15 +303,16 @@ func checkCgoPackage(fsys fs.FS, pkg string) ([]Violation, error) {
 		}
 		return false
 	}
-	// Seed: every Go preamble and every C-family file in the package and
-	// the allowed directories.
+	regular := func(p string) bool {
+		info, err := fs.Stat(fsys, p)
+		return err == nil && info.Mode().IsRegular()
+	}
 	type unit struct {
 		file string
 		src  []byte
 	}
 	var queue []unit
 	seen := map[string]bool{}
-	// enqueue schedules a repository file for include scanning once.
 	enqueue := func(file string) error {
 		if seen[file] {
 			return nil
@@ -293,74 +325,66 @@ func checkCgoPackage(fsys fs.FS, pkg string) ([]Violation, error) {
 		queue = append(queue, unit{file, src})
 		return nil
 	}
-	regular := func(p string) bool {
-		info, err := fs.Stat(fsys, p)
-		return err == nil && info.Mode().IsRegular()
+
+	// The package's preambles, in file name order as cgo reads them. Their
+	// -I directories form one search list for the whole package.
+	searchDirs := []string{pkg}
+	entries, err := fs.ReadDir(fsys, pkg)
+	if err != nil {
+		return nil, err
 	}
-	for _, dir := range allowed {
-		entries, err := fs.ReadDir(fsys, dir)
-		if err != nil {
-			continue // An allowed directory a fixture lacks is not an error.
+	for _, e := range entries {
+		name := path.Join(pkg, e.Name())
+		if e.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
 		}
-		for _, e := range entries {
-			name := path.Join(dir, e.Name())
-			if e.IsDir() {
+		src, err := fs.ReadFile(fsys, name)
+		if err != nil {
+			return nil, err
+		}
+		text, usesC, err := preamble(name, src)
+		if err != nil {
+			return nil, err
+		}
+		if !usesC {
+			continue
+		}
+		for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+			t := strings.TrimSpace(line)
+			if !strings.HasPrefix(t, "#cgo") {
 				continue
 			}
-			src, err := fs.ReadFile(fsys, name)
-			if err != nil {
-				return nil, err
+			if strings.HasSuffix(t, `\`) {
+				out = append(out, Violation{"A", name, "(#cgo line continuation)"})
+				continue
 			}
-			switch {
-			case strings.HasSuffix(name, ".go") && dir == pkg:
-				text, usesC, err := preamble(name, src)
-				if err != nil {
-					return nil, err
-				}
-				if !usesC {
-					continue
-				}
-				for _, line := range strings.Split(text, "\n") {
-					t := strings.TrimSpace(line)
-					if !strings.HasPrefix(t, "#cgo") {
-						continue
-					}
-					if strings.HasSuffix(t, `\`) {
-						out = append(out, Violation{"A", name, "(#cgo line continuation)"})
-						continue
-					}
-					_, args, ok := strings.Cut(t, ":")
-					if !ok {
-						out = append(out, Violation{"A", name, "(malformed #cgo directive)"})
-						continue
-					}
-					for _, arg := range strings.Fields(args) {
-						for _, ref := range cgoArgRefs(arg) {
-							p, ok := resolveCgo(pkg, ref)
-							if !ok || !inAllowed(p) {
-								out = append(out, Violation{"A", name, "cgo flag " + ref})
-								continue
-							}
-							// A flag naming a file (-include, an archive) puts
-							// it in the build: scan it like an included file.
-							if regular(p) {
-								if err := enqueue(p); err != nil {
-									return nil, err
-								}
-							}
-						}
-					}
-				}
-				queue = append(queue, unit{name, []byte(text)})
-			case hasExt(name, buildWithoutCgo):
-				out = append(out, Violation{"A", name, "(assembly, .syso or SWIG source)"})
-			case hasExt(name, buildableExts):
-				if err := enqueue(name); err != nil {
-					return nil, err
+			dirs, problems := cgoDirective(pkg, t, inAllowed)
+			for _, p := range problems {
+				out = append(out, Violation{"A", name, p})
+			}
+			for _, d := range dirs {
+				if !slices.Contains(searchDirs, d) {
+					searchDirs = append(searchDirs, d)
 				}
 			}
 		}
+		queue = append(queue, unit{name, []byte(text)})
 	}
+
+	// C-family files the go command compiles: those directly in the package.
+	for _, e := range entries {
+		name := path.Join(pkg, e.Name())
+		switch {
+		case e.IsDir() || strings.HasSuffix(name, ".go"):
+		case hasExt(name, buildWithoutCgo):
+			out = append(out, Violation{"A", name, "(assembly, .syso or SWIG source)"})
+		case hasExt(name, buildableExts):
+			if err := enqueue(name); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	for len(queue) > 0 {
 		u := queue[0]
 		queue = queue[1:]
@@ -369,40 +393,39 @@ func checkCgoPackage(fsys fs.FS, pkg string) ([]Violation, error) {
 			out = append(out, Violation{"A", u.file, p})
 		}
 		for _, inc := range incs {
-			if inc.kind == "angle" {
-				if inc.path == "" || strings.ContainsAny(inc.path, `/\`) || strings.Contains(inc.path, "..") {
-					out = append(out, Violation{"A", u.file, "include <" + inc.path + "> (system header with a path)"})
+			if strings.ContainsAny(inc.path, `\$`) || strings.HasPrefix(inc.path, "/") || inc.path == "" {
+				out = append(out, Violation{"A", u.file, "include " + inc.String() + " (not a plain relative path)"})
+				continue
+			}
+			candidates := searchDirs
+			if inc.kind == "quote" {
+				candidates = append([]string{path.Dir(u.file)}, searchDirs...)
+			}
+			found, outside := false, false
+			for _, dir := range candidates {
+				p := path.Join(dir, inc.path)
+				if !regular(p) {
 					continue
 				}
-				// -I paths are searched for angle includes too, so a name
-				// that exists in an allowed directory is scanned.
-				for _, dir := range allowed {
-					if p := path.Join(dir, inc.path); regular(p) {
-						if err := enqueue(p); err != nil {
-							return nil, err
-						}
-					}
+				found = true
+				if !inAllowed(p) {
+					outside = true
+					continue
 				}
-				continue
-			}
-			// A quoted include is searched beside the including file, then
-			// on -I paths, which are confined to the allowed directories.
-			target := ""
-			if !strings.ContainsAny(inc.path, `\$`) && !strings.HasPrefix(inc.path, "/") {
-				for _, dir := range append([]string{path.Dir(u.file)}, allowed...) {
-					p := path.Join(dir, inc.path)
-					if info, err := fs.Stat(fsys, p); err == nil && info.Mode().IsRegular() && inAllowed(p) && !strings.HasPrefix(p, "../") {
-						target = p
-						break
-					}
+				if err := enqueue(p); err != nil {
+					return nil, err
 				}
 			}
-			if target == "" {
-				out = append(out, Violation{"A", u.file, "include \"" + inc.path + "\" (not found in allowed directories)"})
-				continue
-			}
-			if err := enqueue(target); err != nil {
-				return nil, err
+			switch {
+			case outside:
+				out = append(out, Violation{"A", u.file, "include " + inc.String() + " (resolves outside allowed directories)"})
+			case found:
+			case inc.kind == "angle" && !strings.Contains(inc.path, "/") && !strings.Contains(inc.path, ".."):
+				// A system header: found in no repository -I directory.
+			case inc.kind == "angle":
+				out = append(out, Violation{"A", u.file, "include " + inc.String() + " (system header with a path)"})
+			default:
+				out = append(out, Violation{"A", u.file, "include " + inc.String() + " (not found in allowed directories)"})
 			}
 		}
 	}
