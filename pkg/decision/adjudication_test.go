@@ -75,6 +75,43 @@ func TestLabelPolicyBoundsAndIdentity(t *testing.T) {
 		t.Fatal("accepted zero policy")
 	}
 }
+
+func TestAdjudicationStorageIdentityHelpersAreBoundedAndNotValidation(t *testing.T) {
+	policy, prediction, config := adjudicationFixture(t)
+	proposal, err := decision.NewAdjudicationProposal(policy, prediction, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := decision.AdjudicationTargetID(proposal.TaskID(), proposal.PictureID(), config.SubjectID, config.QuestionID)
+	if err != nil || target != proposal.TargetID() {
+		t.Fatal("storage target identity drift", err)
+	}
+	firstReference := config.ObservationReceiptIDs[0]
+	id, err := decision.AdjudicationProposalID(policy.ID(), target, config)
+	if err != nil || id != proposal.ID() || config.ObservationReceiptIDs[0] != firstReference {
+		t.Fatal("storage proposal identity drift or mutation", err)
+	}
+	// A metadata hash is deliberately not a validated, authorized proposal.
+	config.Label = "not-a-task-label"
+	if _, err := decision.AdjudicationProposalID(policy.ID(), target, config); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decision.NewAdjudicationProposal(policy, prediction, config); err == nil {
+		t.Fatal("metadata identity bypassed task label validation")
+	}
+	config.Label = string([]byte{255})
+	if _, err := decision.AdjudicationProposalID(policy.ID(), target, config); err == nil {
+		t.Fatal("lossy UTF-8 metadata identity accepted")
+	}
+	config.Label = "low"
+	config.WitnessIDs = make([]shoal.ID, decision.MaxAdjudicationWitnesses+1)
+	if _, err := decision.AdjudicationProposalID(policy.ID(), target, config); err == nil {
+		t.Fatal("unbounded metadata identity accepted")
+	}
+	if _, err := decision.AdjudicationTargetID("", proposal.PictureID(), config.SubjectID, config.QuestionID); err == nil {
+		t.Fatal("empty target binding accepted")
+	}
+}
 func TestAdjudicationCanonicalReferencesAndCopyIsolation(t *testing.T) {
 	policy, prediction, c := adjudicationFixture(t)
 	if policy.Config().OwnerID == prediction.Request().Task().Config().OwnerID {

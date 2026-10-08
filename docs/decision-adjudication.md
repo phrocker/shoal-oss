@@ -31,6 +31,12 @@ target identity binds **task, picture, subject, and question**. Changing the
 request, prediction, report subset, or adjudicator must not create a separate
 target and hide a conflicting adjudication over the same picture.
 
+The bounded `AdjudicationTargetID` and `AdjudicationProposalID` helpers let storage
+check canonical metadata identities without duplicating their encoding. A
+metadata hash is not a validated proposal: readers must reconstruct with
+`NewAdjudicationProposal` and trusted policy/prediction records before accepting
+task-specific labels, witness requirements, or any authority claim.
+
 ## Required service behavior
 
 The following service work remains open under #403, #405, and #419. The contracts

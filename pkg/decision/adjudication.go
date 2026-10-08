@@ -130,6 +130,11 @@ func NewAdjudicationProposal(policy LabelPolicy, prediction PredictionRecord, c 
 		return AdjudicationProposal{}, err
 	}
 	for _, text := range []string{c.Label, c.Reason, string(c.Disposition)} {
+		if text != "" {
+			if err := requiredText(text); err != nil {
+				return AdjudicationProposal{}, err
+			}
+		}
 		if err := budget.text(text); err != nil {
 			return AdjudicationProposal{}, err
 		}
@@ -211,14 +216,11 @@ func NewAdjudicationProposal(policy LabelPolicy, prediction PredictionRecord, c 
 			}
 		}
 	}
-	targetID, err := identity("adjudication-target", struct{ TaskID, PictureID, SubjectID, QuestionID shoal.ID }{request.TaskID(), request.PictureID(), c.SubjectID, c.QuestionID})
+	targetID, err := AdjudicationTargetID(request.TaskID(), request.PictureID(), c.SubjectID, c.QuestionID)
 	if err != nil {
 		return AdjudicationProposal{}, err
 	}
-	id, err := identity("adjudication-proposal", struct {
-		PolicyID, TargetID shoal.ID
-		Config             AdjudicationProposalConfig
-	}{policy.ID(), targetID, c})
+	id, err := AdjudicationProposalID(policy.ID(), targetID, c)
 	if err != nil {
 		return AdjudicationProposal{}, err
 	}
@@ -251,4 +253,87 @@ func cloneAdjudication(c AdjudicationProposalConfig) AdjudicationProposalConfig 
 		c.Truth = &value
 	}
 	return c
+}
+
+// AdjudicationTargetID hashes the bounded target metadata used by durable journals.
+// This establishes content identity only, not registration or authorization.
+func AdjudicationTargetID(taskID, pictureID, subjectID, questionID shoal.ID) (shoal.ID, error) {
+	for _, id := range []shoal.ID{taskID, pictureID, subjectID, questionID} {
+		if err := requiredID(id); err != nil {
+			return "", err
+		}
+	}
+	return identity("adjudication-target", struct{ TaskID, PictureID, SubjectID, QuestionID shoal.ID }{taskID, pictureID, subjectID, questionID})
+}
+
+// AdjudicationProposalID hashes bounded, canonical proposal metadata for storage
+// integrity checks. It does NOT validate task-specific labels, policy witness
+// requirements, or permissions. Reconstruct with NewAdjudicationProposal and
+// trusted policy/prediction records before treating stored metadata as a proposal.
+func AdjudicationProposalID(policyID, targetID shoal.ID, c AdjudicationProposalConfig) (shoal.ID, error) {
+	for _, id := range []shoal.ID{policyID, targetID, c.RequestID, c.PredictionID, c.SubjectID, c.QuestionID} {
+		if err := requiredID(id); err != nil {
+			return "", err
+		}
+	}
+	if len(c.ObservationReceiptIDs) == 0 || len(c.ObservationReceiptIDs) > MaxAdjudicationObservations || len(c.WitnessIDs) > MaxAdjudicationWitnesses {
+		return "", invalid("invalid adjudication reference counts")
+	}
+	var budget byteBudget
+	if err := budget.charge(4096); err != nil {
+		return "", err
+	}
+	if err := budget.ids(policyID, targetID, c.RequestID, c.PredictionID, c.SubjectID, c.QuestionID, c.ExpectedHeadID); err != nil {
+		return "", err
+	}
+	if err := budget.ids(c.ObservationReceiptIDs...); err != nil {
+		return "", err
+	}
+	if err := budget.ids(c.WitnessIDs...); err != nil {
+		return "", err
+	}
+	for _, text := range []string{c.Label, c.Reason, string(c.Disposition)} {
+		if text != "" {
+			if err := requiredText(text); err != nil {
+				return "", err
+			}
+		}
+		if err := budget.text(text); err != nil {
+			return "", err
+		}
+	}
+	if c.ExpectedHeadID == "" {
+		if c.ExpectedVersion != 0 {
+			return "", invalid("head version without predecessor")
+		}
+	} else if c.ExpectedVersion <= 0 || !adjudicationReceiptReference(c.ExpectedHeadID, "adjudication-receipt:") {
+		return "", invalid("invalid adjudication predecessor")
+	}
+	switch c.Disposition {
+	case AdjudicationVerified, AdjudicationDisputed, AdjudicationUnresolved:
+	default:
+		return "", invalid("invalid adjudication disposition")
+	}
+	c = cloneAdjudication(c)
+	for _, references := range []struct {
+		ids    []shoal.ID
+		prefix string
+	}{{c.ObservationReceiptIDs, "outcome-receipt:"}, {c.WitnessIDs, ""}} {
+		sort.Slice(references.ids, func(i, j int) bool { return references.ids[i] < references.ids[j] })
+		for i, id := range references.ids {
+			if err := requiredID(id); err != nil {
+				return "", err
+			}
+			if references.prefix != "" && !adjudicationReceiptReference(id, references.prefix) {
+				return "", invalid("invalid outcome receipt reference")
+			}
+			if i > 0 && references.ids[i-1] == id {
+				return "", invalid("duplicate adjudication reference")
+			}
+		}
+	}
+	return identity("adjudication-proposal", struct {
+		PolicyID, TargetID shoal.ID
+		Config             AdjudicationProposalConfig
+	}{policyID, targetID, c})
 }
