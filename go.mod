@@ -31,6 +31,8 @@ require (
 	google.golang.org/protobuf v1.36.11
 )
 
+require filippo.io/edwards25519 v1.2.0
+
 require (
 	cel.dev/expr v0.25.1 // indirect
 	cloud.google.com/go v0.123.0 // indirect
