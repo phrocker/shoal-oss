@@ -164,7 +164,7 @@ type fixture struct {
 	policyB   []byte
 }
 
-func newFixture(t *testing.T) *fixture {
+func newFixture(t testing.TB) *fixture {
 	t.Helper()
 	now := time.Date(2026, time.August, 26, 18, 0, 0, 0, time.UTC)
 	clock := &fakeClock{now: now}
@@ -198,7 +198,7 @@ func newFixture(t *testing.T) *fixture {
 }
 
 func (f *fixture) newClient(
-	t *testing.T,
+	t testing.TB,
 	base explorer.Client,
 	store authorized.PolicyStore,
 	source, policy []byte,
@@ -263,7 +263,7 @@ func trustedFoldStore(base explorer.Client) authorized.FoldStore {
 }
 
 func (f *fixture) decision(
-	t *testing.T,
+	t testing.TB,
 	subject string,
 	sources, policies [][]byte,
 	operations []auth.Operation,
@@ -273,7 +273,7 @@ func (f *fixture) decision(
 }
 
 func (f *fixture) decisionAtGeneration(
-	t *testing.T,
+	t testing.TB,
 	subject string,
 	sources, policies [][]byte,
 	operations []auth.Operation,
@@ -298,7 +298,7 @@ func (f *fixture) decisionAtGeneration(
 }
 
 func (f *fixture) context(
-	t *testing.T,
+	t testing.TB,
 	decision auth.Decision,
 ) context.Context {
 	t.Helper()
@@ -309,7 +309,7 @@ func (f *fixture) context(
 	return ctx
 }
 
-func (f *fixture) admin(t *testing.T) context.Context {
+func (f *fixture) admin(t testing.TB) context.Context {
 	t.Helper()
 	return f.context(t, f.decision(
 		t,
@@ -320,7 +320,7 @@ func (f *fixture) admin(t *testing.T) context.Context {
 	))
 }
 
-func (f *fixture) alice(t *testing.T) context.Context {
+func (f *fixture) alice(t testing.TB) context.Context {
 	t.Helper()
 	return f.context(t, f.decision(
 		t,
@@ -331,7 +331,7 @@ func (f *fixture) alice(t *testing.T) context.Context {
 	))
 }
 
-func (f *fixture) bob(t *testing.T) context.Context {
+func (f *fixture) bob(t testing.TB) context.Context {
 	t.Helper()
 	return f.context(t, f.decision(
 		t,
