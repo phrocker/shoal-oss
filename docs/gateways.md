@@ -11,8 +11,9 @@ reached by a separate gateway, built in this order:
 
 The first two enforce. The third improves what they enforce: it turns human
 operational activity into attributed observations that the decision work in
-#401 can evaluate and, under #419's rules, learn from. The order is also the
-dependency order.
+#401 can evaluate and, under #419's rules, learn from. The order is priority,
+not dependency: the session gateway does not need the effects gateway, and the
+dependencies that do exist are listed under "Order".
 
 ## Why three, and why separate
 
@@ -24,19 +25,28 @@ session gateway differs from both again:
 | | LLM gateway | Effects gateway | Session gateway |
 | --- | --- | --- | --- |
 | unit | one request | one action, at most once | a long-lived stream yielding many observations |
-| inbound listener | HTTP | none on Path A: the worker pulls | SSH; RDP through `guacd` |
+| inbound listener | HTTP | none on Path A if its probes are `exec`: the worker pulls | SSH; RDP through `guacd` |
 | writes to Shoal | admission and report | dispatch completion | observations, shadow predictions, outcomes |
 | sensitive state | provider credential | one target credential | target credentials and raw session recordings |
 
 Two rows settle that these are separate binaries, not modes of one:
 
-- **Inbound exposure.** A Path A effects worker accepts no connections. Putting
-  an interactive SSH server or `guacd` in the pod that holds an
-  irreversible-effect credential gives every operator-facing connection a route
-  to that credential.
+- **Inbound exposure.** A Path A effects worker pulls its work, and with `exec`
+  probes it accepts no connections at all (`docs/gateway-proxy-design.md`,
+  "Kubernetes reference"). Even with a health listener, putting an interactive
+  SSH server or `guacd` in the pod that holds an irreversible-effect credential
+  gives every operator-facing connection a route to that credential.
 - **Recordings.** Raw sessions carry typed secrets and customer data, and need
   their own storage, retention and replay access. Nothing about an effects
   worker should hold them.
+
+This does not contradict `docs/sentrius-integration.md` §6 ("What must not move
+into Shoal"). §6 keeps session *transport* out of Shoal's dispatch and
+execution: a session is the wrong shape for an action, and SSH and RDP proxies
+effect change by definition. The session gateway is a separate binary that
+observes sessions and reports to Shoal through public contracts. Nothing in
+Shoal's executor performs a session, and the gateway enforces nothing until
+shadow results justify it.
 
 All three follow the deployment rule in `docs/gateway-proxy-design.md` ("The unit
 of deployment is the operational surface"): one binary, deployed once per
@@ -76,10 +86,11 @@ rendered by the core chart unless enabled. Core release gates do not cover them.
 They stay in this repository while the contracts settle, so a contract change and
 the extension that exposed it can land together.
 
-The boundary is enforced the same way #402 enforces "core imports do not depend
-on GitHub": a test fails if anything under `pkg/`, `internal/` or `cmd/` imports
-from `extensions/`, or if an extension imports anything other than the SDK and
-public `pkg/` contracts.
+The boundary follows the rule #402 states for decision contracts, "core imports
+do not depend on GitHub", and goes further by testing it: a new test (#446)
+fails if anything under `pkg/`, `internal/` or `cmd/` imports from
+`extensions/`, or if an extension imports anything other than the SDK and public
+`pkg/` contracts.
 
 **What the rule costs.** An extension cannot reach into internals, so core
 contracts must cover everything an extension needs. The first extension will
@@ -159,8 +170,9 @@ Three parts do not, and are adopted:
   attached to exact context are also adjudications for #401, subject to #419's
   role separation. A ZTAT remains an approval record, not a grant
   (`docs/sentrius-integration.md` §3).
-- **Runtime attestation.** ATPL's `runtime` section. Nothing here records
-  whether a gateway or executor runs attested code. It becomes provenance that
+- **Runtime attestation.** ATPL's `runtime` section. Source attestation
+  references exist in `pkg/decision`, but nothing records whether a gateway or
+  executor runs attested code. It becomes provenance that
   policy may require for executors bound for `EffectMutatesExternal`.
 - **A declarative policy format.** Policy is today spread across descriptor
   registration, chart route tables and `auth` configuration. A versioned file
@@ -169,7 +181,9 @@ Three parts do not, and are adopted:
   the ATPL name; it does not keep ATPL's schema.
 
 Not adopted: `trust_score`. A hand-weighted sum that gates admission is the
-uncalibrated authority #419 forbids and #429 refuses for priority. How far to
+uncalibrated authority #419 forbids: "model scores cannot assign policy
+authority". #429 holds the same line for ranking, where low priority never
+grants permission to skip review. How far to
 trust an agent is a typed decision, evaluated in shadow against attributed
 outcomes and promoted explicitly. Fixed `behavior` thresholds are dropped for
 the same reason.
@@ -181,12 +195,15 @@ the same reason.
 2. **Effects gateway, HTTP.** Blocked on #435 (worker never receives input),
    #436 (no external-effect executor ceiling), #437 (claimant must be
    enqueuer), #438 (nowhere to record a lost-fence ambiguity) and #430 (claims
-   cannot be extended). Then #391. Approval as an admission outcome lands before
+   cannot be extended), and on the decision the design doc requires about
+   heartbeats moving the descriptor generation ("The second blocker: every
+   heartbeat invalidates every claim"), which has no issue of its own. Then #391. Approval as an admission outcome lands before
    the gateway enforces any effect that requires it.
 3. **Core extension contracts.** Collector registration and authority, extractor
    identity, runtime attestation, SDK, import boundary test. Rides on #403, #418
    and #419.
-4. **Session gateway, SSH.** Shadow only. Begins emitting observations only once
+4. **Session gateway, SSH.** Subject to the #421 open decision below, and
+   tracked with it in #447. Shadow only. Begins emitting observations only once
    step 3 and #418 exist; transport and recording can be built earlier.
 5. **Session gateway, RDP.** Same pipeline, `guacd` adapter.
 6. **Extractors.** Commands first, then GUI events, vision and UI Automation.
@@ -198,12 +215,12 @@ shadow results justify it, under the same gate #409 sets for exclusion.
 ## Decided
 
 - **Naming.** The LLM gateway was `shoal-llm-proxy`. Its binary, image, chart
-  key (`llmGateway`) and Kubernetes resources are renamed to match.
+  key (`llmGateway`) and Kubernetes resources are renamed to match (#454).
 - **ATPL.** The declarative policy format (#452) keeps the ATPL name.
 
 ## Open decisions
 
-- **Before building the proxy.** Whether imported recordings from existing
+- **Before building the session gateway.** Whether imported recordings from existing
   tools, admitted as low-authority evidence, should first show that session data
   improves a typed decision in #421, with "it does not" an acceptable result.
 - **Repository.** When, if ever, extensions move to their own repositories.
