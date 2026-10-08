@@ -11,6 +11,10 @@
 // Exact-case checking follows the target type through structs, maps, slices,
 // arrays and pointers. It stops at json.RawMessage, time.Time and any type
 // with its own UnmarshalJSON; such values are checked only for duplicate keys.
+//
+// Embedded (anonymous) struct fields are not promoted: a target that embeds a
+// struct has its promoted keys refused as case mismatches. That fails closed;
+// no current target embeds one. Add promotion before decoding into one.
 package strictjson
 
 import (
