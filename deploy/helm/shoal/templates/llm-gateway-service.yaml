@@ -11,7 +11,7 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.llmGateway.service.type }}
+  type: {{ .Values.llmGateway.service.type | quote }}
   selector:
     {{- include "shoal.llmGatewaySelectorLabels" . | nindent 4 }}
   # One port, and it is not the health port. The probe surface exists for the

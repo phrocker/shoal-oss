@@ -389,6 +389,27 @@ assert_renders "both ceilings on separate references" "\-fleet-external-egress-e
 assert_renders "the ask executor beside a gateway" "\-fleet-external-executor-refs=deploy\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
 assert_renders "and the ask binding survives it" "\-fleet-ask-executor-ref=ask\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
 
+note "== a gateway value cannot carry a character that changes what the pod is given =="
+# Every string the gateway pod is rendered from is a quoted scalar now, and a
+# control character in one is refused where it is written. Before the quoting, a
+# newline in identity.capability appended an argument of the operator's choosing
+# — -allow-plaintext-admission=true among them.
+assert_renders "gateway arguments are quoted scalars" '^ +- "-capability=chat\.completions"$' "${llm_gateway_base[@]}"
+refuses_citing "holds a control character" "a newline in the capability" "${llm_gateway_base[@]}" --set-string 'llmGateway.identity.capability=chat
+            - -allow-plaintext-admission=true'
+refuses_citing "holds a control character" "a newline in the admission token variable" "${llm_gateway_base[@]}" --set-string 'llmGateway.admission.tokenEnv=TOKEN
+            - name: OTHER'
+refuses_citing "holds a control character" "a newline in an allowed host" "${llm_gateway_base[@]}" --set-string 'llmGateway.allowedHosts[0]=llm.example.test
+            - -allow-plaintext-admission=true'
+refuses_citing "holds a control character" "a newline in a model" "${llm_gateway_base[@]}" --set-string 'llmGateway.models[0]=gpt-4o
+            - -allow-plaintext-admission=true'
+refuses_citing "holds a control character" "a newline in the image tag" "${llm_gateway_base[@]}" --set-string 'llmGateway.image.tag=v1
+          securityContext: {}'
+refuses_citing "holds a comma" "a comma inside one allowed host" "${llm_gateway_base[@]}" --set-string 'llmGateway.allowedHosts[0]=a.example.test\,b.example.test'
+refuses_citing "holds a comma" "a comma inside one model" "${llm_gateway_base[@]}" --set-string 'llmGateway.models[0]=gpt-4o\,claude-opus-5'
+renders "a trailing newline the template trims is not a control character in the value" "${llm_gateway_base[@]}" --set-string 'llmGateway.identity.action=complete
+'
+
 note "== llm gateway guards refuse =="
 # The gateway's failure mode is not a crash. It is required to fail closed, so
 # nearly every misconfiguration below renders a pod that passes every probe and
@@ -686,9 +707,9 @@ renders "one model named"        "${llm_gateway_base[@]}" --set 'llmGateway.mode
 renders "several models named"   "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o,claude-opus-5}'
 # Blank entries are dropped rather than rendered, since the list is joined into
 # one argument and a comma pair is an empty model name to the binary.
-assert_renders "a blank model entry is dropped" "\-model=gpt-4o$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o, }'
-assert_renders "models render as one joined argument" "\-model=gpt-4o,claude-opus-5$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o,claude-opus-5}'
-assert_renders "no models renders an empty flag" "\-model=$" "${llm_gateway_base[@]}"
+assert_renders "a blank model entry is dropped" "\-model=gpt-4o\"$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o, }'
+assert_renders "models render as one joined argument" "\-model=gpt-4o,claude-opus-5\"$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o,claude-opus-5}'
+assert_renders "no models renders an empty flag" "\-model=\"$" "${llm_gateway_base[@]}"
 
 note "== rollout and disruption values are validated as written =="
 # These reach the API server verbatim, and their only guard cast to int first —
@@ -735,7 +756,7 @@ refuses_citing "must name a file" "a token path with a trailing slash" "${token_
 # The same path without the slash still renders, or the guard refuses the
 # feature.
 renders "a token path naming a file"  "${token_file_base[@]}" --set 'llmGateway.admission.tokenFile=/var/run/secrets/shoal/token'
-assert_renders "and the flag matches the mount" "admission-token-file=/var/run/secrets/shoal/token$" "${token_file_base[@]}"
+assert_renders "and the flag matches the mount" "admission-token-file=/var/run/secrets/shoal/token\"$" "${token_file_base[@]}"
 
 note "== no Kubernetes API credential in the prompt-processing pod =="
 # This pod needs no API access: it speaks HTTP to the workspace and HTTP to the
@@ -845,7 +866,7 @@ refuses "both upstream key forms chosen explicitly" "${upstream_key_file[@]}" --
 # derives the mount from the directory and the item from the base, so the flag
 # would name a directory while the credential landed inside it.
 refuses_citing "must name a file" "a key path with a trailing slash" "${upstream_key_file[@]}" --set 'llmGateway.upstream.apiKeyFile=/var/run/secrets/upstream/'
-assert_renders "the key flag matches its mount" "upstream-api-key-file=/etc/shoal/upstream/api-key$" "${upstream_key_file[@]}"
+assert_renders "the key flag matches its mount" "upstream-api-key-file=/etc/shoal/upstream/api-key\"$" "${upstream_key_file[@]}"
 refuses "a relative upstream key file"      "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyFile=upstream/api-key
 refuses "an upstream key file at the filesystem root" "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyFile=/api-key
 # Cited: with the source guard gone the chart renders an empty volume source,
