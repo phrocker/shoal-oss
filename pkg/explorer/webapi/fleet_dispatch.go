@@ -628,14 +628,19 @@ type fleetActionWire struct {
 	// meant a successful enqueue reported as an unknown outcome, repeatably,
 	// for as long as the record existed. One record on one route is the bound
 	// that keeps the page size independent of the payload ceiling.
-	Input         json.RawMessage `json:"input,omitempty"`
-	Output        json.RawMessage `json:"output,omitempty"`
-	ErrorCode     string          `json:"error_code,omitempty"`
-	RequestID     string          `json:"request_id"`
-	CorrelationID string          `json:"correlation_id,omitempty"`
-	Deadline      time.Time       `json:"deadline"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	Output    json.RawMessage `json:"output,omitempty"`
+	ErrorCode string          `json:"error_code,omitempty"`
+	// ErrorCodeOrigin says whether the service or the executor decided
+	// ErrorCode, which the code alone cannot tell a reader (#508). Omitted on
+	// a record written before the field existed, which a reader must treat as
+	// "either" rather than as "executor".
+	ErrorCodeOrigin string    `json:"error_code_origin,omitempty"`
+	RequestID       string    `json:"request_id"`
+	CorrelationID   string    `json:"correlation_id,omitempty"`
+	Deadline        time.Time `json:"deadline"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 	// ExecutorKey is the idempotency key an in-process executor already
 	// receives (dispatch_service.go hands it over as IdempotencyKey), derived
 	// at enqueue as a length-prefixed digest over a domain tag, the action ID
@@ -818,9 +823,11 @@ func encodeFleetAction(record fleet.ActionRecord) fleetActionWire {
 		ID: base64.RawURLEncoding.EncodeToString(record.ID), Version: record.Version, State: record.State,
 		AgentID: encodeFleetID(record.AgentID), AgentGeneration: record.AgentGeneration,
 		Capability: record.Capability, Action: record.Action,
-		Output:    append(json.RawMessage(nil), record.Output...),
-		ErrorCode: record.ErrorCode, RequestID: encodeFleetID(record.RequestID),
-		CorrelationID: encodeFleetID(record.CorrelationID), Deadline: record.Deadline,
+		Output:          append(json.RawMessage(nil), record.Output...),
+		ErrorCode:       record.ErrorCode,
+		ErrorCodeOrigin: string(record.ErrorCodeOrigin),
+		RequestID:       encodeFleetID(record.RequestID),
+		CorrelationID:   encodeFleetID(record.CorrelationID), Deadline: record.Deadline,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 		ClaimID: base64.RawURLEncoding.EncodeToString(record.ClaimID), ClaimFence: record.ClaimFence,
 		ClaimLeaseUntil: record.ClaimLeaseUntil, EffectPossible: record.EffectPossible,

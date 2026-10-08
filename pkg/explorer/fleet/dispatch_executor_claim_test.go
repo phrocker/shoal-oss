@@ -3561,3 +3561,132 @@ func TestARecorderFailureLeavesTheRecordUnchanged(t *testing.T) {
 		})
 	}
 }
+
+// TestAnExecutorCannotClaimTheServicesAdjudication is #508: the error code was
+// an unauthenticated string that the service and the executor both wrote,
+// through the same assignment, with nothing recording which.
+//
+// Both halves are asserted, because either alone is insufficient. Reserving
+// the service's codes stops a worker claiming an adjudication that never
+// happened; recording the origin tells a reader which of the two wrote any
+// code at all, including the next code someone adds without remembering to
+// reserve it.
+//
+// The sharpest reserved code is invalid_executor_error, which the service
+// assigns *because* it rejected the worker's own code — so a worker reporting
+// it produces a record saying Shoal refused a code Shoal never saw.
+func TestAnExecutorCannotClaimTheServicesAdjudication(t *testing.T) {
+	claimed := func(t *testing.T, f *executorClaimFixture) (
+		context.Context, ActionRecord,
+	) {
+		t.Helper()
+		worker := f.namedWorker(t, "worker", auth.OperationExecute)
+		record, err := f.service.Claim(worker, ClaimRequest{
+			ID: f.queued.ID, ExpectedVersion: f.queued.Version,
+			ClaimID: []byte("worker-claim"), Lease: time.Minute,
+			Context: dispatchContext(f.now, "worker-request"),
+		})
+		if err != nil {
+			t.Fatalf("the claim this test needs was refused: %v", err)
+		}
+		return worker, record
+	}
+
+	for _, reserved := range []string{
+		"invalid_executor_output",
+		"invalid_executor_evidence",
+		"invalid_executor_error",
+		"executor_error",
+	} {
+		t.Run("refuses "+reserved, func(t *testing.T) {
+			fixture := newExecutorClaimFixture(t)
+			worker, record := claimed(t, fixture)
+			_, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+				ID: fixture.queued.ID, ExpectedVersion: record.Version,
+				ClaimFence: record.ClaimFence, ClaimID: []byte("worker-claim"),
+				Failed:  true,
+				Result:  ExecutionResult{ErrorCode: reserved},
+				Context: dispatchContext(fixture.now, "worker-request"),
+			})
+			if err == nil {
+				t.Fatalf("a worker reported %q, which the service assigns, "+
+					"so the record reads as an adjudication that never "+
+					"happened", reserved)
+			}
+			if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+				t.Fatalf("refused as %v, want an invalid argument", err)
+			}
+			// And nothing was written: this is a boundary refusal, so the
+			// claim is still the worker's to complete properly.
+			stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
+			if stored.State != DispatchClaimed {
+				t.Fatalf("the refused completion moved the record to %q",
+					stored.State)
+			}
+		})
+	}
+
+	t.Run("records the executor as the origin", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		worker, record := claimed(t, fixture)
+		// The returned error is expected and is #492: a durably recorded
+		// failure is answered as a refusal. So the record is read from the
+		// store rather than from the return value, which is what any caller
+		// has to do today.
+		if _, err := fixture.service.CompleteClaim(
+			worker, CompletionRequest{
+				ID: fixture.queued.ID, ExpectedVersion: record.Version,
+				ClaimFence: record.ClaimFence, ClaimID: []byte("worker-claim"),
+				Failed:  true,
+				Result:  ExecutionResult{ErrorCode: "payment_declined"},
+				Context: dispatchContext(fixture.now, "worker-request"),
+			}); err == nil {
+			t.Fatal("a reported failure no longer answers as a refusal, so " +
+				"this test should read the returned record instead (#492)")
+		}
+		completed := fixture.dispatchStore.records[string(fixture.queued.ID)]
+		if completed.State != DispatchFailed {
+			t.Fatalf("the failure was not recorded: state %q", completed.State)
+		}
+		if completed.ErrorCode != "payment_declined" {
+			t.Fatalf("error code = %q", completed.ErrorCode)
+		}
+		if completed.ErrorCodeOrigin != ErrorCodeOriginExecutor {
+			t.Fatalf("origin = %q, want %q: a reader cannot otherwise tell "+
+				"this from the service's own adjudication",
+				completed.ErrorCodeOrigin, ErrorCodeOriginExecutor)
+		}
+	})
+
+	t.Run("records the service as the origin", func(t *testing.T) {
+		// A successful report whose output fails the action's schema: the
+		// service adjudicates and assigns invalid_executor_output itself.
+		fixture := newExecutorClaimFixture(t)
+		worker, record := claimed(t, fixture)
+		// Also answered as a refusal, for the same reason, and the
+		// adjudication is likewise read from the store.
+		if _, err := fixture.service.CompleteClaim(
+			worker, CompletionRequest{
+				ID: fixture.queued.ID, ExpectedVersion: record.Version,
+				ClaimFence: record.ClaimFence, ClaimID: []byte("worker-claim"),
+				Result:  ExecutionResult{Output: json.RawMessage(`"not an object"`)},
+				Context: dispatchContext(fixture.now, "worker-request"),
+			}); err == nil {
+			t.Fatal("an output the schema refuses was accepted")
+		}
+		completed := fixture.dispatchStore.records[string(fixture.queued.ID)]
+		if completed.State != DispatchFailed {
+			t.Fatalf("the adjudication was not recorded: state %q",
+				completed.State)
+		}
+		if completed.ErrorCode != "invalid_executor_output" {
+			t.Fatalf("error code = %q, want the service's adjudication",
+				completed.ErrorCode)
+		}
+		if completed.ErrorCodeOrigin != ErrorCodeOriginService {
+			t.Fatalf("origin = %q, want %q: the service assigned this code "+
+				"and a reader must be able to tell",
+				completed.ErrorCodeOrigin, ErrorCodeOriginService)
+		}
+	})
+}
