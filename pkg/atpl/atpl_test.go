@@ -225,6 +225,19 @@ func TestRoundTripThroughTheRegistryYieldsIdenticalRegistrations(t *testing.T) {
 	}
 }
 
+// The registry records an "atpl-apply" reason detail only if it has exactly
+// the shape Digest produces; a drift between the two would refuse every apply.
+func TestDigestIsAcceptedAsRegistryAssertedPolicySource(t *testing.T) {
+	if fleet.ATPLPolicyDigestPrefix != DigestPrefix {
+		t.Fatalf("registry prefix %q != %q", fleet.ATPLPolicyDigestPrefix, DigestPrefix)
+	}
+	digest := compileOne(t, base(t)).Digest()
+	reason, err := fleet.CallerAssertedRegistryReason(fleet.ReasonCodeATPLApply, digest)
+	if err != nil || reason.Source != digest {
+		t.Fatalf("compiled digest %q as asserted source = %#v, %v", digest, reason, err)
+	}
+}
+
 func TestDigestIsStableAcrossRecompilesOrderAndTime(t *testing.T) {
 	first := compileOne(t, base(t))
 	again := compileOne(t, base(t))

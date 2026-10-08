@@ -14,6 +14,7 @@ import (
 	"strconv"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -73,8 +74,16 @@ func NewLifecycleRecorderWithReader(
 }
 
 // RecordLifecycle records one stable pre-admission receipt. Actor, delegation,
-// and reason are deliberately omitted from the request and accepted only from
-// the trusted recorder result.
+// and the trusted Reason (the decision's audit purpose) are deliberately
+// omitted from the request and accepted only from the trusted recorder result.
+//
+// The caller's reason code and detail are recorded separately, as the
+// session's CallerAssertedReason: what the authenticated actor asserted, never
+// verified, never used for authorization, and never in place of the audit
+// purpose. It is bound into the receipt's query digest, so a retry asserting a
+// different reason conflicts instead of reconciling. A malformed assertion,
+// such as an "atpl-apply" detail that is not a policy digest, is refused
+// before anything is read or written.
 func (r *LifecycleRecorder) RecordLifecycle(
 	ctx context.Context,
 	lifecycle fleet.Lifecycle,
@@ -88,7 +97,12 @@ func (r *LifecycleRecorder) RecordLifecycle(
 	if err := lifecycle.Operation.Validate(); err != nil {
 		return err
 	}
-	requested := lifecycleSession(lifecycle)
+	asserted, err := fleet.CallerAssertedRegistryReason(
+		lifecycle.ReasonCode, lifecycle.ReasonDetail)
+	if err != nil {
+		return err
+	}
+	requested := lifecycleSession(lifecycle, asserted)
 	if r.read != nil {
 		legacyRequested := requested
 		legacyRequested.ID = legacyLifecycleSessionID(lifecycle)
@@ -156,7 +170,7 @@ func (r *LifecycleRecorder) RecordLifecycle(
 			"fleet lifecycle recorder returned an invalid trusted chronology",
 		))
 	}
-	expected, err := expected.Canonical()
+	expected, err = expected.Canonical()
 	if err != nil {
 		return committedLifecycleError(recordErr, err)
 	}
@@ -193,6 +207,16 @@ func validateLifecycleReplay(
 		)
 	}
 	expected := requested
+	if canonical.CallerAssertedReason.IsZero() {
+		// Receipts written before caller-asserted reasons were recorded carry
+		// neither the field nor its query-digest binding. That earlier shape
+		// still reconciles: the retry gains no authority from it, and the
+		// assertion simply was not kept. A receipt that does carry an asserted
+		// reason must match it exactly.
+		expected.CallerAssertedReason = interaction.CallerAssertedReason{}
+		expected.QueryDigest = lifecycleQueryDigest(
+			lifecycle, interaction.CallerAssertedReason{})
+	}
 	expected.RecordedAt = canonical.RecordedAt
 	expected.Actor = canonical.Actor
 	expected.Reason = canonical.Reason
@@ -213,23 +237,24 @@ func validateLifecycleReplay(
 	return nil
 }
 
-func lifecycleSession(lifecycle fleet.Lifecycle) interaction.Session {
+func lifecycleSession(
+	lifecycle fleet.Lifecycle,
+	asserted interaction.CallerAssertedReason,
+) interaction.Session {
 	operation := string(lifecycle.Operation)
 	return interaction.Session{
 		ID:                       lifecycleSessionID(lifecycle),
 		Operation:                interaction.OperationToolCall,
+		CallerAssertedReason:     asserted,
 		SnapshotID:               lifecycle.SnapshotID,
 		SnapshotAsOf:             lifecycle.SnapshotAsOf.UTC(),
 		AuthorizationFingerprint: shoal.ID(lifecycle.AuthorizationFingerprint.String()),
 		AuthorizationExpiresAt:   lifecycle.AuthorizationExpiresAt.UTC(),
 		AuthorizationOperation:   operation,
-		QueryDigest: interaction.Digest(
-			operation + "\x00" + string(lifecycle.AgentID) +
-				"\x00" + hex.EncodeToString(lifecycle.MutationDigest[:]),
-		),
-		RequestID:  lifecycle.RequestID,
-		ResultID:   lifecycle.AgentID,
-		StopReason: "pre_admission",
+		QueryDigest:              lifecycleQueryDigest(lifecycle, asserted),
+		RequestID:                lifecycle.RequestID,
+		ResultID:                 lifecycle.AgentID,
+		StopReason:               "pre_admission",
 		Turns: []interaction.Turn{{
 			Index:    0,
 			Decision: "admitted:" + operation,
@@ -240,13 +265,44 @@ func lifecycleSession(lifecycle fleet.Lifecycle) interaction.Session {
 	}
 }
 
+// lifecycleQueryDigest binds the admitted mutation and the caller-asserted
+// reason. Without an asserted reason it is the original receipt digest, so
+// receipts written before the reason was recorded keep their exact shape. The
+// NUL separators cannot be forged: every bound value is charset-restricted.
+func lifecycleQueryDigest(
+	lifecycle fleet.Lifecycle,
+	asserted interaction.CallerAssertedReason,
+) string {
+	value := string(lifecycle.Operation) + "\x00" + string(lifecycle.AgentID) +
+		"\x00" + hex.EncodeToString(lifecycle.MutationDigest[:])
+	if !asserted.IsZero() {
+		value += "\x00caller-asserted-reason.v1" +
+			"\x00" + asserted.Code +
+			"\x00" + asserted.DetailDigest +
+			"\x00" + asserted.Source
+	}
+	return interaction.Digest(value)
+}
+
 func lifecycleSessionID(lifecycle fleet.Lifecycle) shoal.ID {
+	return LifecycleReceiptID(
+		lifecycle.Operation, lifecycle.RequestID, lifecycle.AgentID)
+}
+
+// LifecycleReceiptID is the durable interaction session ID of the lifecycle
+// receipt for one registry operation, by request and agent. Reading it with
+// the corpus's InteractionRecord returns the receipt, including its
+// CallerAssertedReason (for an "atpl-apply" registration, the policy digest as
+// Source) and the trusted Actor who asserted it.
+func LifecycleReceiptID(
+	operation auth.Operation, requestID, agentID shoal.ID,
+) shoal.ID {
 	return interaction.DerivedID(
 		"session",
 		"fleet.lifecycle.v2",
-		string(lifecycle.Operation),
-		string(lifecycle.RequestID),
-		string(lifecycle.AgentID),
+		string(operation),
+		string(requestID),
+		string(agentID),
 	)
 }
 

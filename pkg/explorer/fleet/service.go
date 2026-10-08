@@ -489,6 +489,16 @@ func (s *Service) begin(ctx context.Context, operation auth.Operation, request R
 	if err := request.validate(now); err != nil {
 		return auth.Decision{}, time.Time{}, err
 	}
+	// The registry's lifecycle receipt records the caller's reason as a
+	// caller-asserted reason. Refuse a shape it cannot record (notably an
+	// "atpl-apply" detail that is not a policy digest) here, before replay
+	// detection, the receipt, or any registry write. This is registry-only:
+	// the shared RequestContext.validate also serves dispatch and admission.
+	if _, err := CallerAssertedRegistryReason(
+		request.ReasonCode, request.ReasonDetail,
+	); err != nil {
+		return auth.Decision{}, time.Time{}, err
+	}
 	decision, err := s.resolver.Resolve(ctx)
 	if err != nil {
 		return auth.Decision{}, time.Time{}, err

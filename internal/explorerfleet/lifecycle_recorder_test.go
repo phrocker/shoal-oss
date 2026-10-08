@@ -119,7 +119,7 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 
 func TestLifecycleRecorderReconcilesLegacyReceiptBeforeWritingV2(t *testing.T) {
 	lifecycle := testLifecycle()
-	accepted := lifecycleSession(lifecycle)
+	accepted := lifecycleSession(lifecycle, interaction.CallerAssertedReason{})
 	accepted.ID = legacyLifecycleSessionID(lifecycle)
 	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
 	accepted.Actor = interaction.ActorContext{
@@ -226,7 +226,7 @@ func TestLifecycleRecorderPreservesCommittedAmbiguity(t *testing.T) {
 func TestLifecycleRecorderRecoversDroppedCommittedResult(t *testing.T) {
 	cause := context.DeadlineExceeded
 	lifecycle := testLifecycle()
-	accepted := lifecycleSession(lifecycle)
+	accepted := lifecycleSession(lifecycle, interaction.CallerAssertedReason{})
 	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
 	accepted.Actor = interaction.ActorContext{
 		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,
@@ -257,7 +257,7 @@ func TestLifecycleRecorderRecoversDroppedCommittedResult(t *testing.T) {
 func TestLifecycleRecorderRejectsDroppedDivergentCommittedResult(t *testing.T) {
 	cause := context.DeadlineExceeded
 	lifecycle := testLifecycle()
-	accepted := lifecycleSession(lifecycle)
+	accepted := lifecycleSession(lifecycle, interaction.CallerAssertedReason{})
 	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
 	accepted.Actor = interaction.ActorContext{
 		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,

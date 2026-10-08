@@ -217,9 +217,28 @@ followed.
   raise the lease; only a heartbeat or a later content change does. The
   "stopped after N of M writes" error names each child left clamped and the
   time its clamped lease ends.
-- `internal/explorerfleet`'s durable lifecycle recorder does not persist reason
-  code or detail, so in a hosted deployment the policy digest reaches
-  `fleet.Lifecycle` but not the durable interaction record.
+- `policy plan` does not yet show which policy produced each live
+  registration. The hosted registry records it (see below), but there is no
+  HTTP route that reads a registration's lifecycle receipt.
+
+## Recorded policy source
+
+A hosted registry (`internal/explorerfleet`'s durable lifecycle recorder)
+records each registration's reason code and detail in its lifecycle receipt as
+`interaction.Session.CallerAssertedReason`: what the authenticated caller
+asserted, attributed to the receipt's trusted `Actor`, not verified by Shoal and
+never used to authorize anything. It sits beside the trusted `Reason`, which
+remains the decision's audit purpose. For reason code `atpl-apply` the detail
+must be exactly `atpl:policy:v1:<64 lowercase hex>` and is kept verbatim as
+`Source`; anything else is refused before the receipt or the registration is
+written. Other reason codes keep their detail only as a SHA-256 `DetailDigest`,
+and every code must match `[A-Za-z0-9_.:-]`. The assertion is bound into the
+receipt's query digest, so a retry of the same request with a different
+assertion conflicts. Receipts written before this was recorded have no
+`CallerAssertedReason` and still reconcile on retry.
+
+The receipt's ID is `explorerfleet.LifecycleReceiptID(operation, request ID,
+agent ID)`, and it is read with the corpus's `InteractionRecord`.
 
 ## Deferred
 

@@ -325,6 +325,92 @@ func (r Reason) Validate() error {
 	return validateDigest("interaction reason digest", r.Digest, false)
 }
 
+// CallerAssertedReason is rationale the authenticated caller asserted for an
+// interaction. It is deliberately a different type and field from Reason:
+// Reason is derived by the authorization boundary from the trusted decision,
+// while a caller-asserted reason is only what the caller said. Shoal bounds
+// its shape and binds it into the durable record, so the assertion is
+// tamper-evident and attributable to the session's Actor, but it never
+// verifies the assertion and never authorizes anything on it.
+//
+// Raw free-form text is never persisted: free-form detail is retained only as
+// DetailDigest. Source is the one verbatim value, and only for a producer that
+// constrains it to a fixed content-address shape before recording, such as an
+// ATPL policy digest ("atpl:policy:v1:<sha256 hex>").
+type CallerAssertedReason struct {
+	// Code is the caller's bounded machine-readable reason category.
+	Code string
+	// DetailDigest is SHA-256 of free-form detail the caller supplied.
+	DetailDigest string
+	// Source is a content address the caller asserted as the source of the
+	// interaction, retained verbatim. It is mutually exclusive with
+	// DetailDigest.
+	Source string
+}
+
+// IsZero reports whether no caller-asserted reason is present.
+func (r CallerAssertedReason) IsZero() bool {
+	return r == CallerAssertedReason{}
+}
+
+// Validate checks the bounded caller-asserted reason shape.
+func (r CallerAssertedReason) Validate() error {
+	if r.IsZero() {
+		return nil
+	}
+	if r.Code == "" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction caller-asserted reason code is required",
+		)
+	}
+	if err := validateReasonToken(
+		"interaction caller-asserted reason code", r.Code,
+	); err != nil {
+		return err
+	}
+	if r.DetailDigest != "" && r.Source != "" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"interaction caller-asserted reason cannot carry both a detail "+
+				"digest and a source",
+		)
+	}
+	if r.Source != "" {
+		return validateReasonToken(
+			"interaction caller-asserted reason source", r.Source)
+	}
+	return validateDigest(
+		"interaction caller-asserted reason detail digest",
+		r.DetailDigest, true,
+	)
+}
+
+// validateReasonToken applies Reason.Code's bound and charset to a retained
+// caller-asserted value, so no caller-controlled byte outside it is persisted.
+func validateReasonToken(name, value string) error {
+	if len(value) > MaxVisibilityLabelSz {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, name+" exceeds the public byte bound")
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9':
+		case character == '_', character == '-', character == '.',
+			character == ':':
+		default:
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				name+" contains an unsupported character",
+			)
+		}
+	}
+	return nil
+}
+
 // Turn is one model decision. A turn that stopped rather than calling a tool
 // carries no ToolCall.
 type Turn struct {
@@ -354,11 +440,15 @@ type Provenance struct {
 // prompt, the answer text, evidence quotes, authorization grants, or
 // model-chosen correlation strings.
 type Session struct {
-	ID                       shoal.ID
-	RecordedAt               time.Time
-	Operation                Operation
-	Actor                    ActorContext
-	Reason                   Reason
+	ID         shoal.ID
+	RecordedAt time.Time
+	Operation  Operation
+	Actor      ActorContext
+	Reason     Reason
+	// CallerAssertedReason is what the authenticated Actor asserted, recorded
+	// beside the trusted Reason and never in its place. It is not verified
+	// and never participates in authorization.
+	CallerAssertedReason     CallerAssertedReason
 	SnapshotID               shoal.ID
 	SnapshotAsOf             time.Time
 	AuthorizationFingerprint shoal.ID
@@ -594,6 +684,9 @@ func (s Session) Validate() error {
 		return err
 	}
 	if err := s.Reason.Validate(); err != nil {
+		return err
+	}
+	if err := s.CallerAssertedReason.Validate(); err != nil {
 		return err
 	}
 	if err := validateDigest(
