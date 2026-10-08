@@ -119,7 +119,7 @@ type RequestOptions struct {
 	// MinReportWindow refuses a grant expiring sooner than this from now. A
 	// token that expires while the effect is still running can never be
 	// reported, so a caller should set this to at least the time it needs to
-	// report after acting. Zero only requires an expiry to be present.
+	// report after acting. Zero still refuses a token that has already expired.
 	MinReportWindow time.Duration
 	// Clock supplies now for MinReportWindow; time.Now when nil.
 	Clock func() time.Time

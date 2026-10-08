@@ -437,7 +437,7 @@ func TestTokenValidate(t *testing.T) {
 func TestDecodeResponseIgnoresUnknownFields(t *testing.T) {
 	var receipt Receipt
 	if err := decodeResponse([]byte(
-		`{"action_id":"YQ","added":{"nested":[1,{"x":null}]},"version":1,"Unrelated":true}`,
+		`{"action_id":"YQ","added":{"nested":[1,{"x":null}]},"version":1,"Unrelated":true,"huge":1e400}`,
 	), &receipt); err != nil || receipt.ActionID != "YQ" || receipt.Version != 1 {
 		t.Fatalf("receipt = %#v, %v", receipt, err)
 	}

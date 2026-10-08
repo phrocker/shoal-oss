@@ -353,7 +353,10 @@ library or Guacamole (a failing `go list` fails that check rather than passing
 it).
 
 `extensions/example-collector` is a synthetic file-tail collector that imports
-from Shoal only `pkg/sdk` and the allowlisted `pkg/collector` and `pkg/shoal`. Run it against a host that provisioned it:
+from Shoal only `pkg/sdk` and the allowlisted `pkg/collector` and `pkg/shoal`
+(its tests also ask for admission through `sdk.New(...).Admission()` and
+`pkg/admission/api`, to prove that seam is reachable from an extension). Run it
+against a host that provisioned it:
 
 ```sh
 SHOAL_TOKEN=... go run ./extensions/example-collector \

@@ -43,14 +43,26 @@ func decodeResponse(raw []byte, out any) error {
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("response carries data after the JSON value")
 	}
-	var generic any
-	if err := json.Unmarshal(raw, &generic); err != nil {
+	// UseNumber, so an unknown field holding a number no float64 can carry is
+	// ignored like any other unknown field rather than failing the response.
+	generic, err := decodeGeneric(raw)
+	if err != nil {
 		return err
 	}
 	if err := exactKnownKeys(generic, reflect.TypeOf(out).Elem(), ""); err != nil {
 		return err
 	}
 	return json.Unmarshal(raw, out)
+}
+
+func decodeGeneric(raw []byte) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var generic any
+	if err := decoder.Decode(&generic); err != nil {
+		return nil, err
+	}
+	return generic, nil
 }
 
 // walkUnique consumes one value, refusing duplicate and fold-equal keys.
