@@ -269,9 +269,15 @@ a deny-list, so these rules are an allowlist (`internal/importboundary/cgo.go`):
     - `#embed`, and `__has_include` / `__has_include_next`;
     - a carriage return not followed by a line feed, which gcc treats as a
       line end and this checker does not (CRLF is normalised).
-- Before parsing, line continuations are spliced and comments removed, as the
-  compiler does. So `#include \` followed by a new line, and `#/**/include`,
-  read as the directive the compiler sees. Macros as include targets,
+- Before matching, the checker normalises CRLF to LF and removes every
+  backslash followed by optional spaces or tabs and a newline
+  (`\\[ \t]*\n`). gcc joins all of these lines, warning when whitespace
+  precedes the newline. The refused forms above are matched in both the raw
+  and the spliced text, so `__a\` + newline + `sm__` is still inline
+  assembly. Include parsing then also replaces comments with a space. So
+  `#include \` followed by a new line, `#inc\ ` + newline + `lude`, and
+  `#/**/include` read as the directive the compiler sees. Trigraphs are
+  refused rather than translated. Macros as include targets,
   digraphs, trigraphs, unterminated comments, line markers, `#cgo` line
   continuations and any other form the parser cannot read are violations.
 - Any other core package with `import "C"`, or with a buildable non-Go file,

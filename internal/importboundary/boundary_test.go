@@ -131,6 +131,17 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 			{"A", "cmd/shoal-capi/probe.c", "(unreadable source: trigraph or unterminated comment)"},
 		},
 		"cgo-probe-lonecr": {{"A", "cmd/shoal-capi/probe.c", "(lone carriage return)"}},
+		// The same forms split by backslash-newline (gcc joins lines before
+		// tokenizing), and a splice with whitespace before the newline.
+		"cgo-probe-splice-asm": {
+			{"A", "cmd/shoal-capi/probe.c", "(assembler include not allowed)"},
+			{"A", "cmd/shoal-capi/probe.c", "(inline assembly not allowed)"},
+		},
+		"cgo-probe-splice-rawstring": {
+			{"A", "cmd/shoal-capi/probe.c", "(raw string literal not allowed)"},
+			{"A", "cmd/shoal-capi/probe.c", "(unreadable source: trigraph or unterminated comment)"},
+		},
+		"cgo-probe-splice-space": {{"A", "cmd/shoal-capi/probe.c", `include "../../extensions/e/notes.md" (resolves outside allowed directories)`}},
 		"cgo-probe-flagforms": {
 			{"A", "cmd/shoal-capi/probe.go", "cgo flag -Wp,-include,${SRCDIR}/x.h"},
 			{"A", "cmd/shoal-capi/probe.go", "cgo flag -Xpreprocessor"},

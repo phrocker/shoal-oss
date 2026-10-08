@@ -109,22 +109,36 @@ var refusedForms = []struct {
 }
 
 // refusals reports every refused form in raw source text.
+// Forms are matched in both the raw and the spliced text, so a
+// backslash-newline inside a token (__a\<newline>sm__) cannot hide it.
 func refusals(src []byte) []string {
 	var out []string
-	text := strings.ReplaceAll(string(src), "\r\n", "\n")
-	if strings.Contains(text, "\r") {
+	raw := strings.ReplaceAll(string(src), "\r\n", "\n")
+	if strings.Contains(raw, "\r") {
 		out = append(out, "(lone carriage return)")
 	}
+	spliced := splice(src)
 	for _, f := range refusedForms {
-		if f.re.MatchString(text) {
+		if f.re.MatchString(raw) || f.re.MatchString(spliced) {
 			out = append(out, "("+f.what+" not allowed)")
 		}
 	}
 	return out
 }
 
-// preprocess applies C translation phases 1 to 3: it splices
-// backslash-newline continuations and replaces comments with a space, so
+// lineSplice is a backslash, optional spaces or tabs, and a newline. gcc
+// joins all of these (warning when whitespace precedes the newline).
+var lineSplice = regexp.MustCompile(`\\[ \t]*\n`)
+
+// splice normalises CRLF to LF and removes every lineSplice, the line
+// joining gcc performs before tokenizing.
+func splice(src []byte) string {
+	return lineSplice.ReplaceAllString(strings.ReplaceAll(string(src), "\r\n", "\n"), "")
+}
+
+// preprocess applies C translation phases 1 to 3: it splices continuations
+// (splice: backslash, optional spaces or tabs, newline) and replaces
+// comments with a space, so
 // "#include \", "#/**/include" and the like read as the directive the
 // compiler sees. ok is false for trigraphs, which can splice lines or form
 // '#' when a compiler flag enables them.
@@ -133,7 +147,7 @@ func preprocess(src []byte) (string, bool) {
 	if regexp.MustCompile(`\?\?[=/'()!<>-]`).MatchString(s) {
 		return "", false
 	}
-	s = strings.ReplaceAll(s, "\\\n", "")
+	s = splice([]byte(s))
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]

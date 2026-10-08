@@ -23,6 +23,12 @@ func TestRefusedForms(t *testing.T) {
 		"#if __has_include_next(<x.h>)\n#endif\n":  true,
 		"// hi\r#include \"x.h\"\n":                true,
 		"int a;\rint b;\n":                         true,
+		// gcc splices backslash-newline before tokenizing, with or without
+		// spaces or tabs before the newline.
+		"__a\\\nsm__(\".inc\\\nlude \\\"x\\\"\");\n": true,
+		"x = R\\\n\"x(\" /* )x\";\n":                 true,
+		"__as\\ \t\nm__(\"nop\");\n":                 true,
+		"int ok\\\n_value;\n":                        false,
 	} {
 		if got := len(refusals([]byte(src))) > 0; got != refused {
 			t.Errorf("%q: refused=%v, want %v", src, got, refused)

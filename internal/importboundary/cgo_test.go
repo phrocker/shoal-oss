@@ -20,6 +20,7 @@ func TestIncludeParsing(t *testing.T) {
 		"spaced":           {"  #  include   \"a.h\"  \n", []include{{"quote", "a.h"}}, 0},
 		"continuation":     {"#include \\\n\"../x.h\"\n", []include{{"quote", "../x.h"}}, 0},
 		"split directive":  {"#incl\\\nude \"../x.h\"\n", []include{{"quote", "../x.h"}}, 0},
+		"spaced splice":    {"#inc\\ \t\nlude \"../x.h\"\n", []include{{"quote", "../x.h"}}, 0},
 		"comment in #":     {"#/**/include \"../x.h\"\n", []include{{"quote", "../x.h"}}, 0},
 		"leading comment":  {"/* x */ #include \"../x.h\"\n", []include{{"quote", "../x.h"}}, 0},
 		"commented out":    {"// #include \"../x.h\"\n/* #include \"../y.h\" */\n", nil, 0},
