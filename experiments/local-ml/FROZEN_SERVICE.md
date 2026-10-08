@@ -68,3 +68,30 @@ and ranking-plan identities. Bundles for the two tasks are not interchangeable.
 Generated source/numeric bundles and the engine state live outside the repository.
 The original compressed evidence and compact run reports are retained. State is a
 single local registration session, not a shared multi-user service deployment.
+
+
+## Executed evidence and independent review
+
+At `db39142`, the [retained run](evidence/frozen-service-2026-10-08/summary.json)
+completed all **188/188** historical proposals through the real service. The first
+process made 188 provider calls. A second process reopened the engine's RFiles
+and returned identical per-subject picture, request, receipt, prediction and label
+records with **zero provider calls**. Both runs also verified immediate retry and
+receipt reads. The retained source representations total 340,577 bytes.
+
+Two separate exports produced byte-identical contents across all 381 files.
+The original provider-only replay also remained byte-identical to its prior
+retained report. All 33 Python tests, targeted Go race tests across the command,
+provider, artifact catalog, service and receipt store, and command vet passed.
+Tests cover source revocation before admission and after completion, renewed
+current authentication, source/model/state substitution, missing/corrupt state,
+source quote bounds, and publication failures. No paid classifier calls occurred.
+
+Two independent adversarial code-review rounds preceded publication. Round 1
+found a durability gap: existing valid metadata could be accepted on retry after
+an earlier file-sync failure without ever confirming that the file contents were
+durable. The fix reopens the metadata, verifies the exact bytes and successfully
+syncs the file before engine use; failure-injection tests exercise retry. A fresh
+round 2 at `db39142` found **no actionable findings**. Review did not simulate
+power loss or concurrent filesystem replacement. Only documentation and retained
+execution evidence changed after that clean review.
