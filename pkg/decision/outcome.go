@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+// MaxOutcomeAncestors bounds retained correction ancestry across outcome stores
+// and adjudication snapshots.
+const MaxOutcomeAncestors = 32
+
 // OutcomeKind keeps reported execution success separate from asserted correctness.
 type OutcomeKind string
 
