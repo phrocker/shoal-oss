@@ -357,9 +357,10 @@ true
 Refuse a line break anywhere in a values subtree, naming the key that holds it.
 
 Takes a dict of path (the dotted key, for the message), value, and two lists of
-paths: free, whose subtrees are not walked at all, and trimmed, whose strings
-are checked after trimming because the templates trim them before use. Recurses
-through maps and lists; every string leaf is checked. Every other scalar kind
+paths: multiline, whose string values may hold LF, CRLF and tab (and nothing
+else of the class below), and trimmed, whose strings are checked after trimming
+because the templates trim them before use. Recurses through maps and lists;
+every map key and every string value is checked. Every other scalar kind
 (number, boolean, null) renders through Go formatting and cannot carry one.
 
 The class is [\p{Cc}\p{Zl}\p{Zp}], in a raw string so the template does not
@@ -367,24 +368,47 @@ unescape it: the ASCII and C1 controls, which take in LF, CR and NEL, plus the
 Unicode line and paragraph separators. go-yaml breaks lines on all of those,
 and RE2's [[:cntrl:]] is ASCII only, so a narrower class lets NEL through.
 
-objectStorage.gcsKeyJson is the one value in the chart that is multi-line by
-design: a service-account key file, rendered as the body of a `|` block scalar
-through `indent 4`. indent splits on LF only, so LF (and CRLF, and tab) stay
-inside the block. A CR alone, a NEL or a separator is a line break that YAML
-sees and indent does not, and the text after it lands at column zero — outside
-the block scalar and outside the Secret. So that value keeps LF, CRLF and tab
-and is refused everything else.
+For anything toYaml emits, this refusal is load-bearing, not defence in depth.
+Quoting protects a value interpolated into a single scalar; toYaml output has
+no quoting to add, because the block it emits is itself the structure, and
+nindent indents that block line by line. Refusing the characters is the only
+defence there:
+
+  Map keys are held to the whole class everywhere, multi-line subtrees
+  included. A key is only ever rendered through toYaml (nodeSelector,
+  tolerations, affinity, resources, annotations, the operator volumes), and a
+  key holding a newline is emitted as a block that nindent indents like any
+  other, so the key can end early and the remainder land in the pod spec —
+  hostNetwork: true among it. No Kubernetes key a values file reaches here has
+  a line break in it.
+
+  The multi-line values are the ones that legitimately span lines: the
+  service-account key file, the body of a `|` block scalar through `indent 4`,
+  and the annotations and operator volumes, which toYaml emits as a `|-` block
+  when they hold LF. Both indent after LF only, so LF, CRLF and tab stay inside
+  the block, and nothing else of the class does: a lone CR, a NEL or
+  U+2028/U+2029 is a line break to YAML that neither indent nor nindent indents
+  after — go-yaml writes the separators raw inside a block scalar — so the text
+  after it lands at column zero, outside the block and outside the object.
+  Annotation "v<LF>w<U+2028>namespace: kube-system" moved the gateway's
+  Service into kube-system.
 */ -}}
 {{- define "shoal.refuseLineBreaks" -}}
 {{- $context := . -}}
-{{- if not (has .path .free) -}}
+{{- $multiline := or .inMultiline (has .path .multiline) -}}
 {{- if kindIs "map" .value -}}
 {{- range $key, $child := .value -}}
-{{- include "shoal.refuseLineBreaks" (dict "path" (printf "%s.%s" $context.path $key) "value" $child "free" $context.free "trimmed" $context.trimmed) -}}
+{{- /* The key is named, quoted: keys are not secrets, and without it the
+       operator has no way to find which one. */ -}}
+{{- $found := regexFind `[\p{Cc}\p{Zl}\p{Zp}]` $key -}}
+{{- if $found -}}
+{{- fail (printf "%s has a key %q, which holds %q, a line break or other control character (NEL, U+2028 and U+2029 included): map keys reach the manifests through toYaml, which renders one holding a line break as a block that nindent indents line by line, so the key ends early and the rest of it becomes fields of the pod spec or object. No key may carry one" $context.path $key $found) -}}
+{{- end -}}
+{{- include "shoal.refuseLineBreaks" (dict "path" (printf "%s.%s" $context.path $key) "value" $child "multiline" $context.multiline "inMultiline" $multiline "trimmed" $context.trimmed) -}}
 {{- end -}}
 {{- else if kindIs "slice" .value -}}
 {{- range $index, $child := .value -}}
-{{- include "shoal.refuseLineBreaks" (dict "path" (printf "%s[%d]" $context.path $index) "value" $child "free" $context.free "trimmed" $context.trimmed) -}}
+{{- include "shoal.refuseLineBreaks" (dict "path" (printf "%s[%d]" $context.path $index) "value" $child "multiline" $context.multiline "inMultiline" $multiline "trimmed" $context.trimmed) -}}
 {{- end -}}
 {{- else if kindIs "string" .value -}}
 {{- $text := .value -}}
@@ -393,15 +417,14 @@ and is refused everything else.
 {{- $text = trim $text -}}
 {{- end -}}
 {{- end -}}
-{{- if eq .path "objectStorage.gcsKeyJson" -}}
+{{- if $multiline -}}
 {{- $text = $text | replace "\r\n" "" | replace "\n" "" | replace "\t" "" -}}
 {{- end -}}
 {{- /* The message names the character and not the value: the walk reaches
        passwords and key files, and a refusal is printed to CI logs. */ -}}
 {{- $found := regexFind `[\p{Cc}\p{Zl}\p{Zp}]` $text -}}
 {{- if $found -}}
-{{- fail (printf "%s holds %q, a line break or other control character (NEL, U+2028 and U+2029 included): the chart renders it into the manifests as a YAML scalar, and a line break there ends the scalar, so the rest of the value becomes YAML of its own — another field, another container argument, another key. No value this chart renders may carry one. A value read with --set-file keeps the file's trailing newline, so strip it" .path $found) -}}
-{{- end -}}
+{{- fail (printf "%s holds %q, a line break or other control character (NEL, U+2028 and U+2029 included): the chart renders it into the manifests as a YAML scalar, and a line break there ends the scalar, so the rest of the value becomes YAML of its own — another field, another container argument, another key. %s A value read with --set-file keeps the file's trailing newline, so strip it" .path $found (ternary "This value may span lines with LF, CRLF and tab, and nothing else: a lone CR, a NEL or a Unicode separator is a line break the indentation does not follow." "No value this chart renders may carry one." $multiline)) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

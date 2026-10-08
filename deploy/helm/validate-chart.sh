@@ -87,7 +87,7 @@ renders() {
   local description="$1"; shift
   if ! helm template shoal "$chart" "$@" >/dev/null 2>&1; then
     fail "should render but was refused: $description"
-    helm template shoal "$chart" "$@" 2>&1 | grep -oE 'execution error.*' | head -1 | sed 's/^/      /'
+    helm template shoal "$chart" "$@" 2>&1 | grep -oE 'execution error.*|Error: .*' | head -1 | sed 's/^/      /' || true
   fi
 }
 
@@ -160,8 +160,11 @@ refuses_citing() {
     fail "should be refused but rendered: $description"
   elif ! printf '%s' "$output" | grep -qF -- "$expected"; then
     fail "refused, but not by the guard under test: $description"
-    printf '%s' "$output" | grep -oE 'execution error.*' | head -1 |
-      cut -c1-200 | sed 's/^/      /'
+    # Helm's own YAML errors carry no "execution error", and under pipefail a
+    # grep that finds nothing would end the whole run here, silently skipping
+    # every check after it. So any error line is shown, and none is not fatal.
+    printf '%s' "$output" | grep -oE 'execution error.*|Error: .*' | head -1 |
+      cut -c1-200 | sed 's/^/      /' || true
   fi
 }
 
@@ -627,8 +630,9 @@ explorer_scalars_quoted "${explorer_base[@]}" --set explorer.storageClassName=fa
 # in a value rendered bare and in one the explorer now quotes.
 assert_renders "a non-ASCII data directory still renders" '^ +mountPath: /var/lib/données$' -f "$chart/values.yaml" --set-string 'writeTier.dataDir=/var/lib/données'
 assert_renders "a non-ASCII explorer state root still renders" '^ +mountPath: "/var/lib/données"$' "${explorer_base[@]}" --set-string 'explorer.stateDir=/var/lib/données'
-# The subtrees the walk leaves alone are rendered through toYaml, which keeps a
-# multi-line value inside its own scalar, and an annotation may hold one.
+# An annotation may span lines with LF: toYaml keeps that inside its own block
+# scalar. (Its other line breaks, and any in a key, are refused; see the toYaml
+# section below.)
 assert_renders "a multi-line Service annotation still renders, as one value" '^    note: \|-$' "${explorer_base[@]}" --set-string 'explorer.service.annotations.note=first
 second'
 # The service-account key file is the one value that is multi-line by design.
@@ -671,10 +675,11 @@ import concurrent.futures, subprocess, sys, yaml
 
 chart = sys.argv[1]
 values = yaml.safe_load(open(chart + "/values.yaml"))
-# Mirrors $lineBreakFree in validate.yaml: rendered through toYaml and
-# legitimately multi-line.
-free = {"explorer.service.annotations", "llmGateway.service.annotations",
-        "llmGateway.admission.tokenVolume", "llmGateway.upstream.apiKeyVolume"}
+# Mirrors $lineBreakMultiline in validate.yaml: values under these may hold LF
+# (and CRLF and tab), and nothing else of the class. They are still walked.
+multiline = ("objectStorage.gcsKeyJson", "explorer.service.annotations",
+             "llmGateway.service.annotations", "llmGateway.admission.tokenVolume",
+             "llmGateway.upstream.apiKeyVolume")
 # Held to a shape (or, for mode, an enumeration) on the default values, so a
 # non-ASCII value there is refused for that reason and not this one.
 shaped = {"mode", "image.pullPolicy", "objectStorage.credentialsSecretName",
@@ -682,8 +687,6 @@ shaped = {"mode", "image.pullPolicy", "objectStorage.credentialsSecretName",
 
 leaves = []
 def walk(path, value):
-    if path in free:
-        return
     if isinstance(value, dict):
         if not value:
             leaves.append((path + ".fuzz", None))
@@ -713,7 +716,7 @@ def check(leaf):
     path, default = leaf
     problems = []
     payloads = [("a NEL", "x\u0085injected: true")]
-    if path != "objectStorage.gcsKeyJson":
+    if not any(path == m or path.startswith(m + ".") for m in multiline):
         payloads.append(("a newline", "x\n  injected: true"))
     for label, payload in payloads:
         result = helm(path, payload)
@@ -1750,6 +1753,246 @@ wired "both credentials from files"           "${both_files[@]}"
 wired "both credentials from the environment" "${llm_gateway_base[@]}"
 wired "a loopback provider that needs no credential" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://localhost:11434/v1,llmGateway.upstream.credentialSecretName=
 wired "an acknowledged plaintext decision plane" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://shoal-explorer:8098,llmGateway.admission.allowPlaintext=true
+
+note "== a map rendered through toYaml cannot carry YAML of its own (#468) =="
+# toYaml was assumed to make whatever it renders safe, and it does not, in two
+# ways. A map key holding a newline is emitted as a block that nindent indents
+# line by line, so the key ends early: nodeSelector key
+# "k<newline>w<newline>    hostNetwork: true<newline>    junk: |" put
+# hostNetwork: true in the pod spec. And a value holding LF is emitted as a
+# `|-` block with U+2028 and U+2029 written raw inside it; YAML reads those as
+# line breaks and nindent does not indent after them, so annotation
+# "v<LF>w<U+2028>namespace: kube-system" moved the Service into kube-system.
+#
+# So every toYaml'd map, for both components, gets each line break as a key and
+# as a value, in a configuration that renders that map. Keys are refused every
+# character of the class. Values are refused it too, except that the
+# annotations and the operator volumes, which legitimately span lines, keep LF,
+# CRLF and tab: those stay inside the block, and a multi-line value with them
+# must render and parse back to exactly itself with nothing injected. Any
+# render, refused or not, is parsed and must contain no injected key.
+join_args() { printf '%s\x1f' "$@"; }
+if ! SHOAL_EXPLORER="$(join_args "${explorer_base[@]}")" \
+  SHOAL_GATEWAY="$(join_args "${llm_gateway_base[@]}")" \
+  SHOAL_TOKEN_VOLUME="$(join_args "${operator_volume[@]}" --set llmGateway.admission.tokenVolume.csi.driver=csi.spiffe.io)" \
+  SHOAL_STORAGE="$(join_args -f "$chart/values.yaml")" \
+  SHOAL_DISTRIBUTED="$(join_args -f "$chart/values-distributed.yaml")" \
+  SHOAL_KEY_VOLUME="$(join_args "${upstream_key_volume[@]}" --set llmGateway.upstream.apiKeyVolume.csi.driver=secrets-store.csi.k8s.io)" \
+  python3 - "$chart" <<'TOYAML'
+import concurrent.futures, json, os, subprocess, sys, tempfile, yaml
+
+chart = sys.argv[1]
+bases = {name: [a for a in os.environ["SHOAL_" + name].split("\x1f") if a]
+         for name in ("EXPLORER", "GATEWAY", "TOKEN_VOLUME", "KEY_VOLUME", "STORAGE", "DISTRIBUTED")}
+
+# (base, path of the map, whether its values may span lines). A path ending in
+# [0] is a one-element list holding the map.
+targets = [
+    ("EXPLORER", "explorer.service.annotations", True),
+    ("EXPLORER", "explorer.nodeSelector", False),
+    ("EXPLORER", "explorer.tolerations[0]", False),
+    ("EXPLORER", "explorer.affinity", False),
+    ("EXPLORER", "explorer.resources.limits", False),
+    ("GATEWAY", "llmGateway.service.annotations", True),
+    ("GATEWAY", "llmGateway.nodeSelector", False),
+    ("GATEWAY", "llmGateway.tolerations[0]", False),
+    ("GATEWAY", "llmGateway.affinity", False),
+    ("GATEWAY", "llmGateway.resources.limits", False),
+    ("STORAGE", "writeTier.resources.limits", False),
+    ("DISTRIBUTED", "readFleet.resources.limits", False),
+    ("TOKEN_VOLUME", "llmGateway.admission.tokenVolume.csi.volumeAttributes", True),
+    ("KEY_VOLUME", "llmGateway.upstream.apiKeyVolume.csi.volumeAttributes", True),
+]
+breaks = {"LF": "\n", "CR": "\r", "NEL": "\u0085", "LS": " ", "PS": " "}
+injected = {"hostNetwork", "namespace", "injected"}
+
+def overlay(path, mapping):
+    root = {}
+    node = root
+    parts = path.split(".")
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    last = parts[-1]
+    if last.endswith("[0]"):
+        node[last[:-3]] = [mapping]
+    else:
+        node[last] = mapping
+    return root
+
+def render(base, values):
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+        json.dump(values, handle)
+    try:
+        return subprocess.run(["helm", "template", "shoal", chart, *bases[base], "-f", handle.name],
+                              capture_output=True, text=True)
+    finally:
+        os.unlink(handle.name)
+
+def injected_keys(text):
+    found = set()
+    def walk(node):
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if key in injected:
+                    found.add(key)
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+    for document in yaml.safe_load_all(text):
+        walk(document)
+    return found
+
+def strings(text):
+    found = set()
+    def walk(node):
+        if isinstance(node, dict):
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+        elif isinstance(node, str):
+            found.add(node)
+    for document in yaml.safe_load_all(text):
+        walk(document)
+    return found
+
+def cases():
+    for base, path, multiline in targets:
+        for name, char in breaks.items():
+            key = f"k{char}hostNetwork: true"
+            yield (base, path, f"{name} in a key", {key: "x"}, f"{path} has a key")
+            value = f"v\nw{char}namespace: kube-system" if char != "\n" else "v\n  injected: true"
+            allowed = multiline and char == "\n"
+            yield (base, path, f"{name} in a value", {"a": value}, None if allowed else f"{path}.a holds")
+        yield (base, path, "the issue's nodeSelector key",
+               {"k\nw\n    hostNetwork: true\n    junk: |": "x"}, f"{path} has a key")
+        if multiline:
+            yield (base, path, "LF, CRLF and tab in a value",
+                   {"a": "{\r\n\t\"line\": 1\n}\n"}, None)
+
+def check(case):
+    base, path, label, mapping, refusal = case
+    result = render(base, overlay(path, mapping))
+    problems = []
+    if result.returncode == 0:
+        found = injected_keys(result.stdout)
+        if found:
+            problems.append(f"{label} under {path} injects {sorted(found)}")
+        if refusal:
+            problems.append(f"{label} under {path} renders and must be refused")
+        else:
+            # The value must reach the object as exactly itself.
+            if mapping["a"] not in strings(result.stdout):
+                problems.append(f"{label} under {path} renders, but not as the value given")
+    elif refusal is None:
+        problems.append(f"{label} under {path} is refused and must render: "
+                        + result.stderr.strip().splitlines()[0][:160])
+    elif refusal not in result.stderr:
+        problems.append(f"{label} under {path} is refused, but not by the walk: "
+                        + result.stderr.strip().splitlines()[0][:160])
+    return problems
+
+all_cases = list(cases())
+with concurrent.futures.ThreadPoolExecutor(8) as pool:
+    problems = [p for found in pool.map(check, all_cases) for p in found]
+for problem in problems:
+    print("      " + problem)
+raise SystemExit(1 if problems or len(all_cases) < 100 else 0)
+TOYAML
+then
+  fail "a toYaml'd map can carry a line break into the manifests, or a valid multi-line value is refused (see above)"
+fi
+# The list above is only as good as its coverage of the templates, so every
+# toYaml in them is found, resolved to the values path it renders, and given a
+# line break in a key under that path — on the default values, where the walk
+# alone stands between the payload and the manifest. A site this cannot
+# resolve fails, so a new toYaml cannot be added without being covered here.
+# (The templates' other loops over caller-supplied values are the gateway's
+# model and allowed-host lists, which hold strings and are walked as values.)
+if ! python3 - "$chart" <<'SITES'
+import json, os, re, subprocess, sys, tempfile, yaml
+
+chart = sys.argv[1]
+templates = os.path.join(chart, "templates")
+defaults = yaml.safe_load(open(os.path.join(chart, "values.yaml")))
+sources = {}
+problems = []
+
+def resolve(expression):
+    for prefix, root in (("$explorer.", "explorer."), ("$gateway.", "llmGateway."), (".Values.", "")):
+        if expression.startswith(prefix):
+            return root + expression[len(prefix):]
+    return None
+
+texts = {name: open(os.path.join(templates, name)).read().splitlines()
+         for name in sorted(os.listdir(templates))}
+for name, lines in texts.items():
+    for number, line in enumerate(lines, 1):
+        match = re.search(r"toYaml\s+(\S+)", line)
+        if not match or "{{" not in line:
+            continue
+        expression = match.group(1)
+        site = f"{name}:{number}"
+        if expression == ".":
+            # The value of the nearest enclosing `with`.
+            for previous in reversed(lines[:number - 1]):
+                found = re.search(r"\{\{-?\s*with\s+(\S+)", previous)
+                if found:
+                    expression = found.group(1)
+                    break
+        if expression == ".volume":
+            # The credential-volume helper: whatever its callers pass as volume.
+            paths = [resolve(m) for other in texts.values() for l in other
+                     for m in re.findall(r'"volume"\s+(\$[\w.]+)', l)]
+        else:
+            paths = [resolve(expression)]
+        if not paths or None in paths:
+            problems.append(f"{site}: cannot tell which value `toYaml {match.group(1)}` renders; teach this check")
+            continue
+        for path in paths:
+            sources.setdefault(path, []).append(site)
+
+if len(sources) < 12:
+    problems.append(f"only {len(sources)} toYaml sources found: the scan is broken")
+
+def default_at(path):
+    node = defaults
+    for part in path.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node
+
+for path, sites in sorted(sources.items()):
+    if path.split(".")[0] in ("global", "llmProxy"):
+        problems.append(f"{path} ({', '.join(sites)}) is rendered but not walked")
+        continue
+    key = "k\nw\n    hostNetwork: true\n    junk: |"
+    parts = path.split(".")
+    overlay = node = {}
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    if isinstance(default_at(path), list):
+        node[parts[-1]] = [{key: "x"}]
+        expected = f"{path}[0] has a key"
+    else:
+        node[parts[-1]] = {key: "x"}
+        expected = f"{path} has a key"
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+        json.dump(overlay, handle)
+    result = subprocess.run(["helm", "template", "shoal", chart, "-f", os.path.join(chart, "values.yaml"),
+                             "-f", handle.name], capture_output=True, text=True)
+    os.unlink(handle.name)
+    if result.returncode == 0 or expected not in result.stderr:
+        problems.append(f"a line break in a key under {path} ({', '.join(sites)}) is not refused by the walk")
+
+for problem in problems:
+    print("      " + problem)
+raise SystemExit(1 if problems else 0)
+SITES
+then
+  fail "a toYaml site in the templates renders a values path the walk does not guard (see above)"
+fi
 
 note "== the guide's worked example still installs =="
 # The example in docs/llm-gateway-deploy.md is copied by operators verbatim, and a

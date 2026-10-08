@@ -12,7 +12,10 @@
        an output that must stay identical. Numbers (replicas, ports, the grace
        period, the partition) stay bare because the API server wants them as
        numbers, and validate.yaml's walk refuses a line break in their string
-       form. */ -}}
+       form. nodeSelector, tolerations, affinity and resources go through
+       toYaml, which cannot be quoted: the block it emits is the structure, so
+       there validate.yaml's refusal of line breaks in their keys and values
+       is the only defence, not a second one. */ -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

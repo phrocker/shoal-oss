@@ -893,11 +893,34 @@
                      chart renders none of it.
          llmProxy    the gateway's old key, refused above when it carries
                      anything and never rendered.
+
+       Every map key is checked as well as every value. Keys reach the
+       manifests through toYaml (nodeSelector, tolerations, affinity,
+       resources, annotations, the operator volumes), and toYaml does not make
+       a key with a line break safe: nindent indents the block it emits line
+       by line, and a key "k<newline>hostNetwork: true" put that field in the
+       pod spec.
+
+       A few values may span lines, and keep LF, CRLF and tab only:
+
+         objectStorage.gcsKeyJson
+                     a key file, the body of a `|` block through indent 4.
          *.service.annotations, llmGateway.admission.tokenVolume,
          llmGateway.upstream.apiKeyVolume
-                     rendered through toYaml, which quotes what it must, and
-                     legitimately multi-line: an annotation can hold a JSON
-                     document, and a CSI volume's attributes are the driver's.
+                     rendered through toYaml, which emits a value holding LF
+                     as a `|-` block, and legitimately multi-line: an
+                     annotation can hold a JSON document, and a CSI volume's
+                     attributes are the driver's.
+
+       For everything toYaml emits, then, the refusal is load-bearing rather
+       than defence in depth: quoting protects a value interpolated into one
+       scalar, but toYaml's output has nothing to quote — the block it emits
+       is the structure — so refusing the characters is the only defence.
+       toYaml does not quote its way out of the rest. It writes U+2028 and
+       U+2029 raw inside that block, YAML reads them as line breaks, and
+       nindent does not indent after them, so annotation
+       "v<LF>w<U+2028>namespace: kube-system" moved the Service into
+       kube-system. A lone CR and NEL are refused for the same reason.
 
        The gateway's values the templates trim are checked trimmed, as the
        gateway's own guard above checks them, so a trailing newline from
@@ -907,11 +930,11 @@
 
        It runs after the explorer's and the gateway's own guards, so a value
        those name more precisely is refused in their words. */ -}}
-{{- $lineBreakFree := list "explorer.service.annotations" "llmGateway.service.annotations" "llmGateway.admission.tokenVolume" "llmGateway.upstream.apiKeyVolume" -}}
+{{- $lineBreakMultiline := list "objectStorage.gcsKeyJson" "explorer.service.annotations" "llmGateway.service.annotations" "llmGateway.admission.tokenVolume" "llmGateway.upstream.apiKeyVolume" -}}
 {{- $lineBreakTrimmed := list "llmGateway.admission" "llmGateway.upstream" "llmGateway.identity" "llmGateway.serviceAccountName" "llmGateway.allowedHosts" "llmGateway.models" -}}
 {{- range $key, $value := .Values -}}
 {{- if not (has $key (list "global" "llmProxy")) -}}
-{{- include "shoal.refuseLineBreaks" (dict "path" $key "value" $value "free" $lineBreakFree "trimmed" $lineBreakTrimmed) -}}
+{{- include "shoal.refuseLineBreaks" (dict "path" $key "value" $value "multiline" $lineBreakMultiline "trimmed" $lineBreakTrimmed) -}}
 {{- end -}}
 {{- end -}}
 
