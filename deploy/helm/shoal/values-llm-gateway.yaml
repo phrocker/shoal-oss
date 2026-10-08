@@ -1,20 +1,20 @@
-# The enforcement plane on its own: the LLM proxy, no storage tier.
+# The enforcement plane on its own: the LLM gateway, no storage tier.
 #
 # This profile does not install as shipped, and that is deliberate. Every value
 # below that is empty is one the chart refuses to render without, because the
-# proxy's failure mode is not a crash. It is required to fail closed, so almost
+# gateway's failure mode is not a crash. It is required to fail closed, so almost
 # every way of misconfiguring it produces a pod that passes every probe and
 # denies every call — indistinguishable from a total outage of whatever sits
 # behind it.
 #
 # Fill them in, then:
 #
-#   helm install shoal deploy/helm/shoal -f my-llm-proxy-values.yaml
+#   helm install shoal deploy/helm/shoal -f my-llm-gateway-values.yaml
 #
 # `helm template` names the first missing one, so working through the errors in
-# order is a usable checklist. See docs/llm-proxy-deploy.md.
+# order is a usable checklist. See docs/llm-gateway-deploy.md.
 #
-# The explorer is not enabled here. The proxy needs one to ask, but it does not
+# The explorer is not enabled here. The gateway needs one to ask, but it does not
 # need it in this release: admission.url can point at an explorer installed
 # separately, in another namespace, or in another cluster. Enabling both from
 # one values file is the combined install, not the default one — see the docs.
@@ -25,14 +25,14 @@ objectStorage:
 writeTier:
   enabled: false
 
-llmProxy:
+llmGateway:
   enabled: true
   image:
-    repository: ghcr.io/YOUR_ORG/shoal-llm-proxy
+    repository: ghcr.io/YOUR_ORG/shoal-llm-gateway
     tag: TAG
-  # Two, and raise it rather than lower it. The proxy is stateless, so replicas
+  # Two, and raise it rather than lower it. The gateway is stateless, so replicas
   # are independent askers of the same decision plane — and a denial here stops
-  # the caller's work outright, so an unavailable proxy is an outage for
+  # the caller's work outright, so an unavailable gateway is an outage for
   # everything configured to go through it.
   replicas: 2
   # The authority clients send as their OpenAI base URL — usually the port-less
@@ -44,16 +44,16 @@ llmProxy:
     url: ""
     # Required in this form. The explorer's API is authenticated in every
     # deployment this chart can render, so without a token every admission
-    # request is a 401 and the proxy denies every call.
+    # request is a 401 and the gateway denies every call.
     #
     # The alternative is a file, which is the only form a rotating credential
     # has: a projected ServiceAccount token is rewritten in place by the
     # kubelet and never updates an environment variable, and a container's
     # environment cannot change after start at all. Replace the two keys above
-    # with the three below for that — and see docs/llm-proxy-deploy.md, which
+    # with the three below for that — and see docs/llm-gateway-deploy.md, which
     # has the whole worked example:
     #
-    #   serviceAccountName: shoal-llm-proxy   (at the llmProxy level)
+    #   serviceAccountName: shoal-llm-gateway   (at the llmGateway level)
     #   admission:
     #     tokenFile: /var/run/secrets/shoal/token
     #     tokenFileSource: projected
@@ -67,7 +67,7 @@ llmProxy:
     # Capped at 5m by the admission surface itself (MaxActionClaimTTL). A
     # larger value is refused rather than shortened, which denies every call.
     #
-    # It is also the window the proxy drains for on SIGTERM, so
+    # It is also the window the gateway drains for on SIGTERM, so
     # terminationGracePeriodSeconds has to exceed it by at least 5s. Raising
     # one without the other is refused at render: a SIGKILL mid-drain kills
     # the calls whose grant has already been spent.
@@ -101,7 +101,7 @@ llmProxy:
     # Must not exceed admission.lease, or a call can outlive the permission it
     # was granted under and the admission is abandoned rather than reported.
     requestTimeout: 30s
-  # The registered descriptor this proxy admits against. All six are resolved
+  # The registered descriptor this gateway admits against. All six are resolved
   # together; an incomplete identity is refused by the plane on every request.
   identity:
     # Canonical unpadded base64url, like the scope identities below: this is

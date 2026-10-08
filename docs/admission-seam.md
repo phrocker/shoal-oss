@@ -2,7 +2,7 @@
 
 An out-of-process caller with a side effect in hand and no way to ask whether
 it may perform it is the gap `docs/enforcement-plane.md` describes. This is the
-seam that closes it, and the prerequisite for the LLM proxy.
+seam that closes it, and the prerequisite for the LLM gateway.
 
 Every other enforcement surface in Shoal adjudicates work Shoal performs.
 `/api/v1/ask` runs the inference. `/api/v1/fleet/actions/invoke` enqueues work

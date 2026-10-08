@@ -91,26 +91,26 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: explorer
 {{- end -}}
 
-{{- define "shoal.llmProxyEnabled" -}}
-{{- .Values.llmProxy.enabled -}}
+{{- define "shoal.llmGatewayEnabled" -}}
+{{- .Values.llmGateway.enabled -}}
 {{- end -}}
 
 {{- /*
-The proxy's names come from a bounded stem for the same reason the explorer's
+The gateway's names come from a bounded stem for the same reason the explorer's
 do: Kubernetes rejects a name over 63 characters, and truncating the finished
 name does not help, because the suffix is appended after the truncation. The
 stem reserves room for the longest suffix instead, so a long release name
 shortens the stem rather than overflowing the name.
 
-  stem         53
-  -llm-proxy   10  -> 63
+  stem         51
+  -llm-gateway 12  -> 63
 */ -}}
-{{- define "shoal.llmProxyStem" -}}
-{{- include "shoal.fullname" . | trunc 53 | trimSuffix "-" -}}
+{{- define "shoal.llmGatewayStem" -}}
+{{- include "shoal.fullname" . | trunc 51 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "shoal.llmProxyName" -}}
-{{- printf "%s-llm-proxy" (include "shoal.llmProxyStem" .) -}}
+{{- define "shoal.llmGatewayName" -}}
+{{- printf "%s-llm-gateway" (include "shoal.llmGatewayStem" .) -}}
 {{- end -}}
 
 {{- /*
@@ -119,14 +119,14 @@ planes are separate processes deliberately, and a selector that could match
 either would let the Service carrying arbitrary prompt traffic land on the pod
 holding the policy store.
 */ -}}
-{{- define "shoal.llmProxySelectorLabels" -}}
-app.kubernetes.io/name: shoal-llm-proxy
+{{- define "shoal.llmGatewaySelectorLabels" -}}
+app.kubernetes.io/name: shoal-llm-gateway
 app.kubernetes.io/instance: {{ .Release.Name }}
-app.kubernetes.io/component: llm-proxy
+app.kubernetes.io/component: llm-gateway
 {{- end -}}
 
 {{- /*
-The proxy's host allow-list, normalized and comma-joined for -allowed-host.
+The gateway's host allow-list, normalized and comma-joined for -allowed-host.
 
 One definition rather than two, because the guard in validate.yaml and the
 argument in the Deployment have to agree about what an entry is. A blank entry
@@ -150,9 +150,9 @@ out of what the workspace receives — the field is free-form, so a prompt fits
 in it as readily as a model name. Naming models here buys policy granularity
 and nothing else; it does not restrict which models may be called.
 */ -}}
-{{- define "shoal.llmProxyModels" -}}
+{{- define "shoal.llmGatewayModels" -}}
 {{- $models := list -}}
-{{- range (default (list) .Values.llmProxy.models) -}}
+{{- range (default (list) .Values.llmGateway.models) -}}
 {{- if trim (default "" .) -}}
 {{- $models = append $models (trim .) -}}
 {{- end -}}
@@ -160,9 +160,9 @@ and nothing else; it does not restrict which models may be called.
 {{- join "," $models -}}
 {{- end -}}
 
-{{- define "shoal.llmProxyAllowedHosts" -}}
+{{- define "shoal.llmGatewayAllowedHosts" -}}
 {{- $hosts := list -}}
-{{- range (default (list) .Values.llmProxy.allowedHosts) -}}
+{{- range (default (list) .Values.llmGateway.allowedHosts) -}}
 {{- if trim (default "" .) -}}
 {{- $hosts = append $hosts (trim .) -}}
 {{- end -}}
@@ -171,7 +171,7 @@ and nothing else; it does not restrict which models may be called.
 {{- end -}}
 
 {{- /*
-One credential volume, for either of the proxy's two -file credentials.
+One credential volume, for either of the gateway's two -file credentials.
 
 The two break differently — an unreadable admission token denies every call,
 an unreadable upstream key fails calls policy already allowed — but the
@@ -186,14 +186,14 @@ the projection and the flag cannot name different files. The directory half of
 that same path is the mountPath at the call site.
 
 defaultMode is 0440 and never 0400, which is the mistake worth spelling out.
-The kubelet writes projected and Secret volumes owned by root; the proxy
+The kubelet writes projected and Secret volumes owned by root; the gateway
 container runs as uid 65532 with every capability dropped. At 0400 the one
 process that needs the credential cannot open it, and the failure is not a
 crash — the pod starts, passes both probes, and fails on the credential at
 every request. 0440 is readable exactly because the pod declares fsGroup 65532
 alongside it; neither half works without the other.
 */ -}}
-{{- define "shoal.llmProxyCredentialVolume" -}}
+{{- define "shoal.llmGatewayCredentialVolume" -}}
 - name: {{ .name }}
   {{- if eq .source "projected" }}
   projected:
@@ -220,7 +220,7 @@ Converts a Go duration literal to milliseconds so the chart can compare two of
 them, failing on anything Go itself would not parse.
 
 Helm has no duration type and no duration arithmetic, and the two durations the
-proxy takes are not independent: an upstream request timeout above the
+gateway takes are not independent: an upstream request timeout above the
 admission lease produces a call that outlives the permission it was granted
 under. Comparing them needs a number, and reading one out of "90s" is the only
 way to get it.
@@ -253,8 +253,8 @@ Takes a dict of name and value; emits the total in milliseconds.
 {{- end -}}
 
 {{- /*
-The proxy's transport rule, as the binary spells it (absoluteURL and isLoopback
-in cmd/shoal-llm-proxy/admission.go): an absolute http(s) URL with a host, and
+The gateway's transport rule, as the binary spells it (absoluteURL and isLoopback
+in cmd/shoal-llm-gateway/admission.go): an absolute http(s) URL with a host, and
 http permitted only to loopback.
 
 These were scheme-prefix tests, which disagreed with the binary in both

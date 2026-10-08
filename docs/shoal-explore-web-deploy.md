@@ -510,8 +510,8 @@ old disclosure posture while the chart claimed the new one.
 
 Probes address the health port below, never the workspace port.
 
-The same chart renders the LLM proxy, under its own `llmProxy` block and also
-off by default — see `docs/llm-proxy-deploy.md`. It is documented separately
+The same chart renders the LLM gateway, under its own `llmGateway` block and also
+off by default — see `docs/llm-gateway-deploy.md`. It is documented separately
 because almost every deployment decision in this guide follows from one binary
 over one state root served by one replica, and the proxy has the opposite
 properties: no state root, several replicas, and a rolling update that is

@@ -126,7 +126,7 @@ pod never becomes ready. See the health-surface section of
 
 ### The enforcement plane
 
-The **LLM proxy** — `shoal-llm-proxy`, an OpenAI-compatible endpoint a caller
+The **LLM gateway** — `shoal-llm-gateway`, an OpenAI-compatible endpoint a caller
 points at instead of the real provider — asks the explorer for admission before
 each call and reports the outcome after it. It is a separate process on purpose:
 it handles untrusted prompt content from arbitrary callers and speaks to
@@ -135,28 +135,28 @@ prompt injection in the decision plane's address space. Like the explorer it is
 off by default and not derived from `mode`.
 
 ```bash
-cp deploy/helm/shoal/values-llm-proxy.yaml my-llm-proxy-values.yaml
+cp deploy/helm/shoal/values-llm-gateway.yaml my-llm-gateway-values.yaml
 # fill in allowedHosts, admission.url and credential, upstream.baseURL and
 # credential, and the six identity fields, then:
-helm upgrade --install shoal deploy/helm/shoal -f my-llm-proxy-values.yaml \
-  --set llmProxy.image.repository=ghcr.io/YOUR_ORG/shoal-llm-proxy \
-  --set llmProxy.image.tag=TAG
+helm upgrade --install shoal deploy/helm/shoal -f my-llm-gateway-values.yaml \
+  --set llmGateway.image.repository=ghcr.io/YOUR_ORG/shoal-llm-gateway \
+  --set llmGateway.image.tag=TAG
 ```
 
-`values-llm-proxy.yaml` **does not install as shipped**, on the same principle.
-`llmProxy.admission.url` may name an explorer installed separately — the proxy
+`values-llm-gateway.yaml` **does not install as shipped**, on the same principle.
+`llmGateway.admission.url` may name an explorer installed separately — the gateway
 needs one to ask, not one in the same release — and both planes compose from one
 values file.
 
 It is a **Deployment**, not a StatefulSet, and that single difference is the
-whole difference between the two planes. The proxy holds no state root, so
+whole difference between the two planes. The gateway holds no state root, so
 replicas are independent askers of one decision plane: more than one is correct,
-the default is two, and `llmProxy.podDisruptionBudget.maxUnavailable: 0` is
+the default is two, and `llmGateway.podDisruptionBudget.maxUnavailable: 0` is
 refused — the posture the explorer requires because it is a singleton would only
 wedge drains here.
 
 The refusals, the probe surface and the flag contract are in
-[`docs/llm-proxy-deploy.md`](../docs/llm-proxy-deploy.md). The short version:
+[`docs/llm-gateway-deploy.md`](../docs/llm-gateway-deploy.md). The short version:
 nearly every misconfiguration of this component produces a pod that passes every
 probe and denies every call, because it is required to fail closed — which from
 outside is a total outage of whatever is configured to go through it. That is

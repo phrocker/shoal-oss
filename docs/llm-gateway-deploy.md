@@ -1,6 +1,6 @@
-# Deploying the Shoal LLM proxy
+# Deploying the Shoal LLM gateway
 
-`shoal-llm-proxy` is the enforcement plane: an OpenAI-compatible endpoint a
+`shoal-llm-gateway` is the enforcement plane: an OpenAI-compatible endpoint a
 caller points at instead of the real provider. For each request it asks the
 Explorer for admission, applies whatever obligations it can satisfy, forwards or
 refuses, and reports the outcome. The value is that it needs no cooperation from
@@ -11,7 +11,7 @@ anything that speaks the API is governed by changing one base URL.
 described — and implemented — as stripping the withheld references and
 forwarding the rest. That enforced nothing: `shoal_references` is a flat list of
 IDs, the material lives in `messages[].content` as free text, and nothing
-connects the two, so the proxy could not identify the bytes it had been told to
+connects the two, so the gateway could not identify the bytes it had been told to
 withhold. Removing the label did not change what the model received either.
 Withholding is therefore as strong as a denial here, which is tracked as
 [#426](https://github.com/phrocker/shoal-oss/issues/426) rather than papered
@@ -33,30 +33,30 @@ over. Read anything below about obligations with that in mind.
 
 `docs/shoal-explore-web-deploy.md` is organised around one binary with one state
 root served by one replica, and nearly every deployment decision in it follows
-from that. The proxy has the opposite properties — no state root, several
+from that. The gateway has the opposite properties — no state root, several
 replicas, a rolling update that is allowed to surge — and a different threat
 model. Folding it into that document would make its title untrue and would bury
 the one contrast that matters most about the two planes.
 
 The two documents cross-reference instead. Read that one for the Explorer the
-proxy asks; read this one for the proxy.
+gateway asks; read this one for the gateway.
 
 ## Why it is a separate process
 
 It must not be inside `shoal-explore-web`. The Explorer holds the policy store
-and the corpus; the proxy handles untrusted prompt content from arbitrary
+and the corpus; the gateway handles untrusted prompt content from arbitrary
 callers and speaks to third-party endpoints. Putting them in one process puts
 prompt injection in the same address space as the decision plane.
 
 That is also why the admission seam is an HTTP API rather than a Go interface —
-see `docs/admission-seam.md`. The proxy is a different binary and, under the
+see `docs/admission-seam.md`. The gateway is a different binary and, under the
 execution boundary, an out-of-process actor whose effects Shoal declares but
 does not contain.
 
-One consequence shapes everything below. The proxy is the first place in Shoal
+One consequence shapes everything below. The gateway is the first place in Shoal
 where a denial means the work does not happen at all; everywhere else,
-enforcement withholds from a response that is still produced. So the proxy must
-fail closed, and a proxy that fails closed on everything is not a crash — it is
+enforcement withholds from a response that is still produced. So the gateway must
+fail closed, and a gateway that fails closed on everything is not a crash — it is
 a pod that passes every probe and refuses every request. From outside, that is
 indistinguishable from a total outage of whatever is configured to go through
 it. Almost every guard in the chart exists to move one way of producing that
@@ -71,13 +71,13 @@ from a production incident to `helm template`.
 | `-allowed-host` | Comma-separated exact-match external authorities — the same gate as the Explorer's. |
 | `-admission-url` | Base URL of the Explorer's authenticated API. |
 | `-allow-plaintext-admission` | Accept a remote `http://` `-admission-url`. Off by default, and the admission hop only. |
-| `-admission-token-env` | Environment variable holding the bearer token the proxy presents to the Explorer. Mutually exclusive with the file form. |
+| `-admission-token-env` | Environment variable holding the bearer token the gateway presents to the Explorer. Mutually exclusive with the file form. |
 | `-admission-token-file` | File holding that token instead, read per request. The only form a rotating credential has. |
 | `-upstream-base-url` | The real OpenAI-compatible provider, including the version segment it documents. |
 | `-upstream-api-key-env` | Environment variable holding the upstream credential. Mutually exclusive with the file form. |
 | `-model` | Model names this deployment expects, comma-separated. Optional; see below. |
 | `-upstream-api-key-file` | File holding that credential instead, read per request. |
-| `-agent-id` | Registered descriptor this proxy admits against. |
+| `-agent-id` | Registered descriptor this gateway admits against. |
 | `-agent-generation` | `int64`, positive. |
 | `-capability` | Registered capability name. |
 | `-action` | Registered action name. |
@@ -90,7 +90,7 @@ Every one of these is a container argument on the pod spec rather than a
 ConfigMap entry, for the reason the Explorer's are: a changed argument changes
 the pod template and rolls the pod on its own. A ConfigMap would need a checksum
 annotation to get the same effect, and without one an edited `-admission-url`
-would leave the running proxy asking the old decision plane while the chart
+would leave the running gateway asking the old decision plane while the chart
 claimed the new one.
 
 ### Credentials, and what "read per request" does and does not buy
@@ -102,7 +102,7 @@ worth being exact about both halves.
 
 It does not make an environment variable rotatable. A process environment is
 fixed once the container starts: updating the Secret behind a `secretKeyRef`
-leaves every running proxy on the old value until the pod is replaced, so
+leaves every running gateway on the old value until the pod is replaced, so
 re-reading `os.Getenv` per request re-reads the same string forever.
 
 And it does not keep a credential out of a crash dump. An environment value is
@@ -143,18 +143,18 @@ while leaving every sign that it is running.
 
 ## No Kubernetes API credential in this pod
 
-The proxy pod sets `automountServiceAccountToken: false`, unconditionally.
+The gateway pod sets `automountServiceAccountToken: false`, unconditionally.
 
 It needs no API access: it speaks HTTP to the workspace with a bearer token and
 HTTP to the provider with another, and nothing it does touches the API server.
 Without this, Kubernetes puts a token for the pod's ServiceAccount on the
 filesystem anyway — so a compromise of the one process in this chart that parses
 arbitrary caller input would inherit whatever RBAC that account carries. That is
-the opposite of the reason the proxy is a separate process from the workspace.
+the opposite of the reason the gateway is a separate process from the workspace.
 
 This suppresses only the *automatic* mount. An explicit `serviceAccountToken`
 projection is a volume this chart declares, and the kubelet still mints it, so
-`llmProxy.admission.tokenFileSource: projected` is unaffected. The two settings
+`llmGateway.admission.tokenFileSource: projected` is unaffected. The two settings
 look like they should conflict and do not — `validate-chart.sh` asserts the
 projection, its audience and the suppression together, because if that were
 wrong the projected-token form would be dead on arrival while every other check
@@ -163,16 +163,16 @@ still passed.
 There is no values key for it, since one could only ever be used to put back a
 credential nothing here consumes. An operator who genuinely needs a token in
 this pod — for a sidecar, say — declares it as a volume through
-`llmProxy.admission.tokenVolume`, which is explicit and auditable in the values
+`llmGateway.admission.tokenVolume`, which is explicit and auditable in the values
 file rather than implicit in a default.
 
 ## Declared models, and why the list exists
 
-`-model` (`llmProxy.models`) names the models this deployment expects. It is
+`-model` (`llmGateway.models`) names the models this deployment expects. It is
 optional, and an empty list is a working configuration.
 
 The reason it exists is not routing — `-model` restricts nothing, and an
-unlisted model is still forwarded. It is the declaration. The proxy sends Shoal
+unlisted model is still forwarded. It is the declaration. The gateway sends Shoal
 a description of what a call would do and never the payload, and `model` is a
 caller-controlled free-text field: a prompt or a secret fits in it exactly as
 well as `gpt-4o` does. So the declaration reports a **named** model as itself
@@ -183,11 +183,11 @@ The trade is explicit. With no list, no caller text can reach the plane through
 this field, and the plane also cannot write policy about which model was used —
 every call reports `other`. Naming models buys that granularity back for the
 ones you name. Either way the caller's own `model` value goes upstream
-unchanged, because rewriting it would make the proxy the reason an unmodified
+unchanged, because rewriting it would make the gateway the reason an unmodified
 client gets a different answer.
 
 A plane that wants to refuse unfamiliar models can deny on `other`. Deciding
-that here would make the proxy a model gate, which #390 lists as a non-goal.
+that here would make the gateway a model gate, which #390 lists as a non-goal.
 
 ## No plaintext acknowledgement for the provider hop
 
@@ -199,16 +199,16 @@ binary at startup, with no way to accept it.
 
 ## Kubernetes: the Helm chart
 
-`deploy/helm/shoal` renders the proxy as a **Deployment** with a Service and a
-PodDisruptionBudget. The `llmProxy` values block is off by default and
-independent of the chart's `mode`, which selects a storage topology the proxy
+`deploy/helm/shoal` renders the gateway as a **Deployment** with a Service and a
+PodDisruptionBudget. The `llmGateway` values block is off by default and
+independent of the chart's `mode`, which selects a storage topology the gateway
 does not depend on.
 
 ```console
-$ cp deploy/helm/shoal/values-llm-proxy.yaml my-llm-proxy-values.yaml
-$ helm upgrade --install shoal deploy/helm/shoal -f my-llm-proxy-values.yaml \
-    --set llmProxy.image.repository=ghcr.io/YOUR_ORG/shoal-llm-proxy \
-    --set llmProxy.image.tag=TAG
+$ cp deploy/helm/shoal/values-llm-gateway.yaml my-llm-gateway-values.yaml
+$ helm upgrade --install shoal deploy/helm/shoal -f my-llm-gateway-values.yaml \
+    --set llmGateway.image.repository=ghcr.io/YOUR_ORG/shoal-llm-gateway \
+    --set llmGateway.image.tag=TAG
 ```
 
 The profile **does not install as shipped**, on the same principle as
@@ -216,13 +216,13 @@ The profile **does not install as shipped**, on the same principle as
 render without. `helm template` names the first missing one, so working through
 the errors in order fills the profile.
 
-Both planes compose from one values file. `llmProxy.admission.url` may equally
+Both planes compose from one values file. `llmGateway.admission.url` may equally
 name an Explorer installed separately, in another namespace, or in another
-cluster — the proxy needs one to ask, not one in the same release:
+cluster — the gateway needs one to ask, not one in the same release:
 
 ```console
 $ helm upgrade --install shoal deploy/helm/shoal \
-    -f my-explorer-values.yaml -f my-llm-proxy-values.yaml
+    -f my-explorer-values.yaml -f my-llm-gateway-values.yaml
 ```
 
 Before changing the chart, run its checks:
@@ -233,7 +233,7 @@ $ deploy/helm/validate-chart.sh
 
 They render every profile, schema-check the output, assert that each refusal
 below still refuses and each valid configuration still renders, and assert that
-the proxy's two listeners are wired end to end. A guard that silently stops
+the gateway's two listeners are wired end to end. A guard that silently stops
 firing is the failure they exist to catch, and the checks themselves are
 mutation-tested: each guard is removed in turn and the case that must then fail
 is confirmed to fail.
@@ -242,40 +242,40 @@ is confirmed to fail.
 
 | Setting | Why the chart will not render without it |
 | --- | --- |
-| `llmProxy.admission.url` | A proxy that cannot ask must deny. With no decision plane every request behind it is refused while the pod stays healthy. It must also be an absolute `http://` or `https://` URL: a bare host is a transport error on every admission. |
+| `llmGateway.admission.url` | A gateway that cannot ask must deny. With no decision plane every request behind it is refused while the pod stays healthy. It must also be an absolute `http://` or `https://` URL: a bare host is a transport error on every admission. |
 | a plaintext `admission.url` to a non-loopback host | Over `http://` the bearer token crosses the network in the clear, and so does the verdict — anything on the path can rewrite a deny into an allow, which removes the enforcement plane while everything still looks healthy. `admission.allowPlaintext: true` accepts it where a mesh already authenticates the hop. |
-| `llmProxy.admission.tokenEnv`, `credentialSecretName`, `credentialSecretKey` | The Explorer's API is authenticated in every deployment this chart can render, so an admission request with no bearer token is a 401 — every time. The proxy then denies every call. Required **in the environment-variable form**; the file form requires other things instead, below. |
+| `llmGateway.admission.tokenEnv`, `credentialSecretName`, `credentialSecretKey` | The Explorer's API is authenticated in every deployment this chart can render, so an admission request with no bearer token is a 401 — every time. The gateway then denies every call. Required **in the environment-variable form**; the file form requires other things instead, below. |
 | a non-boolean `admission.allowPlaintext` | It is rendered verbatim into `-allow-plaintext-admission`, and Go's boolean flag parser refuses anything it cannot read as one. YAML words like `yes` and `on` are strings here, not booleans, and the pod exits at startup on a flag error. |
 | a remote `http://` `upstream.baseURL` | No acknowledgement accepts it, unlike the admission hop: this request carries the prompt and the provider credential. The binary refuses it at startup too, so rendering it is a pod that never serves. |
-| `llmProxy.terminationGracePeriodSeconds` not exceeding `admission.lease` by 5s | The proxy drains for the lease on SIGTERM, because the lease is the bound on an admitted call's whole lifetime including the report that closes it. This value is the kubelet's budget for the same window, so a shorter one means SIGKILL arrives mid-drain and kills the calls whose egress has already happened and whose grant has already been spent — an unreported grant produced by every rolling update, on a schedule, while the pod terminates cleanly as far as the kubelet is concerned. The margin is required because the grace period is whole seconds while a lease need not be, and because the process still has to exit after the drain returns. |
-| `llmProxy.identity.agentID` that is not canonical unpadded base64url | The workspace decodes this field and the binary refuses an undecodable value at startup. The guard reaches encoding mistakes and **not** the class of wrong values: a `shoal.ID` is opaque and variable-length, so there is no width to validate, and a readable name that happens to decode is indistinguishable here from a registered ID. Of fifteen plausible names, eleven decode cleanly to garbage (`gateway` to five bytes, `my-agent` to six) and only four fail on length (`llm-proxy`, `proxy`, `agent`, each `4n+1`). The eleven are refused by the plane on every request instead, as a descriptor that does not exist. |
+| `llmGateway.terminationGracePeriodSeconds` not exceeding `admission.lease` by 5s | The gateway drains for the lease on SIGTERM, because the lease is the bound on an admitted call's whole lifetime including the report that closes it. This value is the kubelet's budget for the same window, so a shorter one means SIGKILL arrives mid-drain and kills the calls whose egress has already happened and whose grant has already been spent — an unreported grant produced by every rolling update, on a schedule, while the pod terminates cleanly as far as the kubelet is concerned. The margin is required because the grace period is whole seconds while a lease need not be, and because the process still has to exit after the drain returns. |
+| `llmGateway.identity.agentID` that is not canonical unpadded base64url | The workspace decodes this field and the binary refuses an undecodable value at startup. The guard reaches encoding mistakes and **not** the class of wrong values: a `shoal.ID` is opaque and variable-length, so there is no width to validate, and a readable name that happens to decode is indistinguishable here from a registered ID. Of fifteen plausible names, eleven decode cleanly to garbage (`gateway` to five bytes, `my-agent` to six) and only four fail on length (`llm-gateway`, `gateway`, `agent`, each `4n+1`). The eleven are refused by the plane on every request instead, as a descriptor that does not exist. |
 | `agentGeneration`, a port, `tokenExpirationSeconds` or `terminationGracePeriodSeconds` that is not a whole number as written | Each is rendered verbatim, and converting before testing is lossy in exactly the cases worth refusing: `int64` of `1.5` is a positive `1`, so a guard that only checked positivity passed it and then rendered `-agent-generation=1.5`, which exits the pod on a flag error. A leading zero is worse than a refusal because it works — `010` is parsed as octal `8`, a generation nothing was registered under. |
-| `llmProxy.admission.lease` above `5m` | `pkg/explorer/fleet` caps an admission lease at `MaxActionClaimTTL` and **refuses** a request outside the bound rather than shortening it. A larger value is not a longer lease; it is every call denied as an invalid argument, which the caller cannot act on and an operator cannot tell apart from a policy denial. |
-| `llmProxy.upstream.baseURL` | An admitted request has nowhere to go, so the caller sees a failure on exactly the calls policy allowed — and the admission is spent on work that never happened. Must also be absolute. |
+| `llmGateway.admission.lease` above `5m` | `pkg/explorer/fleet` caps an admission lease at `MaxActionClaimTTL` and **refuses** a request outside the bound rather than shortening it. A larger value is not a longer lease; it is every call denied as an invalid argument, which the caller cannot act on and an operator cannot tell apart from a policy denial. |
+| `llmGateway.upstream.baseURL` | An admitted request has nowhere to go, so the caller sees a failure on exactly the calls policy allowed — and the admission is spent on work that never happened. Must also be absolute. |
 | a remote upstream with no credential at all | The credential is read at request time and nothing puts one in the pod, so every admitted call is rejected by the provider after admission has been spent on it — policy allowed work that then did not happen. A Secret or an `apiKeyFile` with `apiKeyFileSource: volume` satisfies it; a loopback provider needs neither. |
-| `llmProxy.upstream.requestTimeout` above `admission.lease` | A call that outlives its lease is performed under a token that can no longer be reported against. The fleet record calls that *abandoned* rather than resolved: whether the effect happened is unknown and stays unknown, which breaks the loop the report exists to close. |
-| `llmProxy.allowedHosts` | An empty allow-list answers every request `421 Misdirected Request` before admission is even asked. See the Explorer document's host-authority section: the gate is the same, and the resolved listen address of a pod is an authority no real client sends. |
-| `llmProxy.identity.*` | Admission resolves the agent, capability, action and scope together. An incomplete identity is not a startup failure — it is a proxy that comes up healthy and is refused on every request, with a denial that carries no reason by design. There is nothing in the pod log to read. `agentGeneration` must be a positive `int64`; `sourceID` and `policyID` must be canonical unpadded base64url. |
-| `llmProxy.healthPort` equal to `containerPort` | Two listeners cannot share a port, and which one loses is decided by bind order. If the health listener wins the proxy serves nothing; if the traffic listener wins every probe answers `421` and the pod never becomes ready. |
+| `llmGateway.upstream.requestTimeout` above `admission.lease` | A call that outlives its lease is performed under a token that can no longer be reported against. The fleet record calls that *abandoned* rather than resolved: whether the effect happened is unknown and stays unknown, which breaks the loop the report exists to close. |
+| `llmGateway.allowedHosts` | An empty allow-list answers every request `421 Misdirected Request` before admission is even asked. See the Explorer document's host-authority section: the gate is the same, and the resolved listen address of a pod is an authority no real client sends. |
+| `llmGateway.identity.*` | Admission resolves the agent, capability, action and scope together. An incomplete identity is not a startup failure — it is a gateway that comes up healthy and is refused on every request, with a denial that carries no reason by design. There is nothing in the pod log to read. `agentGeneration` must be a positive `int64`; `sourceID` and `policyID` must be canonical unpadded base64url. |
+| `llmGateway.healthPort` equal to `containerPort` | Two listeners cannot share a port, and which one loses is decided by bind order. If the health listener wins the gateway serves nothing; if the traffic listener wins every probe answers `421` and the pod never becomes ready. |
 | either port below `1024` | The container runs as uid 65532 with all capabilities dropped. The bind fails and the pod restarts forever. |
-| `llmProxy.podDisruptionBudget.maxUnavailable: 0` | The Explorer uses `0` because it is a singleton over one state root. The proxy is stateless and replaceable, so a `0` budget protects nothing and instead makes `kubectl drain` and cluster-autoscaler consolidation block forever on a pod that could safely have moved. |
+| `llmGateway.podDisruptionBudget.maxUnavailable: 0` | The Explorer uses `0` because it is a singleton over one state root. The gateway is stateless and replaceable, so a `0` budget protects nothing and instead makes `kubectl drain` and cluster-autoscaler consolidation block forever on a pod that could safely have moved. |
 | a `tokenFile` or `apiKeyFile` that is relative, or names a file at `/` | The path is both the flag and the mount the chart derives from it. A relative path resolves against a working directory nothing in the pod spec guarantees, so every read fails while the pod stays healthy; a mount at `/` replaces the container's root filesystem and the binary with it. |
 | a `tokenFileSource` or `apiKeyFileSource` the chart does not render | The flag would name a path with no volume mounted there, which is an unreadable credential on every request — a pod that passes every probe and governs nothing. |
 | `admission.credentialSecretName` with `tokenFileSource: projected` or `volume` | Neither source reads a Secret, so it is a credential the operator believes is being presented and the pod never opens. This is the ambiguity the binary refuses two token flags over, arriving through the chart instead. |
 | `admission.tokenAudience` with a source that issues no token | The audience names the verifier a projected token is minted for. With any other source it records a binding that exists nowhere in the deployment. |
-| `tokenFileSource: projected` with no `serviceAccountName` | A projected token's subject is the pod's ServiceAccount, and left implicit that is the namespace's `default` — an account every other pod in the namespace can also mint a token for, so authorizing the proxy authorizes the namespace. Naming `default` explicitly is accepted, and is the acknowledgement. |
+| `tokenFileSource: projected` with no `serviceAccountName` | A projected token's subject is the pod's ServiceAccount, and left implicit that is the namespace's `default` — an account every other pod in the namespace can also mint a token for, so authorizing the gateway authorizes the namespace. Naming `default` explicitly is accepted, and is the acknowledgement. |
 | `tokenFileSource: projected` with no `tokenAudience` | A token projected with no audience is issued for the cluster's own API server, which the Explorer is not. Every admission request is then a 401. |
 | `tokenExpirationSeconds` below `600` | The API server's floor for a token projection. Below it the pod spec is invalid, so the Deployment is accepted and no pod is ever created from it — a rollout that never completes and no pod log at all. |
 | an empty or self-naming `tokenVolume`/`apiKeyVolume` | A volume with a name and no source is not a pod spec the API server accepts; a second name renders a duplicate key, so the volume is named something the mount does not reference and the kubelet never mounts the credential. |
 | both credential files in one directory | Each is mounted as its own volume at its own file's directory, and a pod cannot mount two volumes at one path. |
 | an explicitly chosen `tokenEnv` beside a `tokenFile`, or `apiKeyEnv` beside an `apiKeyFile` | The binary refuses that pair at startup rather than ranking them, so rendering it is a pod that never serves. The variable at its shipped default is not a second choice — that is how the file form stays reachable. |
-| any value still containing `REPLACE_ME` | A placeholder is not configuration. The dangerous case is not the one that fails: an identity of literally `REPLACE_ME` renders a proxy refused on every call while the chart reports success. |
+| any value still containing `REPLACE_ME` | A placeholder is not configuration. The dangerous case is not the one that fails: an identity of literally `REPLACE_ME` renders a gateway refused on every call while the chart reports success. |
 
 A value written and left blank counts as missing, and so does one that is only
 whitespace. A key with nothing after it in YAML is `nil`, not `""`, and `nil`
 stringifies to `"<nil>"` — non-blank. A required-value check that did not
 normalise first would read an absent value as configured and render the pod with
-an empty flag, which is exactly the healthy-and-denying proxy these guards
+an empty flag, which is exactly the healthy-and-denying gateway these guards
 exist for. Every value is therefore normalised before it is tested, and the
 `-allowed-host` argument is built from the same template the guard counts, so
 the chart cannot pass its own check and then render `" llm.example.test"` — an
@@ -294,7 +294,7 @@ Explorer's does:
 | Route | Meaning |
 | --- | --- |
 | `GET /healthz` | The process is up. Stays `200` throughout a drain. |
-| `GET /readyz` | The proxy is serving. `503` before it serves and from the moment shutdown begins. |
+| `GET /readyz` | The gateway is serving. `503` before it serves and from the moment shutdown begins. |
 
 The split is what makes a rollout safe. Readiness drops **before** the listener
 stops accepting, so the endpoints controller removes the pod from the Service
@@ -306,10 +306,10 @@ The readiness probe is deliberately short — `periodSeconds: 3`,
 `failureThreshold: 1`. A failing readiness probe is the only thing that takes
 the pod out of the Service, so that interval *is* the window between the drain
 starting and traffic stopping; a slower probe spends it answering requests the
-proxy has already decided to stop serving.
+gateway has already decided to stop serving.
 
 There is no startup probe, unlike the Explorer. The Explorer needs one because
-opening a large corpus and policy catalog takes time. The proxy opens nothing,
+opening a large corpus and policy catalog takes time. The gateway opens nothing,
 so a startup probe would only postpone the first readiness check.
 
 The Service publishes the traffic port only. The probe surface exists for the
@@ -333,7 +333,7 @@ difference is the whole difference between the two planes.
 The Explorer needs its rolling update to stop the old pod before starting the
 new one, because two processes over one `ReadWriteOnce` state root is a
 split-brain it has no protocol for — and `explorer.replicas` above 1 is refused
-for the same reason. The proxy has no state root at all: the decision lives in
+for the same reason. The gateway has no state root at all: the decision lives in
 the Explorer, the admission token travels in the request it was granted for, and
 nothing is retained between calls. So replicas are independent askers of one
 decision plane, surging is correct, and there is no volume, no ordinal identity
@@ -342,16 +342,16 @@ and no governing headless Service to need a StatefulSet for.
 The default is two replicas, and raising it is the expected direction. The
 rollout is `maxUnavailable: 0`, `maxSurge: 1`: no old pod is removed until a
 surge pod has passed readiness, because a gap in capacity here is an outage for
-everything behind the proxy rather than a slow read. Replicas carry a soft
+everything behind the gateway rather than a slow read. Replicas carry a soft
 anti-affinity across nodes so a single node loss is not the whole plane —
 *soft*, because a cluster with fewer nodes than replicas must still schedule,
 and a Pending pod is as unavailable as a denied one.
 
-Supplying `llmProxy.affinity` replaces that default outright rather than merging
+Supplying `llmGateway.affinity` replaces that default outright rather than merging
 with it. Merging two affinity trees would produce a scheduling constraint
 neither the chart nor the operator wrote.
 
-The pod has no writable path and no `emptyDir` to give one back. The proxy holds
+The pod has no writable path and no `emptyDir` to give one back. The gateway holds
 no state root and must not spool payloads: prompt and completion content is
 exactly what it is governing the egress of, and a scratch directory is where
 that content would end up on a node's disk.
@@ -371,7 +371,7 @@ $ kubectl create secret generic shoal-upstream-key --from-literal=api-key="$PROV
 ```
 
 ```yaml
-llmProxy:
+llmGateway:
   admission:
     credentialSecretName: shoal-admission-token
     credentialSecretKey: token
@@ -387,7 +387,7 @@ or by an operator-supplied volume (below).
 
 Neither of these rotates. Both are environment variables, and a container's
 environment is fixed after start: changing either Secret leaves every running
-proxy on the old value until the pod is replaced. Where that is not acceptable,
+gateway on the old value until the pod is replaced. Where that is not acceptable,
 use a file.
 
 ## A rotating credential: the projected ServiceAccount token
@@ -400,29 +400,29 @@ long-lived static Secret, which is the thing projected tokens exist to avoid.
 ### What the chart needs from you
 
 ```console
-$ kubectl create serviceaccount shoal-llm-proxy
+$ kubectl create serviceaccount shoal-llm-gateway
 ```
 
 That is all: the account is not created by the chart, like the Secrets, and no
 RBAC is needed for the token itself. The Explorer must be configured to accept
 it — its OIDC authenticator has to trust the cluster as an issuer and include
 the audience below in `explorer.auth.oidc.audiences` — and the descriptor the
-proxy admits against has to be registered to the identity the token carries,
-`system:serviceaccount:<namespace>:shoal-llm-proxy`.
+gateway admits against has to be registered to the identity the token carries,
+`system:serviceaccount:<namespace>:shoal-llm-gateway`.
 
 ### The values file, complete
 
 ```yaml
-llmProxy:
+llmGateway:
   enabled: true
   image:
-    repository: ghcr.io/YOUR_ORG/shoal-llm-proxy
+    repository: ghcr.io/YOUR_ORG/shoal-llm-gateway
     tag: TAG
   replicas: 2
   allowedHosts: [llm.internal.example.test]
   # The token's subject is this account. Required for the projected form, and
   # not created by the chart.
-  serviceAccountName: shoal-llm-proxy
+  serviceAccountName: shoal-llm-gateway
   admission:
     url: https://shoal-explorer.shoal.svc.cluster.local:8098
     # The file form. No credentialSecretName, and naming one here is refused:
@@ -435,7 +435,7 @@ llmProxy:
     # would be a 401.
     tokenAudience: shoal
     # 600 is the API server's floor. 3600 is a reasonable lifetime; see below
-    # for why no value above the floor can make the proxy read a stale token.
+    # for why no value above the floor can make the gateway read a stale token.
     tokenExpirationSeconds: 3600
     lease: 60s
   upstream:
@@ -443,7 +443,7 @@ llmProxy:
     credentialSecretName: shoal-upstream-key
     credentialSecretKey: api-key
     requestTimeout: 30s
-  # Must exceed the lease by at least 5s, because the proxy drains for the
+  # Must exceed the lease by at least 5s, because the gateway drains for the
   # lease. The default is 75 against the default 60s lease.
   terminationGracePeriodSeconds: 75
   identity:
@@ -461,14 +461,14 @@ What that renders, in the part that matters:
 spec:
   template:
     spec:
-      serviceAccountName: shoal-llm-proxy
+      serviceAccountName: shoal-llm-gateway
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532            # not optional; see below
       containers:
-        - name: shoal-llm-proxy
+        - name: shoal-llm-gateway
           args:
             - -admission-token-file=/var/run/secrets/shoal/token
             # and no -admission-token-env at all
@@ -498,7 +498,7 @@ and has to name a file inside a directory other than `/` — a volume mounted at
 The kubelet writes projected and Secret volumes owned by root, and this
 container runs as uid 65532 with every capability dropped. At `0400` with no
 `fsGroup`, the one process that needs the credential cannot open it — and the
-failure is not a crash. The proxy starts, passes both probes, and fails every
+failure is not a crash. The gateway starts, passes both probes, and fails every
 admission request on an unreadable file, which from outside looks exactly like a
 policy problem. `fsGroup: 65532` makes the mount group-owned by the group the
 process runs as, and `0440` is then readable and writable by nobody.
@@ -506,7 +506,7 @@ process runs as, and `0440` is then readable and writable by nobody.
 
 ### Why the per-request read sees a fresh token
 
-The proxy reads the file on every request, and that is what makes rotation work:
+The gateway reads the file on every request, and that is what makes rotation work:
 a value captured at startup would be the one that has since expired.
 
 Two properties make it correct rather than racy.
@@ -527,8 +527,8 @@ from it, so there is no pod log to read. And 600 is also where the margin, two
 minutes, stays comfortably clear of the kubelet's own re-projection cadence of
 about a minute.
 
-So **no accepted value above the floor can make this proxy read a stale token**:
-a larger `expirationSeconds` only widens the margin. The one way the proxy can
+So **no accepted value above the floor can make this gateway read a stale token**:
+a larger `expirationSeconds` only widens the margin. The one way the gateway can
 present an expired token is the kubelet failing to refresh at all — a node-level
 problem — and the result is a 401 on every admission request, which denies every
 call. Fail-closed, which is the only direction this component is allowed to
@@ -602,7 +602,7 @@ Two things to know before an upgrade.
 
 **`identity.agentGeneration` pins a descriptor generation.** Re-registering the
 descriptor bumps it, and this value has to be bumped with it in the same change.
-A stale generation is not a startup failure: the proxy comes up, passes its
+A stale generation is not a startup failure: the gateway comes up, passes its
 probes, and is refused on every admission request.
 
 **Changing any setting rolls the pods, by design.** Every setting is an
@@ -611,7 +611,7 @@ running process is on the old one. `maxUnavailable: 0` means the rollout keeps
 every replica serving while it happens.
 
 **The lease is also the drain window, so it is also the rollout's worst case.**
-On SIGTERM the proxy drains for `-lease`, because the lease is the bound on an
+On SIGTERM the gateway drains for `-lease`, because the lease is the bound on an
 admitted call's entire lifetime including the report that closes it — a
 ten-second drain abandoned in-flight calls whose egress had already happened and
 whose grant had already been spent, which made every rolling update a producer
@@ -637,7 +637,7 @@ window.
 
 The chart deliberately does **not** cap the lease below the fleet's own
 `MaxActionClaimTTL` to make rollouts faster. The lease is a correctness bound —
-how long a grant stays reportable, and therefore the longest call this proxy
+how long a grant stays reportable, and therefore the longest call this gateway
 will admit — and capping it for a deployment-convenience reason would silently
 shorten what callers can do, which is the kind of coupling that produces a
 denial nobody can explain.
@@ -651,14 +651,14 @@ Gaps in the flag contract, recorded rather than worked around.
   `prometheus.io/port` — which the storage tier and read fleet both have. Issue
   #390 requires that an operator be able to tell an infrastructural denial (the
   decision plane unreachable) from a policy denial. Without a metrics surface
-  that distinction exists only in logs the proxy is also forbidden from filling
+  that distinction exists only in logs the gateway is also forbidden from filling
   with payload content.
-- **No TLS flags for the proxy's own listener.** `writeTier`, `readFleet`,
-  `tserver` and `compactor` all take `tls.enabled`/`secretName`. The proxy
+- **No TLS flags for the gateway's own listener.** `writeTier`, `readFleet`,
+  `tserver` and `compactor` all take `tls.enabled`/`secretName`. The gateway
   cannot, so it is plaintext behind an ingress or a mesh. The Explorer has the
   same gap, which is also why reaching it over `http://` needs the explicit
   acknowledgement above.
-- **No quiesce delay.** `readFleet` has `-quiesce-delay`; the proxy does not.
+- **No quiesce delay.** `readFleet` has `-quiesce-delay`; the gateway does not.
   Readiness drops and the listener stops accepting in the same breath, so
   requests arriving in the few seconds before the endpoints controller removes
   the pod are refused at the connection rather than answered. Nothing is
@@ -669,17 +669,17 @@ Gaps in the flag contract, recorded rather than worked around.
 - **No report timeout.** `-request-timeout` bounds the upstream call. The report
   that follows it has no bound of its own, and an admission that is never
   reported is the outstanding case `docs/admission-seam.md` describes.
-- **A withhold obligation is refused rather than applied**, because the proxy
+- **A withhold obligation is refused rather than applied**, because the gateway
   cannot identify which message content carries a withheld reference. Withholding
   is therefore as strong as a denial on this surface, which leaves one of #390's
   acceptance criteria unmet in substance. Tracked as
   [#426](https://github.com/phrocker/shoal-oss/issues/426).
 - **No ServiceAccount is created for the projected token form.** The chart
-  references `llmProxy.serviceAccountName` and does not create the account or
+  references `llmGateway.serviceAccountName` and does not create the account or
   any RBAC, on the same principle as the Secrets. An operator wiring the
   Kubernetes-native credential still has one object to create by hand.
 - **The chart cannot check that the Explorer accepts the token it projects.**
   `tokenAudience` has to match an audience the Explorer's authenticator accepts
   and the cluster has to be a trusted issuer there, and neither is visible from
-  the proxy's own values — the Explorer may be in another cluster entirely. A
+  the gateway's own values — the Explorer may be in another cluster entirely. A
   mismatch is a 401 on every admission request, with a healthy pod.
