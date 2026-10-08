@@ -32,6 +32,7 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/phrocker/shoal-oss/internal/strictjson"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -512,14 +513,14 @@ func decodeRequest(writer http.ResponseWriter, request *http.Request, value any)
 		return errors.New("content type must be application/json")
 	}
 	request.Body = http.MaxBytesReader(writer, request.Body, maxRequestBytes)
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(value); err != nil {
-		return fmt.Errorf("decode request body: %w", err)
+	// Read once, then decode strictly. The body is already bounded above, so
+	// holding it is bounded too.
+	raw, err := io.ReadAll(request.Body)
+	if err != nil {
+		return fmt.Errorf("read request body: %w", err)
 	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return errors.New("request body must contain one JSON object")
+	if err := strictjson.Decode(raw, value); err != nil {
+		return fmt.Errorf("decode request body: %w", err)
 	}
 	return nil
 }

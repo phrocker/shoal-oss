@@ -5,4 +5,4 @@ provider calls: 0
 status: 400
 content-type: application/json; charset=utf-8
 shoal-commit-outcome: 
-body: "{\"code\":\"invalid_argument\",\"message\":\"invalid_argument: request body must contain one JSON object\"}\n"
+body: "{\"code\":\"invalid_argument\",\"message\":\"invalid_argument: decode request body: trailing JSON data\"}\n"
