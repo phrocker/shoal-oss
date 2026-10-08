@@ -54,7 +54,7 @@ func profileFixture(t *testing.T) (Profile, Selection, []collectorregistry.Mater
 	if e != nil {
 		t.Fatal(e)
 	}
-	p := Profile{ID: "profile", RevisionID: "revision-v1", BuilderID: "builder", MaterialPurposeID: "purpose", ReleaseID: "release", Query: "Classify original source", TokenizerID: "numeric-v1", OntologyProjectionID: "no-ontology-v1", SourceAuthorityPolicyID: "source-policy", Task: task, Predictor: predictor, EvidencePolicy: ep, RankingPlan: rank, TaskResource: auth.ResourceRequest{AuthorizationDomain: []byte("domain"), SourceID: []byte("tasks"), PolicyID: []byte("task-policy"), ObjectID: task.ID()}, Builder: profileBuilderFunc(testProfileBuilder), MaxDuration: time.Minute}
+	p := Profile{AllowedModes: []collector.Mode{collector.ServerObserved}, ID: "profile", RevisionID: "revision-v1", BuilderID: "builder", MaterialPurposeID: "purpose", ReleaseID: "release", Query: "Classify original source", TokenizerID: "numeric-v1", OntologyProjectionID: "no-ontology-v1", SourceAuthorityPolicyID: "source-policy", Task: task, Predictor: predictor, EvidencePolicy: ep, RankingPlan: rank, TaskResource: auth.ResourceRequest{AuthorizationDomain: []byte("domain"), SourceID: []byte("tasks"), PolicyID: []byte("task-policy"), ObjectID: task.ID()}, Builder: profileBuilderFunc(testProfileBuilder), MaxDuration: time.Minute}
 	d, e := auth.NewDecision(auth.DecisionConfig{Subject: "reader", Actor: "actor", ClientID: "client", AuthorizationDomain: []byte("domain"), AllowedOperations: []auth.Operation{auth.OperationRead, auth.OperationInvoke}, PolicyGeneration: 1, AuthenticationExpires: now.Add(time.Hour), RequestID: "auth-request"})
 	if e != nil {
 		t.Fatal(e)
@@ -212,5 +212,60 @@ func TestProfileNormalizationAndSelectionBounds(t *testing.T) {
 	p.Builder = nil
 	if _, e = normalizeProfile(p); e == nil {
 		t.Fatal("nil builder")
+	}
+}
+
+func TestProfileRequiresExplicitCanonicalCollectorModes(t *testing.T) {
+	p, _, _, _, _ := profileFixture(t)
+	for _, modes := range [][]collector.Mode{nil, {}, {collector.ServerObserved, collector.ServerObserved}, {"unknown"}} {
+		candidate := p
+		candidate.AllowedModes = modes
+		if _, e := normalizeProfile(candidate); e == nil {
+			t.Fatalf("accepted modes %v", modes)
+		}
+	}
+	p.AllowedModes = []collector.Mode{collector.ServerObserved, collector.Imported}
+	normalized, e := normalizeProfile(p)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !reflect.DeepEqual(normalized.AllowedModes, []collector.Mode{collector.Imported, collector.ServerObserved}) {
+		t.Fatal("noncanonical modes")
+	}
+	normalized.AllowedModes[0] = collector.ServerObserved
+	if p.AllowedModes[1] != collector.Imported {
+		t.Fatal("aliased modes")
+	}
+}
+func TestProfileCollectorModeCannotBeLaundered(t *testing.T) {
+	p, s, m, d, now := profileFixture(t)
+	m[0].Registration.Mode = collector.Imported
+	if _, _, e := buildRecord(context.Background(), d, p, s, m, now, "correlation"); e == nil {
+		t.Fatal("imported source admitted by observed-only profile")
+	}
+	p.AllowedModes = []collector.Mode{collector.Imported, collector.ServerObserved}
+	r, f, e := buildRecord(context.Background(), d, p, s, m, now, "correlation")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if f.Sources[0].Mode != collector.Imported {
+		t.Fatal("mode lost")
+	}
+	if e = validateRecord(context.Background(), p, f, r, m); e != nil {
+		t.Fatal(e)
+	}
+	f.Sources[0].Mode = collector.ServerObserved
+	if e = validateRecord(context.Background(), p, f, r, m); e == nil {
+		t.Fatal("substituted frozen mode")
+	}
+	f.Sources[0].Mode = collector.Imported
+	m[0].Registration.Mode = collector.ServerObserved
+	if e = validateRecord(context.Background(), p, f, r, m); e == nil {
+		t.Fatal("changed collector mode")
+	}
+	m[0].Registration.Mode = collector.Imported
+	p.AllowedModes = []collector.Mode{collector.Imported}
+	if e = validateRecord(context.Background(), p, f, r, m); e == nil {
+		t.Fatal("changed allowed modes under same revision")
 	}
 }

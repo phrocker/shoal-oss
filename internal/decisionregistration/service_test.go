@@ -11,6 +11,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/collectorregistry"
 	"github.com/phrocker/shoal-oss/internal/decisionartifacts"
 	registrations "github.com/phrocker/shoal-oss/internal/decisionregistrationstore"
+	"github.com/phrocker/shoal-oss/pkg/collector"
 	"github.com/phrocker/shoal-oss/pkg/decision"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
@@ -83,7 +84,7 @@ func focusedProfile(t *testing.T) Profile {
 	if e != nil {
 		t.Fatal(e)
 	}
-	return Profile{ID: "focused", RevisionID: "v1", BuilderID: "builder", MaterialPurposeID: "purpose", ReleaseID: "release", Query: "Inspect source", TokenizerID: "numeric", OntologyProjectionID: "none", SourceAuthorityPolicyID: "source-policy", Task: task, Predictor: predictor, EvidencePolicy: ep, RankingPlan: rank, TaskResource: auth.ResourceRequest{AuthorizationDomain: []byte("domain"), SourceID: []byte("tasks"), PolicyID: []byte("task-policy"), ObjectID: task.ID()}, Builder: focusedBuilder{}, MaxDuration: time.Minute}
+	return Profile{AllowedModes: []collector.Mode{collector.ServerObserved}, ID: "focused", RevisionID: "v1", BuilderID: "builder", MaterialPurposeID: "purpose", ReleaseID: "release", Query: "Inspect source", TokenizerID: "numeric", OntologyProjectionID: "none", SourceAuthorityPolicyID: "source-policy", Task: task, Predictor: predictor, EvidencePolicy: ep, RankingPlan: rank, TaskResource: auth.ResourceRequest{AuthorizationDomain: []byte("domain"), SourceID: []byte("tasks"), PolicyID: []byte("task-policy"), ObjectID: task.ID()}, Builder: focusedBuilder{}, MaxDuration: time.Minute}
 }
 func focusedDecision(t *testing.T, now time.Time, generation int64) auth.Decision {
 	t.Helper()
@@ -157,5 +158,39 @@ func TestServiceCallerExpiryAndBoundedKey(t *testing.T) {
 	var missing *focusedResolver
 	if _, e := New(Config{Resolver: missing}); e == nil {
 		t.Fatal("typed nil resolver")
+	}
+}
+
+func TestServiceRejectsDelegatedCallerBeforeRegistrationIO(t *testing.T) {
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	delegated, e := auth.NewDecision(auth.DecisionConfig{Subject: "subject", Actor: "actor", OnBehalfOf: []shoal.ID{"delegator"}, AuthorizationDomain: []byte("domain"), AllowedOperations: []auth.Operation{auth.OperationIngest, auth.OperationRead, auth.OperationInvoke}, PolicyGeneration: 1, AuthenticationExpires: now.Add(time.Hour), RequestID: "auth-request"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	p := focusedProfile(t)
+	gate := &focusedAuthority{}
+	resolver := &focusedResolver{decision: delegated}
+	reads := 0
+	backend := &focusedBackend{read: func() { reads++ }}
+	store, e := registrations.New(registrations.Config{Backend: backend, Clock: func() time.Time { return now }})
+	if e != nil {
+		t.Fatal(e)
+	}
+	s, e := New(Config{Resolver: resolver, Registrations: store, ArtifactBackend: backend, Materials: &collectorregistry.MaterialResolver{}, Profiles: []Profile{p}, Authority: gate, Clock: func() time.Time { return now }})
+	if e != nil {
+		t.Fatal(e)
+	}
+	selection := Selection{ProfileID: p.ID, ProfileRevisionID: p.RevisionID, Sources: []SourceInput{{ObservationID: shoal.ID("observation:" + strings.Repeat("a", 64)), Bytes: []byte("source")}}}
+	if _, e = s.Register(context.Background(), []byte("key"), selection); !shoal.IsErrorCode(e, shoal.ErrorNotFound) || errors.Is(e, ErrIndeterminate) {
+		t.Fatalf("delegated registration: %v", e)
+	}
+	if _, e = s.Read(context.Background(), "request"); !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
+		t.Fatalf("delegated read: %v", e)
+	}
+	if _, e = s.Artifacts().LoadAuthorized(context.Background(), delegated, "request"); !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
+		t.Fatalf("delegated execution: %v", e)
+	}
+	if reads != 0 || backend.writes != 0 || gate.calls != 0 {
+		t.Fatalf("delegation reached downstream IO or authority: reads%d writes%d grants%d", reads, backend.writes, gate.calls)
 	}
 }

@@ -31,6 +31,7 @@ const MaxSelectionBytes = 8 << 20
 // and all versioned definitions must remain immutable under this revision.
 // Provisioning this profile makes no assertion about classifier quality.
 type Profile struct {
+	AllowedModes                                               []collector.Mode
 	ID, RevisionID, BuilderID, MaterialPurposeID, ReleaseID    shoal.ID
 	Query                                                      string
 	TokenizerID, OntologyProjectionID, SourceAuthorityPolicyID shoal.ID
@@ -100,12 +101,24 @@ func profileCommitment(p Profile) string {
 		ID, RevisionID, BuilderID, PurposeID, ReleaseID                                                     shoal.ID
 		Query                                                                                               string
 		TokenizerID, OntologyProjectionID, SourcePolicyID, TaskID, PredictorID, EvidencePolicyID, RankingID shoal.ID
+		AllowedModes                                                                                        []collector.Mode
 		Resource                                                                                            auth.ResourceRequest
 		MaxDuration                                                                                         time.Duration
-	}{"operator-profile-v1", p.ID, p.RevisionID, p.BuilderID, p.MaterialPurposeID, p.ReleaseID, p.Query, p.TokenizerID, p.OntologyProjectionID, p.SourceAuthorityPolicyID, p.Task.ID(), p.Predictor.ID(), p.EvidencePolicy.ID(), p.RankingPlan.ID(), p.TaskResource, p.MaxDuration}))
+	}{"operator-profile-v1", p.ID, p.RevisionID, p.BuilderID, p.MaterialPurposeID, p.ReleaseID, p.Query, p.TokenizerID, p.OntologyProjectionID, p.SourceAuthorityPolicyID, p.Task.ID(), p.Predictor.ID(), p.EvidencePolicy.ID(), p.RankingPlan.ID(), p.AllowedModes, p.TaskResource, p.MaxDuration}))
 }
 func profileKey(id, revision shoal.ID) string { return string(profileJSON([]shoal.ID{id, revision})) }
 func normalizeProfile(p Profile) (Profile, error) {
+	if len(p.AllowedModes) == 0 || len(p.AllowedModes) > 2 {
+		return Profile{}, profileInvalid()
+	}
+	p.AllowedModes = append([]collector.Mode(nil), p.AllowedModes...)
+	sort.Slice(p.AllowedModes, func(i, j int) bool { return p.AllowedModes[i] < p.AllowedModes[j] })
+	for i, mode := range p.AllowedModes {
+		if (mode != collector.Imported && mode != collector.ServerObserved) || (i > 0 && mode == p.AllowedModes[i-1]) {
+			return Profile{}, profileInvalid()
+		}
+	}
+
 	for _, id := range []shoal.ID{p.ID, p.RevisionID, p.BuilderID, p.MaterialPurposeID, p.ReleaseID, p.TokenizerID, p.OntologyProjectionID, p.SourceAuthorityPolicyID} {
 		if !profileID(id) {
 			return Profile{}, profileInvalid()
@@ -214,6 +227,13 @@ func resolveSources(p Profile, s Selection, materials []collectorregistry.Materi
 		if !ok {
 			return nil, nil, profileInvalid()
 		}
+		modeAllowed := false
+		for _, mode := range p.AllowedModes {
+			modeAllowed = modeAllowed || mode == m.Registration.Mode
+		}
+		if !modeAllowed {
+			return nil, nil, profileInvalid()
+		}
 		c := m.Observation.Observation.Config()
 		a := m.Artifact
 		if !bytes.Equal(m.Registration.Domain, p.TaskResource.AuthorizationDomain) || !bytes.Equal(a.Domain, p.TaskResource.AuthorizationDomain) || a.CollectorID != c.CollectorID || a.Generation != m.Registration.Generation || a.EnrollmentID != m.Enrollment.ID || a.Ref.ID != c.ArtifactID || a.Ref.Validate() != nil || a.Ref.Digest != m.Observation.ArtifactDigest || a.Ref.Size != int64(len(input.Bytes)) || profileHash(input.Bytes) != a.Ref.Digest {
@@ -224,7 +244,7 @@ func resolveSources(p Profile, s Selection, materials []collectorregistry.Materi
 			return nil, nil, profileInvalid()
 		}
 		sources = append(sources, ResolvedSource{source, bytes.Clone(input.Bytes)})
-		pins = append(pins, registrationstore.SourcePin{CollectorID: c.CollectorID, ObservationID: input.ObservationID, ArtifactID: source.ArtifactID, EnrollmentID: m.Enrollment.ID, AuthorityPolicyID: source.AuthorityPolicyID, Generation: m.Observation.Generation, ArtifactSHA256: a.Ref.Digest, SourceSHA256: profileHash(profileJSON(source)), ReceivedAt: source.ReceivedAt})
+		pins = append(pins, registrationstore.SourcePin{CollectorID: c.CollectorID, ObservationID: input.ObservationID, ArtifactID: source.ArtifactID, EnrollmentID: m.Enrollment.ID, AuthorityPolicyID: source.AuthorityPolicyID, Mode: m.Registration.Mode, Generation: m.Observation.Generation, ArtifactSHA256: a.Ref.Digest, SourceSHA256: profileHash(profileJSON(source)), ReceivedAt: source.ReceivedAt})
 	}
 	return sources, pins, nil
 }

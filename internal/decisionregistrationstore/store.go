@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/internal/decisionstore"
+	"github.com/phrocker/shoal-oss/pkg/collector"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -46,6 +47,9 @@ type Scope struct {
 	OnBehalfOf                   []shoal.ID
 }
 type SourcePin struct {
+	// Mode records whether acquisition was imported or server observed. Neither
+	// mode implies trustworthy content, verified truth, or a training grant.
+	Mode                                                                    collector.Mode
 	CollectorID, ObservationID, ArtifactID, EnrollmentID, AuthorityPolicyID shoal.ID
 	Generation                                                              int64
 	ArtifactSHA256, SourceSHA256                                            string
@@ -158,7 +162,7 @@ func normalizeFrozen(f Frozen) (Frozen, error) {
 				return Frozen{}, invalid()
 			}
 		}
-		if p.Generation < 1 || !digest(p.ArtifactSHA256) || !digest(p.SourceSHA256) || !validTime(p.ReceivedAt) || p.ReceivedAt.After(f.AcceptedAt) {
+		if (p.Mode != collector.Imported && p.Mode != collector.ServerObserved) || p.Generation < 1 || !digest(p.ArtifactSHA256) || !digest(p.SourceSHA256) || !validTime(p.ReceivedAt) || p.ReceivedAt.After(f.AcceptedAt) {
 			return Frozen{}, invalid()
 		}
 	}

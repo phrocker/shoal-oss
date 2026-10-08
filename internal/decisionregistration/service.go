@@ -115,7 +115,9 @@ func (s *Service) caller(ctx context.Context, before *auth.Decision) (auth.Decis
 		return zero, e
 	}
 	fp, e := auth.AuthorizationFingerprint(d)
-	if e != nil || !now.Before(d.AuthenticationExpires()) {
+	// Delegated execution/admission needs a separately specified purpose and
+	// source authority contract. This first registration service fails closed.
+	if e != nil || len(d.OnBehalfOf()) != 0 || !now.Before(d.AuthenticationExpires()) {
 		return zero, auth.ObjectNotFound()
 	}
 	if before != nil {

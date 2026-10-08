@@ -137,7 +137,7 @@ func rootProfile(t *testing.T, name string) (Profile, *rootCounted) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	return Profile{ID: shoal.ID("profile:" + name), RevisionID: "revision:1", BuilderID: "builder:bytes-v1", MaterialPurposeID: "purpose:registration", ReleaseID: "release:conformance", Task: task, Predictor: provider.Identity(), EvidencePolicy: ep, RankingPlan: ranking, TaskResource: auth.ResourceRequest{AuthorizationDomain: []byte("domain"), SourceID: []byte("tasks"), PolicyID: []byte("task-policy"), ObjectID: task.ID()}, SourceAuthorityPolicyID: "authority:source", Builder: rootBuilder{}, MaxDuration: time.Minute, Query: "Prioritize for full inspection", TokenizerID: "byte-count:v1", OntologyProjectionID: "no-ontology:v1"}, &rootCounted{Provider: provider}
+	return Profile{AllowedModes: []collector.Mode{collector.Imported}, ID: shoal.ID("profile:" + name), RevisionID: "revision:1", BuilderID: "builder:bytes-v1", MaterialPurposeID: "purpose:registration", ReleaseID: "release:conformance", Task: task, Predictor: provider.Identity(), EvidencePolicy: ep, RankingPlan: ranking, TaskResource: auth.ResourceRequest{AuthorizationDomain: []byte("domain"), SourceID: []byte("tasks"), PolicyID: []byte("task-policy"), ObjectID: task.ID()}, SourceAuthorityPolicyID: "authority:source", Builder: rootBuilder{}, MaxDuration: time.Minute, Query: "Prioritize for full inspection", TokenizerID: "byte-count:v1", OntologyProjectionID: "no-ontology:v1"}, &rootCounted{Provider: provider}
 }
 
 type rootRuntime struct {
