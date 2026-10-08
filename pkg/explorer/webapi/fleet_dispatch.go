@@ -373,12 +373,30 @@ type fleetActionWire struct {
 	// parameters of an effect Shoal cannot undo, which is why the gap had to be
 	// closed here rather than worked around there.
 	//
-	// Emitted unconditionally because every consumer of this wire is already
-	// scoped to the action's own principal: the six existing-action routes
-	// reach the store through authorizedCurrent, and Pull filters on
-	// sameActionPrincipal. The read-only team overview does not use this
-	// encoder and never reads Input, which is what makes that safe — see the
-	// test that pins it.
+	// Emitted unconditionally, and what bounds who sees it is the
+	// authorization to take the work — not the identity of whoever enqueued
+	// it.
+	//
+	// That distinction matters because an earlier version of this comment made
+	// the narrower claim: that every consumer of this wire is scoped to the
+	// action's own principal, since Pull filtered on sameActionPrincipal. True
+	// when written and false as of #437, which lets a principal granted
+	// OperationExecute on the action's descriptor pull and claim work it did
+	// not enqueue — and therefore read this field. Verified by composing the
+	// two branches and reading the input back as a non-enqueuing executor, so
+	// it is a measured consequence rather than a guess.
+	//
+	// It is also the point: a worker that does not receive the operation's
+	// parameters cannot perform it, which is the whole of #435. So the honest
+	// statement of the exposure is that an action's input is readable by any
+	// principal authorized to execute that descriptor within the action's
+	// scope, and the thing to get right is that grant rather than this field.
+	//
+	// What remains true either way is the one read path that does not require
+	// the reader to be the originating principal: DispatchService.TeamActions
+	// does not use this encoder and pkg/explorer/teamoverview never reads
+	// Input. A test pins that, because if it changes this field becomes
+	// readable without any execute grant at all.
 	Input         json.RawMessage `json:"input,omitempty"`
 	Output        json.RawMessage `json:"output,omitempty"`
 	ErrorCode     string          `json:"error_code,omitempty"`
