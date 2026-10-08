@@ -5,6 +5,7 @@ package explorerfleet
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"testing"
@@ -269,6 +270,7 @@ func TestLifecycleRecorderReconcilesReceiptWrittenBeforeAssertedReasons(t *testi
 	// Exactly what the previous recorder persisted for this request: no
 	// asserted reason and the original query digest.
 	previous := trustedReceipt(lifecycle, interaction.CallerAssertedReason{})
+	previous.ID = v2LifecycleSessionID(lifecycle)
 	store := &reconcilingLifecycleStore{
 		trustedLifecycleRecorder: trustedLifecycleRecorder{lifecycle: lifecycle},
 		stored:                   previous,
@@ -280,7 +282,7 @@ func TestLifecycleRecorderReconcilesReceiptWrittenBeforeAssertedReasons(t *testi
 	if err := recorder.RecordLifecycle(context.Background(), lifecycle); err != nil {
 		t.Fatalf("pre-upgrade receipt reconciliation = %v", err)
 	}
-	if !store.stored.CallerAssertedReason.IsZero() {
+	if !store.stored.CallerAssertedReason.IsZero() || len(store.requests) != 0 {
 		t.Fatal("reconciliation rewrote the pre-upgrade receipt")
 	}
 
@@ -305,7 +307,7 @@ func TestLifecycleRecorderReconcilesReceiptWrittenBeforeAssertedReasons(t *testi
 func TestLifecycleRecorderReconcilesV1ReceiptForAssertingRetry(t *testing.T) {
 	lifecycle := atplLifecycle()
 	accepted := trustedReceipt(lifecycle, interaction.CallerAssertedReason{})
-	accepted.ID = legacyLifecycleSessionID(lifecycle)
+	accepted.ID = v1LifecycleSessionID(lifecycle)
 	store := &reconcilingLifecycleStore{
 		trustedLifecycleRecorder: trustedLifecycleRecorder{lifecycle: lifecycle},
 		stored:                   accepted,
@@ -344,5 +346,91 @@ func TestLifecycleRecorderRecoversDroppedCommittedAssertingResult(t *testing.T) 
 		shoal.IsErrorCode(err, shoal.ErrorInternal) ||
 		shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("dropped committed asserting result = %v", err)
+	}
+}
+
+func TestLifecycleRecorderRefusesStrippedV3Receipt(t *testing.T) {
+	lifecycle := atplLifecycle()
+	// A v3 receipt whose asserted reason was removed (and its digest
+	// recomputed to the absent-field form) must not pass as pre-upgrade.
+	stripped := trustedReceipt(lifecycle, interaction.CallerAssertedReason{})
+	if stripped.ID != LifecycleReceiptID(
+		lifecycle.Operation, lifecycle.RequestID, lifecycle.AgentID,
+	) {
+		t.Fatal("fixture is not a v3 receipt")
+	}
+	store := &reconcilingLifecycleStore{
+		trustedLifecycleRecorder: trustedLifecycleRecorder{lifecycle: lifecycle},
+		stored:                   stripped,
+	}
+	recorder, err := NewLifecycleRecorderWithReader(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = recorder.RecordLifecycle(context.Background(), lifecycle)
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("stripped v3 receipt = %v", err)
+	}
+}
+
+func TestLifecycleRecorderRefusesLegacyReceiptCarryingAssertedReason(t *testing.T) {
+	lifecycle := atplLifecycle()
+	asserted, err := fleet.CallerAssertedRegistryReason(
+		lifecycle.ReasonCode, lifecycle.ReasonDetail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No legitimate writer ever put an asserted reason under a v2 identity.
+	forged := trustedReceipt(lifecycle, asserted)
+	forged.ID = v2LifecycleSessionID(lifecycle)
+	store := &reconcilingLifecycleStore{
+		trustedLifecycleRecorder: trustedLifecycleRecorder{lifecycle: lifecycle},
+		stored:                   forged,
+	}
+	recorder, err := NewLifecycleRecorderWithReader(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = recorder.RecordLifecycle(context.Background(), lifecycle)
+	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("v2 receipt carrying an asserted reason = %v", err)
+	}
+}
+
+func TestLifecycleQueryDigestIsInjectiveAndLegacyStable(t *testing.T) {
+	lifecycle := atplLifecycle()
+	// Absent field: byte for byte the pre-#477 formula.
+	legacy := interaction.Digest(
+		string(lifecycle.Operation) + "\x00" + string(lifecycle.AgentID) +
+			"\x00" + hex.EncodeToString(lifecycle.MutationDigest[:]))
+	if got := lifecycleQueryDigest(
+		lifecycle, interaction.CallerAssertedReason{},
+	); got != legacy {
+		t.Fatalf("absent-field digest = %s, want pre-#477 %s", got, legacy)
+	}
+	digest := interaction.Digest("x")
+	// Each pair differs only in where a boundary between parts falls.
+	pairs := [][2]interaction.CallerAssertedReason{
+		{{Code: "a", Source: "b:c"}, {Code: "a:b", Source: "c"}},
+		{{Code: "a", Source: digest}, {Code: "a", DetailDigest: digest}},
+		{{Code: "ab"}, {Code: "a", Source: "b"}},
+		{{Code: "a", DetailDigest: digest}, {Code: "a" + digest[:1], Source: digest[1:]}},
+	}
+	seen := map[string]interaction.CallerAssertedReason{legacy: {}}
+	for _, pair := range pairs {
+		for _, reason := range pair {
+			value := lifecycleQueryDigest(lifecycle, reason)
+			if previous, ok := seen[value]; ok && previous != reason {
+				t.Fatalf("digest collision: %#v and %#v", previous, reason)
+			}
+			seen[value] = reason
+		}
+	}
+	// An agent ID boundary cannot be traded against the asserted parts.
+	moved := lifecycle
+	moved.AgentID = lifecycle.AgentID + "a"
+	if lifecycleQueryDigest(moved, interaction.CallerAssertedReason{Code: "b"}) ==
+		lifecycleQueryDigest(lifecycle, interaction.CallerAssertedReason{Code: "ab"}) {
+		t.Fatal("agent ID and code boundary is ambiguous")
 	}
 }

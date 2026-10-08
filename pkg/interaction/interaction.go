@@ -329,9 +329,10 @@ func (r Reason) Validate() error {
 // interaction. It is deliberately a different type and field from Reason:
 // Reason is derived by the authorization boundary from the trusted decision,
 // while a caller-asserted reason is only what the caller said. Shoal bounds
-// its shape and binds it into the durable record, so the assertion is
-// tamper-evident and attributable to the session's Actor, but it never
-// verifies the assertion and never authorizes anything on it.
+// its shape, stores it in the durable record attributed to the session's
+// Actor, and lets producers bind it into their retry identity so a divergent
+// retry conflicts. It never verifies the assertion and never authorizes
+// anything on it.
 //
 // Raw free-form text is never persisted: free-form detail is retained only as
 // DetailDigest. Source is the one verbatim value, and only for a producer that

@@ -89,11 +89,21 @@ func TestRegisterExactReplaySurvivesLeaseExpiry(t *testing.T) {
 	if descriptorDigest(replayed) != descriptorDigest(registered) {
 		t.Fatal("exact replay did not return the original descriptor")
 	}
+	// The replay is handed to the recorder (so its asserted reason is checked
+	// against the original receipt), with the identical receipt identity and
+	// mutation digest; the durable recorder reconciles it to that one receipt.
 	recorder.mu.Lock()
-	recordCount := len(recorder.records)
+	records := append([]Lifecycle(nil), recorder.records...)
 	recorder.mu.Unlock()
-	if recordCount != 1 {
-		t.Fatalf("lifecycle record count = %d, want 1", recordCount)
+	if len(records) != 2 {
+		t.Fatalf("lifecycle record count = %d, want 2", len(records))
+	}
+	if records[1].RequestID != records[0].RequestID ||
+		records[1].AgentID != records[0].AgentID ||
+		records[1].MutationDigest != records[0].MutationDigest ||
+		records[1].ReasonCode != records[0].ReasonCode ||
+		records[1].ReasonDetail != records[0].ReasonDetail {
+		t.Fatalf("replay lifecycle differs from the original: %#v", records)
 	}
 
 	divergent := request

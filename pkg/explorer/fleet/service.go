@@ -99,6 +99,22 @@ func (s *Service) Register(ctx context.Context, request RegisterRequest) (Descri
 	); err != nil {
 		return Descriptor{}, err
 	} else if ok {
+		// A replay is still an authenticated registry request, so it gets a
+		// lifecycle receipt like every other one, over the identical stored
+		// mutation. Under the original request ID this reconciles with the
+		// original receipt, and a different asserted reason conflicts instead
+		// of succeeding. Under a new request ID it records that request's own
+		// assertion, attributed to its caller; the receipt that admitted the
+		// generation is unchanged.
+		if err := s.record(ctx, decision, request.Context,
+			auth.OperationAgentRegister, replay.ID,
+			registryMutationDigest(Mutation{
+				RegistrationKey:    request.RegistrationKey,
+				ExpectedGeneration: request.ExpectedGeneration,
+				Descriptor:         replay,
+			})); err != nil {
+			return Descriptor{}, err
+		}
 		return replay, nil
 	}
 	spec, err := request.Spec.canonical(now)
