@@ -3629,22 +3629,31 @@ func TestAnExecutorCannotClaimTheServicesAdjudication(t *testing.T) {
 	t.Run("records the executor as the origin", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
 		worker, record := claimed(t, fixture)
-		// The returned error is expected and is #492: a durably recorded
-		// failure is answered as a refusal. So the record is read from the
-		// store rather than from the return value, which is what any caller
-		// has to do today.
-		if _, err := fixture.service.CompleteClaim(
+		// #492 fixed: the report was recorded, so the operation succeeded and
+		// the committed record comes back. Both are read — the returned
+		// record and the stored one — because returning a record that does
+		// not match what landed would be the same defect in a new place.
+		returned, err := fixture.service.CompleteClaim(
 			worker, CompletionRequest{
 				ID: fixture.queued.ID, ExpectedVersion: record.Version,
 				ClaimFence: record.ClaimFence, ClaimID: []byte("worker-claim"),
 				Failed:  true,
 				Result:  ExecutionResult{ErrorCode: "payment_declined"},
 				Context: dispatchContext(fixture.now, "worker-request"),
-			}); err == nil {
-			t.Fatal("a reported failure no longer answers as a refusal, so " +
-				"this test should read the returned record instead (#492)")
+			})
+		if err != nil {
+			t.Fatalf("a durably recorded failure was answered as a "+
+				"refusal: %v", err)
 		}
 		completed := fixture.dispatchStore.records[string(fixture.queued.ID)]
+		if returned.State != completed.State ||
+			returned.ErrorCode != completed.ErrorCode ||
+			returned.ErrorCodeOrigin != completed.ErrorCodeOrigin {
+			t.Fatalf("the returned record disagrees with the stored one: "+
+				"%q/%q/%q vs %q/%q/%q", returned.State, returned.ErrorCode,
+				returned.ErrorCodeOrigin, completed.State, completed.ErrorCode,
+				completed.ErrorCodeOrigin)
+		}
 		if completed.State != DispatchFailed {
 			t.Fatalf("the failure was not recorded: state %q", completed.State)
 		}
@@ -3663,18 +3672,26 @@ func TestAnExecutorCannotClaimTheServicesAdjudication(t *testing.T) {
 		// service adjudicates and assigns invalid_executor_output itself.
 		fixture := newExecutorClaimFixture(t)
 		worker, record := claimed(t, fixture)
-		// Also answered as a refusal, for the same reason, and the
-		// adjudication is likewise read from the store.
-		if _, err := fixture.service.CompleteClaim(
+		// Committed as failed with the service's own code, and answered as a
+		// success, for the same reason as above (#492).
+		returned, err := fixture.service.CompleteClaim(
 			worker, CompletionRequest{
 				ID: fixture.queued.ID, ExpectedVersion: record.Version,
 				ClaimFence: record.ClaimFence, ClaimID: []byte("worker-claim"),
 				Result:  ExecutionResult{Output: json.RawMessage(`"not an object"`)},
 				Context: dispatchContext(fixture.now, "worker-request"),
-			}); err == nil {
-			t.Fatal("an output the schema refuses was accepted")
+			})
+		if err != nil {
+			t.Fatalf("a committed invalid_executor_output was answered as a "+
+				"refusal: %v", err)
 		}
 		completed := fixture.dispatchStore.records[string(fixture.queued.ID)]
+		if returned.ErrorCode != completed.ErrorCode ||
+			returned.ErrorCodeOrigin != completed.ErrorCodeOrigin {
+			t.Fatalf("the returned record disagrees with the stored one: "+
+				"%q/%q vs %q/%q", returned.ErrorCode, returned.ErrorCodeOrigin,
+				completed.ErrorCode, completed.ErrorCodeOrigin)
+		}
 		if completed.State != DispatchFailed {
 			t.Fatalf("the adjudication was not recorded: state %q",
 				completed.State)

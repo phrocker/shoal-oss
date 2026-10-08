@@ -889,8 +889,12 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	// mutation of that assignment is observable, and it is kept because a
 	// future completion route authorized differently would otherwise silently
 	// record the claim's operation instead of its own.
-	return s.applyExecutionResult(
+	// This caller invoked the work, so the execution outcome is its own error
+	// and it propagates. See applyExecutionResult's tail for why the other
+	// caller does not.
+	record, _, err := s.applyExecutionResult(
 		ctx, current, action, result, auth.OperationInvoke, executionErr)
+	return record, err
 }
 
 // CompleteClaim records the outcome of work a remote executor performed out of
@@ -1162,8 +1166,18 @@ func (s *DispatchService) completeClaim(
 	if request.Failed {
 		executionErr = shoal.NewError(shoal.ErrorInternal, "remote executor reported failure")
 	}
-	return s.applyExecutionResult(
+	record, committed, err := s.applyExecutionResult(
 		ctx, current, action, request.Result, authorizing, executionErr)
+	if committed {
+		// The report was recorded, which is what this operation was asked to
+		// do. Whether the work succeeded is in the record's State and
+		// ErrorCode, where a worker already has to look to tell one from the
+		// other — and where it reads its own rejection off the record rather
+		// than inferring it from a status that also means "your request never
+		// happened" (#492).
+		return record, nil
+	}
+	return record, err
 }
 
 // applyExecutionResult is the terminal transition: it turns an ExecutionResult
@@ -1185,7 +1199,7 @@ func (s *DispatchService) applyExecutionResult(
 	result ExecutionResult,
 	authorizing auth.Operation,
 	executionErr error,
-) (ActionRecord, error) {
+) (ActionRecord, bool, error) {
 	finishNow := s.clock().UTC()
 	next := cloneActionRecord(current)
 	// The completion is a transition of its own and is authorized separately
@@ -1276,16 +1290,16 @@ func (s *DispatchService) applyExecutionResult(
 		!finishNow.Before(latest.ClaimLeaseUntil) ||
 		!finishNow.Before(latest.Deadline) {
 		if readErr != nil {
-			return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, readErr)
+			return ActionRecord{}, false, errors.Join(ErrExecutionAmbiguous, readErr)
 		}
-		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, ErrClaimLost)
+		return ActionRecord{}, false, errors.Join(ErrExecutionAmbiguous, ErrClaimLost)
 	}
 	// A current decision and registry state are required again after the
 	// effect. Failure is explicitly ambiguous; it is never described as a
 	// rollback and the executor idempotency key remains stable for recovery.
 	finalDecision, err := s.resolver.Resolve(ctx)
 	if err != nil {
-		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, err)
+		return ActionRecord{}, false, errors.Join(ErrExecutionAmbiguous, err)
 	}
 	// Still authorized by either of the routes that let the caller take this
 	// work, re-evaluated against a decision resolved after the effect.
@@ -1302,15 +1316,15 @@ func (s *DispatchService) applyExecutionResult(
 	// two and cannot disagree with the one Pull and Claim use.
 	stillClaimable, authorizeErr := s.claimableBy(ctx, finalDecision, current, finishNow)
 	if authorizeErr != nil {
-		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, authorizeErr)
+		return ActionRecord{}, false, errors.Join(ErrExecutionAmbiguous, authorizeErr)
 	}
 	if !stillClaimable {
-		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous,
+		return ActionRecord{}, false, errors.Join(ErrExecutionAmbiguous,
 			shoal.NewError(shoal.ErrorUnauthorized, "terminal execution identity changed"))
 	}
 	next.ExecutionFingerprint, err = auth.AuthorizationFingerprint(finalDecision)
 	if err != nil {
-		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, err)
+		return ActionRecord{}, false, errors.Join(ErrExecutionAmbiguous, err)
 	}
 	next.ExecutionPolicyGeneration = finalDecision.PolicyGeneration()
 	next.ExecutionExpiresAt = finalDecision.AuthenticationExpires()
@@ -1319,7 +1333,7 @@ func (s *DispatchService) applyExecutionResult(
 	if err := s.recorder.RecordAction(ctx, ActionAudit{
 		Phase: "effect_outcome", Operation: authorizing, Record: next, EffectError: executionErr,
 	}); err != nil {
-		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, ErrRecordingUnavailable, err)
+		return ActionRecord{}, false, errors.Join(ErrExecutionAmbiguous, ErrRecordingUnavailable, err)
 	}
 	stored, err := s.store.ApplyAction(ctx, DispatchMutation{
 		Token:           transitionToken("complete", current.ID, current.ExecutorKey, next.Version),
@@ -1327,17 +1341,32 @@ func (s *DispatchService) applyExecutionResult(
 		TransitionKind: actionEventKind(next), Record: next,
 	})
 	if err != nil {
-		return ActionRecord{}, errors.Join(ErrExecutionAmbiguous, err)
+		return ActionRecord{}, false, errors.Join(ErrExecutionAmbiguous, err)
 	}
 	if err := s.publishTransition(
 		context.WithoutCancel(ctx), actionEventKind(stored), stored,
 	); err != nil {
-		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
+		return ActionRecord{}, false, errors.Join(ErrActionCommitted, err)
 	}
-	if executionErr != nil {
-		return cloneActionRecord(stored), executionErr
-	}
-	return cloneActionRecord(stored), nil
+	// Committed. The second return says so, and it is the whole point of the
+	// signature: executionErr here is the *outcome* of work that is now
+	// durably recorded, not a reason the operation failed. Both are true at
+	// once, and the two callers want different halves.
+	//
+	// ExecuteClaim invoked the work itself, so an execution failure is
+	// genuinely its error and it propagates it. CompleteClaim only recorded
+	// what a worker reported, and the reporting succeeded — so answering it
+	// with an error told a worker that had just performed an irreversible
+	// external effect that its report was refused, when the record had
+	// landed. It could not tell "committed as failed" from "nothing
+	// happened", which is the one ambiguity this whole design exists to
+	// remove (#492).
+	//
+	// Returned as a bool rather than inferred from a non-zero record: every
+	// refusal above returns the zero record, so a caller *could* key on that,
+	// but then no test can tell a correct caller from one that forgot, and
+	// the next return added above would silently join the committed set.
+	return cloneActionRecord(stored), true, executionErr
 }
 
 func validateExecutionEvidence(
