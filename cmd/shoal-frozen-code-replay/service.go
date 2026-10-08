@@ -106,6 +106,7 @@ func makeStateDirectory(path string, syncDir func(string) error) error {
 }
 
 type serviceState struct {
+	PredictorID          shoal.ID
 	Schema               int
 	ModelSHA256          string
 	ManifestSHA256       string
@@ -113,12 +114,15 @@ type serviceState struct {
 	CreatedAt            time.Time
 }
 
-func loadServiceState(dir, modelHash, manifestHash, sourceHash string) (serviceState, error) {
-	return loadServiceStateWithSync(dir, modelHash, manifestHash, sourceHash, func(f *os.File) error { return f.Sync() })
+func loadServiceState(dir, modelHash, manifestHash, sourceHash string, predictorID shoal.ID) (serviceState, error) {
+	return loadServiceStateWithSync(dir, modelHash, manifestHash, sourceHash, predictorID, func(f *os.File) error { return f.Sync() })
 }
-func loadServiceStateWithSync(dir, modelHash, manifestHash, sourceHash string, syncFile func(*os.File) error) (serviceState, error) {
+func loadServiceStateWithSync(dir, modelHash, manifestHash, sourceHash string, predictorID shoal.ID, syncFile func(*os.File) error) (serviceState, error) {
 	if !validDigest(modelHash) || !validDigest(manifestHash) || !validDigest(sourceHash) {
 		return serviceState{}, errors.New("three external SHA256 pins required")
+	}
+	if e := shoal.ValidateRequiredID("predictor ID", predictorID); e != nil {
+		return serviceState{}, e
 	}
 	if e := makeStateDirectory(dir, syncDirectory); e != nil {
 		return serviceState{}, e
@@ -131,7 +135,7 @@ func loadServiceStateWithSync(dir, modelHash, manifestHash, sourceHash string, s
 		} else if !os.IsNotExist(e) {
 			return serviceState{}, e
 		}
-		state := serviceState{1, modelHash, manifestHash, sourceHash, time.Now().UTC()}
+		state := serviceState{Schema: 2, PredictorID: predictorID, ModelSHA256: modelHash, ManifestSHA256: manifestHash, SourceManifestSHA256: sourceHash, CreatedAt: time.Now().UTC()}
 		b, e := json.Marshal(state)
 		if e != nil {
 			return serviceState{}, e
@@ -148,8 +152,14 @@ func loadServiceStateWithSync(dir, modelHash, manifestHash, sourceHash string, s
 	if e = json.Unmarshal(b, &state); e != nil {
 		return serviceState{}, e
 	}
+	if state.Schema != 2 {
+		return serviceState{}, errors.New("unsupported service state schema; explicit recovery required")
+	}
+	if state.PredictorID != predictorID {
+		return serviceState{}, errors.New("incompatible predictor/runtime for persisted service state; explicit recovery required")
+	}
 	canonical, e := json.Marshal(state)
-	if e != nil || !bytes.Equal(canonical, b) || state.Schema != 1 || state.ModelSHA256 != modelHash || state.ManifestSHA256 != manifestHash || state.SourceManifestSHA256 != sourceHash || state.CreatedAt.IsZero() || state.CreatedAt.After(time.Now().UTC()) {
+	if e != nil || !bytes.Equal(canonical, b) || state.Schema != 2 || state.ModelSHA256 != modelHash || state.ManifestSHA256 != manifestHash || state.SourceManifestSHA256 != sourceHash || state.CreatedAt.IsZero() || state.CreatedAt.After(time.Now().UTC()) {
 		return serviceState{}, errors.New("state or pinned bundle mismatch")
 	}
 
@@ -292,6 +302,9 @@ type serviceSession struct {
 }
 
 func openServiceSession(bundle *loadedBundle, sources []sourceEvidence, state serviceState, stateDir string) (*serviceSession, error) {
+	if state.Schema != 2 || state.PredictorID != bundle.Provider.Identity().ID() {
+		return nil, errors.New("incompatible predictor/runtime for persisted service state; explicit recovery required")
+	}
 	task, policy, ranking, e := serviceDefinitions()
 	if e != nil {
 		return nil, e
@@ -416,7 +429,19 @@ func inquireServiceRows(dir, modelHash, manifestHash, sourceManifestHash, stateD
 	if e != nil {
 		return out, e
 	}
-	saved, e := loadServiceState(stateDir, modelHash, manifestHash, sourceManifestHash)
+
+	lock, e := acquireSessionLock(stateDir)
+	if e != nil {
+		return out, e
+	}
+	// Registered first, this defer runs after the engine has fully closed.
+	defer func() {
+		if e := lock.Close(); e != nil {
+			out = serviceReport{}
+			retErr = errors.Join(retErr, e)
+		}
+	}()
+	saved, e := loadServiceState(stateDir, modelHash, manifestHash, sourceManifestHash, bundle.Provider.Identity().ID())
 	if e != nil {
 		return out, e
 	}

@@ -29,7 +29,8 @@ producer, not authorization or authenticated historical provenance.
 
 Each subject has a source-backed picture, request and durable receipt. Immediate
 retry and process restart return the original stored prediction without another
-provider call. State metadata binds all three external pins and the import time;
+provider call. State metadata binds all three external pins, the effective predictor/runtime
+identity and the import time;
 missing/corrupt metadata or changed pins cannot silently create new request
 identities. Publication errors leave explicit uncertainty rather than claiming
 that a completed filesystem rename was rolled back.
@@ -93,5 +94,33 @@ an earlier file-sync failure without ever confirming that the file contents were
 durable. The fix reopens the metadata, verifies the exact bytes and successfully
 syncs the file before engine use; failure-injection tests exercise retry. A fresh
 round 2 at `db39142` found **no actionable findings**. Review did not simulate
-power loss or concurrent filesystem replacement. Only documentation and retained
-execution evidence changed after that clean review.
+power loss or concurrent filesystem replacement. That was the initial publication review; the additional review findings and
+fixes below supersede its clean verdict for the current head.
+
+
+## Additional adversarial review and session ownership
+
+A subsequent user-requested review found two more correctness issues. Two live
+engine handles could each reserve and execute the same request/key, because the
+embedded engine does not coordinate independent processes. Inquiry now holds a
+nonblocking exclusive Linux file lock from before metadata admission until after
+engine close. The lock file remains in place so all cooperating invocations use
+the same inode. Another inquiry against that directory is rejected before state
+or engine mutation; process exit releases the lock. This is a local advisory lock,
+not coordination across machines or protection against a privileged process
+replacing files in the state directory. Service inquiry fails closed on unsupported
+platforms; the provider-only replay remains available independently.
+
+The second issue was runtime drift: unchanged bundle pins could rebuild different
+request identities with a new Go/runtime identity, then fail on the old receipt
+key after inserting new artifacts. State schema 2 now persists the effective
+predictor identity and rejects drift before opening the engine. Exact replay
+requires the same predictor/runtime identity. Schema-1 state is rejected with an
+explicit recovery requirement; there is no silent migration or regeneration of
+historical request identities. Preserve old state for recovery rather than deleting
+it. A new state directory creates a separate registration session.
+
+Regression tests cover cross-process lock contention, release on process exit,
+symlink refusal, rejection before state mutation, runtime drift, and legacy state
+admission. The original evidence above remains the initial implementation's run;
+final revised execution evidence is recorded separately below.

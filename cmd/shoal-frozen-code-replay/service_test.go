@@ -110,18 +110,18 @@ func TestServiceRejectsStateOrInputRebinding(t *testing.T) {
 func TestServiceStatePinsAndDirectoryDurability(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nested", "state")
 	pins := []string{strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)}
-	first, e := loadServiceState(dir, pins[0], pins[1], pins[2])
+	first, e := loadServiceState(dir, pins[0], pins[1], pins[2], "test-predictor")
 	if e != nil {
 		t.Fatal(e)
 	}
 	for i := range pins {
 		changed := append([]string{}, pins...)
 		changed[i] = strings.Repeat("d", 64)
-		if _, e = loadServiceState(dir, changed[0], changed[1], changed[2]); e == nil {
+		if _, e = loadServiceState(dir, changed[0], changed[1], changed[2], "test-predictor"); e == nil {
 			t.Fatal("accepted state pin substitution")
 		}
 	}
-	second, e := loadServiceState(dir, pins[0], pins[1], pins[2])
+	second, e := loadServiceState(dir, pins[0], pins[1], pins[2], "test-predictor")
 	if e != nil || first != second {
 		t.Fatal("state identity changed", e)
 	}
@@ -155,7 +155,7 @@ func TestLocalRegistrationRechecksRevokedSourceOnRetryAndRead(t *testing.T) {
 		t.Fatal(e)
 	}
 	stateDir := t.TempDir()
-	saved, e := loadServiceState(stateDir, mh, ph, sh)
+	saved, e := loadServiceState(stateDir, mh, ph, sh, bundle.Provider.Identity().ID())
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -232,13 +232,13 @@ func TestLocalRegistrationRechecksRevokedSourceOnRetryAndRead(t *testing.T) {
 func TestStateRetryConfirmsFileDurabilityBeforeEngineOpen(t *testing.T) {
 	dir := t.TempDir()
 	pins := []string{strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)}
-	original, e := loadServiceState(dir, pins[0], pins[1], pins[2])
+	original, e := loadServiceState(dir, pins[0], pins[1], pins[2], "test-predictor")
 	if e != nil {
 		t.Fatal(e)
 	}
 	injected := errors.New("file sync failed")
 	calls := 0
-	if _, e = loadServiceStateWithSync(dir, pins[0], pins[1], pins[2], func(f *os.File) error {
+	if _, e = loadServiceStateWithSync(dir, pins[0], pins[1], pins[2], "test-predictor", func(f *os.File) error {
 		calls++
 		if filepath.Base(f.Name()) != "service-state.json" {
 			t.Fatal("wrong identity file")
@@ -253,8 +253,99 @@ func TestStateRetryConfirmsFileDurabilityBeforeEngineOpen(t *testing.T) {
 	if _, e = os.Stat(filepath.Join(dir, "engine")); !os.IsNotExist(e) {
 		t.Fatal("engine opened before state confirmation")
 	}
-	retry, e := loadServiceStateWithSync(dir, pins[0], pins[1], pins[2], func(f *os.File) error { calls++; return f.Sync() })
+	retry, e := loadServiceStateWithSync(dir, pins[0], pins[1], pins[2], "test-predictor", func(f *os.File) error { calls++; return f.Sync() })
 	if e != nil || retry != original || calls != 2 {
 		t.Fatal("retry changed identity or skipped sync", e)
+	}
+}
+
+func snapshotServiceFiles(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	files := map[string]string{}
+	e := filepath.WalkDir(dir, func(path string, entry os.DirEntry, e error) error {
+		if e != nil {
+			return e
+		}
+		if !entry.IsDir() {
+			b, e := os.ReadFile(path)
+			if e != nil {
+				return e
+			}
+			relative, e := filepath.Rel(dir, path)
+			if e != nil {
+				return e
+			}
+			files[relative] = digest(b)
+		}
+		return nil
+	})
+	if e != nil {
+		t.Fatal(e)
+	}
+	return files
+}
+func TestServiceRejectsRuntimeDriftWithoutEngineMutation(t *testing.T) {
+	dir, mh, ph, sh := serviceFixture(t)
+	stateDir := t.TempDir()
+	first, e := inquireServiceRows(dir, mh, ph, sh, stateDir, 1)
+	if e != nil {
+		t.Fatal(e)
+	}
+	path := filepath.Join(stateDir, "service-state.json")
+	raw, e := os.ReadFile(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var state serviceState
+	if e = json.Unmarshal(raw, &state); e != nil {
+		t.Fatal(e)
+	}
+	if state.Schema != 2 || state.PredictorID != first.PredictorID {
+		t.Fatal("state omitted effective predictor identity")
+	}
+	// Simulate a previous Go/runtime environment, while preserving every model,
+	// source, and numeric pin. A new runtime must not silently mint fresh receipts.
+	state.PredictorID = shoal.ID("decision:predictor:v1:" + strings.Repeat("0", 64))
+	changed, _ := json.Marshal(state)
+	write(t, stateDir, "service-state.json", changed)
+	before := snapshotServiceFiles(t, stateDir)
+	if _, e = inquireServiceRows(dir, mh, ph, sh, stateDir, 1); e == nil || !strings.Contains(e.Error(), "incompatible predictor/runtime") {
+		t.Fatalf("runtime drift accepted or wrong error: %v", e)
+	}
+	if after := snapshotServiceFiles(t, stateDir); !reflect.DeepEqual(before, after) {
+		t.Fatal("runtime rejection mutated persistent service files")
+	}
+	// The original state remains usable; rejection did not reserve new work.
+	write(t, stateDir, "service-state.json", raw)
+	second, e := inquireServiceRows(dir, mh, ph, sh, stateDir, 1)
+	if e != nil || second.ProviderCalls != 0 || !reflect.DeepEqual(first.Rows, second.Rows) {
+		t.Fatal("runtime rejection changed receipts", e)
+	}
+}
+func TestServiceRejectsLegacyStateWithoutMigration(t *testing.T) {
+	dir, mh, ph, sh := serviceFixture(t)
+	stateDir := t.TempDir()
+	if _, e := inquireServiceRows(dir, mh, ph, sh, stateDir, 1); e != nil {
+		t.Fatal(e)
+	}
+	path := filepath.Join(stateDir, "service-state.json")
+	raw, e := os.ReadFile(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var legacy map[string]any
+	if e = json.Unmarshal(raw, &legacy); e != nil {
+		t.Fatal(e)
+	}
+	legacy["Schema"] = 1
+	delete(legacy, "PredictorID")
+	changed, _ := json.Marshal(legacy)
+	write(t, stateDir, "service-state.json", changed)
+	before := snapshotServiceFiles(t, stateDir)
+	if _, e = inquireServiceRows(dir, mh, ph, sh, stateDir, 1); e == nil || !strings.Contains(e.Error(), "explicit recovery required") {
+		t.Fatalf("legacy state silently migrated: %v", e)
+	}
+	if after := snapshotServiceFiles(t, stateDir); !reflect.DeepEqual(before, after) {
+		t.Fatal("legacy rejection mutated persistence")
 	}
 }
