@@ -244,7 +244,8 @@ func (s *Store) commit(ctx context.Context, scope string, b Binding, old Snapsho
 }
 
 // Register is an explicit trusted coverage assertion. Exact retries preserve its
-// original time/version even after admissions. Begin never creates this barrier.
+// original CreatedAt; they return the current snapshot without advancing its
+// version. Begin never creates this barrier.
 func (s *Store) Register(ctx context.Context, scope Scope, b Binding) (Snapshot, error) {
 	var zero Snapshot
 	sd, e := scopeDigest(scope)
