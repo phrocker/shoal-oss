@@ -22,6 +22,10 @@ const (
 	testApproverAudience = "shoal-approvals"
 	testApproverClient   = "shoal-console"
 	testApproverValue    = "shoal-approvers"
+	// testHumanClaim is the user-only claim a Keycloak protocol mapper adds
+	// to user sessions and never to a service account's.
+	testHumanClaim = "shoal_principal_type"
+	testHumanValue = "human"
 )
 
 // approverMappingDocument is the valid mapping the tests start from.
@@ -35,7 +39,7 @@ func approverMappingDocument(issuer string) map[string]any {
 		"values":     []string{testApproverValue},
 		"max_values": 8,
 		"human_assertion": map[string]any{
-			"claim": []string{"idtyp"}, "absent": true,
+			"claim": []string{testHumanClaim}, "equals": testHumanValue,
 		},
 	}
 }
@@ -80,9 +84,10 @@ func approverClaims(issuer *fakeOIDCIssuer, now time.Time, subject string) jwt.M
 		"realm_access": map[string]any{
 			"roles": []any{"offline_access", testApproverValue},
 		},
-		"iat": now.Add(-time.Minute).Unix(),
-		"nbf": now.Add(-time.Minute).Unix(),
-		"exp": now.Add(time.Hour).Unix(),
+		testHumanClaim: testHumanValue,
+		"iat":          now.Add(-time.Minute).Unix(),
+		"nbf":          now.Add(-time.Minute).Unix(),
+		"exp":          now.Add(time.Hour).Unix(),
 	}
 }
 
@@ -195,10 +200,26 @@ func TestApproverTokenRefusals(t *testing.T) {
 		// Agents and clients holding the group.
 		{"client credentials: sub equals azp",
 			func(c jwt.MapClaims) { c["sub"] = testApproverClient }, nil, errApproverClient},
-		{"app-only token (idtyp=app)",
-			func(c jwt.MapClaims) { c["idtyp"] = "app" }, nil, errApproverNotHuman},
-		{"human assertion claim present but null",
-			func(c jwt.MapClaims) { c["idtyp"] = nil }, nil, errApproverNotHuman},
+		{"no human assertion claim (a service account)",
+			func(c jwt.MapClaims) { delete(c, testHumanClaim) }, nil, errApproverNotHuman},
+		{"human assertion claim with another value",
+			func(c jwt.MapClaims) { c[testHumanClaim] = "service" }, nil, errApproverNotHuman},
+		{"human assertion claim in another case",
+			func(c jwt.MapClaims) { c[testHumanClaim] = "Human" }, nil, errApproverNotHuman},
+		{"human assertion claim null",
+			func(c jwt.MapClaims) { c[testHumanClaim] = nil }, nil, errApproverNotHuman},
+		{"human assertion claim as an array",
+			func(c jwt.MapClaims) { c[testHumanClaim] = []any{testHumanValue} }, nil, errApproverNotHuman},
+		{"Keycloak service account: client_id",
+			func(c jwt.MapClaims) { c["client_id"] = testApproverClient }, nil, errApproverClientToken},
+		{"Keycloak service account: clientId",
+			func(c jwt.MapClaims) { c["clientId"] = testApproverClient }, nil, errApproverClientToken},
+		{"Auth0 client credentials: gty",
+			func(c jwt.MapClaims) { c["gty"] = "client-credentials" }, nil, errApproverClientToken},
+		{"client credentials: gty with an underscore",
+			func(c jwt.MapClaims) { c["gty"] = "client_credentials" }, nil, errApproverClientToken},
+		{"gty that is not a string",
+			func(c jwt.MapClaims) { c["gty"] = []any{"client-credentials"} }, nil, errApproverClientToken},
 		{"client not allowed",
 			func(c jwt.MapClaims) { c["azp"] = "other-client" }, nil, errApproverClient},
 		{"client case differs",
@@ -344,13 +365,50 @@ func TestApproverPathIsLiteralSegments(t *testing.T) {
 	}
 }
 
+// TestApproverRefusesTheReviewersServiceAccountToken is the #523 review's
+// reproduction: a Keycloak service-account token for the console client —
+// a UUID sub, azp the allowed client, preferred_username
+// service-account-<client>, no idtyp, holding the approver role. Under the
+// documented "idtyp absent" assertion it was minted an approver. The
+// assertion is now positive, and Keycloak's own client marker refuses it too.
+func TestApproverRefusesTheReviewersServiceAccountToken(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	authenticator := newTestOIDCAuthenticator(t, approverTestConfig(
+		t, issuer, fixedClock(now), approverMappingDocument(issuer.server.URL)))
+	serviceAccount := func() jwt.MapClaims {
+		claims := approverClaims(
+			issuer, now, "0f8fad5b-d9cb-469f-a165-70867728950e")
+		delete(claims, testHumanClaim)
+		claims["preferred_username"] = "service-account-" + testApproverClient
+		return claims
+	}
+	if _, err := authenticator.authenticate(bearerRequest(issuer.signRS256(
+		t, testKID, serviceAccount()))); !errors.Is(err, errApproverNotHuman) {
+		t.Fatalf("the service-account token = %v, want not-human", err)
+	}
+	withMarker := serviceAccount()
+	withMarker["client_id"] = testApproverClient
+	if _, err := authenticator.authenticate(bearerRequest(issuer.signRS256(
+		t, testKID, withMarker))); err == nil {
+		t.Fatal("the service-account token with client_id was minted")
+	}
+	// Even if a misconfigured mapper gave it the human claim, its client
+	// marker refuses it.
+	withMarker[testHumanClaim] = testHumanValue
+	if _, err := authenticator.authenticate(bearerRequest(issuer.signRS256(
+		t, testKID, withMarker))); !errors.Is(err, errApproverClientToken) {
+		t.Fatalf("a service account carrying the human claim = %v", err)
+	}
+}
+
 // TestApproverHumanAssertionEquals covers the equals form.
 func TestApproverHumanAssertionEquals(t *testing.T) {
 	issuer := newFakeOIDCIssuer(t)
 	now := time.Now()
 	document := approverMappingDocument(issuer.server.URL)
 	document["human_assertion"] = map[string]any{
-		"claim": []string{"idtyp"}, "equals": "user",
+		"claim": []string{"ext", "kind"}, "equals": "user",
 	}
 	authenticator := newTestOIDCAuthenticator(
 		t, approverTestConfig(t, issuer, fixedClock(now), document))
@@ -363,7 +421,7 @@ func TestApproverHumanAssertionEquals(t *testing.T) {
 	} {
 		claims := approverClaims(issuer, now, "bob")
 		if probe.value != nil {
-			claims["idtyp"] = probe.value
+			claims["ext"] = map[string]any{"kind": probe.value}
 		}
 		_, err := authenticator.authenticate(bearerRequest(
 			issuer.signRS256(t, testKID, claims)))
@@ -408,7 +466,7 @@ func TestApproverMappingStartupRefusals(t *testing.T) {
 		{"unknown field", edit(func(d map[string]any) { d["fallback"] = "reader" })},
 		{"unknown nested field", edit(func(d map[string]any) {
 			d["human_assertion"] = map[string]any{
-				"claim": []string{"idtyp"}, "absent": true, "or": "x",
+				"claim": []string{testHumanClaim}, "equals": testHumanValue, "or": "x",
 			}
 		})},
 		{"duplicate key", []byte(strings.Replace(string(valid),
@@ -449,13 +507,23 @@ func TestApproverMappingStartupRefusals(t *testing.T) {
 			d["max_values"] = approverMappingMaxValues + 1
 		})},
 		{"no human assertion", edit(func(d map[string]any) { delete(d, "human_assertion") })},
-		{"human assertion with both forms", edit(func(d map[string]any) {
+		{"human assertion by absence (removed)", edit(func(d map[string]any) {
+			d["human_assertion"] = map[string]any{
+				"claim": []string{"idtyp"}, "absent": true,
+			}
+		})},
+		{"human assertion with absence and equals", edit(func(d map[string]any) {
 			d["human_assertion"] = map[string]any{
 				"claim": []string{"idtyp"}, "absent": true, "equals": "user",
 			}
 		})},
-		{"human assertion with neither form", edit(func(d map[string]any) {
+		{"human assertion without equals", edit(func(d map[string]any) {
 			d["human_assertion"] = map[string]any{"claim": []string{"idtyp"}}
+		})},
+		{"human assertion with an empty value", edit(func(d map[string]any) {
+			d["human_assertion"] = map[string]any{
+				"claim": []string{"idtyp"}, "equals": "",
+			}
 		})},
 		{"oversized file", []byte(`{"version":"` +
 			strings.Repeat("x", approverMappingMaxBytes) + `"}`)},
@@ -528,10 +596,10 @@ func TestApproverMappingDigestIsSemantic(t *testing.T) {
 		"value":    func(d map[string]any) { d["values"] = []string{"x", "z"} },
 		"max":      func(d map[string]any) { d["max_values"] = 9 },
 		"assertion": func(d map[string]any) {
-			d["human_assertion"] = map[string]any{"claim": []string{"idtyp"}, "equals": "user"}
+			d["human_assertion"] = map[string]any{"claim": []string{testHumanClaim}, "equals": "user"}
 		},
 		"assert claim": func(d map[string]any) {
-			d["human_assertion"] = map[string]any{"claim": []string{"typ"}, "absent": true}
+			d["human_assertion"] = map[string]any{"claim": []string{"typ"}, "equals": testHumanValue}
 		},
 	} {
 		document := approverMappingDocument(issuer.server.URL)
@@ -594,7 +662,7 @@ func TestBrowserAuthConfigDisclosesNoMapping(t *testing.T) {
 	}
 	for _, secret := range []string{
 		testApproverAudience, testApproverClient, testApproverValue,
-		"realm_access", "idtyp",
+		"realm_access", testHumanClaim,
 	} {
 		if strings.Contains(with, secret) {
 			t.Fatalf("browser config discloses %q", secret)

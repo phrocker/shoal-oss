@@ -793,7 +793,7 @@ func (a *oidcAuthenticator) authenticate(
 	if _, err := a.parser.ParseWithClaims(raw, claims, keyFunc); err != nil {
 		return auth.Decision{}, err
 	}
-	return a.mint(claims)
+	return a.mint(ctx, claims)
 }
 
 // keyFuncForContext returns a jwt.Keyfunc bound to the request context so JWKS
@@ -849,14 +849,16 @@ func (a *oidcAuthenticator) keyFuncForContext(ctx context.Context) jwt.Keyfunc {
 // nothing else does: a token on the approver audience is minted as an
 // approver or denied, and a token on a workspace audience is minted by the
 // workspace mappings, which never grant approve. A token on both is denied.
-func (a *oidcAuthenticator) mint(claims jwt.MapClaims) (auth.Decision, error) {
+func (a *oidcAuthenticator) mint(
+	ctx context.Context, claims jwt.MapClaims,
+) (auth.Decision, error) {
 	if a.approver != nil {
 		approver, err := a.approverAudience(claims)
 		if err != nil {
 			return auth.Decision{}, err
 		}
 		if approver {
-			return a.mintApprover(claims)
+			return a.mintApprover(ctx, claims)
 		}
 	}
 	return a.mintWorkspace(claims)
@@ -1239,6 +1241,9 @@ type oidcMetadata struct {
 	JWKSURI               string `json:"jwks_uri"`
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
+	// SubjectTypesSupported decides whether the issuer can back an
+	// approver mapping; see approverSubjectTypesPublic.
+	SubjectTypesSupported []string `json:"subject_types_supported,omitempty"`
 }
 
 // oidcMetadataCache resolves the issuer's discovery document once and shares it

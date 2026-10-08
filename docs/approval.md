@@ -203,9 +203,42 @@ conflict of interest #419 forbids.
   "claim": ["realm_access", "roles"],
   "values": ["shoal-approvers"],
   "max_values": 64,
-  "human_assertion": {"claim": ["idtyp"], "absent": true}
+  "human_assertion": {"claim": ["shoal_principal_type"], "equals": "human"}
 }
 ```
+
+**The human assertion is positive.** It names a claim that only human tokens
+carry and the exact value it must have. There is no "claim is absent" form:
+absence proves nothing about who a token was issued to. An earlier draft of
+this mapping documented `idtyp` absent, and a Keycloak service-account token
+passed it — Keycloak never emits `idtyp`, and its client-credentials tokens
+(like Entra's and Auth0's) have `sub != azp`. Per issuer:
+
+- **Keycloak.** Add a protocol mapper to the console client that sets a
+  claim on user sessions only — for example a hard-coded claim
+  `shoal_principal_type` = `human` on a client scope the service account does
+  not get, or a user-attribute mapper — and name it in `human_assertion`.
+  Keycloak's discovery states `subject_types_supported: ["public"]` unless a
+  pairwise mapper is configured.
+- **Microsoft Entra ID: not supported for approvers in this slice.** Entra
+  issues pairwise `sub` values (a different `sub` per application) and says
+  so in discovery, so the same person would be a different `oidc:<iss>#<sub>`
+  as requester and as approver. Startup refuses it (below). A stable identity
+  claim (such as `oid`) used identically on the workspace and approver
+  branches is a follow-up.
+- **Auth0 / Okta.** Use a positive claim set only for interactive users — an
+  Auth0 Action that adds a namespaced claim on login flows (not on
+  `credentials-exchange`), or an Okta custom claim scoped to a user group —
+  and check that discovery states public subjects only.
+
+**The issuer must state public subject identifiers only.** The approval
+service separates people by `oidc:<iss>#<sub>`. Under the pairwise subject
+type one human has a different `sub` per client and could approve their own
+request. So the server refuses to start with an approver mapping unless the
+issuer's discovery document states `subject_types_supported` as exactly
+`["public"]`. A missing statement, any other list, or a discovery document
+that cannot be read is a refusal; there is no override. Every approver mint
+checks the cached discovery document again.
 
 Startup refuses the file, and the server does not start, when: a field is
 unknown, a key is repeated, or anything follows the object; `version` is not
@@ -215,8 +248,8 @@ empty or is one of the workspace audiences; `client_ids`, `claim` or `values`
 is empty; any string has leading or trailing whitespace or a control
 character; `claim` is not a list of path segments (a dotted string is refused,
 and a segment containing a dot names a key containing a dot, never a path);
-`max_values` is outside 1–1024; `human_assertion` is missing or gives other
-than exactly one of `absent: true` and `equals`. The mapping also requires the
+`max_values` is outside 1–1024; `human_assertion` is missing or has no
+`equals` (an `absent` key is an unknown field). The mapping also requires the
 default OIDC identity (subject claim `sub`, identities `oidc:<iss>#<sub>`) and
 refuses the legacy Entra identity mode, in which the same human would carry an
 `entra:` identity as a requester and an `oidc:` one as an approver and could
@@ -228,8 +261,13 @@ token on the approver audience is minted as an approver or denied — there is
 no fallback to reader. A token carrying both is denied. On the approver
 audience every one of these is required:
 
-- `azp` is one of `client_ids`, and `sub != azp` (a client acting as itself is
-  a client-credentials grant, whatever groups it holds);
+- `azp` is one of `client_ids`, and `sub != azp`. This catches exactly one
+  shape — a token whose subject is literally its own client — and not
+  client-credentials tokens in general, which on Keycloak, Entra and Auth0
+  have `sub != azp`. The human assertion is what refuses those;
+- none of `client_id` or `clientId` (Keycloak service accounts) is present,
+  and `gty` is not `client-credentials` / `client_credentials` (Auth0) —
+  defence in depth beside the human assertion, never instead of it;
 - none of `act`, `may_act`, `_claim_names`, `_claim_sources`, `hasgroups`, or
   the configured `-oidc-delegation-claim` is present (delegation, or a group
   list the issuer truncated);
@@ -433,6 +471,9 @@ transition reconciled on a lagging replica has the same property.
 - Dataset export of approvals and refusals as adjudications (#401, #419). Every
   field it needs is stored on the approval record.
 - Approval lifecycle events (needs #480 item 1).
+- A stable identity claim (for example `oid`) used identically on the
+  workspace and approver branches, which would let a pairwise issuer such as
+  Entra back an approver mapping.
 - Approver pools per action or descriptor (a later ATPL version may only
   reference an operator-defined pool), a second approver-only issuer, and
   quorum.

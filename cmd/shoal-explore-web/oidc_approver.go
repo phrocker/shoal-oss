@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -62,6 +63,21 @@ var approverDelegationClaims = []string{
 	"act", "may_act", "_claim_names", "_claim_sources", "hasgroups",
 }
 
+// approverClientClaims mark a token issued to a client rather than a human.
+// Keycloak puts client_id (clientId before 24) on a service account's token;
+// Auth0 sets gty to client-credentials. None of them is the guard — the
+// positive human assertion is — but a token carrying one is refused
+// whatever else it says. sub == azp is the only other client shape this code
+// recognizes, and it is caught only in that literal form: Keycloak, Entra and
+// Auth0 client-credentials tokens all have sub != azp.
+var approverClientClaims = []string{"client_id", "clientId"}
+
+// approverClientGrantTypes are gty values that mark a client-credentials
+// token.
+var approverClientGrantTypes = map[string]struct{}{
+	"client-credentials": {}, "client_credentials": {},
+}
+
 var (
 	// errApproverAudienceConfusion is returned for a token carrying both the
 	// approver audience and a workspace audience, or neither.
@@ -78,6 +94,15 @@ var (
 	// errApproverNotHuman is returned when the human assertion fails.
 	errApproverNotHuman = shoal.NewError(
 		shoal.ErrorUnauthorized, "approver token is not a human's")
+	// errApproverClientToken is returned for a token carrying a client
+	// identifier claim or a client-credentials grant marker.
+	errApproverClientToken = shoal.NewError(
+		shoal.ErrorUnauthorized, "approver token was issued to a client")
+	// errApproverSubjectTypes is returned while the issuer's discovery does
+	// not state public subject identifiers only.
+	errApproverSubjectTypes = shoal.NewError(
+		shoal.ErrorUnauthorized,
+		"issuer does not state public subject identifiers only")
 	// errApproverUnmapped is returned when no claim value matches exactly.
 	errApproverUnmapped = shoal.NewError(
 		shoal.ErrorUnauthorized, "approver token claim is not mapped")
@@ -101,12 +126,16 @@ type approverMappingFile struct {
 }
 
 // approverHumanAssertJSON says what makes a token a human's: a claim that
-// must be absent (for example idtyp, which Entra sets to "app" on app-only
-// tokens), or one that must equal a value exactly. Exactly one of absent and
-// equals is given.
+// must equal a value exactly, on a claim only human tokens carry (for
+// example one a Keycloak protocol mapper adds to user sessions alone).
+//
+// It is positive by design. An earlier draft also accepted "this claim is
+// absent", and the documented example — idtyp absent — passed a Keycloak
+// service-account token, because Keycloak never emits idtyp. Absence proves
+// nothing about who a token was issued to, so it is not a form this file
+// accepts; an "absent" key is an unknown field and refused.
 type approverHumanAssertJSON struct {
 	Claim  []string `json:"claim"`
-	Absent bool     `json:"absent"`
 	Equals *string  `json:"equals"`
 }
 
@@ -124,7 +153,6 @@ type approverMapping struct {
 
 type approverHumanAssertion struct {
 	claim  []string
-	absent bool
 	equals string
 }
 
@@ -217,19 +245,14 @@ func parseApproverMapping(
 	if err != nil {
 		return nil, err
 	}
-	human := approverHumanAssertion{claim: humanClaim}
-	switch {
-	case file.HumanAssertion.Absent && file.HumanAssertion.Equals == nil:
-		human.absent = true
-	case !file.HumanAssertion.Absent && file.HumanAssertion.Equals != nil:
-		if !approverText(*file.HumanAssertion.Equals) {
-			return nil, approverMappingInvalid(
-				"human_assertion.equals is invalid")
-		}
-		human.equals = *file.HumanAssertion.Equals
-	default:
+	if file.HumanAssertion.Equals == nil ||
+		!approverText(*file.HumanAssertion.Equals) {
 		return nil, approverMappingInvalid(
-			"human_assertion needs exactly one of absent:true or equals")
+			"human_assertion.equals is required: the assertion is a claim " +
+				"only human tokens carry, equal to a value")
+	}
+	human := approverHumanAssertion{
+		claim: humanClaim, equals: *file.HumanAssertion.Equals,
 	}
 	mapping := &approverMapping{
 		issuer: file.Issuer, audience: file.Audience,
@@ -331,12 +354,8 @@ func (m *approverMapping) computeDigest() auth.Digest {
 	list(sorted(m.values))
 	text(fmt.Sprint(m.maxValues))
 	list(m.human.claim)
-	if m.human.absent {
-		text("absent")
-	} else {
-		text("equals")
-		text(m.human.equals)
-	}
+	text("equals")
+	text(m.human.equals)
 	return auth.DigestBytes(approverMappingDigestTag, buffer.Bytes())
 }
 
@@ -478,9 +497,12 @@ func (a *oidcAuthenticator) approverAudience(
 // Every check is required and none falls back to anything: a token that
 // fails one is denied, not minted as a reader.
 func (a *oidcAuthenticator) mintApprover(
-	claims jwt.MapClaims,
+	ctx context.Context, claims jwt.MapClaims,
 ) (auth.Decision, error) {
 	mapping := a.approver
+	if err := a.verifyApproverDiscovery(ctx); err != nil {
+		return auth.Decision{}, err
+	}
 	forbidden := approverDelegationClaims
 	if a.delegationClaim != "" {
 		forbidden = append(append([]string(nil), forbidden...), a.delegationClaim)
@@ -488,6 +510,20 @@ func (a *oidcAuthenticator) mintApprover(
 	for _, name := range forbidden {
 		if _, present := claims[name]; present {
 			return auth.Decision{}, errApproverDelegated
+		}
+	}
+	for _, name := range approverClientClaims {
+		if _, present := claims[name]; present {
+			return auth.Decision{}, errApproverClientToken
+		}
+	}
+	if grant, present := claims["gty"]; present {
+		text, ok := grant.(string)
+		if !ok {
+			return auth.Decision{}, errApproverClientToken
+		}
+		if _, client := approverClientGrantTypes[text]; client {
+			return auth.Decision{}, errApproverClientToken
 		}
 	}
 	subject, err := requiredStringClaim(claims, "sub")
@@ -502,8 +538,10 @@ func (a *oidcAuthenticator) mintApprover(
 		return auth.Decision{}, errApproverClient
 	}
 	if _, allowed := mapping.clientIDs[client]; !allowed || subject == client {
-		// sub == azp is a client acting as itself: a client-credentials
-		// grant, whatever groups it has been given.
+		// sub == azp catches exactly one shape: a token whose subject is
+		// literally its own client. Most client-credentials tokens are not
+		// that shape (see approverClientClaims); the human assertion is what
+		// refuses them.
 		return auth.Decision{}, errApproverClient
 	}
 	if err := mapping.human.holds(claims); err != nil {
@@ -575,15 +613,43 @@ func (h approverHumanAssertion) holds(claims jwt.MapClaims) error {
 	if err != nil {
 		return errApproverNotHuman
 	}
-	if h.absent {
-		if present {
-			return errApproverNotHuman
-		}
-		return nil
-	}
 	text, ok := value.(string)
 	if !present || !ok || text != h.equals {
 		return errApproverNotHuman
+	}
+	return nil
+}
+
+// approverSubjectTypesPublic reports whether discovery states public subject
+// identifiers and nothing else.
+//
+// The approval service separates approver from requester by identity, and
+// both are oidc:<iss>#<sub>. Under the pairwise subject type an issuer gives
+// one human a different sub per client, so the same person requesting through
+// one client and approving through another would look like two people, and
+// could approve their own request. Entra is such an issuer. Until a stable
+// identity claim is used identically on both branches, an issuer that offers
+// pairwise identifiers — or does not say — cannot back an approver mapping.
+func approverSubjectTypesPublic(metadata oidcMetadata) bool {
+	return len(metadata.SubjectTypesSupported) == 1 &&
+		metadata.SubjectTypesSupported[0] == "public"
+}
+
+// verifyApproverDiscovery refuses an approver mapping unless the issuer's
+// discovery states public subject identifiers only. A missing or failed
+// discovery is a refusal. It is called at startup, so the server does not
+// start, and again on every approver mint against the cached discovery
+// document, so a mint can never rest on a check that did not happen.
+func (a *oidcAuthenticator) verifyApproverDiscovery(ctx context.Context) error {
+	if a == nil || a.approver == nil {
+		return nil
+	}
+	metadata, err := a.keys.metadata.get(ctx, false)
+	if err != nil {
+		return errApproverSubjectTypes
+	}
+	if !approverSubjectTypesPublic(metadata) {
+		return errApproverSubjectTypes
 	}
 	return nil
 }

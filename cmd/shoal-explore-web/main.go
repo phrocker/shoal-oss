@@ -515,6 +515,18 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// approval service pins every decision to it.
 	var approverMapping auth.Digest
 	if oidcAuthenticator, ok := authenticator.(*oidcAuthenticator); ok {
+		// An approver mapping needs an issuer that states public subject
+		// identifiers only; refuse to start otherwise, including when
+		// discovery cannot be read.
+		if err := oidcAuthenticator.verifyApproverDiscovery(ctx); err != nil {
+			listener.Close()
+			return fmt.Errorf(
+				"refusing to serve %s with -oidc-approver-mapping-file: the "+
+					"issuer's discovery must state subject_types_supported "+
+					"[\"public\"] only (pairwise subjects, as Entra issues, "+
+					"would let one human approve their own request): %w",
+				listener.Addr(), err)
+		}
 		approverMapping = oidcAuthenticator.approverMappingDigest()
 		browserAuth, err = oidcAuthenticator.browserAuthConfig(ctx)
 		if err != nil {

@@ -944,6 +944,7 @@ func (s *Server) authorizedContext(
 		ServiceRole:            template.ServiceRole(),
 		ServiceCeilingIdentity: template.ServiceCeilingIdentity(),
 		SelectedOntology:       selectedOntology,
+		GrantProvenance:        template.GrantProvenance(),
 	})
 	if err != nil {
 		return nil, auth.Decision{}, shoal.NewError(

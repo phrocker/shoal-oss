@@ -62,8 +62,10 @@ type fakeOIDCIssuer struct {
 	discoveryJWKSURI  string
 	authorizationPath string
 	tokenPath         string
-	jwksStarted       chan<- struct{}
-	jwksRelease       <-chan struct{}
+	// subjectTypes is the discovery subject_types_supported; nil omits it.
+	subjectTypes []string
+	jwksStarted  chan<- struct{}
+	jwksRelease  <-chan struct{}
 }
 
 func newFakeOIDCIssuer(t *testing.T) *fakeOIDCIssuer {
@@ -78,6 +80,7 @@ func newFakeOIDCIssuer(t *testing.T) *fakeOIDCIssuer {
 		jwksStatus:        http.StatusOK,
 		authorizationPath: "/authorize",
 		tokenPath:         "/token",
+		subjectTypes:      []string{"public"},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", issuer.serveDiscovery)
@@ -113,6 +116,7 @@ func (f *fakeOIDCIssuer) serveDiscovery(
 		JWKSURI:               jwksURI,
 		AuthorizationEndpoint: f.server.URL + f.authorizationPath,
 		TokenEndpoint:         f.server.URL + f.tokenPath,
+		SubjectTypesSupported: f.subjectTypes,
 	})
 }
 
