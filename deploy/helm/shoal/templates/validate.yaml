@@ -208,9 +208,25 @@
 
 {{- /* The LLM gateway was the LLM proxy, under the key llmProxy. A values file
        still using that key would otherwise render nothing for it and report
-       success: the gateway an operator configured simply absent. */ -}}
-{{- if hasKey .Values "llmProxy" -}}
-{{- fail "llmProxy has been renamed to llmGateway: move these values under llmGateway (and values-llm-proxy.yaml to values-llm-gateway.yaml). The Deployment and Service are now named <release>-llm-gateway; repoint callers of <release>-llm-proxy" -}}
+       success: the gateway an operator configured simply absent, or enabled
+       under the new key with half its settings left behind under the old one.
+
+       A null or empty llmProxy, or one that only says it is disabled, is
+       ignored: null is how Helm deletes a key, and a values dump taken from
+       the old chart's defaults carries `enabled: false` for operators who
+       never used it. */ -}}
+{{- $legacyGateway := .Values.llmProxy -}}
+{{- if $legacyGateway -}}
+{{- $legacyMessage := "llmProxy has been renamed to llmGateway: move these values under llmGateway (and values-llm-proxy.yaml to values-llm-gateway.yaml), rebuild the image (it now runs /usr/local/bin/shoal-llm-gateway), and repoint callers of <release>-llm-proxy to <release>-llm-gateway. See docs/llm-gateway-deploy.md, Upgrading" -}}
+{{- if not (kindIs "map" $legacyGateway) -}}
+{{- fail $legacyMessage -}}
+{{- end -}}
+{{- if $legacyGateway.enabled -}}
+{{- fail $legacyMessage -}}
+{{- end -}}
+{{- if and (eq (include "shoal.llmGatewayEnabled" .) "true") (gt (len (omit $legacyGateway "enabled")) 0) -}}
+{{- fail $legacyMessage -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* The LLM gateway (#390).

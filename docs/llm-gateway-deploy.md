@@ -248,7 +248,7 @@ is confirmed to fail.
 | a non-boolean `admission.allowPlaintext` | It is rendered verbatim into `-allow-plaintext-admission`, and Go's boolean flag parser refuses anything it cannot read as one. YAML words like `yes` and `on` are strings here, not booleans, and the pod exits at startup on a flag error. |
 | a remote `http://` `upstream.baseURL` | No acknowledgement accepts it, unlike the admission hop: this request carries the prompt and the provider credential. The binary refuses it at startup too, so rendering it is a pod that never serves. |
 | `llmGateway.terminationGracePeriodSeconds` not exceeding `admission.lease` by 5s | The gateway drains for the lease on SIGTERM, because the lease is the bound on an admitted call's whole lifetime including the report that closes it. This value is the kubelet's budget for the same window, so a shorter one means SIGKILL arrives mid-drain and kills the calls whose egress has already happened and whose grant has already been spent — an unreported grant produced by every rolling update, on a schedule, while the pod terminates cleanly as far as the kubelet is concerned. The margin is required because the grace period is whole seconds while a lease need not be, and because the process still has to exit after the drain returns. |
-| `llmGateway.identity.agentID` that is not canonical unpadded base64url | The workspace decodes this field and the binary refuses an undecodable value at startup. The guard reaches encoding mistakes and **not** the class of wrong values: a `shoal.ID` is opaque and variable-length, so there is no width to validate, and a readable name that happens to decode is indistinguishable here from a registered ID. Of fifteen plausible names, eleven decode cleanly to garbage (`gateway` to five bytes, `my-agent` to six) and only four fail on length (`llm-gateway`, `gateway`, `agent`, each `4n+1`). The eleven are refused by the plane on every request instead, as a descriptor that does not exist. |
+| `llmGateway.identity.agentID` that is not canonical unpadded base64url | The workspace decodes this field and the binary refuses an undecodable value at startup. The guard reaches encoding mistakes and **not** the class of wrong values: a `shoal.ID` is opaque and variable-length, so there is no width to validate, and a readable name that happens to decode is indistinguishable here from a registered ID. Of fifteen plausible names, eleven decode cleanly to garbage (`gateway` to five bytes, `my-agent` to six) and only four fail on length (`llm-proxy`, `proxy`, `agent`, each `4n+1`). The eleven are refused by the plane on every request instead, as a descriptor that does not exist. |
 | `agentGeneration`, a port, `tokenExpirationSeconds` or `terminationGracePeriodSeconds` that is not a whole number as written | Each is rendered verbatim, and converting before testing is lossy in exactly the cases worth refusing: `int64` of `1.5` is a positive `1`, so a guard that only checked positivity passed it and then rendered `-agent-generation=1.5`, which exits the pod on a flag error. A leading zero is worse than a refusal because it works — `010` is parsed as octal `8`, a generation nothing was registered under. |
 | `llmGateway.admission.lease` above `5m` | `pkg/explorer/fleet` caps an admission lease at `MaxActionClaimTTL` and **refuses** a request outside the bound rather than shortening it. A larger value is not a longer lease; it is every call denied as an invalid argument, which the caller cannot act on and an operator cannot tell apart from a policy denial. |
 | `llmGateway.upstream.baseURL` | An admitted request has nowhere to go, so the caller sees a failure on exactly the calls policy allowed — and the admission is spent on work that never happened. Must also be absolute. |
@@ -598,7 +598,25 @@ created and no pod is ever made from it.
 
 ## Upgrading
 
-Two things to know before an upgrade.
+**From the LLM proxy.** This component was `shoal-llm-proxy`, under the chart
+key `llmProxy`. Moving to the gateway changes four things, and none of them is
+caught by the old configuration failing loudly unless the chart says so:
+
+- Move the values from `llmProxy` to `llmGateway`, and `values-llm-proxy.yaml`
+  overlays to `values-llm-gateway.yaml`. The chart refuses to render while
+  `llmProxy` is still enabled, or still carries settings alongside an enabled
+  `llmGateway`. A leftover `llmProxy: {enabled: false}` or null is ignored.
+- Rebuild the image. The Deployment runs `/usr/local/bin/shoal-llm-gateway`; an
+  image built before the rename contains only `shoal-llm-proxy` and the pod
+  never starts.
+- Repoint callers. The Deployment, Service and PodDisruptionBudget are now named
+  `<release>-llm-gateway`, and Helm replaces the old objects rather than
+  renaming them.
+- Update anything outside the chart that selects the pods. The component label
+  is now `llm-gateway`, so a NetworkPolicy or monitor written against
+  `llm-proxy` silently stops matching.
+
+Two things to know before any upgrade.
 
 **`identity.agentGeneration` pins a descriptor generation.** Re-registering the
 descriptor bumps it, and this value has to be bumped with it in the same change.

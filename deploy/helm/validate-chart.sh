@@ -395,7 +395,15 @@ note "== llm gateway guards refuse =="
 # denies every call — which from outside is a total outage of whatever is
 # configured to go through it. That is what these move to render time.
 refuses_citing "llmProxy has been renamed to llmGateway" \
-  "values under the pre-rename llmProxy key" "${llm_gateway_base[@]}" --set llmProxy.enabled=true
+  "the pre-rename llmProxy key still enabled" -f "$chart/values.yaml" --set llmProxy.enabled=true
+refuses_citing "llmProxy has been renamed to llmGateway" \
+  "settings left under llmProxy beside an enabled llmGateway" "${llm_gateway_base[@]}" \
+  --set llmProxy.upstream.requestTimeout=30s
+refuses_citing "llmProxy has been renamed to llmGateway" \
+  "a scalar llmProxy" -f "$chart/values.yaml" --set llmProxy=true
+renders "a null llmProxy is ignored"     "${llm_gateway_base[@]}" --set llmProxy=null
+renders "an empty llmProxy is ignored"   "${llm_gateway_base[@]}" --set-json 'llmProxy={}'
+renders "a disabled llmProxy is ignored" "${llm_gateway_base[@]}" --set llmProxy.enabled=false
 refuses "no admission URL"              "${llm_gateway_base[@]}" --set llmGateway.admission.url=
 refuses "blank admission URL"           "${llm_gateway_base[@]}" --set llmGateway.admission.url=" "
 refuses "admission URL with no scheme"  "${llm_gateway_base[@]}" --set llmGateway.admission.url=shoal.example.test
