@@ -260,6 +260,54 @@ func TestInheritCarriesApprovalAndDelegationCannotDropIt(t *testing.T) {
 	}
 }
 
+func TestInheritedApprovalSurvivesEncode(t *testing.T) {
+	text := strings.Replace(basePolicy, `{"name": "query", "inherit": true}`,
+		`{"name": "query", "inherit": true, `+approvalRequired+`}`, 1)
+	document := decodeString(t, "base.atpl.json", text)
+	policy := compileOne(t, document)
+	encoded, err := Encode(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reread := decodeString(t, "base.atpl.json", string(encoded))
+	query := agentByID(&reread, "searcher").Capabilities[0].Actions[0]
+	if !query.Inherit || query.Approval == nil || !query.Approval.Required {
+		t.Fatalf("encode lost the inherited action's approval: %+v\n%s", query, encoded)
+	}
+	recompiled := compileOne(t, reread)
+	if recompiled.Digest() != policy.Digest() {
+		t.Fatalf("digest changed across encode: %s != %s", recompiled.Digest(), policy.Digest())
+	}
+	if !specAction(t, recompiled, "searcher", "search", "query").RequiresApproval {
+		t.Fatal("child no longer requires approval after encode")
+	}
+}
+
+func TestCreatePlanShowsApproval(t *testing.T) {
+	document := decodeString(t, "base.atpl.json", withApproval(t))
+	policy := compileOne(t, document)
+	registry := newRegistry(t, document)
+	plan := Diff(policy, registry.Live(t), "")
+	for _, entry := range plan.Entries {
+		if entry.Kind != KindCreate {
+			t.Fatalf("%s = %s, want create", entry.ID, entry.Kind)
+		}
+		var approvals []Change
+		for _, change := range entry.Changes {
+			if strings.HasSuffix(change.Path, ".approval") {
+				approvals = append(approvals, change)
+			}
+		}
+		var want []Change
+		if entry.ID == "planner" {
+			want = []Change{{Op: "+", Path: "capabilities[name=tickets].actions[name=open].approval", Detail: "required"}}
+		}
+		if !reflect.DeepEqual(approvals, want) {
+			t.Fatalf("%s approval changes = %+v, want %+v (all: %+v)", entry.ID, approvals, want, entry.Changes)
+		}
+	}
+}
+
 func TestDigestsChangeOnlyForApprovalRequiredActions(t *testing.T) {
 	document := base(t)
 	policy := compileOne(t, document)
