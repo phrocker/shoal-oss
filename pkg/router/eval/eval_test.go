@@ -180,6 +180,17 @@ func report(t *testing.T, split string) {
 			t.Fatal(err)
 		}
 	}
+	// The reports are goldens: a change to the router, its fixtures or its
+	// model that moves any number fails here until the report is rewritten
+	// with -update, so the change is visible in review. The test report is
+	// the pre-registered run; rewriting it is a new result, not a correction.
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stored) != text {
+		t.Fatalf("%s differs from this run; rerun with -update and review", path)
+	}
 }
 
 func TestEvaluationTrain(t *testing.T) { report(t, "train") }
