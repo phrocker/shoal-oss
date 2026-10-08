@@ -66,7 +66,7 @@
     "dispatch.error.executor_error.executor": "The failure was reported as executor_error, which, if accurate, means the executor failed without giving an error code.",
     "dispatch.error.executor_error.either": "The failure was recorded as executor_error, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the executor failed without giving an error code.",
     "dispatch.error.executor_error.next": "Reconcile with the target before requesting the work again.",
-    "dispatch.error.unrecognized.service": "Shoal recorded the failure with an error code this renderer does not recognize: {code}.",
+    "dispatch.error.unrecognized.service": "Shoal recorded the failure as {code}, an error code this renderer does not recognize.",
     "dispatch.error.unrecognized.executor": "The failure was reported with an error code Shoal does not define: {code}.",
     "dispatch.error.unrecognized.either": "The failure was recorded with an error code this renderer does not recognize, which either the executor reported or Shoal assigned; the record does not say which: {code}.",
     "dispatch.error.unrecognized.next": "{origin, select, executor {Reconcile with the target before requesting the work again; Shoal cannot interpret the code.} other {Reconcile with the target before requesting the work again; this renderer cannot interpret the code.}}",

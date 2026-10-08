@@ -242,28 +242,75 @@ func TestAnUnknownOriginIsNeverTheExecutors(t *testing.T) {
 // output Shoal then refused (invalid_executor_output) — and it does not say
 // Shoal decided the work failed: executor_error is Shoal's code for a
 // failure the executor reported without one.
+//
+// The checks are positive, not a list of banned phrases: each service reason
+// begins with one fixed form, the service transition is one exact sentence,
+// no other service-origin sentence names Shoal, and every "Shoal" any failure
+// sentence says, under any origin, is followed by "recorded" or is one of the
+// few non-crediting forms shoalOnlyRecords lists.
 func TestShoalIsCreditedOnlyWithTheCode(t *testing.T) {
 	r := New(nil)
-	for _, code := range append(sourceErrorCodes(t), "made up by an executor") {
+	at := "2026-10-08 12:03:00 UTC"
+	codes := append(sourceErrorCodes(t), "made up by an executor")
+	for _, code := range codes {
+		shown := code
+		if _, _, known := errorCodeKey(code); !known {
+			shown = "“" + code + "”"
+		}
 		for _, s := range failureSentences(t, r, failedWith(code, fleet.ErrorCodeOriginService)) {
-			text := strings.ToLower(s.Text)
-			for _, phrase := range []string{"reported as failed", "reported failure", "reported the failure"} {
-				if strings.Contains(text, phrase) {
-					t.Errorf("%s: the reporter is said to have reported a failure: %s", code, s.Text)
+			switch {
+			case s.Role == RoleReason:
+				prefix := "Shoal recorded the failure as " + shown + ", "
+				if !strings.HasPrefix(s.Text, prefix) {
+					t.Errorf("%s: service reason does not begin %q: %s", code, prefix, s.Text)
 				}
-			}
-			for _, phrase := range []string{"shoal failed", "shoal decided", "failed by shoal", "shoal determined"} {
-				if strings.Contains(text, phrase) {
-					t.Errorf("%s: Shoal is credited with the failure itself: %s", code, s.Text)
+			case s.Key == "dispatch.transition.fail":
+				want := "At " + at + ", Shoal recorded the failure as " + shown +
+					" after worker-1 reported its outcome."
+				if s.Text != want {
+					t.Errorf("%s: service transition\n got %s\nwant %s", code, s.Text, want)
 				}
-			}
-			if s.Role == RoleOutcome && strings.Contains(text, "shoal") {
-				t.Errorf("%s: the outcome credits Shoal: %s", code, s.Text)
-			}
-			if strings.Contains(text, "shoal") && s.Role != RoleReason && s.Key != "dispatch.transition.fail" {
+			case strings.Contains(s.Text, "Shoal"):
 				t.Errorf("%s: %s names Shoal: %s", code, s.Key, s.Text)
 			}
 		}
+	}
+	for _, origin := range errorCodeOriginCases(t) {
+		for _, code := range codes {
+			for _, s := range failureSentences(t, r, failedWith(code, origin)) {
+				shoalOnlyRecords(t, code+" origin="+string(origin), wantOrigin[origin], s.Text)
+			}
+		}
+	}
+}
+
+// shoalOnlyRecords requires every "Shoal" in text to be followed by
+// "recorded", or to be one of the forms that credit Shoal with nothing: the
+// disjunction an unknown origin uses ("… or Shoal assigned; the record does
+// not say which") and the negations in the executor's unrecognized-code
+// sentences ("Shoal does not define", "Shoal cannot interpret").
+func shoalOnlyRecords(t *testing.T, what string, origin Selector, text string) {
+	t.Helper()
+	allowed := map[Selector][]string{
+		OriginEither:   {"or Shoal assigned"},
+		OriginExecutor: {"Shoal does not define", "Shoal cannot interpret"},
+	}[origin]
+	for i := 0; ; {
+		j := strings.Index(text[i:], "Shoal")
+		if j < 0 {
+			return
+		}
+		i += j
+		ok := strings.HasPrefix(text[i+len("Shoal"):], " recorded ")
+		for _, form := range allowed {
+			start := i - strings.Index(form, "Shoal")
+			ok = ok || (start >= 0 && strings.HasPrefix(text[start:], form))
+		}
+		if !ok {
+			word, _, _ := strings.Cut(strings.TrimSpace(text[i+len("Shoal"):]), " ")
+			t.Errorf("%s: Shoal is paired with %q: %s", what, word, text)
+		}
+		i += len("Shoal")
 	}
 }
 

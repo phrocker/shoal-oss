@@ -5034,7 +5034,7 @@ next dispatch.error.invalid_executor_output.next
 
 == failed code=made up by an executor origin=service
 reason dispatch.error.unrecognized.service
-  Shoal recorded the failure with an error code this renderer does not recognize: “made up by an executor”.
+  Shoal recorded the failure as “made up by an executor”, an error code this renderer does not recognize.
   record=action:act-1 principal=worker-1 claim=claim-1
   quote service
 next dispatch.error.unrecognized.next
