@@ -435,6 +435,9 @@ refuses_citing "holds a control character" "a newline in the projected token aud
 refuses_citing "holds a control character" "a NEL in the capability" "${llm_gateway_base[@]}" --set-string "llmGateway.identity.capability=chat$(printf '\u0085')- -allow-plaintext-admission=true"
 refuses_citing "holds a control character" "a line separator in an allowed host" "${llm_gateway_base[@]}" --set-string "llmGateway.allowedHosts[0]=llm.example.test$(printf '\u2028')x"
 refuses_citing "holds a control character" "a paragraph separator in a model" "${llm_gateway_base[@]}" --set-string "llmGateway.models[0]=gpt-4o$(printf '\u2029')x"
+# The contrast: a non-ASCII character that is not a line break still renders,
+# so widening the class did not start refusing ordinary values.
+assert_renders "a non-ASCII model name still renders" '\-model=modèle-é"$' "${llm_gateway_base[@]}" --set-string 'llmGateway.models[0]=modèle-é'
 renders "a trailing newline the template trims is not a control character in the value" "${llm_gateway_base[@]}" --set-string 'llmGateway.identity.action=complete
 '
 
