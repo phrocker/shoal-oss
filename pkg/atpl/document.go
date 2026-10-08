@@ -161,10 +161,23 @@ type Action struct {
 	InputSchema  json.RawMessage `json:"input_schema,omitempty"`
 	OutputSchema json.RawMessage `json:"output_schema,omitempty"`
 	Approval     *Approval       `json:"approval,omitempty"`
+	// Attestation, when present, must be {"required": true}: claims on the
+	// action require a current verified executor attestation (#446,
+	// docs/executor-attestation.md). Exactly approval's strictness: absent
+	// means not required, an explicit false is refused, an inherited action
+	// may add it and nothing can remove a parent's. It is accepted only on an
+	// action that declares the external effect.
+	Attestation *Attestation `json:"attestation,omitempty"`
 }
 
 // Approval is an action's approval requirement. Required must be true.
 type Approval struct {
+	Required bool `json:"required"`
+}
+
+// Attestation is an action's executor attestation requirement. Required must
+// be true.
+type Attestation struct {
 	Required bool `json:"required"`
 }
 
@@ -175,10 +188,11 @@ type Approval struct {
 func (a Action) MarshalJSON() ([]byte, error) {
 	if a.Inherit {
 		return json.Marshal(struct {
-			Name     string    `json:"name"`
-			Inherit  bool      `json:"inherit"`
-			Approval *Approval `json:"approval,omitempty"`
-		}{Name: a.Name, Inherit: true, Approval: a.Approval})
+			Name        string       `json:"name"`
+			Inherit     bool         `json:"inherit"`
+			Approval    *Approval    `json:"approval,omitempty"`
+			Attestation *Attestation `json:"attestation,omitempty"`
+		}{Name: a.Name, Inherit: true, Approval: a.Approval, Attestation: a.Attestation})
 	}
 	return json.Marshal(struct {
 		Name         string          `json:"name"`
@@ -186,9 +200,11 @@ func (a Action) MarshalJSON() ([]byte, error) {
 		InputSchema  json.RawMessage `json:"input_schema"`
 		OutputSchema json.RawMessage `json:"output_schema"`
 		Approval     *Approval       `json:"approval,omitempty"`
+		Attestation  *Attestation    `json:"attestation,omitempty"`
 	}{
 		Name: a.Name, Effects: nonNil(a.Effects),
 		InputSchema: a.InputSchema, OutputSchema: a.OutputSchema, Approval: a.Approval,
+		Attestation: a.Attestation,
 	})
 }
 
@@ -264,8 +280,9 @@ var reserved = map[string]string{
 		"agents[].capabilities[].actions[].approval: {\"required\": true} (docs/atpl.md)",
 	"obligations": "is not declared in policy: admission obligations are computed per " +
 		"request at admission, and expressing them here is deferred (see docs/atpl.md, \"Deferred\")",
-	"attestation": "requires a later ATPL version (#446)",
-	"runtime":     "requires a later ATPL version (runtime attestation, #446)",
+	"attestation": "is declared per action only, as " +
+		"agents[].capabilities[].actions[].attestation: {\"required\": true} (docs/atpl.md)",
+	"runtime": "requires a later ATPL version (runtime attestation, #446)",
 	"trust_score": "is not part of ATPL in Shoal: trust in an agent is a typed " +
 		"decision, not a policy field (see docs/gateways.md, \"What comes from ATPL\")",
 	"behavior": "is not part of ATPL in Shoal: fixed behavior thresholds are not " +
@@ -688,7 +705,7 @@ func decodeAction(name, capabilityPath string, index int, raw json.RawMessage) (
 	}
 	object.path = capabilityPath + ".actions" + selector("name", actionName, index)
 	if err := object.only("name", "inherit", "effects", "input_schema", "output_schema",
-		"approval"); err != nil {
+		"approval", "attestation"); err != nil {
 		return Action{}, err
 	}
 	if err := object.require("name"); err != nil {
@@ -699,6 +716,9 @@ func decodeAction(name, capabilityPath string, index int, raw json.RawMessage) (
 		return Action{}, err
 	}
 	if action.Approval, err = decodeApproval(object); err != nil {
+		return Action{}, err
+	}
+	if action.Attestation, err = decodeAttestation(object); err != nil {
 		return Action{}, err
 	}
 	if action.Inherit {
@@ -766,6 +786,37 @@ func decodeApproval(action object) (*Approval, error) {
 	}
 	return &Approval{Required: true}, nil
 }
+
+// decodeAttestation reads an action's attestation object with exactly
+// decodeApproval's strictness: {"required": true} and nothing else.
+func decodeAttestation(action object) (*Attestation, error) {
+	raw, present := action.fields["attestation"]
+	if !present {
+		return nil, nil
+	}
+	attestation, err := decodeObject(action.file, action.child("attestation"), raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := attestation.only("required"); err != nil {
+		return nil, err
+	}
+	if err := attestation.require("required"); err != nil {
+		return nil, err
+	}
+	required, err := attestation.boolean("required")
+	if err != nil {
+		return nil, err
+	}
+	if !required {
+		return nil, refuse(attestation.file, attestation.child("required"), attestationNotRequired)
+	}
+	return &Attestation{Required: true}, nil
+}
+
+// attestationNotRequired is the refusal for "required": false.
+const attestationNotRequired = "must be true; omit attestation for an action that does not " +
+	"require it (a policy file cannot switch a requirement off)"
 
 // approvalNotRequired is the refusal for "required": false, from Decode and,
 // for documents built in code, from Compile.

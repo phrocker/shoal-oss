@@ -366,7 +366,7 @@ func (s *AdmissionService) Request(
 	// The same record an enqueue of this request would build, validated
 	// identically and not written. It carries the declaration, so what was
 	// admitted is part of the record's identity and a retry cannot change it.
-	base, action, err := dispatch.queuedRecord(ctx, decision, EnqueueRequest{
+	base, action, executorRef, err := dispatch.queuedRecordBinding(ctx, decision, EnqueueRequest{
 		ID: actionID, IdempotencyKey: request.IdempotencyKey,
 		AgentID: request.AgentID, AgentGeneration: request.AgentGeneration,
 		Capability: request.Capability, Action: request.Action,
@@ -420,11 +420,32 @@ func (s *AdmissionService) Request(
 	if err != nil {
 		return AdmissionGrant{}, err
 	}
+	// The grant is born claimed, so it is a claim grant like any other and
+	// goes through applyClaim's attestation gate (#446). Leaving it out would
+	// make admission the bypass: Path B grants exactly the permission to
+	// perform an external effect that Path A's Claim gates.
+	//
+	// Read after every other refusal above, so the attestation store is
+	// consulted only for a request that would otherwise be granted. A store
+	// failure answers unavailable and writes nothing — it is not a denial,
+	// because a denial is durable and an outage is not a decision.
+	attestation, err := dispatch.claimAttestation(
+		ctx, decision, action, executorRef, now)
+	if err != nil {
+		return AdmissionGrant{}, err
+	}
 	// An admission grant is requested and reported by one identity under
 	// invoke, so that is the operation its claim is authorized by.
 	record, err := applyClaim(
 		base, action, request.TokenID, request.Lease,
-		decision, auth.OperationInvoke, now)
+		decision, auth.OperationInvoke, now, attestation)
+	if errors.Is(err, ErrAttestationRequired) {
+		// The existing durable denial, with no reason on the wire, exactly as
+		// approval and the effect ceiling refuse: a caller cannot tell this
+		// control from any other. The reason is audited for the operator.
+		dispatch.auditAttestationRefusal(ctx, base, auth.OperationInvoke)
+		return s.deny(ctx, base, decision)
+	}
 	if err != nil {
 		return AdmissionGrant{}, err
 	}

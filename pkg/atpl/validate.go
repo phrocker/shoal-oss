@@ -385,6 +385,10 @@ func (c *compiler) action(
 		return fleet.Action{}, located("approval.required", approvalNotRequired)
 	}
 	requiresApproval := action.Approval != nil
+	if action.Attestation != nil && !action.Attestation.Required {
+		return fleet.Action{}, located("attestation.required", attestationNotRequired)
+	}
+	requiresAttestation := action.Attestation != nil
 	if action.Inherit {
 		if parent == nil {
 			return fleet.Action{}, located("inherit", "requires a parent to inherit from")
@@ -402,7 +406,9 @@ func (c *compiler) action(
 			// The parent's requirement is inherited, never dropped; the
 			// child may add one the parent lacks.
 			RequiresApproval: inherited.RequiresApproval || requiresApproval,
-		}, nil
+			// Likewise attestation: inherited, never dropped, may be added.
+			RequiresAttestation: inherited.RequiresAttestation || requiresAttestation,
+		}, attestationNeedsExternal(inherited.Effects, requiresAttestation)
 	}
 	effects := make(fleet.Effects, 0, len(action.Effects))
 	for _, effect := range action.Effects {
@@ -414,10 +420,21 @@ func (c *compiler) action(
 	}
 	return fleet.Action{
 		Name: action.Name, Effects: effects,
-		InputSchema:      append(json.RawMessage(nil), action.InputSchema...),
-		OutputSchema:     append(json.RawMessage(nil), action.OutputSchema...),
-		RequiresApproval: requiresApproval,
-	}, nil
+		InputSchema:         append(json.RawMessage(nil), action.InputSchema...),
+		OutputSchema:        append(json.RawMessage(nil), action.OutputSchema...),
+		RequiresApproval:    requiresApproval,
+		RequiresAttestation: requiresAttestation,
+	}, attestationNeedsExternal(effects, requiresAttestation)
+}
+
+// attestationNeedsExternal is the registry's refusal (canonicalCapabilities)
+// located on the field, so the policy author sees which declaration to fix.
+func attestationNeedsExternal(effects fleet.Effects, required bool) error {
+	if required && !containsEffect(effects, fleet.EffectMutatesExternal) {
+		return located("attestation", "requires the action to declare the external effect; "+
+			"attestation applies only to external work")
+	}
+	return nil
 }
 
 // delegatedAction re-composes capabilitiesSubset for one canonical action so
@@ -449,6 +466,13 @@ func delegatedAction(parent *parentView, parentCapability *fleet.Capability, cap
 		return located("approval", fmt.Sprintf(
 			"is required by parent %s's action; a delegated action keeps its parent's "+
 				"approval requirement (declare \"approval\": {\"required\": true}, or inherit the action)",
+			parent.label))
+	}
+	// The same for attestation.
+	if allowed.RequiresAttestation && !action.RequiresAttestation {
+		return located("attestation", fmt.Sprintf(
+			"is required by parent %s's action; a delegated action keeps its parent's "+
+				"attestation requirement (declare \"attestation\": {\"required\": true}, or inherit the action)",
 			parent.label))
 	}
 	if !fleet.CapabilitiesSubset([]fleet.Capability{capability}, parent.capabilities) {

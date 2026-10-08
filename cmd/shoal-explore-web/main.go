@@ -33,6 +33,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/executorattest"
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
 	"github.com/phrocker/shoal-oss/internal/explorerfleet"
 	"github.com/phrocker/shoal-oss/internal/explorerfleetevents"
@@ -201,6 +202,17 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"reference may not also appear in: transmission is a separate "+
 			"declaration so that it is never acquired by naming a reference "+
 			"for mutation alone",
+	)
+	fleetExecutorAttestation := flags.String(
+		"fleet-executor-attestation",
+		os.Getenv("SHOAL_FLEET_EXECUTOR_ATTESTATION"),
+		"Path to the executor attestation trust file (docs/executor-"+
+			"attestation.md): per executor reference, the operator verifiers "+
+			"and pinned image digests an executor's attestation must match. "+
+			"Each reference must also be bound by -fleet-external-executor-refs "+
+			"or -fleet-external-egress-executor-refs. Required before a "+
+			"descriptor may register an action that requires attestation; "+
+			"empty configures no trust root, so such registrations are refused",
 	)
 	concealWithholding := flags.Bool(
 		"conceal-withholding",
@@ -395,7 +407,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// collision check is the reason it must not be deferred — a reference
 	// named by both this and -fleet-ask-executor-ref has to be refused
 	// whether or not the ask binding ever gets as far as being attempted.
-	if err := bindExternalFleetEffects(executors, externalFleetEffectBindings{
+	externalBindings := externalFleetEffectBindings{
 		mutating:     splitCommaList(*fleetExternalExecutorRefs),
 		transmitting: splitCommaList(*fleetExternalEgressExecutorRefs),
 		// Trimmed, because splitCommaList trims the entries of the two lists
@@ -403,7 +415,13 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		// would miss a collision that newConfiguredFleetExecutors then
 		// reports as an unrelated allow-list failure.
 		askReference: strings.TrimSpace(*fleetAskExecutorRef),
-	}); err != nil {
+	}
+	if err := bindExternalFleetEffects(executors, externalBindings); err != nil {
+		return err
+	}
+	attestationTrust, err := loadExecutorAttestationTrust(
+		*fleetExecutorAttestation, externalBindings)
+	if err != nil {
 		return err
 	}
 
@@ -559,6 +577,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		approverMapping: func(context.Context) (auth.Digest, error) {
 			return approverMapping, nil
 		},
+
+		executorAttestation: attestationTrust,
 
 		concealWithholding: *concealWithholding,
 		mosaic: authorized.MosaicBudget{
@@ -718,8 +738,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 				"fleet HTTP dependencies are incomplete",
 			)
 		}
-		fleetHandler, err := webapi.NewFleetHandler(
-			opened.fleetRegistry, opened.fleetDispatch)
+		var fleetHandler http.Handler
+		if opened.attestation != nil {
+			fleetHandler, err = webapi.NewFleetHandlerWithAttestation(
+				opened.fleetRegistry, opened.fleetDispatch, opened.attestation)
+		} else {
+			fleetHandler, err = webapi.NewFleetHandler(
+				opened.fleetRegistry, opened.fleetDispatch)
+		}
 		if err != nil {
 			listener.Close()
 			return err
@@ -978,6 +1004,10 @@ type serviceConfig struct {
 	// executors is the host-owned allowlist of opaque fleet executor
 	// references. A non-nil empty registry keeps agent registration disabled.
 	executors fleet.ExecutorRegistry
+	// executorAttestation is the -fleet-executor-attestation trust. Nil
+	// configures no trust root: actions requiring attestation cannot
+	// register, and the presentation route is not mounted.
+	executorAttestation *executorattest.Trust
 	// generationReader is the shared current-policy authority used by
 	// authorized reads, settings, dispatch, and event delivery. Tests and
 	// deployments with a mutable policy lifecycle inject its durable reader.
@@ -1008,6 +1038,7 @@ type openedService struct {
 	fleetEvents   webapi.FleetEventService
 	admission     webapi.AdmissionProvider
 	approvals     webapi.FleetApprovalProvider
+	attestation   webapi.FleetAttestationProvider
 	teamOverview  webapi.TeamOverviewProvider
 	client        *authorized.Client
 	backfilled    int
@@ -1138,9 +1169,43 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
-		fleetRegistry, err := explorerfleet.Compose(
+		// Executor attestation (#446). Without a trust file nothing is
+		// composed: the registry refuses attested actions and dispatch has no
+		// attestation to read, so every attested claim is refused.
+		var (
+			attestationTrust   fleet.AttestationTrust
+			attestationReader  fleet.ExecutorAttestations
+			attestationService *fleet.AttestationService
+		)
+		if config.executorAttestation != nil {
+			adapter, err := openExecutorAttestations(
+				embedded.Runtime.EmbeddedEngine(), config.executorAttestation)
+			if err != nil {
+				store.Close()
+				embedded.Close()
+				return closed, err
+			}
+			attestationTrust, attestationReader = adapter, adapter
+			attestationRecorder, err := explorerfleet.NewAttestationRecorder(
+				interactionRecorder, snapshots)
+			if err != nil {
+				store.Close()
+				embedded.Close()
+				return closed, err
+			}
+			attestationService, err = fleet.NewAttestationService(fleet.AttestationConfig{
+				Presenter: adapter, Resolver: config.resolver,
+				Recorder: attestationRecorder, Clock: config.clock,
+			})
+			if err != nil {
+				store.Close()
+				embedded.Close()
+				return closed, err
+			}
+		}
+		fleetRegistry, err := explorerfleet.ComposeWithAttestationTrust(
 			embedded.Runtime, config.resolver, fleetLifecycleRecorder, snapshots,
-			executors, nil, config.clock)
+			executors, nil, config.clock, attestationTrust)
 		if err != nil {
 			store.Close()
 			embedded.Close()
@@ -1174,9 +1239,9 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
-		fleetDispatch, err := explorerfleet.ComposeDispatch(
+		fleetDispatch, err := explorerfleet.ComposeDispatchWithAttestations(
 			embedded.Runtime, fleetRegistry, config.resolver, actionRecorder,
-			actionEvents, nil, config.clock,
+			actionEvents, nil, config.clock, attestationReader,
 		)
 		if err != nil {
 			store.Close()
@@ -1344,6 +1409,7 @@ func openService(
 			fleetEvents:   fleetEvents,
 			admission:     boundAdmissionService,
 			approvals:     boundApprovalService,
+			attestation:   optionalAttestation(attestationService),
 			teamOverview:  teamOverview,
 			client:        client,
 			backfilled:    backfilled,

@@ -22,6 +22,7 @@ import (
 	"net/http"
 
 	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
+	attestationapi "github.com/phrocker/shoal-oss/pkg/attestation/api"
 	collectorapi "github.com/phrocker/shoal-oss/pkg/collector/api"
 	decisionapi "github.com/phrocker/shoal-oss/pkg/decision/api"
 )
@@ -39,9 +40,10 @@ type Config struct {
 }
 
 type Client struct {
-	collectors *collectorapi.Client
-	decisions  *decisionapi.Client
-	admission  *admissionapi.Client
+	collectors  *collectorapi.Client
+	decisions   *decisionapi.Client
+	admission   *admissionapi.Client
+	attestation *attestationapi.Client
 }
 
 func New(c Config) (*Client, error) {
@@ -57,9 +59,16 @@ func New(c Config) (*Client, error) {
 	if e != nil {
 		return nil, fmt.Errorf("sdk: %w", e)
 	}
-	return &Client{collectors: collectors, decisions: decisions, admission: admission}, nil
+	attestation, e := attestationapi.NewClient(attestationapi.Config{BaseURL: c.BaseURL, HTTPClient: c.HTTPClient, Token: c.Token})
+	if e != nil {
+		return nil, fmt.Errorf("sdk: %w", e)
+	}
+	return &Client{collectors: collectors, decisions: decisions, admission: admission, attestation: attestation}, nil
 }
 
 func (c *Client) Collectors() *collectorapi.Client { return c.collectors }
 func (c *Client) Decisions() *decisionapi.Client   { return c.decisions }
 func (c *Client) Admission() *admissionapi.Client  { return c.admission }
+
+// Attestation presents executor attestations (docs/executor-attestation.md).
+func (c *Client) Attestation() *attestationapi.Client { return c.attestation }

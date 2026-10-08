@@ -365,6 +365,17 @@ the approver and fleet groups disjoint.
   durably with no reason, like any other denial. Holding is not available
   there: the caller is waiting on the answer with the payload in hand.
 
+### Beside executor attestation
+
+An action may require both approval and executor attestation
+(`docs/executor-attestation.md`). They gate different moments and do not
+interact: approval holds a request before any record exists; attestation is
+judged when a claim is granted (Claim, ExtendClaim and the born-claimed
+admission grant), against the claimant. An approved, materialized record is
+claimed like any other, so its claimant still needs a current attestation.
+Both deny Path B durably with no reason. Both are generation changes when
+registered, with the same stranding note below.
+
 ## Work that already exists when the flag is registered
 
 `RequiresApproval` gates new work. It does not reach a record already queued,

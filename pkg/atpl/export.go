@@ -231,6 +231,11 @@ func exportAgent(descriptor fleet.Descriptor, ttl time.Duration) (Agent, error) 
 			if action.RequiresApproval {
 				written.Approval = &Approval{Required: true}
 			}
+			// Likewise: a re-applied export without it would describe the
+			// agent without its control.
+			if action.RequiresAttestation {
+				written.Attestation = &Attestation{Required: true}
+			}
 			exported.Actions = append(exported.Actions, written)
 		}
 		agent.Capabilities = append(agent.Capabilities, exported)

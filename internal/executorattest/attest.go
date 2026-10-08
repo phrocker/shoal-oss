@@ -4,8 +4,10 @@
 // executors and records the latest verified result per principal and executor
 // ref.
 //
-// It is the verifier half of #446 slice 3. Fleet enforcement (claims requiring
-// a current attestation) is not wired yet.
+// It is the verifier half of #446 slice 3. The fleet consumes it through
+// interfaces it defines (fleet.ExecutorAttestations, fleet.AttestationTrust,
+// fleet.AttestationPresenter), adapted in cmd/shoal-explore-web; see
+// docs/executor-attestation.md, "Enforcement".
 //
 // A statement is an Ed25519 signature, under a signing context distinct from
 // collectorattest's, over canonical JSON binding the caller's authorization
