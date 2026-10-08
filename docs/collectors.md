@@ -228,9 +228,11 @@ a deny-list, so these rules are an allowlist (`internal/importboundary/cgo.go`):
   not contain `import "C"`. It may not contain any source the go command
   builds besides `.go` files: C, C++, Objective-C, Fortran, headers,
   assembly, `.syso`, `.swig` or `.swigcxx`, including under `testdata/`.
-  Module files and plain documentation and data (`.md`, `.txt`, `.json`,
-  YAML, CSV, golden files, and any non-buildable file under `testdata/`) are
-  fine. Allowing cgo in an extension later needs its own design.
+  In fact an extension may contain only `.go`, `go.mod`, `go.sum` and `.md`
+  files, plus `.json` and `.golden` files under a `testdata/` directory.
+  Any extension file is something an include elsewhere could try to name, so
+  the set is kept small. The example extension needs only `.go` and
+  `go.mod`. Allowing cgo in an extension later needs its own design.
 - **Core may use cgo only in `CgoPackages`**, which today is `cmd/shoal-capi`,
   the only cgo package in the tree. For that package:
   - `#cgo` directives are an exact allowlist. The only verbs are `CFLAGS` and
@@ -257,7 +259,16 @@ a deny-list, so these rules are an allowlist (`internal/importboundary/cgo.go`):
     is scanned, so the checker and the compiler cannot disagree about which
     file is used. A quoted include found nowhere is a violation. An angle
     include found nowhere is a system header and may not contain `/` or
-    `..`. `#include_next`, `#import` and `#embed` are treated the same way.
+    `..`. `#include_next` and `#import` are treated the same way.
+  - Constructs the checker cannot follow are refused outright in the
+    package's preambles, its C files and every repository file they include:
+    - inline assembly (`asm`, `__asm`, `__asm__`), and any `.include` or
+      `.incbin` text, because the assembler fetches files itself;
+    - C++ raw strings (`R"`, `LR"`, `uR"`, `UR"`, `u8R"`), which desynchronise
+      comment and string scanning;
+    - `#embed`, and `__has_include` / `__has_include_next`;
+    - a carriage return not followed by a line feed, which gcc treats as a
+      line end and this checker does not (CRLF is normalised).
 - Before parsing, line continuations are spliced and comments removed, as the
   compiler does. So `#include \` followed by a new line, and `#/**/include`,
   read as the directive the compiler sees. Macros as include targets,
@@ -274,6 +285,42 @@ a deny-list, so these rules are an allowlist (`internal/importboundary/cgo.go`):
 Residual: flags and search paths supplied by the build environment
 (`CGO_CFLAGS`, `CGO_LDFLAGS` and the like, `pkg-config` search paths, system
 include directories) are outside a source check.
+
+**Threat model.** The checker keeps the dependency direction in place
+against mistakes and casual circumvention. It covers the Go import graph,
+module wiring (go.mod, go.work, replace, tool, nested modules, symlinks) and
+the one allowlisted cgo package. It is not a sandbox against a committer who
+deliberately smuggles code through C, the assembler or toolchain behaviour;
+static analysis of C does not converge on that. Two things bound the
+residual:
+
+- cgo is confined to a single allowlisted package (`cmd/shoal-capi`), whose
+  changes require review;
+- build-environment flags are outside any source check.
+
+Classes closed by fixtures in `internal/importboundary/testdata`:
+
+- **Imports in both directions:** imports of `extensions/` from anywhere in
+  the root module, including `_`, `testdata` and other skipped-by-`./...`
+  directories; and extension imports of anything beyond the allowlist.
+- **Transitive leaks** of `internal/` through the allowlist.
+- **Module wiring:**
+  - module-path spoofing and stray replaces in extension modules;
+  - nested extension modules, and loose files under `extensions/`;
+  - bridges through nested modules wired by go.mod or go.work;
+  - local replaces onto fixtures or unchecked directories;
+  - `tool` directives;
+  - glued-parenthesis and unknown go.mod directives;
+  - symlinks.
+- **cgo outside the allowlist,** including C, assembly, `.syso` and SWIG.
+- **Inside the allowlisted package:**
+  - disallowed `#cgo` flags (`-Iinc`, `-include`, `@file`, `-Wp`,
+    `-Xpreprocessor`, `-iquote`, `LDFLAGS`, absolute paths);
+  - include spellings: angle includes with paths, macro includes, `.inc`
+    chains, line continuations, comments inside the directive, forced
+    includes;
+  - decoy resolution;
+  - inline assembly `.include`, raw strings, and a lone carriage return.
 
 A go.mod `tool` directive puts its package in the module's build graph. Core
 `go.mod` files may not name a tool under `extensions/`. An extension may

@@ -32,8 +32,18 @@ import (
 // Anything the simple parser cannot read is a violation. Any other core
 // package with import "C" or a buildable non-Go source is a violation.
 //
-// Residual: flags and search paths supplied by the build environment
-// (CGO_CFLAGS, CGO_LDFLAGS, pkg-config) are outside a source check.
+// Constructs the checker cannot follow (inline assembly and assembler
+// .include/.incbin, raw strings, #embed, __has_include, a lone carriage
+// return) are refused outright in that package (refusals).
+//
+// Threat model: this enforces dependency direction against mistakes and
+// casual circumvention in the Go import graph, module wiring and the single
+// allowlisted cgo package. It is not a sandbox against a committer
+// deliberately smuggling code through C, assembler or toolchain behaviour;
+// that residual is bounded by cgo being confined to one allowlisted package
+// whose changes require review. Flags and search paths supplied by the build
+// environment (CGO_CFLAGS, CGO_LDFLAGS, pkg-config) are outside any source
+// check.
 
 // CgoPackages are the only core packages that may use cgo. Today that is the
 // C ABI library.
@@ -65,21 +75,52 @@ func hasExt(name string, exts []string) bool {
 // extensionFileAllowed reports whether an extension module may contain the
 // file: Go sources, module files and plain documentation or data. Under a
 // testdata directory any non-buildable file is data.
+//
+// The set is deliberately small, since any extension file is something an
+// include elsewhere could try to name: .go, go.mod, go.sum and .md, plus
+// .json and .golden under a testdata directory. The example extension needs
+// only .go and go.mod.
 func extensionFileAllowed(name string) bool {
 	base := path.Base(name)
 	switch {
-	case strings.HasSuffix(base, ".go"), base == "go.mod", base == "go.sum":
+	case strings.HasSuffix(base, ".go"), base == "go.mod", base == "go.sum", path.Ext(base) == ".md":
 		return true
-	case hasExt(name, buildableExts):
-		return false
-	case strings.Contains("/"+name+"/", "/testdata/"):
-		return true
+	case strings.Contains("/"+path.Dir(name)+"/", "/testdata/"):
+		return path.Ext(base) == ".json" || path.Ext(base) == ".golden"
 	}
-	switch path.Ext(base) {
-	case ".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".golden":
-		return true
+	return false
+}
+
+// refusedForms are constructs the checker cannot follow and refuses
+// outright in the allowlisted cgo package: inline assembly (the assembler
+// fetches files itself through .include and .incbin), C++ raw strings
+// (which desynchronise comment and string scanning), #embed and
+// __has_include. A lone carriage return, which gcc treats as a line end and
+// this checker would not, is refused separately.
+var refusedForms = []struct {
+	re   *regexp.Regexp
+	what string
+}{
+	{regexp.MustCompile(`\b(asm|__asm|__asm__)\b`), "inline assembly"},
+	{regexp.MustCompile(`(?i)\.(include|incbin)\b`), "assembler include"},
+	{regexp.MustCompile(`(^|[^A-Za-z0-9_])(L|u8|u|U)?R"`), "raw string literal"},
+	{regexp.MustCompile(`#\s*embed\b`), "#embed"},
+	{regexp.MustCompile(`__has_include(_next)?\b`), "__has_include"},
+}
+
+// refusals reports every refused form in raw source text.
+func refusals(src []byte) []string {
+	var out []string
+	text := strings.ReplaceAll(string(src), "\r\n", "\n")
+	if strings.Contains(text, "\r") {
+		out = append(out, "(lone carriage return)")
 	}
-	return base == "LICENSE" || base == "NOTICE" || base == ".gitignore"
+	for _, f := range refusedForms {
+		if f.re.MatchString(text) {
+			out = append(out, "("+f.what+" not allowed)")
+		}
+	}
+	return out
 }
 
 // preprocess applies C translation phases 1 to 3: it splices
@@ -175,7 +216,7 @@ func includes(src []byte) ([]include, []string) {
 			continue
 		}
 		switch name {
-		case "include", "include_next", "import", "embed":
+		case "include", "include_next", "import":
 		default:
 			continue
 		}
@@ -388,6 +429,9 @@ func checkCgoPackage(fsys fs.FS, pkg string) ([]Violation, error) {
 	for len(queue) > 0 {
 		u := queue[0]
 		queue = queue[1:]
+		for _, r := range refusals(u.src) {
+			out = append(out, Violation{"A", u.file, r})
+		}
 		incs, problems := includes(u.src)
 		for _, p := range problems {
 			out = append(out, Violation{"A", u.file, p})

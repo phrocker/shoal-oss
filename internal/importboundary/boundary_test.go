@@ -112,14 +112,25 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 		// #cgo arguments are an exact allowlist: -I${SRCDIR}/... into allowed
 		// directories and plain -D only. An angle include found through an
 		// allowed -I is scanned, so a header in a package subdirectory cannot
-		// pull in an extension's .txt file.
-		"cgo-probe-iinc-txt": {
-			{"A", "cmd/shoal-capi/inc/pwn.h", `include "../../../extensions/e/payload.txt" (resolves outside allowed directories)`},
+		// pull in an extension's .md file.
+		"cgo-probe-iinc-md": {
+			{"A", "cmd/shoal-capi/inc/pwn.h", `include "../../../extensions/e/payload.md" (resolves outside allowed directories)`},
 			{"A", "cmd/shoal-capi/probe.go", "cgo flag -Iinc"},
 		},
 		// Every existing candidate is checked, so a benign decoy on a later
 		// search path cannot hide the file the compiler takes first.
 		"cgo-probe-decoy": {{"A", "cmd/shoal-capi/probe.go", `include "../tests/x.h" (resolves outside allowed directories)`}},
+		// Forms the checker cannot follow are refused outright: inline
+		// assembly (.include/.incbin), C++ raw strings, a lone CR.
+		"cgo-probe-asm": {
+			{"A", "cmd/shoal-capi/probe.c", "(assembler include not allowed)"},
+			{"A", "cmd/shoal-capi/probe.c", "(inline assembly not allowed)"},
+		},
+		"cgo-probe-rawstring": {
+			{"A", "cmd/shoal-capi/probe.c", "(raw string literal not allowed)"},
+			{"A", "cmd/shoal-capi/probe.c", "(unreadable source: trigraph or unterminated comment)"},
+		},
+		"cgo-probe-lonecr": {{"A", "cmd/shoal-capi/probe.c", "(lone carriage return)"}},
 		"cgo-probe-flagforms": {
 			{"A", "cmd/shoal-capi/probe.go", "cgo flag -Wp,-include,${SRCDIR}/x.h"},
 			{"A", "cmd/shoal-capi/probe.go", "cgo flag -Xpreprocessor"},

@@ -30,7 +30,7 @@ func TestIncludeParsing(t *testing.T) {
 		"trigraph":         {"??=include \"../x.h\"\n", nil, 1},
 		"unterminated":     {"/* never closed\n#include \"a.h\"\n", nil, 1},
 		"line marker":      {"# 1 \"x.h\"\n", nil, 1},
-		"embed":            {"#embed \"blob.bin\"\n", []include{{"quote", "blob.bin"}}, 0},
+		"embed":            {"#embed \"blob.bin\"\n", nil, 0}, // refused by refusals
 		"null directive":   {"#\n#define X 1\n", nil, 0},
 		"include_next":     {"#include_next <a.h>\n", []include{{"angle", "a.h"}}, 0},
 		"objc import":      {"#import \"a.h\"\n", []include{{"quote", "a.h"}}, 0},
