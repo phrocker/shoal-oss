@@ -793,7 +793,11 @@ func (a *oidcAuthenticator) authenticate(
 	if _, err := a.parser.ParseWithClaims(raw, claims, keyFunc); err != nil {
 		return auth.Decision{}, err
 	}
-	return a.mint(ctx, claims)
+	correlationID, err := correlationIDFor(request, "oidc-correlation-")
+	if err != nil {
+		return auth.Decision{}, err
+	}
+	return a.mint(ctx, claims, correlationID)
 }
 
 // keyFuncForContext returns a jwt.Keyfunc bound to the request context so JWKS
@@ -849,8 +853,13 @@ func (a *oidcAuthenticator) keyFuncForContext(ctx context.Context) jwt.Keyfunc {
 // nothing else does: a token on the approver audience is minted as an
 // approver or denied, and a token on a workspace audience is minted by the
 // workspace mappings, which never grant approve. A token on both is denied.
+//
+// The correlation ID is resolved once by the caller and threaded into both
+// branches, so an approver's decision and a workspace caller's carry one the
+// same way. Without it every dispatch, admission and approval route refuses
+// the request (#524).
 func (a *oidcAuthenticator) mint(
-	ctx context.Context, claims jwt.MapClaims,
+	ctx context.Context, claims jwt.MapClaims, correlationID shoal.ID,
 ) (auth.Decision, error) {
 	if a.approver != nil {
 		approver, err := a.approverAudience(claims)
@@ -858,15 +867,15 @@ func (a *oidcAuthenticator) mint(
 			return auth.Decision{}, err
 		}
 		if approver {
-			return a.mintApprover(ctx, claims)
+			return a.mintApprover(ctx, claims, correlationID)
 		}
 	}
-	return a.mintWorkspace(claims)
+	return a.mintWorkspace(claims, correlationID)
 }
 
 // mintWorkspace mints a token on a workspace audience.
 func (a *oidcAuthenticator) mintWorkspace(
-	claims jwt.MapClaims,
+	claims jwt.MapClaims, correlationID shoal.ID,
 ) (auth.Decision, error) {
 	subject, err := requiredStringClaim(claims, a.subjectClaim)
 	if errors.Is(err, errMissingMappedClaim) && a.subjectFallbackClaim != "" {
@@ -952,6 +961,7 @@ func (a *oidcAuthenticator) mintWorkspace(
 		// a token the parser accepted within the configured clock skew.
 		AuthenticationExpires: expiration.Time.UTC().Add(a.authenticationLeeway),
 		RequestID:             requestID,
+		CorrelationID:         correlationID,
 		AuditPurpose:          a.auditPurpose,
 	})
 	if err != nil {

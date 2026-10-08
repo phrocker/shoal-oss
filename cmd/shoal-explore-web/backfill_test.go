@@ -206,7 +206,7 @@ func TestBackfillGrantsPreExistingCorpusOnlyWhenGated(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		decision, err := authenticator.mint()
+		decision, err := authenticator.mint(nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -351,7 +351,7 @@ func mintDevelopmentDecision(t *testing.T) (auth.Decision, error) {
 	if err != nil {
 		return auth.Decision{}, err
 	}
-	return authenticator.mint()
+	return authenticator.mint(nil)
 }
 
 // ingestOneThroughService ingests a single document through the authorized

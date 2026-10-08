@@ -25,7 +25,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
@@ -128,12 +130,18 @@ func (a *developmentAuthenticator) Authenticate(
 		return auth.Decision{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "request is required")
 	}
-	return a.mint()
+	return a.mint(request)
 }
 
 // mint issues one short-lived development decision.
-func (a *developmentAuthenticator) mint() (auth.Decision, error) {
+func (a *developmentAuthenticator) mint(
+	request *http.Request,
+) (auth.Decision, error) {
 	requestID, err := newRequestID()
+	if err != nil {
+		return auth.Decision{}, err
+	}
+	correlationID, err := correlationIDFor(request, "dev-correlation-")
 	if err != nil {
 		return auth.Decision{}, err
 	}
@@ -147,8 +155,90 @@ func (a *developmentAuthenticator) mint() (auth.Decision, error) {
 		PolicyGeneration:      workspacePolicyGeneration,
 		AuthenticationExpires: a.clock().Add(a.lifetime),
 		RequestID:             requestID,
+		CorrelationID:         correlationID,
 		AuditPurpose:          developmentAuditPurpose,
 	})
+}
+
+// CorrelationIDHeader threads a caller's trace across a hop.
+//
+// RequestID identifies one request; CorrelationID groups the related ones. A
+// caller with no upstream context is the root of its own trace and gets a
+// generated value; a caller that is itself handling an upstream request — a
+// gateway, an agent acting for a user — supplies this so the correlation
+// survives the hop, which is the field's entire purpose.
+const CorrelationIDHeader = "Shoal-Correlation-ID"
+
+// correlationIDFor resolves the correlation ID a minted decision carries.
+//
+// Every dispatch, admission and approval route required this and neither
+// shipped authenticator set it, so every such request was refused with
+// "dispatch correlation ID is required" (#524). The asymmetry was the whole
+// bug: one of the two provenance identifiers was minted and the other was not,
+// and the bound wrappers then overwrote the request body's value with the
+// decision's empty one — correctly, because the authenticated decision has to
+// be authoritative so a body cannot forge provenance. So the fix belongs here,
+// at the mint, and not there.
+//
+// A supplied value is honoured rather than ignored, and honouring it is safe
+// to reason about: AuthorizationFingerprint deliberately excludes request IDs
+// and correlation, so a caller-chosen correlation cannot shift an
+// authorization decision. It is provenance for grouping, not authority.
+//
+// A malformed value is refused rather than silently replaced, so a caller that
+// meant to thread a trace learns that it did not.
+func correlationIDFor(
+	request *http.Request, prefix string,
+) (shoal.ID, error) {
+	if request != nil {
+		values := request.Header.Values(CorrelationIDHeader)
+		if len(values) > 1 {
+			return "", shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"correlation ID header must appear at most once")
+		}
+		if len(values) == 1 {
+			return validateSuppliedCorrelationID(values[0])
+		}
+	}
+	return newCorrelationID(prefix)
+}
+
+// validateSuppliedCorrelationID refuses a caller's value that this process
+// would not want in an audit record.
+//
+// shoal.ValidateRequiredID checks emptiness and the byte bound and nothing
+// about the characters, so the printable check is explicit here for the same
+// reason the ambiguity target's is: the value is caller-controlled and reaches
+// a durable record that something eventually renders, where a control
+// character is at best unreadable and at worst a terminal escape.
+func validateSuppliedCorrelationID(value string) (shoal.ID, error) {
+	id := shoal.ID(strings.TrimSpace(value))
+	if string(id) != value {
+		return "", shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"correlation ID must not be padded with whitespace")
+	}
+	if err := shoal.ValidateRequiredID("correlation ID", id); err != nil {
+		return "", err
+	}
+	for _, candidate := range string(id) {
+		if !unicode.IsPrint(candidate) || candidate == ' ' {
+			return "", shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"correlation ID must be printable and contain no spaces")
+		}
+	}
+	return id, nil
+}
+
+func newCorrelationID(prefix string) (shoal.ID, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", shoal.WrapError(
+			shoal.ErrorUnavailable, "correlation identity unavailable", err)
+	}
+	return shoal.ID(prefix + hex.EncodeToString(raw)), nil
 }
 
 func newRequestID() (shoal.ID, error) {

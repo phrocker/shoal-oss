@@ -498,7 +498,7 @@ func (a *oidcAuthenticator) approverAudience(
 // Every check is required and none falls back to anything: a token that
 // fails one is denied, not minted as a reader.
 func (a *oidcAuthenticator) mintApprover(
-	ctx context.Context, claims jwt.MapClaims,
+	ctx context.Context, claims jwt.MapClaims, correlationID shoal.ID,
 ) (auth.Decision, error) {
 	mapping := a.approver
 	if err := a.verifyApproverDiscovery(ctx); err != nil {
@@ -598,8 +598,12 @@ func (a *oidcAuthenticator) mintApprover(
 		PolicyGeneration:    workspacePolicyGeneration,
 		AuthenticationExpires: expiration.Time.UTC().Add(
 			a.authenticationLeeway),
-		RequestID:    requestID,
-		AuditPurpose: oidcApproverAuditPurpose,
+		RequestID: requestID,
+		// Without a correlation ID every dispatch, admission and approval
+		// route refuses the request (#524), and an approver's decide route is
+		// one of them.
+		CorrelationID: correlationID,
+		AuditPurpose:  oidcApproverAuditPurpose,
 		GrantProvenance: auth.GrantProvenance{
 			Issuer: mapping.issuer, Subject: subject,
 			ClaimPath:     append([]string(nil), mapping.claim...),
