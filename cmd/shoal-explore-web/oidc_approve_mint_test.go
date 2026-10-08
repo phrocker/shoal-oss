@@ -89,4 +89,39 @@ func TestNoAuthenticatorMintsAnApprover(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNotApprover("-dev-auth workspace principal", decision)
+
+	// With an approver mapping in force, the workspace audience is
+	// unchanged: every workspace mapping, alone and together, and a token
+	// that also carries the approver claim and value, mints no approve. Only
+	// the approver audience can, and the approver tests cover it.
+	mapped := newTestOIDCAuthenticator(t, approverTestConfig(
+		t, issuer, fixedClock(now), approverMappingDocument(issuer.server.URL)))
+	for _, mapping := range []struct {
+		name   string
+		access []string
+	}{
+		{"mapped: reader", []string{"reader"}},
+		{"mapped: contributor", []string{"writer"}},
+		{"mapped: fleet", []string{"fleet"}},
+		{"mapped: combined", []string{"reader", "writer", "fleet"}},
+		{"mapped: the approver value as a workspace value",
+			[]string{"reader", testApproverValue}},
+	} {
+		claims := issuer.defaultClaims(now)
+		claims["access"] = mapping.access
+		claims["azp"] = testApproverClient
+		claims["realm_access"] = map[string]any{
+			"roles": []any{testApproverValue},
+		}
+		decision, err := mapped.Authenticate(
+			bearerRequest(issuer.signRS256(t, testKID, claims)))
+		if err != nil {
+			t.Fatalf("%s: %v", mapping.name, err)
+		}
+		assertNotApprover(mapping.name, decision)
+		if decision.GrantProvenance().Set() {
+			t.Fatalf("%s: a workspace decision carries grant provenance",
+				mapping.name)
+		}
+	}
 }

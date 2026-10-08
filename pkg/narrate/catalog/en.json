@@ -98,6 +98,7 @@
     "approval.outcome.unresolvable.identity_taken": "The request to run action {action} on agent {agent} was approved but can never become work.",
     "approval.outcome.unresolvable.target_moved": "The request to run action {action} on agent {agent} can no longer progress.",
     "approval.outcome.unresolvable.policy_generation_moved": "The request to run action {action} on agent {agent} can no longer progress.",
+    "approval.outcome.unresolvable.approver_mapping_moved": "The request to run action {action} on agent {agent} was approved but can no longer become work.",
     "approval.outcome.unresolvable.deadline_passed": "The request to run action {action} on agent {agent} can no longer progress.",
     "approval.outcome.unrecognized": "The request to run action {action} on agent {agent} is in a state this renderer does not recognize: {state}, with condition {condition}.",
 
@@ -106,6 +107,7 @@
     "approval.reason.identity_taken": "Another route’s action already holds this action identity.",
     "approval.reason.target_moved": "Agent {agent} has moved past generation {generation}, or is gone, since the request was made.",
     "approval.reason.policy_generation_moved": "The policy generation in force has moved since the request was made under generation {policy}.",
+    "approval.reason.approver_mapping_moved": "The operator’s approver mapping has changed since {approver} approved it, so the approval no longer stands.",
     "approval.reason.deadline_passed": "The action deadline passed at {deadline, time}, so the request can no longer be re-requested.",
     "approval.reason.stored_differs": "The stored record still says {stored, select, pending {pending} approved {approved} enqueued {enqueued} refused {refused} expired {expired} other {something else}}; this status is computed and nothing was written.",
 
@@ -125,6 +127,7 @@
     "approval.next.identity_taken": "Make a new request under a different action identity; it needs its own approval.",
     "approval.next.target_moved": "Make a new request against the agent’s current generation; it needs its own approval.",
     "approval.next.policy_generation_moved": "Make a new request under the policy generation now in force; it needs its own approval.",
+    "approval.next.approver_mapping_moved": "Make a new request; it needs its own approval from an approver under the mapping now in force.",
     "approval.next.deadline_passed": "Make a new request with a later deadline; it needs its own approval.",
     "approval.next.enqueued": "Where the work is now is the action’s own status.",
     "approval.next.final": "Nothing further can happen to this request; a new request needs its own approval.",

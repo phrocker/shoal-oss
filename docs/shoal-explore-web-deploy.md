@@ -168,6 +168,7 @@ closed. Authentication never falls back to anonymous or development authority.
 | `-oidc-reader-values` / `SHOAL_OIDC_READER_VALUES` | Comma-separated claim values granting list, read, connect, neighborhood, retrieve, workspace-settings read, and agent resolve. |
 | `-oidc-contributor-values` / `SHOAL_OIDC_CONTRIBUTOR_VALUES` | Comma-separated claim values granting ingest and workspace-settings write in addition to reader operations. |
 | `-oidc-fleet-values` / `SHOAL_OIDC_FLEET_VALUES` | Comma-separated claim values granting Fleet control-plane access: agent register/heartbeat/revoke, delegation for child-agent registration, dispatch/invoke, subscription create/delete/deliver, and event publication. |
+| `-oidc-approver-mapping-file` / `SHOAL_OIDC_APPROVER_MAPPING_FILE` | Operator file (`shoal.approvers/v1`) mapping OIDC humans on a dedicated approver audience to `action_approve` and nothing else. Without it no token may approve. See `docs/approval.md`, "The OIDC approver mapping". |
 
 At least one reader, contributor, or Fleet value is required. A missing,
 malformed, or unmapped authorization claim is denied before a service operation runs.

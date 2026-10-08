@@ -1448,6 +1448,126 @@ next approval.next.policy_generation_moved
   Make a new request under the policy generation now in force; it needs its own approval.
   record=approval:act-1
 
+== unresolvable/approver_mapping_moved stored=approved now=untimed
+outcome approval.outcome.unresolvable.approver_mapping_moved
+  The request to run action close-ticket on agent agent-7 was approved but can no longer become work.
+  record=approval:act-1 approval_digest=1f58b9145b24d108d7ac38887338b3ea3229833b9c1e418250343f907bfd1047 agent=agent-7
+  identifiers close-ticket agent-7
+reason approval.reason.approver_mapping_moved
+  The operator’s approver mapping has changed since bob approved it, so the approval no longer stands.
+  record=approval:act-1
+  identifiers bob
+reason approval.reason.stored_differs
+  The stored record still says approved; this status is computed and nothing was written.
+  record=approval:act-1
+history approval.transition.requested
+  alice requested it at 2026-10-08 12:00:00 UTC under policy generation 9, with an action deadline of 2026-10-08 14:00:00 UTC.
+  record=approval:act-1 principal=alice request=req-1
+  identifiers alice
+history approval.transition.approved
+  bob approved it at 2026-10-08 12:10:00 UTC.
+  record=approval:act-1 principal=bob request=req-2
+  identifiers bob
+next approval.next.approver_mapping_moved
+  Make a new request; it needs its own approval from an approver under the mapping now in force.
+  record=approval:act-1
+
+== unresolvable/approver_mapping_moved stored=approved now=2m0s
+outcome approval.outcome.unresolvable.approver_mapping_moved
+  The request to run action close-ticket on agent agent-7 was approved but can no longer become work.
+  record=approval:act-1 approval_digest=1f58b9145b24d108d7ac38887338b3ea3229833b9c1e418250343f907bfd1047 agent=agent-7
+  identifiers close-ticket agent-7
+reason approval.reason.approver_mapping_moved
+  The operator’s approver mapping has changed since bob approved it, so the approval no longer stands.
+  record=approval:act-1
+  identifiers bob
+reason approval.reason.stored_differs
+  The stored record still says approved; this status is computed and nothing was written.
+  record=approval:act-1
+history approval.transition.requested
+  alice requested it at 2026-10-08 12:00:00 UTC under policy generation 9, with an action deadline of 2026-10-08 14:00:00 UTC.
+  record=approval:act-1 principal=alice request=req-1
+  identifiers alice
+history approval.transition.approved
+  bob approved it at 2026-10-08 12:10:00 UTC.
+  record=approval:act-1 principal=bob request=req-2
+  identifiers bob
+next approval.next.approver_mapping_moved
+  Make a new request; it needs its own approval from an approver under the mapping now in force.
+  record=approval:act-1
+
+== unresolvable/approver_mapping_moved stored=approved now=30m0s
+outcome approval.outcome.unresolvable.approver_mapping_moved
+  The request to run action close-ticket on agent agent-7 was approved but can no longer become work.
+  record=approval:act-1 approval_digest=1f58b9145b24d108d7ac38887338b3ea3229833b9c1e418250343f907bfd1047 agent=agent-7
+  identifiers close-ticket agent-7
+reason approval.reason.approver_mapping_moved
+  The operator’s approver mapping has changed since bob approved it, so the approval no longer stands.
+  record=approval:act-1
+  identifiers bob
+reason approval.reason.stored_differs
+  The stored record still says approved; this status is computed and nothing was written.
+  record=approval:act-1
+history approval.transition.requested
+  alice requested it at 2026-10-08 12:00:00 UTC under policy generation 9, with an action deadline of 2026-10-08 14:00:00 UTC.
+  record=approval:act-1 principal=alice request=req-1
+  identifiers alice
+history approval.transition.approved
+  bob approved it at 2026-10-08 12:10:00 UTC.
+  record=approval:act-1 principal=bob request=req-2
+  identifiers bob
+next approval.next.approver_mapping_moved
+  Make a new request; it needs its own approval from an approver under the mapping now in force.
+  record=approval:act-1
+
+== unresolvable/approver_mapping_moved stored=approved now=3h0m0s
+outcome approval.outcome.unresolvable.approver_mapping_moved
+  The request to run action close-ticket on agent agent-7 was approved but can no longer become work.
+  record=approval:act-1 approval_digest=1f58b9145b24d108d7ac38887338b3ea3229833b9c1e418250343f907bfd1047 agent=agent-7
+  identifiers close-ticket agent-7
+reason approval.reason.approver_mapping_moved
+  The operator’s approver mapping has changed since bob approved it, so the approval no longer stands.
+  record=approval:act-1
+  identifiers bob
+reason approval.reason.stored_differs
+  The stored record still says approved; this status is computed and nothing was written.
+  record=approval:act-1
+history approval.transition.requested
+  alice requested it at 2026-10-08 12:00:00 UTC under policy generation 9, with an action deadline of 2026-10-08 14:00:00 UTC.
+  record=approval:act-1 principal=alice request=req-1
+  identifiers alice
+history approval.transition.approved
+  bob approved it at 2026-10-08 12:10:00 UTC.
+  record=approval:act-1 principal=bob request=req-2
+  identifiers bob
+next approval.next.approver_mapping_moved
+  Make a new request; it needs its own approval from an approver under the mapping now in force.
+  record=approval:act-1
+
+== unresolvable/approver_mapping_moved stored=approved now=-30m0s
+outcome approval.outcome.unresolvable.approver_mapping_moved
+  The request to run action close-ticket on agent agent-7 was approved but can no longer become work.
+  record=approval:act-1 approval_digest=1f58b9145b24d108d7ac38887338b3ea3229833b9c1e418250343f907bfd1047 agent=agent-7
+  identifiers close-ticket agent-7
+reason approval.reason.approver_mapping_moved
+  The operator’s approver mapping has changed since bob approved it, so the approval no longer stands.
+  record=approval:act-1
+  identifiers bob
+reason approval.reason.stored_differs
+  The stored record still says approved; this status is computed and nothing was written.
+  record=approval:act-1
+history approval.transition.requested
+  alice requested it at 2026-10-08 12:00:00 UTC under policy generation 9, with an action deadline of 2026-10-08 14:00:00 UTC.
+  record=approval:act-1 principal=alice request=req-1
+  identifiers alice
+history approval.transition.approved
+  bob approved it at 2026-10-08 12:10:00 UTC.
+  record=approval:act-1 principal=bob request=req-2
+  identifiers bob
+next approval.next.approver_mapping_moved
+  Make a new request; it needs its own approval from an approver under the mapping now in force.
+  record=approval:act-1
+
 == unresolvable/deadline_passed stored=pending now=untimed
 outcome approval.outcome.unresolvable.deadline_passed
   The request to run action close-ticket on agent agent-7 can no longer progress.

@@ -82,6 +82,7 @@ therefore reports three things: `state`, what the request effectively is now;
 | `unresolvable` | `identity_taken` | committed to become work, but another route's action holds the identity |
 | `unresolvable` | `target_moved` | the agent's generation moved, or the agent is gone |
 | `unresolvable` | `policy_generation_moved` | the policy generation in force (read from the generation authority, not the caller's token) moved since the request |
+| `unresolvable` | `approver_mapping_moved` | stored approved, but the operator approver mapping in force is not the one the approval was given under; it can never materialize |
 | `unresolvable` | `deadline_passed` | the action deadline passed; it can no longer be re-requested |
 | `refused` / `expired` | — | final |
 
@@ -140,6 +141,17 @@ asked as an approver:
   to the work. Equality is across fields, as in
   `internal/decisionadjudication`: acting for someone does not establish
   independence from them.
+
+  For an OIDC approver this is **one comparison, not two**. A mapped approver
+  is minted with actor = subject (`oidc:<iss>#<sub>`, below), so the subject
+  and actor checks test the same identity, and the separation margin is
+  exactly "the approver's subject must not overlap anyone involved". That is
+  not a weakening: before the mapping every OIDC token's actor was the
+  literal `shoal-explore-web-oidc`, a constant no principal controlled — and
+  because the requester's actor is involved, that constant made every OIDC
+  approver overlap every OIDC requester. No OIDC approver could approve any
+  OIDC request; the flow failed closed, under a refusal ("approver is not
+  independent of the request") that misdescribed the cause.
 - No delegation. A decision carrying `OnBehalfOf` is refused.
 - The approver must **fail** `dispatch`, `invoke` and `execute` on the scope.
   Under shared scopes, which every OIDC-minted principal has, holding approve
@@ -163,13 +175,108 @@ What these rules deliberately do not do:
   identity rule is what prevents it approving its own request in that case.
 
 `auth.OperationActionApprove` (`action_approve`) is granted by
-`auth.ServiceRoleActionApproval` (`action_approval`) and nothing else grants it.
-It is in **no** operation list the shipped binary mints — not the three OIDC
-mappings, the unmapped fallback, or the `-dev-auth` principal. Two tests hold
-that: `oidc_approve_grant_test.go` parses every package-level
-`[]auth.Operation` in the command, and `oidc_approve_mint_test.go` mints a
-decision through each authenticator and asks it whether it authorizes approve.
-An approver role mapping is deferred.
+`auth.ServiceRoleActionApproval` (`action_approval`) and, in the shipped
+binary, by exactly one list: `oidcApproverOperations`, minted only through the
+approver mapping below. It is in none of the three workspace OIDC mappings,
+the unmapped fallback, or the `-dev-auth` principal. Two tests hold that:
+`oidc_approve_grant_test.go` parses every package-level `[]auth.Operation` in
+the command and requires approve in the approver list alone (and that list to
+be approve alone), and `oidc_approve_mint_test.go` mints a decision through
+each authenticator — with and without an approver mapping in force, including
+workspace tokens that carry the approver claim and value — and asks it whether
+it authorizes approve.
+
+### The OIDC approver mapping
+
+`-oidc-approver-mapping-file` (environment `SHOAL_OIDC_APPROVER_MAPPING_FILE`)
+names an operator file mapping OIDC humans to the approver role. **No file
+means no approvers.** It is never in ATPL: ATPL is written by registrants,
+and letting a registrant name who approves its own agents' work is the
+conflict of interest #419 forbids.
+
+```json
+{
+  "version": "shoal.approvers/v1",
+  "issuer": "https://idp.example.com/realms/shoal",
+  "audience": "shoal-approvals",
+  "client_ids": ["shoal-console"],
+  "claim": ["realm_access", "roles"],
+  "values": ["shoal-approvers"],
+  "max_values": 64,
+  "human_assertion": {"claim": ["idtyp"], "absent": true}
+}
+```
+
+Startup refuses the file, and the server does not start, when: a field is
+unknown, a key is repeated, or anything follows the object; `version` is not
+`shoal.approvers/v1`; `issuer` is not byte-equal to the trimmed
+`-oidc-issuer` (no trailing-slash, case or whitespace leniency); `audience` is
+empty or is one of the workspace audiences; `client_ids`, `claim` or `values`
+is empty; any string has leading or trailing whitespace or a control
+character; `claim` is not a list of path segments (a dotted string is refused,
+and a segment containing a dot names a key containing a dot, never a path);
+`max_values` is outside 1–1024; `human_assertion` is missing or gives other
+than exactly one of `absent: true` and `equals`. The mapping also requires the
+default OIDC identity (subject claim `sub`, identities `oidc:<iss>#<sub>`) and
+refuses the legacy Entra identity mode, in which the same human would carry an
+`entra:` identity as a requester and an `oidc:` one as an approver and could
+approve their own request.
+
+**Minting is decided by audience and fails closed.** A token on a workspace
+audience is minted by the workspace mappings, which never grant approve. A
+token on the approver audience is minted as an approver or denied — there is
+no fallback to reader. A token carrying both is denied. On the approver
+audience every one of these is required:
+
+- `azp` is one of `client_ids`, and `sub != azp` (a client acting as itself is
+  a client-credentials grant, whatever groups it holds);
+- none of `act`, `may_act`, `_claim_names`, `_claim_sources`, `hasgroups`, or
+  the configured `-oidc-delegation-claim` is present (delegation, or a group
+  list the issuer truncated);
+- the human assertion holds;
+- the value at `claim` is a string or an array of at most `max_values`
+  strings, and one of them equals a configured value **byte for byte** — no
+  trimming, case folding or Unicode normalization;
+- where the token also carries the workspace authorization claim, none of its
+  values maps to `-oidc-fleet-values` (the human holds dispatch).
+
+Every failure is the same generic authentication denial. The decision grants
+`action_approve` and nothing else, with subject = actor = `oidc:<iss>#<sub>`,
+client `oidc:<iss>#<azp>`, no `OnBehalfOf`, the workspace policy generation,
+and an `auth.GrantProvenance` of issuer, subject, claim path, matched value
+and the mapping digest. The provenance is appended to the authorization
+fingerprint only when present, so every existing fingerprint is unchanged.
+
+**The mapping digest is pinned, not the generation.** The workspace policy
+generation stays fixed configuration: deriving it from a hash of the mapping
+could move it backwards. Instead the digest of the mapping in force
+(canonical; reordering a set does not move it) is `ApprovalConfig.ApproverMapping`:
+
+- `decide` requires the approver decision's mapping digest to equal the one in
+  force (both zero when no mapping is configured; a decision without
+  provenance is refused while one is), and stores it on the record as
+  `ApproverMappingDigest` beside `ApproverProvenance`;
+- the requester's re-request checks it again before `approved → enqueued`. A
+  changed mapping refuses (`409`, `ErrApproverMappingMoved`), the row stays
+  approved, and Status reports `unresolvable` / `approver_mapping_moved`;
+- a pending request is unaffected until it is decided, and is then decided
+  under the mapping in force.
+
+**Audit.** Each approval transition's audit carries the acting principal's
+provenance; the trusted session commits to it (its query digest covers it) and
+the durable approval record holds the values. No token byte is recorded
+anywhere.
+
+**Disclosure.** The mapping is never served: the browser login configuration
+is identical with and without it, and no approval response carries the
+provenance or the digest. Non-approvers keep their `404`s. The requester sees
+who approved their own request (`approver`, `approver_actor`) — that is
+accountability for that request, and it is intended.
+
+**Not detected.** A human who holds the fleet mapping through a group their
+approver token does not carry is not detected; separation is per credential,
+and the identity rule is what stops them approving their own request. Keep
+the approver and fleet groups disjoint.
 
 ## What enqueue, invoke and admission do
 
@@ -234,6 +341,11 @@ heartbeat interval; this is the same property queued dispatch work already has.
   decode version 4 rather than reading the action without its flag.
 - The new `ActionRecord` fields are additive; gob decodes older records with
   them absent, and `Validate` requires them all or none.
+- `ApprovalRecord.ApproverMappingDigest` and `ApproverProvenance` are
+  additive gob fields: a record a previous build wrote decodes with both
+  zero, and a previous build reads a record that has them by skipping them.
+  `Validate` refuses either on an undecided record and a digest that is not
+  its provenance's.
 - `approval.*` event kinds are reserved: the public publish route refuses them
   and no operation may publish them through the trusted path. No approval
   events are published in this slice.
@@ -321,7 +433,9 @@ transition reconciled on a lagging replica has the same property.
 - Dataset export of approvals and refusals as adjudications (#401, #419). Every
   field it needs is stored on the approval record.
 - Approval lifecycle events (needs #480 item 1).
-- An approver role mapping for OIDC.
+- Approver pools per action or descriptor (a later ATPL version may only
+  reference an operator-defined pool), a second approver-only issuer, and
+  quorum.
 - Synchronous invoke of an approval-required action, by design rather than
   through the replay branch.
 - A claim-time generation re-check (after #438/#430).

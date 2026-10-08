@@ -31,16 +31,23 @@ import (
 // missed workspaceOperations — the -dev-auth principal's ceiling — on the
 // argument that it is not OIDC-minted, and that is the one a reviewer found.
 // The table below is checked against the set of lists this command defines, so
-// a fifth list added without a row fails here rather than going unguarded.
+// a sixth list added without a row fails here rather than going unguarded.
+//
+// Since #451 slice 2 exactly one list may grant approve: oidcApproverOperations,
+// minted only on the approver audience under the operator mapping file. It
+// must grant approve and nothing else — in particular none of dispatch,
+// invoke or execute, which the approval service refuses an approver for.
 func TestNoMintedPrincipalCanApprove(t *testing.T) {
 	lists := []struct {
-		name string
-		set  []auth.Operation
+		name     string
+		set      []auth.Operation
+		approver bool
 	}{
-		{"oidcFleetOperations", oidcFleetOperations},
-		{"oidcContributorOperations", oidcContributorOperations},
-		{"oidcReaderOperations", oidcReaderOperations},
-		{"workspaceOperations", workspaceOperations},
+		{"oidcFleetOperations", oidcFleetOperations, false},
+		{"oidcContributorOperations", oidcContributorOperations, false},
+		{"oidcReaderOperations", oidcReaderOperations, false},
+		{"workspaceOperations", workspaceOperations, false},
+		{"oidcApproverOperations", oidcApproverOperations, true},
 	}
 	covered := make([]string, len(lists))
 	for i, list := range lists {
@@ -57,6 +64,14 @@ func TestNoMintedPrincipalCanApprove(t *testing.T) {
 		if len(list.set) == 0 {
 			t.Fatalf("the %s list is empty; a guard over an empty list "+
 				"asserts nothing", list.name)
+		}
+		if list.approver {
+			if len(list.set) != 1 ||
+				list.set[0] != auth.OperationActionApprove {
+				t.Fatalf("the %s list is %v; the approver role grants "+
+					"action_approve and nothing else", list.name, list.set)
+			}
+			continue
 		}
 		for _, operation := range list.set {
 			if operation == auth.OperationActionApprove {

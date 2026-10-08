@@ -36,6 +36,11 @@ func TestApprovalErrorsNeverSurfaceAsInternal(t *testing.T) {
 			http.StatusConflict, shoal.ErrorConflict},
 		{"approval superseded", fleetApprovalError(fleet.ErrApprovalSuperseded),
 			http.StatusConflict, shoal.ErrorConflict},
+		{"approver mapping moved", fleetApprovalError(fleet.ErrApproverMappingMoved),
+			http.StatusConflict, shoal.ErrorConflict},
+		{"wrapped approver mapping moved", fleetApprovalError(errors.Join(
+			errors.New("context"), fleet.ErrApproverMappingMoved)),
+			http.StatusConflict, shoal.ErrorConflict},
 		{"approval not found", fleetApprovalError(fleet.ErrApprovalNotFound),
 			http.StatusNotFound, shoal.ErrorNotFound},
 	} {

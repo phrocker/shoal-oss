@@ -56,7 +56,7 @@ func (f Fingerprint) String() string {
 
 // AuthorizationFingerprint deterministically hashes the exact canonical
 // domain, identity, delegation, operation, source, policy, generation, and
-// service-ceiling grants. Expiry and request/audit identifiers are excluded
+// service-ceiling grants, and the grant provenance when one is set. Expiry and request/audit identifiers are excluded
 // because they do not change the authorized projection.
 func AuthorizationFingerprint(decision Decision) (Fingerprint, error) {
 	cloned, err := decision.cloneValidated()
@@ -91,6 +91,9 @@ func AuthorizationFingerprint(decision Decision) (Fingerprint, error) {
 		encoder.boolean(true)
 		encoder.text(string(cloned.selectedOntology.SchemaID()))
 		encoder.text(string(cloned.selectedOntology.VersionID()))
+	}
+	if cloned.grantProvenance.Set() {
+		encoder.grantProvenance(cloned.grantProvenance)
 	}
 	return Fingerprint(encoder.sum()), nil
 }

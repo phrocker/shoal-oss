@@ -138,6 +138,7 @@ var ApprovalConditions = []fleet.ApprovalCondition{
 	fleet.ApprovalConditionTargetMoved, fleet.ApprovalConditionPolicyMoved,
 	fleet.ApprovalConditionDeadlinePassed, fleet.ApprovalConditionIdentityTaken,
 	fleet.ApprovalConditionAwaitingAction,
+	fleet.ApprovalConditionApproverMappingMoved,
 }
 
 // EffectiveApproval is one row of the status table in docs/approval.md: an
@@ -161,6 +162,7 @@ var EffectiveApprovals = []EffectiveApproval{
 	{fleet.ApprovalUnresolvable, fleet.ApprovalConditionTargetMoved, []fleet.ApprovalState{fleet.ApprovalPending, fleet.ApprovalApproved, fleet.ApprovalEnqueued}},
 	{fleet.ApprovalUnresolvable, fleet.ApprovalConditionPolicyMoved, []fleet.ApprovalState{fleet.ApprovalPending, fleet.ApprovalApproved, fleet.ApprovalEnqueued}},
 	{fleet.ApprovalUnresolvable, fleet.ApprovalConditionDeadlinePassed, []fleet.ApprovalState{fleet.ApprovalPending, fleet.ApprovalApproved, fleet.ApprovalEnqueued}},
+	{fleet.ApprovalUnresolvable, fleet.ApprovalConditionApproverMappingMoved, []fleet.ApprovalState{fleet.ApprovalApproved}},
 	{fleet.ApprovalRefused, fleet.ApprovalConditionNone, []fleet.ApprovalState{fleet.ApprovalRefused}},
 	{fleet.ApprovalExpired, fleet.ApprovalConditionNone, []fleet.ApprovalState{fleet.ApprovalExpired}},
 }

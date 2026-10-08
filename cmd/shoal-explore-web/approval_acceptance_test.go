@@ -42,6 +42,9 @@ type approvalHarness struct {
 	isOpen    bool
 	requests  atomic.Int64
 	wrap      func(fleet.ApprovalStore) fleet.ApprovalStore
+	// mapping is the approver mapping digest the service is opened with;
+	// nil means none, as in the shipped binary without the mapping file.
+	mapping func(context.Context) (auth.Digest, error)
 }
 
 func newApprovalHarness(t *testing.T) *approvalHarness {
@@ -80,6 +83,7 @@ func (h *approvalHarness) open() {
 		},
 		generationReader:  h.reader,
 		wrapApprovalStore: h.wrap,
+		approverMapping:   h.mapping,
 	})
 	if err != nil {
 		h.t.Fatal(err)

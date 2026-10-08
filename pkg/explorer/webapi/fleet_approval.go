@@ -192,7 +192,8 @@ func fleetApprovalError(err error) error {
 		return nil
 	case errors.Is(err, fleet.ErrApprovalConflict),
 		errors.Is(err, fleet.ErrApprovalExpired),
-		errors.Is(err, fleet.ErrApprovalSuperseded):
+		errors.Is(err, fleet.ErrApprovalSuperseded),
+		errors.Is(err, fleet.ErrApproverMappingMoved):
 		if shoal.IsErrorCode(err, shoal.ErrorConflict) {
 			return err
 		}

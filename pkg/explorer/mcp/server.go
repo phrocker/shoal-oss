@@ -882,6 +882,7 @@ func (s *Server) bindHTTPSessionDecision(
 		ServiceRole:            decision.ServiceRole(),
 		ServiceCeilingIdentity: decision.ServiceCeilingIdentity(),
 		SelectedOntology:       selectedOntology,
+		GrantProvenance:        decision.GrantProvenance(),
 	})
 	if err != nil {
 		return nil, shoal.NewError(
