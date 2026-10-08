@@ -1,0 +1,213 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package effectsgateway
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"net/http"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+)
+
+// The dispatch client's wire behaviour is tested against the real explorer
+// handler in cmd/shoal-explore-web (effects_gateway_client_test.go). These are
+// the pure parts: the status mapping, which the real handler cannot be made to
+// produce on demand for every row, and the local refusals.
+
+func TestStatusErrorMapping(t *testing.T) {
+	for _, row := range []struct {
+		status int
+		header http.Header
+		body   string
+		kind   DispatchErrorKind
+		code   string
+	}{
+		{404, nil, `{"code":"not_found","message":"fleet action not found"}`, DispatchNotFound, "not_found"},
+		{409, nil, `{"code":"conflict"}`, DispatchConflict, "conflict"},
+		{503, http.Header{"Shoal-Commit-Outcome": {"indeterminate"}}, `{"code":"unavailable","indeterminate":true}`, DispatchIndeterminate, "unavailable"},
+		{503, http.Header{"Shoal-Commit-Outcome": {" Indeterminate "}}, ``, DispatchIndeterminate, ""},
+		{503, nil, `{"code":"unavailable"}`, DispatchUnavailable, "unavailable"},
+		{503, http.Header{"Shoal-Commit-Outcome": {"committed"}}, ``, DispatchUnavailable, ""},
+		{400, nil, `{"code":"invalid_argument"}`, DispatchInvalid, "invalid_argument"},
+		{401, nil, ``, DispatchUnauthorized, ""},
+		{403, nil, ``, DispatchUnauthorized, ""},
+		{504, nil, ``, DispatchDeadline, ""},
+		{500, nil, `{"code":"internal"}`, DispatchStatus, "internal"},
+		{502, nil, `<html>bad gateway</html>`, DispatchStatus, ""},
+		// A code that is not a short snake-case token is dropped, so a proxy
+		// cannot put text into the error through it.
+		{409, nil, `{"code":"Conflict: see https://evil.example"}`, DispatchConflict, ""},
+	} {
+		header := row.header
+		if header == nil {
+			header = http.Header{}
+		}
+		err := statusError("claim", &http.Response{StatusCode: row.status, Header: header}, []byte(row.body))
+		var dispatchErr *DispatchError
+		if !errors.As(err, &dispatchErr) || dispatchErr.Kind != row.kind ||
+			dispatchErr.Code != row.code || dispatchErr.Status != row.status {
+			t.Errorf("%d %v %s: %#v", row.status, row.header, row.body, err)
+		}
+		if DispatchKind(err) != row.kind {
+			t.Errorf("%d: DispatchKind = %q", row.status, DispatchKind(err))
+		}
+	}
+	if DispatchKind(errors.New("other")) != "" {
+		t.Error("a foreign error has a dispatch kind")
+	}
+}
+
+func TestDispatchErrorNeverFormatsItsCause(t *testing.T) {
+	const secret = "/api/v1/fleet/actions/c2VjcmV0/claim?token=s3cret"
+	cause := &url.Error{Op: "Post", URL: "https://explorer" + secret, Err: context.DeadlineExceeded}
+	err := &DispatchError{Op: "claim", Kind: DispatchTransport, Failure: ClassifyFailure(cause), cause: cause}
+	if strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "c2VjcmV0") {
+		t.Fatalf("error text carries the cause: %s", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("the cause is not reachable through errors.Is")
+	}
+	if !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("error text lacks the classified kind: %s", err)
+	}
+}
+
+func TestNewClaimID(t *testing.T) {
+	random := bytes.NewReader(bytes.Repeat([]byte{0xaa}, 64))
+	id, nonce, err := NewClaimID("gateway-7f9c-0", random)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]byte("gw1|gateway-7f9c-0|"), bytes.Repeat([]byte{0xaa}, ClaimNonceBytes)...)
+	if !bytes.Equal(id, want) || nonce != (ClaimNonce{0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa}) {
+		t.Fatalf("claim ID = %q, nonce = %x", id, nonce)
+	}
+	// Fresh per attempt from the real source.
+	a, _, err := NewClaimID("pod", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _, _ := NewClaimID("pod", nil)
+	if bytes.Equal(a, b) {
+		t.Fatal("two claim attempts produced one claim ID")
+	}
+	longest := strings.Repeat("p", fleet.MaxActionIDBytes-len(claimIDPrefix)-1-ClaimNonceBytes)
+	if id, _, err := NewClaimID(longest, nil); err != nil || len(id) != fleet.MaxActionIDBytes {
+		t.Fatalf("longest pod name: %d bytes, %v", len(id), err)
+	}
+	for _, pod := range []string{"", longest + "p", "a|b", "a b", "pod\n", "pöd"} {
+		if _, _, err := NewClaimID(pod, nil); err == nil {
+			t.Errorf("pod %q accepted", pod)
+		}
+	}
+	if _, _, err := NewClaimID("pod", bytes.NewReader(nil)); err == nil {
+		t.Fatal("an exhausted random source produced a claim ID")
+	}
+}
+
+func TestRequestContextWire(t *testing.T) {
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.FixedZone("EST", -5*3600))
+	good := RequestContext{RequestID: []byte{0, 1}, ReasonCode: "gateway_claim", Deadline: now.Add(time.Minute)}
+	wire, err := good.wire("claim", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire.Deadline.Location() != time.UTC || wire.RequestID != "AAE" || wire.CorrelationID != "" {
+		t.Fatalf("wire = %#v", wire)
+	}
+	for name, mutate := range map[string]func(*RequestContext){
+		"no request ID":        func(r *RequestContext) { r.RequestID = nil },
+		"long request ID":      func(r *RequestContext) { r.RequestID = make([]byte, fleet.MaxActionIDBytes+1) },
+		"long correlation ID":  func(r *RequestContext) { r.CorrelationID = make([]byte, fleet.MaxActionIDBytes+1) },
+		"no reason":            func(r *RequestContext) { r.ReasonCode = "" },
+		"untrimmed reason":     func(r *RequestContext) { r.ReasonCode = "claim " },
+		"long reason":          func(r *RequestContext) { r.ReasonCode = strings.Repeat("r", fleet.MaxReasonCodeBytes+1) },
+		"deadline now":         func(r *RequestContext) { r.Deadline = now },
+		"deadline in the past": func(r *RequestContext) { r.Deadline = now.Add(-time.Second) },
+		"no deadline":          func(r *RequestContext) { r.Deadline = time.Time{} },
+	} {
+		request := good
+		mutate(&request)
+		if _, err := request.wire("claim", now); DispatchKind(err) != DispatchRefusedLocal {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestDispatchClientRefusesLocallyBeforeSending(t *testing.T) {
+	base, _ := url.Parse("https://explorer.invalid")
+	transport := &countingTransport{}
+	client, err := NewDispatchClient(base, &http.Client{Transport: transport},
+		func() (string, error) { return "token", nil }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	request := RequestContext{RequestID: []byte("r"), ReasonCode: "x", Deadline: time.Now().Add(time.Minute)}
+	claimID := []byte("claim")
+	checks := map[string]error{}
+	_, checks["pull limit 0"] = client.Pull(ctx, request, "", 0)
+	_, checks["pull limit 257"] = client.Pull(ctx, request, "", fleet.MaxDispatchListResults+1)
+	_, checks["pull bad cursor"] = client.Pull(ctx, request, "!!", 1)
+	_, checks["claim no ID"] = client.Claim(ctx, nil, ClaimRequest{Context: request, ExpectedVersion: 1, ClaimID: claimID, Lease: time.Minute})
+	_, checks["claim no version"] = client.Claim(ctx, []byte("a"), ClaimRequest{Context: request, ClaimID: claimID, Lease: time.Minute})
+	_, checks["claim no claim ID"] = client.Claim(ctx, []byte("a"), ClaimRequest{Context: request, ExpectedVersion: 1, Lease: time.Minute})
+	_, checks["claim zero lease"] = client.Claim(ctx, []byte("a"), ClaimRequest{Context: request, ExpectedVersion: 1, ClaimID: claimID})
+	_, checks["claim lease over ceiling"] = client.Claim(ctx, []byte("a"), ClaimRequest{Context: request, ExpectedVersion: 1, ClaimID: claimID, Lease: fleet.MaxActionClaimTTL + 1})
+	_, checks["complete both output and failure"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, Output: []byte(`{}`), Failed: true, ErrorCode: ErrorOutcomeUnknown})
+	_, checks["complete success with code"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, Output: []byte(`{}`), ErrorCode: ErrorOutcomeUnknown})
+	_, checks["complete success without output"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID})
+	_, checks["complete failure off vocabulary"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, Failed: true, ErrorCode: "executor_error"})
+	_, checks["complete failure without code"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, Failed: true})
+	_, checks["resolve no agent"] = client.Resolve(ctx, nil, request)
+	for name, err := range checks {
+		if DispatchKind(err) != DispatchRefusedLocal {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if transport.calls != 0 {
+		t.Fatalf("%d requests left for locally refused calls", transport.calls)
+	}
+
+	noToken, _ := NewDispatchClient(base, &http.Client{Transport: transport},
+		func() (string, error) { return "", ErrNoCredential }, nil)
+	if _, err := noToken.Pull(ctx, request, "", 1); DispatchKind(err) != DispatchNoCredential {
+		t.Fatalf("no credential = %v", err)
+	}
+	injected, _ := NewDispatchClient(base, &http.Client{Transport: transport},
+		func() (string, error) { return "t\r\nX-Evil: 1", nil }, nil)
+	if _, err := injected.Pull(ctx, request, "", 1); DispatchKind(err) != DispatchNoCredential {
+		t.Fatalf("credential with a line break = %v", err)
+	}
+	if transport.calls != 0 {
+		t.Fatal("a request left without a usable credential")
+	}
+}
+
+type countingTransport struct{ calls int }
+
+func (c *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	c.calls++
+	return nil, errors.New("no network in this test")
+}
