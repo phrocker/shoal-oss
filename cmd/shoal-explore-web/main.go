@@ -321,6 +321,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"from discovery. Environment fallback "+
 			"SHOAL_OIDC_AUTHORIZATION_ENDPOINT",
 	)
+	oidcApproverMappingFile := flags.String(
+		"oidc-approver-mapping-file", "",
+		"Operator file (shoal.approvers/v1) mapping OIDC humans to the "+
+			"approver role on an audience of its own; without it no token "+
+			"may approve. Environment fallback SHOAL_OIDC_APPROVER_MAPPING_FILE")
 	oidcTokenEndpoint := flags.String(
 		"oidc-token-endpoint", "",
 		"Token endpoint override for browser login; otherwise read from "+
@@ -441,6 +446,9 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			os.Getenv("SHOAL_OIDC_AUTHORIZATION_ENDPOINT")),
 		tokenEndpoint: firstNonEmpty(
 			*oidcTokenEndpoint, os.Getenv("SHOAL_OIDC_TOKEN_ENDPOINT")),
+		approverMappingFile: firstNonEmpty(
+			*oidcApproverMappingFile,
+			os.Getenv("SHOAL_OIDC_APPROVER_MAPPING_FILE")),
 	}, legacyEntraConfig{
 		tenantID: firstNonEmpty(
 			*entraTenant, os.Getenv("SHOAL_ENTRA_TENANT")),
@@ -503,7 +511,23 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 	var browserAuth *webapi.BrowserAuthConfig
+	// The approver mapping in force. Zero when none is configured; the
+	// approval service pins every decision to it.
+	var approverMapping auth.Digest
 	if oidcAuthenticator, ok := authenticator.(*oidcAuthenticator); ok {
+		// An approver mapping needs an issuer that states public subject
+		// identifiers only; refuse to start otherwise, including when
+		// discovery cannot be read.
+		if err := oidcAuthenticator.verifyApproverDiscovery(ctx); err != nil {
+			listener.Close()
+			return fmt.Errorf(
+				"refusing to serve %s with -oidc-approver-mapping-file: the "+
+					"issuer's discovery must state subject_types_supported "+
+					"[\"public\"] only (pairwise subjects, as Entra issues, "+
+					"would let one human approve their own request): %w",
+				listener.Addr(), err)
+		}
+		approverMapping = oidcAuthenticator.approverMappingDigest()
 		browserAuth, err = oidcAuthenticator.browserAuthConfig(ctx)
 		if err != nil {
 			listener.Close()
@@ -532,6 +556,9 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		backfill:  backfill,
 		ontology:  activeOntology,
 		executors: executors,
+		approverMapping: func(context.Context) (auth.Digest, error) {
+			return approverMapping, nil
+		},
 
 		concealWithholding: *concealWithholding,
 		mosaic: authorized.MosaicBudget{
@@ -774,6 +801,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 				"unmapped authorization claims are denied\n",
 			strings.Join(oidc.audiences, ","),
 		)
+		if approverMapping != (auth.Digest{}) {
+			fmt.Fprintf(output,
+				"OIDC approver mapping is in force (%s); approvals are "+
+					"pinned to it\n", approverMapping)
+		}
 	}
 	if *backend == "embedded" {
 		if activeOntology != nil {
@@ -960,6 +992,9 @@ type serviceConfig struct {
 	// compare-and-set writes looks like to the caller — while every other
 	// dependency stays the one this function composes.
 	wrapApprovalStore func(fleet.ApprovalStore) fleet.ApprovalStore
+	// approverMapping returns the operator approver mapping digest in force
+	// (#451), or the zero digest. Nil means none.
+	approverMapping func(context.Context) (auth.Digest, error)
 }
 
 // openedService is the constructed workspace service together with what the
@@ -1228,6 +1263,9 @@ func openService(
 			// The same current-policy authority the authorized client and
 			// workspace settings use.
 			Generations: generationReader,
+			// The operator approver mapping in force; decisions and
+			// materializations are pinned to it.
+			ApproverMapping: config.approverMapping,
 		})
 		if err != nil {
 			store.Close()

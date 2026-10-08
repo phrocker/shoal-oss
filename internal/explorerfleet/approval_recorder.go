@@ -76,6 +76,19 @@ func (r *ApprovalRecorder) RecordApproval(
 		"approval audit request ID", audit.RequestID); err != nil {
 		return err
 	}
+	// The acting principal's grant provenance (#451): which operator approver
+	// mapping, and which claim value, made it an approver. It is validated
+	// here and, on the decision, must be exactly what the record stores, so
+	// an audit can never attest a provenance the durable row does not hold.
+	if err := audit.Provenance.Validate(); err != nil {
+		return err
+	}
+	if audit.Phase == "approval_decision" &&
+		!audit.Provenance.Equal(audit.Record.ApproverProvenance) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"fleet approval audit provenance does not match its decision")
+	}
 	snapshot, err := r.snapshots.InteractionSnapshot(ctx)
 	if err != nil {
 		return err
@@ -85,13 +98,11 @@ func (r *ApprovalRecorder) RecordApproval(
 		ID:                     approvalSessionID(audit),
 		Operation:              interaction.OperationToolCall,
 		AuthorizationOperation: string(audit.Operation),
-		QueryDigest: interaction.Digest(
-			string(audit.Operation) + ":" + audit.Phase + ":" +
-				string(audit.Record.State)),
-		RequestID:  audit.RequestID,
-		ResultID:   shoal.ID(hex.EncodeToString(audit.Record.ID)),
-		StopReason: audit.Phase,
-		SnapshotID: shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
+		QueryDigest:            approvalQueryDigest(audit),
+		RequestID:              audit.RequestID,
+		ResultID:               shoal.ID(hex.EncodeToString(audit.Record.ID)),
+		StopReason:             audit.Phase,
+		SnapshotID:             shoal.ID(snapshot.ID), SnapshotAsOf: snapshot.AsOf,
 		AuthorizationFingerprint: shoal.ID(
 			audit.AuthorizationFingerprint.String()),
 		AuthorizationExpiresAt: audit.AuthorizationExpiresAt,
@@ -127,6 +138,35 @@ func (r *ApprovalRecorder) RecordApproval(
 			"fleet approval recorder returned a mismatched trusted session"))
 	}
 	return nil
+}
+
+// approvalQueryDigest is what the session records about the transition. An
+// audit whose acting principal carries grant provenance commits to it as
+// well: the issuer, subject, claim path, matched value and mapping digest are
+// length-framed into the digest, so the trusted session attests exactly which
+// mapping and claim made the approver one. The session schema holds
+// identities and digests only, so the values themselves live on the durable
+// approval record (ApproverProvenance); the session pins them. A transition
+// by a principal with no provenance digests exactly what it did before.
+// No token bytes reach either.
+func approvalQueryDigest(audit fleet.ApprovalAudit) string {
+	query := string(audit.Operation) + ":" + audit.Phase + ":" +
+		string(audit.Record.State)
+	if !audit.Provenance.Set() {
+		return interaction.Digest(query)
+	}
+	digest := sha256.New()
+	writeActionField(digest, []byte("shoal.fleet.approval-provenance.v1"))
+	writeActionField(digest, []byte(audit.Provenance.Issuer))
+	writeActionField(digest, []byte(audit.Provenance.Subject))
+	writeActionField(digest, []byte(strconv.Itoa(len(audit.Provenance.ClaimPath))))
+	for _, segment := range audit.Provenance.ClaimPath {
+		writeActionField(digest, []byte(segment))
+	}
+	writeActionField(digest, []byte(audit.Provenance.MatchedValue))
+	writeActionField(digest, audit.Provenance.MappingDigest[:])
+	return interaction.Digest(
+		query + ":provenance:" + hex.EncodeToString(digest.Sum(nil)))
 }
 
 func approvalSessionID(audit fleet.ApprovalAudit) shoal.ID {

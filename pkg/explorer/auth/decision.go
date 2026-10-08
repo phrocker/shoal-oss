@@ -46,6 +46,10 @@ type DecisionConfig struct {
 	ServiceRole            ServiceRole
 	ServiceCeilingIdentity shoal.ID
 	SelectedOntology       ontology.OntologyIdentity
+	// GrantProvenance is set only by an authenticator that granted the
+	// decision's authority through an operator mapping (#451). It is
+	// additive: a decision without one fingerprints exactly as before.
+	GrantProvenance GrantProvenance
 }
 
 // Decision is an immutable trusted authorization decision.
@@ -66,6 +70,7 @@ type Decision struct {
 	serviceRole            ServiceRole
 	serviceCeilingIdentity shoal.ID
 	selectedOntology       ontology.OntologyIdentity
+	grantProvenance        GrantProvenance
 }
 
 // NewDecision validates, canonicalizes, and defensively owns a trusted
@@ -147,6 +152,9 @@ func NewDecision(config DecisionConfig) (Decision, error) {
 			return Decision{}, err
 		}
 	}
+	if err := config.GrantProvenance.Validate(); err != nil {
+		return Decision{}, err
+	}
 	if config.ServiceRole == "" {
 		if config.ServiceCeilingIdentity != "" {
 			return Decision{}, shoal.NewError(
@@ -190,6 +198,7 @@ func NewDecision(config DecisionConfig) (Decision, error) {
 		serviceRole:            config.ServiceRole,
 		serviceCeilingIdentity: config.ServiceCeilingIdentity,
 		selectedOntology:       config.SelectedOntology,
+		grantProvenance:        config.GrantProvenance.Clone(),
 	}, nil
 }
 
@@ -497,6 +506,7 @@ func (d Decision) cloneValidated() (Decision, error) {
 		ServiceRole:            d.serviceRole,
 		ServiceCeilingIdentity: d.serviceCeilingIdentity,
 		SelectedOntology:       d.selectedOntology,
+		GrantProvenance:        d.grantProvenance,
 	})
 }
 

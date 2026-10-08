@@ -948,6 +948,8 @@ func DeriveEffectiveDecision(
 		AuditPurpose:           base.AuditPurpose(),
 		ServiceRole:            base.ServiceRole(),
 		ServiceCeilingIdentity: base.ServiceCeilingIdentity(),
+		// Narrowing removes authority; it never changes who granted it.
+		GrantProvenance: base.GrantProvenance(),
 	}
 	if selectedSet {
 		config.SelectedOntology = selected

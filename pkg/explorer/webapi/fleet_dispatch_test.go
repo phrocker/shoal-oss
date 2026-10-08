@@ -729,4 +729,35 @@ func TestFleetDispatchErrorMarksEveryIndeterminateJoin(t *testing.T) {
 			}
 		})
 	}
+	// The approver mapping moved (#451). Approval sentinels are mapped by
+	// fleetApprovalError, which matches them above its fall-through to
+	// fleetDispatchError. Nothing was written — the row stays approved and
+	// no action exists — so each form is a clean 409, never marked: bare, as
+	// the service raises it, and joined.
+	for _, probe := range []struct {
+		name string
+		err  error
+	}{
+		{"approver mapping moved", fleet.ErrApproverMappingMoved},
+		{"approver mapping moved, as the service raises it", shoal.WrapError(
+			shoal.ErrorConflict,
+			"the approver mapping a decision was made under is no longer in force",
+			fleet.ErrApproverMappingMoved)},
+		{"approver mapping moved, joined", errors.Join(
+			errors.New("context"), fleet.ErrApproverMappingMoved)},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			mapped := fleetApprovalError(probe.err)
+			if explorer.IsIndeterminateCommit(mapped) {
+				t.Fatal("a moved approver mapping is marked indeterminate; " +
+					"nothing was committed")
+			}
+			if got := primaryErrorCode(mapped); got != shoal.ErrorConflict {
+				t.Fatalf("code = %q, want conflict", got)
+			}
+			if !errors.Is(mapped, fleet.ErrApproverMappingMoved) {
+				t.Fatal("the mapped error lost its sentinel")
+			}
+		})
+	}
 }

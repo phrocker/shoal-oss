@@ -213,8 +213,10 @@ var oidcFleetOperations = []auth.Operation{
 	// also grants dispatch and invoke, and the approval service refuses any
 	// approver holding either on the scope, so approve here would be dead
 	// weight; on the reader or contributor list it would mint an approver of
-	// every mapped token. Approval needs a role mapping of its own, and
-	// oidc_approve_grant_test.go asserts its absence from every list.
+	// every mapped token. Approval has a role mapping of its own — the
+	// operator file behind -oidc-approver-mapping-file, on an audience of
+	// its own (oidc_approver.go) — and oidc_approve_grant_test.go asserts
+	// that oidcApproverOperations is the only list that grants it.
 	auth.OperationSubscriptionCreate,
 	auth.OperationSubscriptionDelete,
 	auth.OperationSubscriptionDeliver,
@@ -269,6 +271,9 @@ type oidcConfig struct {
 	authorizationArrayOnly     bool
 	legacyTenantID             string
 	legacyAuthority            string
+	// approverMappingFile names the operator approver mapping (#451). Empty
+	// means no approvers: no token mints OperationActionApprove.
+	approverMappingFile string
 
 	// httpClient and clock are injected by tests; production leaves them nil.
 	httpClient *http.Client
@@ -288,7 +293,7 @@ func (c oidcConfig) configured() bool {
 		len(c.contributorValues) > 0 || len(c.fleetValues) > 0 ||
 		c.browserClientID != "" ||
 		c.browserScope != "" || c.authorizationEndpoint != "" ||
-		c.tokenEndpoint != ""
+		c.tokenEndpoint != "" || c.approverMappingFile != ""
 }
 
 // oidcAuthenticator validates bearer tokens against the issuer's JWKS
@@ -320,6 +325,11 @@ type oidcAuthenticator struct {
 	browserScope               string
 	authorizationEndpoint      string
 	tokenEndpoint              string
+	// approver is the operator approver mapping, or nil. workspaceAudiences
+	// is the set the approver audience must be disjoint from, and that
+	// decides which branch a token is minted on.
+	approver           *approverMapping
+	workspaceAudiences map[string]struct{}
 }
 
 func newOIDCAuthenticator(
@@ -403,6 +413,38 @@ func newOIDCAuthenticator(
 				"-oidc-contributor-values, or -oidc-fleet-values mapping is required")
 	}
 
+	var approver *approverMapping
+	if path := strings.TrimSpace(config.approverMappingFile); path != "" {
+		approver, err = loadApproverMapping(path, issuer, audiences)
+		if err != nil {
+			return nil, err
+		}
+		// The approval service separates approver from requester by
+		// identity. An approver is always oidc:<iss>#<sub>, so the workspace
+		// principals it is compared against must be named the same way: under
+		// a legacy identity mode (entra:<oid>, or another subject claim) the
+		// same human would carry two unrelated identities, and could approve
+		// their own request.
+		if subjectClaim != "sub" || subjectFallbackClaim != "" ||
+			config.trimIdentityValues ||
+			(config.identityPrefix != "" &&
+				config.identityPrefix != oidcIdentityPrefix+issuer+"#") {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"-oidc-approver-mapping-file requires the default OIDC "+
+					"identity (subject claim sub, identities oidc:<iss>#<sub>); "+
+					"it cannot be combined with the legacy Entra identity mode")
+		}
+	}
+	workspaceAudiences := make(map[string]struct{}, len(audiences))
+	for _, audience := range audiences {
+		workspaceAudiences[audience] = struct{}{}
+	}
+	parserAudiences := append([]string(nil), audiences...)
+	if approver != nil {
+		parserAudiences = append(parserAudiences, approver.audience)
+	}
+
 	httpClient := config.httpClient
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: oidcHTTPTimeout}
@@ -436,7 +478,7 @@ func newOIDCAuthenticator(
 	parser := jwt.NewParser(
 		jwt.WithValidMethods(algorithmNames),
 		jwt.WithIssuer(issuer),
-		jwt.WithAudience(audiences...),
+		jwt.WithAudience(parserAudiences...),
 		jwt.WithExpirationRequired(),
 		jwt.WithLeeway(skew),
 		jwt.WithTimeFunc(clock),
@@ -483,6 +525,8 @@ func newOIDCAuthenticator(
 		browserScope:               strings.TrimSpace(config.browserScope),
 		authorizationEndpoint:      strings.TrimSpace(config.authorizationEndpoint),
 		tokenEndpoint:              strings.TrimSpace(config.tokenEndpoint),
+		approver:                   approver,
+		workspaceAudiences:         workspaceAudiences,
 	}, nil
 }
 
@@ -749,7 +793,7 @@ func (a *oidcAuthenticator) authenticate(
 	if _, err := a.parser.ParseWithClaims(raw, claims, keyFunc); err != nil {
 		return auth.Decision{}, err
 	}
-	return a.mint(claims)
+	return a.mint(ctx, claims)
 }
 
 // keyFuncForContext returns a jwt.Keyfunc bound to the request context so JWKS
@@ -800,7 +844,30 @@ func (a *oidcAuthenticator) keyFuncForContext(ctx context.Context) jwt.Keyfunc {
 }
 
 // mint maps validated claims to a conservatively-scoped decision.
-func (a *oidcAuthenticator) mint(claims jwt.MapClaims) (auth.Decision, error) {
+//
+// With an approver mapping configured, the audience decides the branch and
+// nothing else does: a token on the approver audience is minted as an
+// approver or denied, and a token on a workspace audience is minted by the
+// workspace mappings, which never grant approve. A token on both is denied.
+func (a *oidcAuthenticator) mint(
+	ctx context.Context, claims jwt.MapClaims,
+) (auth.Decision, error) {
+	if a.approver != nil {
+		approver, err := a.approverAudience(claims)
+		if err != nil {
+			return auth.Decision{}, err
+		}
+		if approver {
+			return a.mintApprover(ctx, claims)
+		}
+	}
+	return a.mintWorkspace(claims)
+}
+
+// mintWorkspace mints a token on a workspace audience.
+func (a *oidcAuthenticator) mintWorkspace(
+	claims jwt.MapClaims,
+) (auth.Decision, error) {
 	subject, err := requiredStringClaim(claims, a.subjectClaim)
 	if errors.Is(err, errMissingMappedClaim) && a.subjectFallbackClaim != "" {
 		subject, err = requiredStringClaim(claims, a.subjectFallbackClaim)
@@ -1174,6 +1241,9 @@ type oidcMetadata struct {
 	JWKSURI               string `json:"jwks_uri"`
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
+	// SubjectTypesSupported decides whether the issuer can back an
+	// approver mapping; see approverSubjectTypesPublic.
+	SubjectTypesSupported []string `json:"subject_types_supported,omitempty"`
 }
 
 // oidcMetadataCache resolves the issuer's discovery document once and shares it

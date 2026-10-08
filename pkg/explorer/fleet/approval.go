@@ -71,6 +71,12 @@ var (
 	// generation other than the one the request was made under.
 	ErrApprovalSuperseded = errors.New(
 		"fleet approval: policy generation has moved since the request")
+	// ErrApproverMappingMoved reports a decision, or a materialization of
+	// one, under an approver mapping other than the one in force: the
+	// approver's credential was minted under a mapping that has since
+	// changed, or the mapping changed between the approval and its use.
+	ErrApproverMappingMoved = errors.New(
+		"fleet approval: approver mapping has moved since the decision")
 )
 
 // approvalRequired is what enqueue and invoke return for an action that
@@ -182,6 +188,15 @@ type ApprovalRecord struct {
 	DecidedAt                time.Time
 	DecisionRequestID        shoal.ID
 	DecisionCorrelationID    shoal.ID
+	// ApproverMappingDigest is the operator approver mapping the decision
+	// was made under, and ApproverProvenance is the claim that mapped the
+	// approver to the role (#451). Both are zero for a decision made by an
+	// approver no mapping granted, and for every record written before they
+	// existed: they are additive, so an older record decodes unchanged. An
+	// approved record is materialized only while ApproverMappingDigest is
+	// still the digest in force. Neither ever holds token bytes.
+	ApproverMappingDigest auth.Digest
+	ApproverProvenance    auth.GrantProvenance
 	// MaterializedAt is when the approved request was committed to become
 	// work. It is written by the approved → enqueued compare-and-set, before
 	// the ActionRecord exists, and is the UpdatedAt the ActionRecord is
@@ -279,7 +294,9 @@ func (r ApprovalRecord) Validate() error {
 		r.ApproverClientID != "" ||
 		r.ApproverFingerprint != (auth.Fingerprint{}) ||
 		r.ApproverPolicyGeneration != 0 || !r.DecidedAt.IsZero() ||
-		r.DecisionRequestID != "" || r.DecisionCorrelationID != "" {
+		r.DecisionRequestID != "" || r.DecisionCorrelationID != "" ||
+		r.ApproverMappingDigest != (auth.Digest{}) ||
+		r.ApproverProvenance.Set() {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"an undecided approval carries approver provenance")
@@ -327,6 +344,17 @@ func (r ApprovalRecord) validateDecision() error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "approval decision provenance is incomplete")
 	}
+	// The mapping digest and the provenance are written together: a digest
+	// with no claim behind it, or a claim under a different digest, is not a
+	// record any decide wrote.
+	if err := r.ApproverProvenance.Validate(); err != nil {
+		return err
+	}
+	if r.ApproverProvenance.MappingDigest != r.ApproverMappingDigest {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"approval mapping digest does not match its provenance")
+	}
 	return nil
 }
 
@@ -336,6 +364,7 @@ func CloneApprovalRecord(input ApprovalRecord) ApprovalRecord {
 	result.ID = append([]byte(nil), input.ID...)
 	result.Request = cloneActionRecord(input.Request)
 	result.RequestDigest = append([]byte(nil), input.RequestDigest...)
+	result.ApproverProvenance = input.ApproverProvenance.Clone()
 	return result
 }
 
@@ -430,6 +459,10 @@ type ApprovalAudit struct {
 	RequestID                shoal.ID
 	AuthorizationFingerprint auth.Fingerprint
 	AuthorizationExpiresAt   time.Time
+	// Provenance is the acting decision's grant provenance: which operator
+	// mapping, and which claim value, made it an approver. It is empty for a
+	// principal no mapping granted. It never carries token bytes.
+	Provenance auth.GrantProvenance
 }
 
 type ApprovalRecorder interface {
@@ -457,6 +490,17 @@ type ApprovalConfig struct {
 	// the one in force; deciding and reporting against the token's would
 	// approve, or call live, a request under a superseded policy.
 	Generations auth.GenerationReader
+	// ApproverMapping returns the digest of the operator approver mapping in
+	// force (#451), or the zero digest when none is configured. Optional:
+	// nil means no mapping. Decide requires the approver's decision to have
+	// been minted under exactly this digest and records it; an approved
+	// request is materialized only while it is still the one in force.
+	//
+	// It is a digest of the mapping rather than a policy generation on
+	// purpose. The workspace generation is fixed configuration, and deriving
+	// one from a hash could move it backwards; the digest only ever needs to
+	// be compared for equality.
+	ApproverMapping func(context.Context) (auth.Digest, error)
 	// Window is how long a request stays decidable. Zero means
 	// DefaultApprovalWindow. It is clamped to each request's deadline.
 	Window time.Duration
@@ -468,6 +512,7 @@ type ApprovalService struct {
 	recorder    ApprovalRecorder
 	narrowed    func(context.Context) bool
 	generations auth.GenerationReader
+	mapping     func(context.Context) (auth.Digest, error)
 	window      time.Duration
 }
 
@@ -488,8 +533,27 @@ func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
 	return &ApprovalService{
 		dispatch: config.Dispatch, store: config.Store,
 		recorder: config.Recorder, narrowed: config.Narrowed,
-		generations: config.Generations, window: window,
+		generations: config.Generations, mapping: config.ApproverMapping,
+		window: window,
 	}, nil
+}
+
+// approverMapping returns the approver mapping digest in force, or the zero
+// digest when the host configures none.
+func (s *ApprovalService) approverMapping(
+	ctx context.Context,
+) (auth.Digest, error) {
+	if s.mapping == nil {
+		return auth.Digest{}, nil
+	}
+	return s.mapping(ctx)
+}
+
+func approverMappingMoved() error {
+	return shoal.WrapError(
+		shoal.ErrorConflict,
+		"the approver mapping a decision was made under is no longer in force",
+		ErrApproverMappingMoved)
 }
 
 // ApprovalReceipt answers a request. State is where the request is; Action is
@@ -533,6 +597,11 @@ const (
 	// ApprovalConditionPolicyMoved: the policy generation has moved since the
 	// request was made. Neither the approver nor the requester can act on it.
 	ApprovalConditionPolicyMoved ApprovalCondition = "policy_generation_moved"
+	// ApprovalConditionApproverMappingMoved: approved, but the operator
+	// approver mapping in force is not the one the approval was given under.
+	// The approval can never materialize; a pending request is unaffected
+	// until it is decided.
+	ApprovalConditionApproverMappingMoved ApprovalCondition = "approver_mapping_moved"
 	// ApprovalConditionDeadlinePassed: the request's action deadline has
 	// passed, so it can no longer be re-requested and so never materialized.
 	ApprovalConditionDeadlinePassed ApprovalCondition = "deadline_passed"
@@ -792,6 +861,17 @@ func (s *ApprovalService) advance(
 				shoal.ErrorConflict,
 				"the policy generation an approval was given under is no "+
 					"longer in force", ErrApprovalSuperseded)
+		}
+		// And so must the approver mapping. The approver was an approver
+		// because a mapping said so; if the operator has changed it since,
+		// that statement is no longer one the operator stands behind. The
+		// row stays approved, and Status reports approver_mapping_moved.
+		mapping, err := s.approverMapping(ctx)
+		if err != nil {
+			return ApprovalReceipt{}, err
+		}
+		if mapping != current.ApproverMappingDigest {
+			return ApprovalReceipt{}, approverMappingMoved()
 		}
 		next := CloneApprovalRecord(current)
 		next.Version++
@@ -1084,6 +1164,19 @@ func (s *ApprovalService) decide(
 			"approval policy generation does not match the request",
 			ErrApprovalSuperseded)
 	}
+	// The approver must have been made one under the mapping now in force.
+	// A credential minted under an earlier mapping is a statement the
+	// operator has since withdrawn or changed. Where no mapping is
+	// configured both are zero, and a decision without provenance passes;
+	// where one is, a decision without provenance does not.
+	mapping, err := s.approverMapping(ctx)
+	if err != nil {
+		return ApprovalRecord{}, err
+	}
+	provenance := decision.GrantProvenance()
+	if provenance.MappingDigest != mapping {
+		return ApprovalRecord{}, approverMappingMoved()
+	}
 	if !bytes.Equal(request.RequestDigest, current.RequestDigest) {
 		return ApprovalRecord{}, approvalConflict()
 	}
@@ -1106,6 +1199,8 @@ func (s *ApprovalService) decide(
 	next.DecidedAt = notBefore(now, current)
 	next.DecisionRequestID = decision.RequestID()
 	next.DecisionCorrelationID = decision.CorrelationID()
+	next.ApproverMappingDigest = provenance.MappingDigest
+	next.ApproverProvenance = provenance
 	next.UpdatedAt = next.DecidedAt
 	stored, err := s.commit(
 		ctx, "approval_decision", auth.OperationActionApprove,
@@ -1237,6 +1332,16 @@ func (s *ApprovalService) eligibility(
 		involved[ancestor.Subject] = struct{}{}
 		involved[ancestor.Actor] = struct{}{}
 	}
+	// Read this loop as one comparison for an OIDC approver, not two. A
+	// mapped approver's decision is minted with actor = subject
+	// (oidc:<iss>#<sub>), so both iterations test the same identity. That is
+	// not a weakening: before #451 slice 2 every OIDC token's actor was the
+	// literal shoal-explore-web-oidc, a constant no principal controlled, and
+	// it made this check fire on every OIDC requester/approver pair — no
+	// OIDC approver could approve any OIDC request (failing closed, under a
+	// refusal that misdescribed the cause). The separation margin for an
+	// OIDC approver is exactly "the subject must not overlap anyone
+	// involved".
 	for _, identity := range []shoal.ID{decision.Subject(), decision.Actor()} {
 		if _, overlaps := involved[identity]; overlaps {
 			return Descriptor{}, shoal.NewError(
@@ -1376,6 +1481,15 @@ func (s *ApprovalService) effectiveState(
 	if condition != ApprovalConditionNone {
 		return ApprovalUnresolvable, condition, nil
 	}
+	if current.State == ApprovalApproved {
+		mapping, err := s.approverMapping(ctx)
+		if err != nil {
+			return "", "", err
+		}
+		if mapping != current.ApproverMappingDigest {
+			return ApprovalUnresolvable, ApprovalConditionApproverMappingMoved, nil
+		}
+	}
 	return current.State, ApprovalConditionNone, nil
 }
 
@@ -1485,6 +1599,7 @@ func (s *ApprovalService) commit(
 		RequestID:                decision.RequestID(),
 		AuthorizationFingerprint: fingerprint,
 		AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+		Provenance:               decision.GrantProvenance(),
 	}); err != nil {
 		return ApprovalRecord{}, errors.Join(ErrRecordingUnavailable, err)
 	}
