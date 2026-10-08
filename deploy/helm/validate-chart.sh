@@ -479,6 +479,32 @@ assert_renders "a non-ASCII model name still renders" '\-model=modèle-é"$' "${
 renders "a trailing newline the template trims is not a control character in the value" "${llm_gateway_base[@]}" --set-string 'llmGateway.identity.action=complete
 '
 
+note "== a name override cannot carry YAML of its own =="
+# Both overrides are rendered unquoted into names and labels on every object.
+# A line break in either used to end the scalar and inject the remainder:
+# fullnameOverride "x<newline>  namespace: kube-system" moved the gateway's
+# objects into kube-system.
+refuses_citing "fullnameOverride" "a newline in fullnameOverride" "${llm_gateway_base[@]}" --set-string 'fullnameOverride=x
+  namespace: kube-system'
+refuses_citing "nameOverride" "a newline in nameOverride" -f "$chart/values.yaml" --set-string 'nameOverride=x
+  namespace: kube-system'
+refuses_citing "fullnameOverride" "a NEL in fullnameOverride" -f "$chart/values.yaml" --set-string "fullnameOverride=x$(printf '\u0085')y"
+refuses_citing "fullnameOverride" "a full name that cannot be a Service name" -f "$chart/values.yaml" --set-string fullnameOverride=9shoal
+refuses_citing "nameOverride" "an upper-case name override" -f "$chart/values.yaml" --set-string nameOverride=Shoal
+refuses_citing "fullnameOverride" "a full name over 63 characters" -f "$chart/values.yaml" --set-string fullnameOverride=$(printf 'a%.0s' $(seq 1 64))
+refuses_citing "nameOverride" "a non-string name override" -f "$chart/values.yaml" --set nameOverride=7
+# The contrast: ordinary overrides still render, and an empty one is unset.
+assert_renders "a valid fullnameOverride names the gateway" '^  name: platform-llm-gateway$' "${llm_gateway_base[@]}" --set-string fullnameOverride=platform
+assert_renders "a valid nameOverride names the release's objects" 'app.kubernetes.io/name: "lake"' -f "$chart/values.yaml" --set-string nameOverride=lake
+assert_renders "beside a full name, a label-valid name override still renders" 'app.kubernetes.io/name: "Shoal.App_v2"' -f "$chart/values.yaml" --set-string fullnameOverride=shoal --set-string nameOverride=Shoal.App_v2
+refuses_citing "nameOverride" "beside a full name, a newline in the name override" -f "$chart/values.yaml" --set-string fullnameOverride=shoal --set-string 'nameOverride=x
+  namespace: kube-system'
+# A label must be a string: a name override that YAML would read as a number
+# or boolean stays one once quoted.
+assert_renders "a numeric-looking name override stays a string label" 'app.kubernetes.io/name: "1.5"' -f "$chart/values.yaml" --set-string fullnameOverride=shoal --set-string nameOverride=1.5
+renders "an empty fullnameOverride is unset" -f "$chart/values.yaml" --set-string fullnameOverride=
+renders "a 63-character fullnameOverride still renders" -f "$chart/values.yaml" --set-string fullnameOverride=$(printf 'a%.0s' $(seq 1 63))
+
 note "== llm gateway guards refuse =="
 # The gateway's failure mode is not a crash. It is required to fail closed, so
 # nearly every misconfiguration below renders a pod that passes every probe and
