@@ -63,7 +63,9 @@ var FleetErrorCodes = []string{
 	"executor_error",
 }
 
-// errorCodeKey maps a recorded error code to its catalog stem. ok is false
+// errorCodeKey maps a recorded error code to its catalog stem. A known code
+// is still only what was reported: the record does not say who assigned it
+// (#508), so its templates state the meaning conditionally. ok is false
 // for a code outside both closed sets: an executor may record any bounded
 // string, and such a code is shown only as a quotation.
 func errorCodeKey(code string) (stem string, status int, ok bool) {
@@ -190,6 +192,9 @@ var (
 	}
 )
 
+// A result does not say whether the service or the predictor set its reason
+// (#509), so these are narrated conditionally and attributed to both.
+//
 // DecisionServiceReasons are the whole-request reasons the decision service
 // writes (internal/decisionservice/service.go, terminal(...)), by status.
 // Mirrored for the same reason as the gateway codes. A predictor may return

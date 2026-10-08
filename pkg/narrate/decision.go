@@ -74,7 +74,8 @@ func (r *Renderer) Prediction(p decision.PredictionRecord, opts Options) ([]Sent
 	}
 	b.add(RoleOutcome, "decision.outcome."+string(result.Status), args, baseRefs...)
 
-	// Why a whole request has no answers.
+	// Why a whole request has no answers. The reason may be the service's or
+	// the predictor's own, and the record does not say which (#509).
 	reasonKey := ""
 	if result.Status != decision.Completed {
 		if knownDecisionReason(result.Status, result.Reason) {

@@ -156,14 +156,14 @@ a predictor's own whole-request or per-answer reason.
 Fleet checks only an `ErrorCode`'s length and whitespace, so an executor can
 report any code, including a gateway code or one fleet itself writes
 (`invalid_executor_output`, `executor_error`). The record does not say who
-assigned it. Every error sentence is therefore phrased as a report — "The
+assigned it (#508). Every error sentence is therefore phrased as a report — "The
 failure was reported as outcome_unknown, which, if accurate, means …" — and
 never states a gateway or fleet meaning as fact. Retry advice is derived only
 from the record's `EffectPossible` and state: while an effect is possible, the
 next step is always to reconcile with the target, whatever the code says.
 
 Likewise, the decision service writes its own whole-request reasons and passes
-a predictor's through unchanged. A whole-request abstention or failure reason
+a predictor's through unchanged, and the result does not say which (#509). A whole-request abstention or failure reason
 is attributed to "the predictor or the service" (`predictor_or_service` on a
 quote), its meaning is conditional ("if accurate"), and its next step starts
 "If …". A success is "reported as succeeded by" the claimant, or the admitted
@@ -239,8 +239,10 @@ selectors by import path to deny `Now`, `Since`, `Until`, `After`, `Tick`,
   history lands (#438/#430), add an `ActionRecord` history sentence per
   attempt.
 - Neither `ErrorCode` nor a decision result records who assigned the code or
-  reason. Once fleet and the decision service record that, codes Shoal itself
-  assigned can be narrated as Shoal's determinations.
+  reason: #508 (fleet: an action record doesn't say who assigned its error
+  code) and #509 (decision: a result doesn't say whether the service or the
+  predictor set its reason). Once they are resolved, codes and reasons Shoal
+  itself assigned can be narrated as Shoal's determinations.
 - The source state of each `DispatchEdges` edge is checked against fleet's
   guards by review, not by test: the guards are spread through fleet's
   services. A transition table exported by fleet would let the test check them.
