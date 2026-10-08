@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -123,6 +124,21 @@ func identityDigest(a Attribution) string {
 func receiptID(scope string, target shoal.ID, identity, key string) shoal.ID {
 	return shoal.ID("adjudication-receipt:" + digestParts("adjudication-receipt-v1", scope, string(target), identity, key))
 }
+
+// ReceiptID derives an idempotency receipt identity without reading storage.
+// Scope and attribution must already have been resolved by a trusted caller.
+// Its encoding is identical to the journal's existing receipt derivation.
+func ReceiptID(scope Scope, targetID shoal.ID, key []byte, attribution Attribution) (shoal.ID, error) {
+	if len(key) == 0 || len(key) > shoal.MaxIDBytes || !textID(targetID) || !validAttribution(attribution) {
+		return "", invalid()
+	}
+	sd, e := scopeDigest(scope)
+	if e != nil {
+		return "", e
+	}
+	return receiptID(sd, targetID, identityDigest(attribution), hash(key)), nil
+}
+
 func (s *Store) coordinate(scope string, target shoal.ID) allocator.Coordinate {
 	return allocator.Coordinate{Row: []byte("adjudication-journal:" + digestParts("adjudication-journal-v1", scope, string(target))), Family: []byte("j"), Qualifier: []byte("history"), Visibility: append([]byte(nil), s.config.Visibility...)}
 }
@@ -192,10 +208,44 @@ func lookup(j journal, id shoal.ID, proposal shoal.ID, basis shoal.ID) (Receipt,
 	return Receipt{}, false, nil
 }
 
+// detachedHistory keeps the guard outside the mutable journal representation.
+// Opaque authenticated IDs are copied as bytes through their shoal.ID values.
+func detachedHistory(j journal) []Receipt {
+	history := make([]Receipt, len(j.Entries))
+	for i, e := range j.Entries {
+		r := e.Receipt
+		r.ProposalConfig.ObservationReceiptIDs = slices.Clone(r.ProposalConfig.ObservationReceiptIDs)
+		r.ProposalConfig.WitnessIDs = slices.Clone(r.ProposalConfig.WitnessIDs)
+		if r.ProposalConfig.Truth != nil {
+			value := *r.ProposalConfig.Truth
+			r.ProposalConfig.Truth = &value
+		}
+		r.Adjudicator.OnBehalfOf = slices.Clone(r.Adjudicator.OnBehalfOf)
+		history[i] = r
+	}
+	return history
+}
+
 // Append attempts one CAS only. Exact retries replay the original server time
 // and attribution even when later adjudications have advanced the target head.
 // The proposal AND retained basis reference must match for an exact retry.
 func (s *Store) Append(ctx context.Context, scope Scope, key []byte, proposal decision.AdjudicationProposal, attribution Attribution, basisID shoal.ID) (Receipt, error) {
+	return s.append(ctx, scope, key, proposal, attribution, basisID, nil)
+}
+
+// AppendChecked rechecks the trusted service's authorization after all journal
+// reads and validation, immediately before the CAS or a pre-CAS response. The
+// guard receives a detached history from the exact read used for that CAS (nil
+// if the read failed). It can reauthorize newly added history as well. Guard
+// failures are returned unchanged and never imply an attempted journal write.
+// The service remains responsible for authorization after a CAS attempt.
+func (s *Store) AppendChecked(ctx context.Context, scope Scope, key []byte, proposal decision.AdjudicationProposal, attribution Attribution, basisID shoal.ID, guard func(context.Context, []Receipt) error) (Receipt, error) {
+	if guard == nil {
+		return Receipt{}, invalid()
+	}
+	return s.append(ctx, scope, key, proposal, attribution, basisID, guard)
+}
+func (s *Store) append(ctx context.Context, scope Scope, key []byte, proposal decision.AdjudicationProposal, attribution Attribution, basisID shoal.ID, guard func(context.Context, []Receipt) error) (Receipt, error) {
 	if len(key) == 0 || len(key) > shoal.MaxIDBytes || proposal.Validate() != nil || !validAttribution(attribution) || !textID(basisID) {
 		return Receipt{}, invalid()
 	}
@@ -206,12 +256,24 @@ func (s *Store) Append(ctx context.Context, scope Scope, key []byte, proposal de
 	identity := identityDigest(attribution)
 	kd := hash(key)
 	id := receiptID(sd, proposal.TargetID(), identity, kd)
+	var guardedHistory []Receipt
+	checkedReturn := func(r Receipt, e error) (Receipt, error) {
+		if guard != nil {
+			if denied := guard(ctx, guardedHistory); denied != nil {
+				return Receipt{}, denied
+			}
+		}
+		return r, e
+	}
 	j, old, e := s.read(ctx, sd, proposal.TargetID())
 	if e != nil {
-		return Receipt{}, e
+		return checkedReturn(Receipt{}, e)
+	}
+	if guard != nil {
+		guardedHistory = detachedHistory(j)
 	}
 	if r, found, e := lookup(j, id, proposal.ID(), basisID); found {
-		return r, e
+		return checkedReturn(r, e)
 	}
 	cfg := proposal.Config()
 	var head shoal.ID
@@ -219,29 +281,29 @@ func (s *Store) Append(ctx context.Context, scope Scope, key []byte, proposal de
 		head = j.Entries[len(j.Entries)-1].Receipt.ID
 	}
 	if cfg.ExpectedHeadID != head || cfg.ExpectedVersion != int64(len(j.Entries)) {
-		return Receipt{}, ErrConflict
+		return checkedReturn(Receipt{}, ErrConflict)
 	}
 	if len(j.Entries) >= MaxEntries {
-		return Receipt{}, ErrLimit
+		return checkedReturn(Receipt{}, ErrLimit)
 	}
 	now, e := s.now()
 	if e != nil {
-		return Receipt{}, e
+		return checkedReturn(Receipt{}, e)
 	}
 	if len(j.Entries) > 0 && now.Before(j.Entries[len(j.Entries)-1].Receipt.ReceivedAt) {
-		return Receipt{}, ErrUnavailable
+		return checkedReturn(Receipt{}, ErrUnavailable)
 	}
 	receipt := Receipt{BasisID: basisID, ID: id, Version: int64(len(j.Entries) + 1), TargetID: proposal.TargetID(), TaskID: proposal.TaskID(), PictureID: proposal.PictureID(), PolicyID: proposal.PolicyID(), ProposalID: proposal.ID(), ProposalConfig: cfg, Adjudicator: attribution, ReceivedAt: now}
 	j.Entries = append(j.Entries, entry{receipt, kd, identity})
 	encoded, e := encode(j)
 	if e != nil {
-		return Receipt{}, e
+		return checkedReturn(Receipt{}, e)
 	}
 	if e = validateJournal(j); e != nil {
-		return Receipt{}, ErrCorrupt
+		return checkedReturn(Receipt{}, ErrCorrupt)
 	}
 	if ctx.Err() != nil {
-		return Receipt{}, ErrUnavailable
+		return checkedReturn(Receipt{}, ErrUnavailable)
 	}
 	coord := s.coordinate(sd, proposal.TargetID())
 	condition := allocator.Condition{Coordinate: coord, Absent: old == nil}
@@ -249,6 +311,15 @@ func (s *Store) Append(ctx context.Context, scope Scope, key []byte, proposal de
 		condition.Value = old
 		condition.TimestampSet = true
 		condition.Timestamp = receipt.Version - 1
+	}
+	if guard != nil {
+		if e = guard(ctx, guardedHistory); e != nil {
+			return Receipt{}, e
+		}
+	}
+	// A guard may consume the remaining deadline without returning an error.
+	if ctx.Err() != nil {
+		return Receipt{}, ErrUnavailable
 	}
 	status, writeErr := s.config.Backend.CompareAndMutate(ctx, allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{condition}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: receipt.Version, Value: encoded}}})
 	current, _, e := s.read(ctx, sd, proposal.TargetID())

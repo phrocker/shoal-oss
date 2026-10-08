@@ -564,3 +564,219 @@ func TestBasisIsRequiredAndPartOfExactReplay(t *testing.T) {
 		t.Fatal("missing persisted basis accepted", e)
 	}
 }
+
+func TestReceiptIDMatchesStoredIdentityAndOpaqueAttribution(t *testing.T) {
+	scope := Scope{Domain: []byte("domain")}
+	id, err := ReceiptID(scope, "target:fixed", []byte{0, 255}, attribution())
+	if err != nil || id != "adjudication-receipt:1cb7fbd2109aba11a3c2d523bcc5431bbbbe1b879036506800f1f56f3f859936" {
+		t.Fatalf("identity encoding changed: %s %v", id, err)
+	}
+	policy, p, c, clock := fixture(t)
+	proposal := proposed(t, policy, p, c)
+	a := attribution()
+	a.SubjectID = shoal.ID(string([]byte{255, 0}))
+	a.ActorID = shoal.ID(string([]byte{254, 1}))
+	a.ClientID = shoal.ID(string([]byte{253}))
+	a.OnBehalfOf = []shoal.ID{shoal.ID(string([]byte{252, 0}))}
+	want, err := ReceiptID(scope, proposal.TargetID(), []byte{0, 255}, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &memoryCAS{}
+	s, _ := New(Config{Backend: backend, Clock: clock})
+	got, err := s.Append(context.Background(), scope, []byte{0, 255}, proposal, a, "basis:1")
+	if err != nil || got.ID != want {
+		t.Fatalf("stored %s expected %s: %v", got.ID, want, err)
+	}
+	a.AuthorizationFingerprint = "auth-sha256:" + strings.Repeat("c", 64)
+	rotated, err := ReceiptID(scope, proposal.TargetID(), []byte{0, 255}, a)
+	if err != nil || rotated != want {
+		t.Fatalf("grant rotation changed stable identity: %v", err)
+	}
+	for _, tc := range []struct {
+		scope  Scope
+		target shoal.ID
+		key    []byte
+		a      Attribution
+	}{
+		{Scope{}, "target", []byte("key"), a}, {scope, "", []byte("key"), a}, {scope, "target", nil, a}, {scope, "target", make([]byte, shoal.MaxIDBytes+1), a}, {scope, "target", []byte("key"), Attribution{}},
+	} {
+		if _, err := ReceiptID(tc.scope, tc.target, tc.key, tc.a); err == nil {
+			t.Fatal("accepted invalid identity arguments")
+		}
+	}
+}
+
+type readHookCAS struct {
+	*memoryCAS
+	afterRead func()
+}
+
+func (b *readHookCAS) ReadExact(ctx context.Context, coords []allocator.Coordinate) ([]allocator.Cell, error) {
+	cells, err := b.memoryCAS.ReadExact(ctx, coords)
+	if b.afterRead != nil {
+		b.afterRead()
+	}
+	return cells, err
+}
+
+func TestAppendCheckedGuardsEveryReadDependentResponse(t *testing.T) {
+	for _, mode := range []string{"new", "retry", "key conflict", "head conflict", "read failure", "corrupt", "limit"} {
+		t.Run(mode, func(t *testing.T) {
+			policy, p, c, clock := fixture(t)
+			proposal := proposed(t, policy, p, c)
+			backend := &readHookCAS{memoryCAS: &memoryCAS{}}
+			s, _ := New(Config{Backend: backend, Clock: clock})
+			ctx := context.Background()
+			scope := Scope{[]byte("domain")}
+			key := []byte("key")
+			basis := shoal.ID("basis:1")
+			if mode == "retry" || mode == "key conflict" || mode == "head conflict" || mode == "limit" || mode == "corrupt" {
+				r, err := s.Append(ctx, scope, key, proposal, attribution(), basis)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "key conflict" {
+					basis = "basis:other"
+				}
+				if mode == "head conflict" {
+					key = []byte("other")
+				}
+				if mode == "limit" {
+					for i := 1; i < MaxEntries; i++ {
+						c.ExpectedHeadID = r.ID
+						c.ExpectedVersion = r.Version
+						r, err = s.Append(ctx, scope, []byte(fmt.Sprintf("entry%d", i)), proposed(t, policy, p, c), attribution(), basis)
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					c.ExpectedHeadID = r.ID
+					c.ExpectedVersion = r.Version
+					proposal = proposed(t, policy, p, c)
+					key = []byte("overflow")
+				}
+				if mode == "corrupt" {
+					for k, cell := range backend.cells {
+						cell.Value = []byte("{}")
+						backend.cells[k] = cell
+					}
+				}
+			}
+			if mode == "read failure" {
+				backend.readFail.Store(true)
+			}
+			before := backend.writes.Load()
+			revoked := false
+			backend.afterRead = func() { revoked = true }
+			denied := errors.New("current authority denied")
+			calls := 0
+			r, err := s.AppendChecked(ctx, scope, key, proposal, attribution(), basis, func(_ context.Context, h []Receipt) error {
+				calls++
+				if !revoked {
+					t.Fatal("guard ran before storage read")
+				}
+				if (mode == "read failure" || mode == "corrupt") && h != nil {
+					t.Fatal("failed read supplied history")
+				}
+				return denied
+			})
+			if err != denied || r.ID != "" || backend.writes.Load() != before || calls != 1 {
+				t.Fatalf("response %+v %v writes=%d calls=%d", r, err, backend.writes.Load()-before, calls)
+			}
+		})
+	}
+}
+
+func TestAppendCheckedExactHistoryDetachedAndUncertaintyUnchanged(t *testing.T) {
+	policy, p, c, clock := fixture(t)
+	ctx := context.Background()
+	scope := Scope{[]byte("domain")}
+	backend := &memoryCAS{}
+	s, _ := New(Config{Backend: backend, Clock: clock})
+	a := attribution()
+	a.OnBehalfOf = []shoal.ID{"delegate"}
+	first := proposed(t, policy, p, c)
+	r1, err := s.Append(ctx, scope, []byte("first"), first, a, "basis:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.ExpectedHeadID = r1.ID
+	c.ExpectedVersion = 1
+	second := proposed(t, policy, p, c)
+	r2, err := s.Append(ctx, scope, []byte("second"), second, a, "basis:2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate := func(_ context.Context, h []Receipt) error {
+		if len(h) != 2 || h[0].ID != r1.ID || h[1].ID != r2.ID {
+			t.Fatalf("guard omitted latest stored history: %+v", h)
+		}
+		h[0].ProposalConfig.ObservationReceiptIDs[0] = "changed"
+		h[0].ProposalConfig.WitnessIDs[0] = "changed"
+		h[0].Adjudicator.OnBehalfOf[0] = "changed"
+		h[0].ID = "changed"
+		return nil
+	}
+	replay, err := s.AppendChecked(ctx, scope, []byte("first"), first, a, "basis:1", mutate)
+	if err != nil || !reflect.DeepEqual(replay, r1) {
+		t.Fatalf("guard mutated replay: %+v %v", replay, err)
+	}
+	c.ExpectedHeadID = r2.ID
+	c.ExpectedVersion = 2
+	third := proposed(t, policy, p, c)
+	r3, err := s.AppendChecked(ctx, scope, []byte("third"), third, a, "basis:3", mutate)
+	if err != nil || r3.Version != 3 {
+		t.Fatalf("guard mutated CAS journal: %+v %v", r3, err)
+	}
+	history, err := s.History(ctx, scope, first.TargetID())
+	if err != nil || !reflect.DeepEqual(history[:2], []Receipt{r1, r2}) {
+		t.Fatalf("guard changed stored history: %v", err)
+	}
+	if _, err = s.AppendChecked(ctx, scope, []byte("nil"), third, a, "basis:3", nil); err == nil {
+		t.Fatal("accepted nil guard")
+	}
+	c.ExpectedHeadID = r3.ID
+	c.ExpectedVersion = 3
+	fourth := proposed(t, policy, p, c)
+	backend.afterCAS = func() { backend.readFail.Store(true) }
+	calls := 0
+	_, err = s.AppendChecked(ctx, scope, []byte("fourth"), fourth, a, "basis:4", func(_ context.Context, h []Receipt) error {
+		calls++
+		if len(h) != 3 {
+			t.Fatal("wrong fourth history")
+		}
+		return nil
+	})
+	if !errors.Is(err, ErrIndeterminate) || calls != 1 {
+		t.Fatalf("post-CAS uncertainty lost: %v calls=%d", err, calls)
+	}
+}
+
+func TestDetachedHistoryCopiesTruthAndPreservesNil(t *testing.T) {
+	truth := true
+	original := journal{Entries: []entry{{Receipt: Receipt{ProposalConfig: decision.AdjudicationProposalConfig{Truth: &truth}}}}}
+	detached := detachedHistory(original)
+	*detached[0].ProposalConfig.Truth = false
+	if !truth || detached[0].ProposalConfig.ObservationReceiptIDs != nil || detached[0].ProposalConfig.WitnessIDs != nil || detached[0].Adjudicator.OnBehalfOf != nil {
+		t.Fatal("detached history aliases truth or changes nil fields")
+	}
+}
+
+func TestAppendCheckedCanceledByGuardNeverWrites(t *testing.T) {
+	policy, p, c, clock := fixture(t)
+	backend := &memoryCAS{}
+	s, _ := New(Config{Backend: backend, Clock: clock})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err := s.AppendChecked(ctx, Scope{[]byte("domain")}, []byte("key"), proposed(t, policy, p, c), attribution(), "basis:1", func(_ context.Context, h []Receipt) error {
+		if h == nil || len(h) != 0 {
+			t.Fatal("absent journal must be empty successful history")
+		}
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, ErrUnavailable) || errors.Is(err, ErrIndeterminate) || backend.writes.Load() != 0 {
+		t.Fatalf("canceled guard wrote or implied write: %v", err)
+	}
+}
