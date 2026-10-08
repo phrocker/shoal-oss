@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"sort"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/lexicon"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -165,15 +164,13 @@ func (a *Analysis) fill(index int, receipt Receipt) (Proposal, error) {
 		return slotAbstain(ReasonInvalidInput, nil), nil
 	}
 	schema := target.SlotSchema
-	action := fleet.Action{InputSchema: schema}
 	if c.kind == KindAction {
-		action = *target.Action
-		schema = action.InputSchema
+		schema = target.Action.InputSchema
 	}
 	if missing := missingRequired(schema, rendered, g.input); len(missing) > 0 {
 		return slotAbstain(ReasonMissingSlot, missing), nil
 	}
-	canonical, err := fleet.ValidateActionInput(action, rendered)
+	canonical, err := a.catalog.validator.ValidateInput(schema, rendered)
 	if err != nil {
 		return slotAbstain(ReasonInvalidInput, nil), nil
 	}

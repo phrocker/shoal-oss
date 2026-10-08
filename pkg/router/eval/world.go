@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/lexicon"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
@@ -209,9 +208,8 @@ func (w *World) Targets(caller string) []router.Target {
 						AgentID: shoal.ID(d.ID), AgentGeneration: 1, Capability: c.Name, Action: a.Name,
 						RequiresApproval: a.RequiresApproval,
 					}},
-					Action: &fleet.Action{Name: a.Name, InputSchema: compact.Bytes(),
-						OutputSchema: json.RawMessage(`{"type":"object"}`), RequiresApproval: a.RequiresApproval},
-					Name: a.Name,
+					Action: &router.ActionSpec{Name: a.Name, InputSchema: compact.Bytes(), RequiresApproval: a.RequiresApproval},
+					Name:   a.Name,
 				})
 			}
 		}

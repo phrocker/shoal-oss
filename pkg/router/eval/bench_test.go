@@ -8,6 +8,8 @@ import (
 	"context"
 	"os"
 	"testing"
+
+	"github.com/phrocker/shoal-oss/internal/routerwire"
 )
 
 // Benchmarks run over the train and dev texts only; the test split is not
@@ -31,7 +33,7 @@ func benchCases(b *testing.B) (*Runner, []Case) {
 		b.Fatal(err)
 	}
 	selected := append(train, dev...)
-	r := NewRunner(w, provider)
+	r := NewRunner(w, routerwire.Predictor(provider, ReleaseID), routerwire.Validator())
 	for _, caller := range w.Callers() {
 		if _, err := r.Catalog(caller); err != nil {
 			b.Fatal(err)

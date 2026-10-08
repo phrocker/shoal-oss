@@ -13,6 +13,10 @@ import (
 // mention resolver's bound.
 const MaxTokens = 32
 
+// MaxTextBytes bounds the bytes of one routed text, matching the authorized
+// mention resolver's bound.
+const MaxTextBytes = 4096
+
 // Input is everything one routing reads. Tokens and Mentions come from the
 // caller's text through the authorized mention resolver; Mentions name only
 // nodes the caller may see. NodeConcepts maps visible mention nodes to their

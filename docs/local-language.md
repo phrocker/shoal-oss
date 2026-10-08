@@ -80,7 +80,11 @@ Built:
 - `pkg/router` is pure. It holds the proposal contract, the
   `shoal.router.grammar/v1` grammars, the `router.pair/v1` features, the
   aggregation, slot validation, the lexical baseline and the trainer.
-- `internal/routershadow` is the authorized composition and the recorder.
+- `internal/routershadow` is the shadow service and its recorder. It reaches
+  Shoal only through ports.
+- `internal/routerwire` is the one adapter that composes the ports from the
+  authorized client, the fleet registry, the caller's authorization and the
+  decision provider.
 - `narrate.Proposal` renders proposals.
 
 How it works:
@@ -90,26 +94,55 @@ How it works:
   provider. Its only evidence is the numeric feature artifact.
 - An action's input is canonicalized by `fleet.ValidateActionInput`, which
   returns the exact bytes an enqueue stores.
-- An allowlist guards authority. Every package under `pkg/router` and
-  `internal/routershadow` is checked; `go list` finds them, so a new
-  subpackage is checked too. Each use of a function, method or func value
-  from the fleet, explorer, auth, decision and decision-service packages must
-  be on a named allowlist of reads, accessors and pure record constructors,
-  each with a reason. Also refused:
-  - `unsafe`, `reflect`, `os/exec` and network imports;
-  - `go:linkname`;
-  - module imports outside a short list;
-  - interface methods over controlled types;
-  - func values bound elsewhere.
+- **Authority is structural.** The router cannot act because it cannot hold
+  anything that acts. The guarded packages are everything `go list` finds
+  under `pkg/router` and `internal/routershadow`, so a new subpackage is
+  guarded too. Four rules hold them, each enforced by a test:
+  1. They may import only data packages: `pkg/decision`, `pkg/lexicon`,
+     `pkg/ontology`, `pkg/inference`, `pkg/document`, `pkg/graph` and
+     `pkg/shoal`.
+  2. None of their transitive dependencies holds a service: the explorer
+     and its client, fleet, coordination, the decision service, decision
+     registration, the decision provider and the adapter.
+  3. The exported API of each allowed import, walked through every type it
+     mentions, exposes no type from any other module package. No function
+     the router can call hands it a service, an authority or a client.
+  4. Every other value comes through the router's own ports
+     (`internal/routershadow/ports.go` and `router.InputValidator`).
+     `internal/routerwire` implements them with unexported wrappers. Each
+     wrapper holds its service in an unexported field and has exactly its
+     port's methods; a test pins every method set, and another checks that
+     no service type satisfies any port.
 
-  A violating fixture reaches controlled operations every way the review
-  named: Enqueue, Invoke, Claim, ExecuteClaim, Cancel, Register, Heartbeat,
-  Revoke, CompleteClaim in a subpackage, a stored func variable, a variable
-  bound in another package, a local interface, reflection and linkname. A
-  test asserts each is flagged, and each rule was mutation-checked.
-  - **Residual:** the guard does not follow calls into the allowed
-    non-controlled packages (`pkg/lexicon`, `pkg/ontology` and the like). It
-    relies on their holding data and pure functions.
+  Also refused outright: `unsafe`, `reflect`, `plugin`, `os/exec`, `syscall`
+  and network imports, and `go:linkname`.
+
+  **`internal/routerwire` is the reviewed surface.** It is about 300 lines.
+  Every wrapper method is one of these:
+  - a read: `fleet.Service.List`, `ResolveMentions`, `Neighborhood`, or
+    `AuthorizePublishedOntology`;
+  - a pure check: `AuthorizeObject`, the authorization fingerprint, or
+    `fleet.ValidateActionInput`;
+  - the in-process linear prediction.
+
+  **Exemption.** `pkg/decision` imports `pkg/explorer/auth` for one
+  constant, so auth and its dependencies (the Accumulo client among them)
+  are linked in. They are unreachable: rule 1 forbids importing them and
+  rule 3 finds no API that returns their types. A test requires that auth
+  is reached only through `pkg/decision`.
+
+  **Fixtures.** Each review round's bypasses are kept as fixtures, and a
+  test shows every one is now impossible. Mutation checks confirm that
+  removing any rule lets a fixture through.
+  - **Round 1:** Enqueue, Invoke, Claim, ExecuteClaim, Cancel, Register,
+    Heartbeat, Revoke, CompleteClaim in a subpackage, a stored func
+    variable, a variable bound elsewhere, a local interface, reflection and
+    linkname. The import rule refuses them.
+  - **Round 2:**
+    - Asserting the Config's client to `Connect`. This no longer compiles:
+      the Config holds no client. Asserting a wrapper finds nothing.
+    - Generics instantiated with the registry and the dispatcher. The
+      import rule refuses them.
 - An approval-required proposal handed to `Enqueue` is still held.
 - Records hold no text: only an HMAC of the normalized text, scoped to the
   caller.
@@ -151,11 +184,11 @@ in both. Residuals:
   and its receipt never carry that ID.
 - **Configuration.** The operator must pair the lexicon bundle with the
   ontology its lookup templates were derived from. The bundle does not
-  record that ontology, so `OntologyBinding` carries the published version
-  itself. `New` refuses a binding whose version does not have the bound
+  record that ontology, so `routerwire.OntologyBinding` carries the published version
+  itself. `routerwire.Lookups` refuses a binding whose version does not have the bound
   identity, or whose relationships do not derive exactly the bundle's
   templates.
-- **Utterance key.** The host key must be random and secret. `New` refuses
+- **Utterance key.** The host key must be random and secret. `routershadow.New` refuses
   a key shorter than 32 bytes or with fewer than 16 distinct byte values,
   such as an all-zero or repeated-byte key.
 

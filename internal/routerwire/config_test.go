@@ -2,12 +2,13 @@
 // contributor license agreements. See the NOTICE file distributed with this
 // work for additional information regarding copyright ownership.
 
-package routershadow
+package routerwire
 
 import (
 	"bytes"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/internal/routershadow"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 )
@@ -20,14 +21,13 @@ func TestNewRefusesWeakHostKeys(t *testing.T) {
 		"same byte": bytes.Repeat([]byte{7}, 64),
 		"two bytes": bytes.Repeat([]byte{1, 2}, 32),
 	} {
-		config := w.service.config
+		config := w.config
 		config.HostKey = key
-		if _, err := New(config); err == nil {
+		if _, err := routershadow.New(config); err == nil {
 			t.Errorf("%s key accepted", name)
 		}
 	}
-	config := w.service.config
-	if _, err := New(config); err != nil {
+	if _, err := routershadow.New(w.config); err != nil {
 		t.Fatalf("valid config refused: %v", err)
 	}
 }
@@ -47,9 +47,7 @@ func TestNewRefusesAMismatchedOntologyBinding(t *testing.T) {
 		"templates from another version": {Configured: base, Identity: baseIdentity, Published: base},
 		"identity of another version":    {Configured: base, Identity: baseIdentity, Published: target},
 	} {
-		config := w.service.config
-		config.Ontology = binding
-		if _, err := New(config); err == nil {
+		if _, err := Lookups(w.reader, *binding, w.bundle); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}

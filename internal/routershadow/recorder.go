@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/lexicon"
 	"github.com/phrocker/shoal-oss/pkg/router"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -67,7 +66,7 @@ type Record struct {
 // UtteranceKey is HMAC-SHA256 under the host key over the caller scope
 // (principal and authorization fingerprint) and the normalized text (tokens
 // joined by one space), each length-prefixed.
-func UtteranceKey(hostKey []byte, principal shoal.ID, fingerprint auth.Fingerprint, tokens []lexicon.Token) string {
+func UtteranceKey(hostKey []byte, principal shoal.ID, fingerprint [32]byte, tokens []lexicon.Token) string {
 	mac := hmac.New(sha256.New, hostKey)
 	field := func(b []byte) {
 		var n [8]byte

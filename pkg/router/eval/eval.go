@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/phrocker/shoal-oss/internal/decisionlinear"
 	"github.com/phrocker/shoal-oss/internal/routershadow"
 	"github.com/phrocker/shoal-oss/pkg/router"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -27,26 +26,24 @@ var FixedNow = time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 // ReleaseID is the evaluation release of the router model.
 const ReleaseID shoal.ID = "router-pair-v1:eval"
 
-// NewProvider loads a decisionlinear model.
-func NewProvider(model []byte) (*decisionlinear.Provider, error) {
-	sum := sha256.Sum256(model)
-	return decisionlinear.New(decisionlinear.Config{ModelBytes: model, ExpectedSHA256: hex.EncodeToString(sum[:]), ReleaseID: ReleaseID})
-}
-
 // Runner routes fixture cases through the same analysis, decision and
 // aggregation the shadow service uses, with visibility from the fixture.
 type Runner struct {
-	World    *World
-	Decider  *routershadow.Decider
-	catalogs map[string]*router.Catalog
+	World     *World
+	Decider   *routershadow.Decider
+	validator router.InputValidator
+	catalogs  map[string]*router.Catalog
 }
 
-// NewRunner builds a runner over a loaded provider.
-func NewRunner(w *World, provider *decisionlinear.Provider) *Runner {
+// NewRunner builds a runner over the router's predictor and input-validator
+// ports; the caller wires them (internal/routerwire), as the shadow service's
+// host does.
+func NewRunner(w *World, predictor routershadow.Predictor, validator router.InputValidator) *Runner {
 	return &Runner{
-		World:    w,
-		Decider:  &routershadow.Decider{Provider: provider, ReleaseID: ReleaseID, Clock: func() time.Time { return FixedNow }},
-		catalogs: map[string]*router.Catalog{},
+		World:     w,
+		Decider:   &routershadow.Decider{Predictor: predictor, Clock: func() time.Time { return FixedNow }},
+		validator: validator,
+		catalogs:  map[string]*router.Catalog{},
 	}
 }
 
@@ -55,7 +52,7 @@ func (r *Runner) Catalog(caller string) (*router.Catalog, error) {
 	if c, ok := r.catalogs[caller]; ok {
 		return c, nil
 	}
-	c, err := router.NewCatalog(r.World.Targets(caller), r.World.Grammars)
+	c, err := router.NewCatalog(r.World.Targets(caller), r.World.Grammars, r.validator)
 	if err != nil {
 		return nil, err
 	}

@@ -4,9 +4,13 @@
 
 // Package routershadow runs the language router in shadow mode (#500): it
 // routes a caller's text to a proposal under the caller's current
-// authorization, runs the lexical baseline beside it, and records both. Nothing
-// it produces is executed, enqueued, invoked, evaluated or registered; a test
-// walks this package's syntax and fails if it calls any of those.
+// authorization, runs the lexical baseline beside it, and records both.
+//
+// Nothing it produces is executed, enqueued, invoked, evaluated or
+// registered, and nothing it holds can do so: it imports no package that
+// holds a service, and reaches Shoal only through the ports in ports.go,
+// which internal/routerwire implements with wrappers that have no other
+// methods. See authority_test.go and docs/local-language.md.
 package routershadow
 
 import (
@@ -14,16 +18,9 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"strings"
 	"time"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer"
-	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
-	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
-	"github.com/phrocker/shoal-oss/pkg/extraction"
 	"github.com/phrocker/shoal-oss/pkg/lexicon"
-	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/router"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -42,35 +39,15 @@ const EnumerationTimeout = 10 * time.Second
 
 var errEnumeration = shoal.NewError(shoal.ErrorUnavailable, "router target enumeration did not finish")
 
-// ReasonCode is the caller-asserted reason the router's fleet reads record.
-const ReasonCode = "router_shadow"
-
 // DecisionTarget is a host-provisioned decision profile the router may
-// propose. It is visible to a caller only when the caller may invoke its
-// task resource, exactly as decision registration checks.
+// propose, as data. The adapter returns only those the caller may invoke.
 type DecisionTarget struct {
 	ProfileID         shoal.ID
 	ProfileRevisionID shoal.ID
 	TaskID            shoal.ID
 	Name              string
-	TaskResource      auth.ResourceRequest
 	// SlotSchema is the router-side input schema, in the fleet subset.
 	SlotSchema json.RawMessage
-}
-
-// OntologyBinding names the published ontology the lexicon bundle's lookup
-// templates were derived from. Templates are visible only when the caller may
-// see that published identity. The bundle does not record which ontology its
-// templates came from, so the operator supplies the published version itself:
-// New refuses a binding whose Published version does not have Identity, or
-// whose relationships do not derive exactly the bundle's templates. That
-// catches a bundle paired with the wrong ontology; it cannot catch an
-// operator who supplies a matching version that is not the one Identity's
-// catalog publishes, which AuthorizePublishedOntology then checks.
-type OntologyBinding struct {
-	Configured ontology.OntologyVersion
-	Identity   ontology.OntologyIdentity
-	Published  ontology.OntologyVersion
 }
 
 // MinHostKeyBytes and minHostKeyDistinct bound the utterance key. A key of
@@ -93,53 +70,21 @@ func hostKeyValid(key []byte) bool {
 	return len(distinct) >= minHostKeyDistinct
 }
 
-func checkOntologyBinding(b *OntologyBinding, bundle *lexicon.Bundle) error {
-	refuse := shoal.NewError(shoal.ErrorInvalidArgument, "router ontology binding does not match the lexicon bundle's templates")
-	identity, err := ontology.NewOntologyIdentity(b.Published)
-	if err != nil || identity != b.Identity {
-		return refuse
-	}
-	derived, err := lexicon.DeriveTemplates(b.Published.Relationships())
-	if err != nil || !sameTemplates(derived, bundle.Templates()) {
-		return refuse
-	}
-	return nil
-}
-
-func sameTemplates(a, b []lexicon.Template) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	ids := func(x []shoal.ID) string {
-		parts := make([]string, len(x))
-		for i, id := range x {
-			parts[i] = string(id)
-		}
-		return strings.Join(parts, "\x00")
-	}
-	for i := range a {
-		if a[i].ID != b[i].ID || a[i].RelationKey != b[i].RelationKey || a[i].Direction != b[i].Direction ||
-			a[i].PhraseKey != b[i].PhraseKey || ids(a[i].SubjectConcepts) != ids(b[i].SubjectConcepts) ||
-			ids(a[i].AnswerConcepts) != ids(b[i].AnswerConcepts) {
-			return false
-		}
-	}
-	return true
-}
-
-// Config wires the shadow router. Every dependency is the real authorized
-// component; the router reads through them as the caller.
+// Config wires the shadow router to its ports. Lookups is optional: without
+// it no lookup template is offered.
 type Config struct {
-	Client    *authorized.Client
-	Fleet     *fleet.Service
-	Resolver  auth.Resolver
+	Caller    CallerResolver
+	Targets   TargetLister
+	Decisions DecisionGate
+	Lookups   LookupGate
+	Mentions  MentionResolver
+	Concepts  ConceptReader
+	Validator router.InputValidator
 	Lexicon   *lexicon.Bundle
 	Grammars  *router.GrammarSet
-	Decisions []DecisionTarget
-	Ontology  *OntologyBinding
 	Decider   *Decider
 	Recorder  Recorder
-	// HostKey keys the utterance HMAC. At least 32 bytes.
+	// HostKey keys the utterance HMAC: at least 32 random bytes.
 	HostKey []byte
 	Clock   func() time.Time
 }
@@ -151,21 +96,15 @@ type Service struct {
 
 // New validates the configuration.
 func New(config Config) (*Service, error) {
-	if config.Client == nil || config.Fleet == nil || config.Resolver == nil || config.Lexicon == nil ||
-		config.Decider == nil || config.Decider.Provider == nil || config.Recorder == nil ||
-		config.Clock == nil {
+	if config.Caller == nil || config.Targets == nil || config.Decisions == nil || config.Mentions == nil ||
+		config.Concepts == nil || config.Validator == nil || config.Lexicon == nil ||
+		config.Decider == nil || config.Decider.Predictor == nil || config.Recorder == nil || config.Clock == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "router shadow dependencies are required")
 	}
 	if !hostKeyValid(config.HostKey) {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "router shadow host key is too short or not random")
 	}
-	if config.Ontology != nil {
-		if err := checkOntologyBinding(config.Ontology, config.Lexicon); err != nil {
-			return nil, err
-		}
-	}
 	config.HostKey = append([]byte(nil), config.HostKey...)
-	config.Decisions = append([]DecisionTarget(nil), config.Decisions...)
 	return &Service{config: config}, nil
 }
 
@@ -179,19 +118,15 @@ func (s *Service) Route(ctx context.Context, text string) (router.Proposal, erro
 		*into = now.Sub(from).Nanoseconds()
 		return now
 	}
-	decision, err := s.config.Resolver.Resolve(ctx)
+	caller, err := s.config.Caller.RouterCaller(ctx)
 	if err != nil {
 		return router.Proposal{}, err
 	}
-	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	targets, err := s.visibleTargets(ctx)
 	if err != nil {
 		return router.Proposal{}, err
 	}
-	targets, err := s.visibleTargets(ctx, decision)
-	if err != nil {
-		return router.Proposal{}, err
-	}
-	catalog, err := router.NewCatalog(targets, s.config.Grammars)
+	catalog, err := router.NewCatalog(targets, s.config.Grammars, s.config.Validator)
 	if err != nil {
 		return router.Proposal{}, err
 	}
@@ -199,10 +134,10 @@ func (s *Service) Route(ctx context.Context, text string) (router.Proposal, erro
 
 	tokens := lexicon.Tokenize(text)
 	input := router.Input{Tokens: tokens, Catalog: catalog, NodeConcepts: map[shoal.ID]shoal.ID{}}
-	if len(text) > authorized.MaxMentionBytes || len(tokens) > authorized.MaxMentionTokens {
+	if len(text) > router.MaxTextBytes || len(tokens) > router.MaxTokens {
 		input.OutOfBounds = true
 	} else if len(tokens) > 0 {
-		input.Mentions, err = s.config.Client.ResolveMentions(ctx, s.config.Lexicon, text)
+		input.Mentions, err = s.config.Mentions.RouterMentions(ctx, s.config.Lexicon, text)
 		if err != nil {
 			return router.Proposal{}, err
 		}
@@ -217,13 +152,13 @@ func (s *Service) Route(ctx context.Context, text string) (router.Proposal, erro
 		return router.Proposal{}, err
 	}
 	t = stage(&latency.AnalyzeNS, t)
-	correlation := decision.CorrelationID()
+	correlation := caller.CorrelationID
 	if correlation == "" {
-		correlation = decision.RequestID()
+		correlation = caller.RequestID
 	}
 	decided, err := s.config.Decider.Decide(ctx, DecideInput{
-		Analysis: analysis, PrincipalID: decision.Subject(), CorrelationID: correlation,
-		AuthFingerprint: hex.EncodeToString(fingerprint[:]), AuthExpiresAt: decision.AuthenticationExpires(),
+		Analysis: analysis, PrincipalID: caller.Principal, CorrelationID: correlation,
+		AuthFingerprint: hex.EncodeToString(caller.Fingerprint[:]), AuthExpiresAt: caller.ExpiresAt,
 	})
 	if err != nil {
 		return router.Proposal{}, err
@@ -239,9 +174,9 @@ func (s *Service) Route(ctx context.Context, text string) (router.Proposal, erro
 	record := Record{
 		Version:         RecordVersion,
 		RecordedAt:      s.config.Clock().UTC(),
-		Principal:       decision.Subject(),
-		AuthFingerprint: hex.EncodeToString(fingerprint[:]),
-		UtteranceKey:    UtteranceKey(s.config.HostKey, decision.Subject(), fingerprint, tokens),
+		Principal:       caller.Principal,
+		AuthFingerprint: hex.EncodeToString(caller.Fingerprint[:]),
+		UtteranceKey:    UtteranceKey(s.config.HostKey, caller.Principal, caller.Fingerprint, tokens),
 		TokenCount:      len(tokens),
 		LexiconBundleID: s.config.Lexicon.ID().String(),
 		Proposal:        decided.Proposal,
@@ -261,11 +196,11 @@ func (s *Service) Route(ctx context.Context, text string) (router.Proposal, erro
 }
 
 // visibleTargets enumerates what the caller can currently see: actions on
-// every descriptor the fleet lists for it, decision profiles whose task
-// resource it may invoke, and lookup templates when it may see the bundle's
-// published ontology. A target it cannot see is absent exactly as one that
-// does not exist. More than router.MaxTargets fails closed.
-func (s *Service) visibleTargets(ctx context.Context, decision auth.Decision) ([]router.Target, error) {
+// every descriptor the registry lists for it, decision profiles it may
+// invoke, and lookup templates when it may see the bundle's published
+// ontology. A target it cannot see is absent exactly as one that does not
+// exist. More than router.MaxTargets fails closed.
+func (s *Service) visibleTargets(ctx context.Context) ([]router.Target, error) {
 	var targets []router.Target
 	add := func(t router.Target) error {
 		if len(targets) == router.MaxTargets {
@@ -285,25 +220,18 @@ func (s *Service) visibleTargets(ctx context.Context, decision auth.Decision) ([
 			}
 			return nil, errEnumeration
 		}
-		now := s.config.Clock().UTC()
-		listed, err := s.config.Fleet.List(listCtx, fleet.ListRequest{
-			Context: fleet.RequestContext{
-				RequestID: decision.RequestID(), CorrelationID: decision.CorrelationID(),
-				ReasonCode: ReasonCode, Deadline: now.Add(30 * time.Second),
-			},
-			Cursor: cursor, Limit: fleet.MaxListResults,
-		})
+		listed, next, err := s.config.Targets.RouterDescriptorPage(listCtx, cursor)
 		if err != nil {
 			if listCtx.Err() != nil && ctx.Err() == nil {
 				return nil, errEnumeration
 			}
 			return nil, err
 		}
-		descriptors += len(listed.Descriptors)
+		descriptors += len(listed)
 		if descriptors > router.MaxTargets {
 			return nil, router.ErrTooManyTargets
 		}
-		for _, d := range listed.Descriptors {
+		for _, d := range listed {
 			for _, c := range d.Capabilities {
 				for _, a := range c.Actions {
 					action := a
@@ -319,24 +247,20 @@ func (s *Service) visibleTargets(ctx context.Context, decision auth.Decision) ([
 				}
 			}
 		}
-		if len(listed.Next) == 0 {
+		if len(next) == 0 {
 			break
 		}
-		if bytes.Compare(listed.Next, cursor) <= 0 {
+		if bytes.Compare(next, cursor) <= 0 {
 			// A continuation that does not advance would never end.
 			return nil, errEnumeration
 		}
-		cursor = listed.Next
+		cursor = next
 	}
-	now := s.config.Clock().UTC()
-	for _, d := range s.config.Decisions {
-		err := decision.AuthorizeObject(auth.OperationInvoke, d.TaskResource, now)
-		if invisible(err) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
+	decisions, err := s.config.Decisions.RouterVisibleDecisions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range decisions {
 		if err := add(router.Target{
 			Ref: router.TargetRef{Kind: router.KindDecision, Decision: &router.DecisionRef{
 				ProfileID: d.ProfileID, ProfileRevisionID: d.ProfileRevisionID, TaskID: d.TaskID,
@@ -346,13 +270,12 @@ func (s *Service) visibleTargets(ctx context.Context, decision auth.Decision) ([
 			return nil, err
 		}
 	}
-	if s.config.Ontology != nil {
-		err := s.config.Client.AuthorizePublishedOntology(ctx, s.config.Ontology.Configured, s.config.Ontology.Identity, auth.OperationNeighborhood)
-		switch {
-		case invisible(err):
-		case err != nil:
+	if s.config.Lookups != nil {
+		visible, err := s.config.Lookups.RouterLookupsVisible(ctx)
+		if err != nil {
 			return nil, err
-		default:
+		}
+		if visible {
 			for _, t := range s.config.Lexicon.Templates() {
 				if err := add(router.Target{
 					Ref: router.TargetRef{Kind: router.KindLookup, Lookup: &router.LookupRef{
@@ -368,17 +291,9 @@ func (s *Service) visibleTargets(ctx context.Context, decision auth.Decision) ([
 	return targets, nil
 }
 
-// invisible is the answer for an object the caller may not see or that does
-// not exist: the authorization layer gives both the same not-found or
-// unauthorized shape, and the router treats both as absent.
-func invisible(err error) bool {
-	return shoal.IsErrorCode(err, shoal.ErrorNotFound) || shoal.IsErrorCode(err, shoal.ErrorUnauthorized)
-}
-
 // concepts reads the ontology concept of each unambiguous mentioned node,
-// through the authorized neighborhood read, when a lookup is a candidate.
-// Every mentioned node is one the caller may see, so the read depends only on
-// visible nodes.
+// when a lookup is a candidate. Every mentioned node is one the caller may
+// see, so the read depends only on visible nodes.
 func (s *Service) concepts(ctx context.Context, catalog *router.Catalog, mentions []lexicon.Mention, into map[shoal.ID]shoal.ID) error {
 	lookup := false
 	for _, key := range catalog.Keys() {
@@ -393,19 +308,13 @@ func (s *Service) concepts(ctx context.Context, catalog *router.Catalog, mention
 	if !lookup || len(ids) == 0 {
 		return nil
 	}
-	neighborhood, err := s.config.Client.Neighborhood(ctx, explorer.NeighborhoodRequest{NodeIDs: ids})
+	concepts, err := s.config.Concepts.RouterNodeConcepts(ctx, ids)
 	if err != nil {
 		return err
 	}
-	wanted := map[shoal.ID]bool{}
 	for _, id := range ids {
-		wanted[id] = true
-	}
-	for _, n := range neighborhood.Nodes {
-		if wanted[n.ID] {
-			if concept := n.Properties[extraction.GraphPropertyOntologyConceptID]; concept != "" {
-				into[n.ID] = shoal.ID(concept)
-			}
+		if concept, ok := concepts[id]; ok {
+			into[id] = concept
 		}
 	}
 	return nil

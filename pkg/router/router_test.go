@@ -17,6 +17,14 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+// fleetValidator is the test's validator: fleet's own, as internal/routerwire
+// supplies it. Only this test file imports fleet; the router does not.
+type fleetValidator struct{}
+
+func (fleetValidator) ValidateInput(schema, input json.RawMessage) (json.RawMessage, error) {
+	return fleet.ValidateActionInput(fleet.Action{InputSchema: schema}, input)
+}
+
 const restartGrammar = `{
   "schema": "shoal.router.grammar/v1",
   "target": {"kind": "action", "capability": "ops", "action": "restart"},
@@ -68,7 +76,7 @@ func grammarSet(t testing.TB, docs ...string) *GrammarSet {
 func restartTarget(agent string) Target {
 	return Target{
 		Ref:    TargetRef{Kind: KindAction, Action: &ActionRef{AgentID: shoal.ID(agent), AgentGeneration: 1, Capability: "ops", Action: "restart", RequiresApproval: true}},
-		Action: &fleet.Action{Name: "restart", InputSchema: restartSchema, OutputSchema: json.RawMessage(`{"type":"object"}`), RequiresApproval: true},
+		Action: &ActionSpec{Name: "restart", InputSchema: restartSchema, RequiresApproval: true},
 		Name:   "restart",
 	}
 }
@@ -125,7 +133,7 @@ func (w world) input(text string, catalog *Catalog) Input {
 
 func catalog(t testing.TB, set *GrammarSet, targets ...Target) *Catalog {
 	t.Helper()
-	c, err := NewCatalog(targets, set)
+	c, err := NewCatalog(targets, set, fleetValidator{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +322,7 @@ func TestInputIsWhatEnqueueStores(t *testing.T) {
 	if !bytes.Contains(rendered, []byte(`"mode":"force"`)) || !bytes.Contains(rendered, []byte(`"mode":"graceful"`)) {
 		t.Fatalf("rendered = %s", rendered)
 	}
-	want, err := fleet.ValidateActionInput(*restartTarget("a").Action, rendered)
+	want, err := fleet.ValidateActionInput(fleet.Action{InputSchema: restartSchema}, rendered)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +406,7 @@ func TestCatalogBound(t *testing.T) {
 	for i := range targets {
 		targets[i] = restartTarget(strings.Repeat("a", i+1))
 	}
-	if _, err := NewCatalog(targets, nil); err != ErrTooManyTargets {
+	if _, err := NewCatalog(targets, nil, fleetValidator{}); err != ErrTooManyTargets {
 		t.Fatalf("over-bound catalog = %v", err)
 	}
 }

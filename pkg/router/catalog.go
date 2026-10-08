@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"sort"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/lexicon"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -19,13 +18,29 @@ import (
 // can see more is refused (fail closed), never routed over a truncated set.
 const MaxTargets = 256
 
+// ActionSpec is the router's own copy of a registered action's data: its
+// name, input schema and whether it requires approval. The router holds no
+// registry type, so nothing it holds has a method that could act.
+type ActionSpec struct {
+	Name             string
+	InputSchema      json.RawMessage
+	RequiresApproval bool
+}
+
+// InputValidator validates and canonicalizes a filled input against a schema
+// in the fleet descriptor subset. The host supplies it (internal/routerwire
+// wraps fleet.ValidateActionInput), so an action's proposed input is exactly
+// what an enqueue would store. It must be pure.
+type InputValidator interface {
+	ValidateInput(schema, input json.RawMessage) (json.RawMessage, error)
+}
+
 // Target is one target the caller can currently see. Callers build it only
 // from authorized reads; the router never sees a target the caller cannot.
 type Target struct {
 	Ref TargetRef
-	// Action is the registered action, for an action target. Its input
-	// schema is what fleet.ValidateActionInput checks.
-	Action *fleet.Action
+	// Action is the registered action's data, for an action target.
+	Action *ActionSpec
 	// SlotSchema is the router-side input schema of a decision target, in
 	// the same declarative subset fleet descriptors use.
 	SlotSchema json.RawMessage
@@ -51,6 +66,7 @@ type Catalog struct {
 	candidates []candidate
 	digest     string
 	grammars   *GrammarSet
+	validator  InputValidator
 }
 
 // ErrTooManyTargets is returned when the visible targets exceed MaxTargets.
@@ -59,8 +75,12 @@ var ErrTooManyTargets = shoal.NewError(shoal.ErrorUnavailable, "router visible t
 // NewCatalog groups visible targets by binding key and binds each to its
 // grammar from set, or to a default grammar of cue words from its name. A
 // grammar whose key no visible target has is never bound, so it can never
-// fire. The digest covers only what is bound here.
-func NewCatalog(targets []Target, set *GrammarSet) (*Catalog, error) {
+// fire. The digest covers only what is bound here. validator checks every
+// action and decision input.
+func NewCatalog(targets []Target, set *GrammarSet, validator InputValidator) (*Catalog, error) {
+	if validator == nil {
+		return nil, invalid("router catalog requires an input validator")
+	}
 	if len(targets) > MaxTargets {
 		return nil, ErrTooManyTargets
 	}
@@ -95,7 +115,7 @@ func NewCatalog(targets []Target, set *GrammarSet) (*Catalog, error) {
 		}
 		c.executors = append(c.executors, cloneTarget(t))
 	}
-	catalog := &Catalog{grammars: set}
+	catalog := &Catalog{grammars: set, validator: validator}
 	for _, c := range byKey {
 		sort.Slice(c.executors, func(i, j int) bool {
 			return c.executors[i].Ref.Action.AgentID < c.executors[j].Ref.Action.AgentID
@@ -142,8 +162,6 @@ func cloneTarget(t Target) Target {
 	if t.Action != nil {
 		a := *t.Action
 		a.InputSchema = append(json.RawMessage(nil), a.InputSchema...)
-		a.OutputSchema = append(json.RawMessage(nil), a.OutputSchema...)
-		a.Effects = append(fleet.Effects(nil), a.Effects...)
 		t.Action = &a
 	}
 	t.SlotSchema = append(json.RawMessage(nil), t.SlotSchema...)

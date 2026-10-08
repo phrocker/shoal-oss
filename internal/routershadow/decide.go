@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"time"
 
-	"github.com/phrocker/shoal-oss/internal/decisionlinear"
 	"github.com/phrocker/shoal-oss/pkg/decision"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/inference"
@@ -21,13 +20,13 @@ import (
 // DecisionTimeout bounds one target-choice decision.
 const DecisionTimeout = 5 * time.Second
 
-// Decider serves the target-choice decision in process with an unchanged
-// internal/decisionlinear provider. The decision's evidence is the numeric
+// Decider serves the target-choice decision in process through the Predictor
+// port (internal/routerwire wraps an unchanged internal/decisionlinear
+// provider). The decision's evidence is the numeric
 // feature artifact alone: the request carries no text, no token and no target
 // identity, only opaque candidate subjects and their feature vectors.
 type Decider struct {
-	Provider  *decisionlinear.Provider
-	ReleaseID shoal.ID
+	Predictor Predictor
 	Clock     func() time.Time
 }
 
@@ -120,8 +119,8 @@ func (d *Decider) Decide(ctx context.Context, in DecideInput) (Decided, error) {
 	if deadline.After(in.AuthExpiresAt) {
 		deadline = in.AuthExpiresAt
 	}
-	request, err := decision.NewDecisionRequest(task, picture, d.Provider.Identity(), decision.RequestConfig{
-		PrincipalID: in.PrincipalID, ReleaseID: d.ReleaseID, CorrelationID: in.CorrelationID,
+	request, err := decision.NewDecisionRequest(task, picture, d.Predictor.RouterPredictorIdentity(), decision.RequestConfig{
+		PrincipalID: in.PrincipalID, ReleaseID: d.Predictor.RouterReleaseID(), CorrelationID: in.CorrelationID,
 		RequestedAt: now, Deadline: deadline, SubjectIDs: artifact.Subjects,
 	})
 	if err != nil {
@@ -131,11 +130,7 @@ func (d *Decider) Decide(ctx context.Context, in DecideInput) (Decided, error) {
 	// bounded in real time by the same budget.
 	ctx, cancel := context.WithTimeout(ctx, deadline.Sub(now))
 	defer cancel()
-	predictor, err := d.Provider.Resolve(ctx, d.ReleaseID, request.PredictorID())
-	if err != nil {
-		return Decided{}, err
-	}
-	result, err := predictor.Predict(ctx, request, artifact.Bytes)
+	result, err := d.Predictor.RouterPredict(ctx, request, artifact.Bytes)
 	if err != nil {
 		return Decided{}, err
 	}

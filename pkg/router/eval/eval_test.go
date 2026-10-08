@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/decisionlinear"
+	"github.com/phrocker/shoal-oss/internal/routerwire"
 	"github.com/phrocker/shoal-oss/pkg/decision"
 	"github.com/phrocker/shoal-oss/pkg/router"
 )
@@ -41,11 +42,17 @@ func load(t testing.TB) (*World, *Cases) {
 	return w, cases
 }
 
+// NewProvider loads a decisionlinear model for the evaluation release.
+func NewProvider(model []byte) (*decisionlinear.Provider, error) {
+	sum := sha256.Sum256(model)
+	return decisionlinear.New(decisionlinear.Config{ModelBytes: model, ExpectedSHA256: hex.EncodeToString(sum[:]), ReleaseID: ReleaseID})
+}
+
 func trainModel(t testing.TB, w *World, cases *Cases) []byte {
 	t.Helper()
 	// Features do not depend on the model, so any provider serves the
 	// analysis; the runner's decider is not used here.
-	r := &Runner{World: w, catalogs: map[string]*router.Catalog{}}
+	r := &Runner{World: w, validator: routerwire.Validator(), catalogs: map[string]*router.Catalog{}}
 	train, err := cases.Split("train")
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +166,7 @@ func runSplit(t *testing.T, split string) (*World, []Outcome) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	outcomes, err := NewRunner(w, provider).Run(context.Background(), selected)
+	outcomes, err := NewRunner(w, routerwire.Predictor(provider, ReleaseID), routerwire.Validator()).Run(context.Background(), selected)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,7 +2,7 @@
 // contributor license agreements. See the NOTICE file distributed with this
 // work for additional information regarding copyright ownership.
 
-package routershadow
+package routerwire
 
 import (
 	"bytes"
@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/decisionlinear"
+	"github.com/phrocker/shoal-oss/internal/routershadow"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -87,8 +88,9 @@ type world struct {
 	bundle     *lexicon.Bundle
 	ids        map[string]shoal.ID
 	nodes      []graph.Node
-	recorder   *MemoryRecorder
-	service    *Service
+	recorder   *routershadow.MemoryRecorder
+	service    *routershadow.Service
+	config     routershadow.Config
 	grammars   *router.GrammarSet
 }
 
@@ -266,20 +268,24 @@ const (
 "cues":["owns","owner"],"patterns":["who owns {subject}"],"slots":[{"name":"subject"}]}`
 )
 
-func (w *world) decisionTargets() []DecisionTarget {
-	risk := DecisionTarget{
-		ProfileID: "service-operation-risk", ProfileRevisionID: "r1", TaskID: "task:service-operation-risk",
-		Name:         "service operation risk",
+func (w *world) decisionTargets() []DecisionProfile {
+	risk := DecisionProfile{
+		Target: routershadow.DecisionTarget{
+			ProfileID: "service-operation-risk", ProfileRevisionID: "r1", TaskID: "task:service-operation-risk",
+			Name:       "service operation risk",
+			SlotSchema: schema(`{"type":"object","required":["service","operation"],"additionalProperties":false,"properties":{"service":{"type":"string"},"operation":{"type":"string","enum":["restart","rollback"]}}}`),
+		},
 		TaskResource: auth.ResourceRequest{AuthorizationDomain: domain, SourceID: sourceA, PolicyID: policyA, ObjectID: "task:service-operation-risk"},
-		SlotSchema:   schema(`{"type":"object","required":["service","operation"],"additionalProperties":false,"properties":{"service":{"type":"string"},"operation":{"type":"string","enum":["restart","rollback"]}}}`),
 	}
-	targets := []DecisionTarget{risk}
+	targets := []DecisionProfile{risk}
 	if w.hidden {
-		targets = append(targets, DecisionTarget{
-			ProfileID: "breach-exposure", ProfileRevisionID: "r1", TaskID: "task:breach-exposure",
-			Name:         "breach exposure",
+		targets = append(targets, DecisionProfile{
+			Target: routershadow.DecisionTarget{
+				ProfileID: "breach-exposure", ProfileRevisionID: "r1", TaskID: "task:breach-exposure",
+				Name:       "breach exposure",
+				SlotSchema: schema(`{"type":"object","required":["service"],"properties":{"service":{"type":"string"}}}`),
+			},
 			TaskResource: auth.ResourceRequest{AuthorizationDomain: domain, SourceID: sourceB, PolicyID: policyB, ObjectID: "task:breach-exposure"},
-			SlotSchema:   schema(`{"type":"object","required":["service"],"properties":{"service":{"type":"string"}}}`),
 		})
 	}
 	return targets
@@ -381,7 +387,7 @@ func newWorld(t testing.TB, store authorized.PolicyStore, hidden bool) *world {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = base.Close() })
-	w := &world{t: t, hidden: hidden, authority: authority, base: base, store: store, ids: map[string]shoal.ID{}, recorder: &MemoryRecorder{}}
+	w := &world{t: t, hidden: hidden, authority: authority, base: base, store: store, ids: map[string]shoal.ID{}, recorder: &routershadow.MemoryRecorder{}}
 	writerA := w.client(sourceA, policyA)
 	writerB := w.client(sourceB, policyB)
 	w.materialize(writerA, "visible", sourceA, policyA, visibleNodes)
@@ -451,13 +457,24 @@ func newWorld(t testing.TB, store authorized.PolicyStore, hidden bool) *world {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.service, err = New(Config{
-		Client: w.reader, Fleet: w.fleet, Resolver: authority.Resolver(), Lexicon: w.bundle,
-		Grammars: w.grammars, Decisions: w.decisionTargets(),
-		Ontology: &OntologyBinding{Configured: baseVersion, Identity: identity, Published: target},
-		Decider:  &Decider{Provider: provider, ReleaseID: "router-pair-v1:test", Clock: func() time.Time { return at }},
-		Recorder: w.recorder, HostKey: hostKey, Clock: func() time.Time { return at },
-	})
+	clock := func() time.Time { return at }
+	lookups, err := Lookups(w.reader, OntologyBinding{Configured: baseVersion, Identity: identity, Published: target}, w.bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.config = routershadow.Config{
+		Caller:    Caller(authority.Resolver()),
+		Targets:   Targets(w.fleet, authority.Resolver(), clock),
+		Decisions: Decisions(authority.Resolver(), clock, w.decisionTargets()),
+		Lookups:   lookups,
+		Mentions:  Mentions(w.reader),
+		Concepts:  Concepts(w.reader),
+		Validator: Validator(),
+		Lexicon:   w.bundle, Grammars: w.grammars,
+		Decider:  &routershadow.Decider{Predictor: Predictor(provider, "router-pair-v1:test"), Clock: clock},
+		Recorder: w.recorder, HostKey: hostKey, Clock: clock,
+	}
+	w.service, err = routershadow.New(w.config)
 	if err != nil {
 		t.Fatal(err)
 	}

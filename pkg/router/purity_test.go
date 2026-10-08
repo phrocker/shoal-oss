@@ -20,10 +20,9 @@ func TestRouterIsPure(t *testing.T) {
 		"bytes": true, "crypto/sha256": true, "encoding/hex": true, "encoding/json": true,
 		"errors": true, "fmt": true, "io": true, "math": true, "sort": true, "strconv": true,
 		"strings": true, "unicode/utf8": true,
-		"github.com/phrocker/shoal-oss/pkg/decision":       true,
-		"github.com/phrocker/shoal-oss/pkg/explorer/fleet": true,
-		"github.com/phrocker/shoal-oss/pkg/lexicon":        true,
-		"github.com/phrocker/shoal-oss/pkg/shoal":          true,
+		"github.com/phrocker/shoal-oss/pkg/decision": true,
+		"github.com/phrocker/shoal-oss/pkg/lexicon":  true,
+		"github.com/phrocker/shoal-oss/pkg/shoal":    true,
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
