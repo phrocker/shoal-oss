@@ -864,3 +864,153 @@
 {{- fail "llmGateway.podDisruptionBudget.maxUnavailable must not be 0: the gateway is stateless and replaceable, so refusing every voluntary eviction protects nothing and instead makes kubectl drain and cluster-autoscaler consolidation block forever on a pod that could safely have moved. The explorer uses 0 because it is a singleton over one state root; this is not" -}}
 {{- end -}}
 {{- end -}}
+
+{{- /* No value may carry a line break (#468).
+
+       Most of the storage tier's values are rendered as bare YAML scalars —
+       image.pullPolicy, writeTier.storageSize, writeTier.dataDir, every Secret
+       name, the accumulo group and timeout arguments — and so, before this,
+       were several of the explorer's. A newline in any of them ended the scalar
+       and the remainder became YAML of the operator's choosing:
+       explorer.service.type "ClusterIP<newline>  externalIPs: [6.6.6.6]" gave
+       the Service an external IP, and writeTier.storageSize could name the
+       volume's storage class.
+
+       The templates the storage profiles render are not quoted to fix it,
+       because those profiles must render byte-identically to the release
+       before (validate-chart.sh holds that). Refusing at render closes the
+       injection without changing a byte of a valid manifest, and it is needed
+       even where a value is quoted: a quoted value with a line break in it
+       names no Secret, path or flag value that exists, and the pod starts on
+       it anyway. The explorer's own templates are not in those profiles, so
+       their scalars are quoted as well.
+
+       So the whole of .Values is walked rather than a list of keys, and a key
+       added later is covered without anyone remembering to add it here.
+       Excluded, each for a stated reason:
+
+         global      a parent chart's values, passed to every subchart; this
+                     chart renders none of it.
+         llmProxy    the gateway's old key, refused above when it carries
+                     anything and never rendered.
+
+       Every map key is checked as well as every value. Keys reach the
+       manifests through toYaml (nodeSelector, tolerations, affinity,
+       resources, annotations, the operator volumes), and toYaml does not make
+       a key with a line break safe: nindent indents the block it emits line
+       by line, and a key "k<newline>hostNetwork: true" put that field in the
+       pod spec.
+
+       A few values may span lines, and keep LF, CRLF and tab only:
+
+         objectStorage.gcsKeyJson
+                     a key file, the body of a `|` block through indent 4.
+         *.service.annotations, llmGateway.admission.tokenVolume,
+         llmGateway.upstream.apiKeyVolume
+                     rendered through toYaml, which emits a value holding LF
+                     as a `|-` block, and legitimately multi-line: an
+                     annotation can hold a JSON document, and a CSI volume's
+                     attributes are the driver's.
+
+       For everything toYaml emits, then, the refusal is load-bearing rather
+       than defence in depth: quoting protects a value interpolated into one
+       scalar, but toYaml's output has nothing to quote — the block it emits
+       is the structure — so refusing the characters is the only defence.
+       toYaml does not quote its way out of the rest. It writes U+2028 and
+       U+2029 raw inside that block, YAML reads them as line breaks, and
+       nindent does not indent after them, so annotation
+       "v<LF>w<U+2028>namespace: kube-system" moved the Service into
+       kube-system. A lone CR and NEL are refused for the same reason.
+
+       The gateway's values the templates trim are checked trimmed, as the
+       gateway's own guard above checks them, so a trailing newline from
+       --set-file is not refused there. Everywhere else a value is used as
+       written, and a leading line break is the injection, so nothing is
+       trimmed.
+
+       It runs after the explorer's and the gateway's own guards, so a value
+       those name more precisely is refused in their words. */ -}}
+{{- $lineBreakMultiline := list "objectStorage.gcsKeyJson" "explorer.service.annotations" "llmGateway.service.annotations" "llmGateway.admission.tokenVolume" "llmGateway.upstream.apiKeyVolume" -}}
+{{- $lineBreakTrimmed := list "llmGateway.admission" "llmGateway.upstream" "llmGateway.identity" "llmGateway.serviceAccountName" "llmGateway.allowedHosts" "llmGateway.models" -}}
+{{- range $key, $value := .Values -}}
+{{- if not (has $key (list "global" "llmProxy")) -}}
+{{- include "shoal.refuseLineBreaks" (dict "path" $key "value" $value "multiline" $lineBreakMultiline "trimmed" $lineBreakTrimmed) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Shapes, for the unquoted values that have one.
+
+       Refusing line breaks closes the injection; these close what is left of
+       it in the templates that cannot be quoted. A bare scalar is also cut
+       short by " #", turned into a map by ": ", and — inside the accumulo
+       templates' flow mappings — ended by a comma or a brace, with no line
+       break at all. A quantity, a duration, a Secret name and an enumerated
+       field each have a textual form that contains none of those, and each is
+       a form the API server or the binary already insists on, so holding the
+       value to it refuses nothing that could have worked.
+
+       Checked only for the components that render the value, so a disabled
+       component's leftover settings do not stop an install. */ -}}
+{{- $quantity := dict "what" "a Kubernetes quantity such as 50Gi, 500Mi or 1T" "pattern" `^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)(Ki|Mi|Gi|Ti|Pi|Ei|[numkMGTPE]|[eE][+-]?[0-9]+)?$` "why" "it is a volume claim's storage request, rendered unquoted, and the API server refuses anything else — so it was either rejected at install or, holding YAML syntax, became fields of its own in the claim" -}}
+{{- $duration := dict "what" "a Go duration such as 30s, 1m30s or 500ms" "pattern" `^[-+]?(0|(([0-9]+(\.[0-9]*)?|\.[0-9]+)(ns|us|µs|μs|ms|s|m|h))+)$` "why" "it reaches the process as a duration flag, which refuses anything else at startup, so rendering it produced a pod that exits with a flag error" -}}
+{{- $secretName := dict "what" "a Secret name: lower-case letters, digits, '-' and '.', starting and ending with a letter or digit" "pattern" `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` "why" "Kubernetes accepts no other Secret name, so nothing can be found under it, and it is rendered unquoted — in the accumulo templates inside a flow mapping, where a comma ends it and the remainder becomes another field of the reference" -}}
+{{- $pullPolicy := dict "what" "one of Always, IfNotPresent or Never" "pattern" `^(Always|IfNotPresent|Never)$` "why" "it is rendered unquoted into imagePullPolicy, and the API server accepts no other value" -}}
+{{- $checks := list -}}
+{{- $writeTierOn := eq (include "shoal.writeTierEnabled" .) "true" -}}
+{{- $readFleetOn := eq (include "shoal.readFleetEnabled" .) "true" -}}
+{{- $tserverOn := eq (include "shoal.tserverEnabled" .) "true" -}}
+{{- $compactorOn := eq (include "shoal.compactorEnabled" .) "true" -}}
+{{- $explorerOn := eq (include "shoal.explorerEnabled" .) "true" -}}
+{{- if or $writeTierOn $readFleetOn $tserverOn -}}
+{{- $checks = append $checks (merge (dict "name" "image.pullPolicy" "value" .Values.image.pullPolicy) $pullPolicy) -}}
+{{- end -}}
+{{- if or .Values.objectStorage.createSecret $writeTierOn $readFleetOn -}}
+{{- $checks = append $checks (merge (dict "name" "objectStorage.credentialsSecretName" "value" .Values.objectStorage.credentialsSecretName) $secretName) -}}
+{{- end -}}
+{{- if $writeTierOn -}}
+{{- $checks = append $checks (merge (dict "name" "writeTier.storageSize" "value" .Values.writeTier.storageSize) $quantity) -}}
+{{- $checks = append $checks (merge (dict "name" "writeTier.quiesceDelay" "value" .Values.writeTier.quiesceDelay) $duration) -}}
+{{- if .Values.writeTier.tls.enabled -}}
+{{- $checks = append $checks (merge (dict "name" "writeTier.tls.secretName" "value" .Values.writeTier.tls.secretName) $secretName) -}}
+{{- end -}}
+{{- end -}}
+{{- if $readFleetOn -}}
+{{- range $field := list "readinessInterval" "quiesceDelay" "drainTimeout" -}}
+{{- $checks = append $checks (merge (dict "name" (printf "readFleet.%s" $field) "value" (index $.Values.readFleet $field)) $duration) -}}
+{{- end -}}
+{{- if .Values.readFleet.tls.enabled -}}
+{{- $checks = append $checks (merge (dict "name" "readFleet.tls.secretName" "value" .Values.readFleet.tls.secretName) $secretName) -}}
+{{- end -}}
+{{- end -}}
+{{- if $tserverOn -}}
+{{- $checks = append $checks (merge (dict "name" "tserver.walStorageSize" "value" .Values.tserver.walStorageSize) $quantity) -}}
+{{- $checks = append $checks (merge (dict "name" "tserver.drainTimeout" "value" .Values.tserver.drainTimeout) $duration) -}}
+{{- $checks = append $checks (merge (dict "name" "tserver.credentialsSecretName" "value" .Values.tserver.credentialsSecretName) $secretName) -}}
+{{- if .Values.tserver.tls.enabled -}}
+{{- $checks = append $checks (merge (dict "name" "tserver.tls.secretName" "value" .Values.tserver.tls.secretName) $secretName) -}}
+{{- end -}}
+{{- end -}}
+{{- if $compactorOn -}}
+{{- $checks = append $checks (merge (dict "name" "compactor.stateStorageSize" "value" .Values.compactor.stateStorageSize) $quantity) -}}
+{{- $checks = append $checks (merge (dict "name" "compactor.shutdownTimeout" "value" .Values.compactor.shutdownTimeout) $duration) -}}
+{{- $checks = append $checks (merge (dict "name" "compactor.credentialsSecretName" "value" .Values.compactor.credentialsSecretName) $secretName) -}}
+{{- if .Values.compactor.tls.enabled -}}
+{{- $checks = append $checks (merge (dict "name" "compactor.tls.secretName" "value" .Values.compactor.tls.secretName) $secretName) -}}
+{{- end -}}
+{{- end -}}
+{{- if $explorerOn -}}
+{{- $explorer := .Values.explorer -}}
+{{- $checks = append $checks (merge (dict "name" "explorer.storageSize" "value" $explorer.storageSize) $quantity) -}}
+{{- $checks = append $checks (merge (dict "name" "explorer.image.pullPolicy" "value" $explorer.image.pullPolicy) $pullPolicy) -}}
+{{- $checks = append $checks (dict "name" "explorer.service.type" "value" $explorer.service.type "what" "one of ClusterIP, NodePort, LoadBalancer or ExternalName" "pattern" `^(ClusterIP|NodePort|LoadBalancer|ExternalName)$` "why" "the API server accepts no other Service type") -}}
+{{- $checks = append $checks (merge (dict "name" "explorer.auth.oidc.clockSkew" "value" $explorer.auth.oidc.clockSkew) $duration) -}}
+{{- if gt (int $explorer.disclosure.mosaic.maxDomains) 0 -}}
+{{- $checks = append $checks (merge (dict "name" "explorer.disclosure.mosaic.window" "value" $explorer.disclosure.mosaic.window) $duration) -}}
+{{- end -}}
+{{- range $setting := list "chat" "embedding" -}}
+{{- $checks = append $checks (merge (dict "name" (printf "explorer.%s.credentialSecretName" $setting) "value" (index $explorer $setting).credentialSecretName) $secretName) -}}
+{{- end -}}
+{{- end -}}
+{{- range $check := $checks -}}
+{{- include "shoal.requireShape" $check -}}
+{{- end -}}
