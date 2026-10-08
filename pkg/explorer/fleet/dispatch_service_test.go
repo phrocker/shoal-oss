@@ -349,8 +349,20 @@ func TestDispatchAuthorizationReplayConflictAndCancellationFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	delegatedCtx := bindDecision(t, authority, delegatedWithoutGrant)
+	// Unauthorized, and honestly so.
+	//
+	// This was the existence oracle #536 reports — not because the code is
+	// unauthorized, but because the check ran *after* the descriptor lookup,
+	// so reaching it implied the agent existed while a nonexistent one
+	// answered not-found. The fix moved the caller-only checks ahead of the
+	// lookup, so this answer is now identical whether or not the agent
+	// exists, and it can say what it actually is: this caller holds no
+	// delegate grant.
+	//
+	// TestAnInvokeHolderWithoutStandingCannotReachTheAdmissionGate asserts
+	// the identity that licenses it.
 	if _, err := service.Enqueue(delegatedCtx, dispatchEnqueue(now, "request")); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
-		t.Fatalf("delegation without grant = %v", err)
+		t.Fatalf("delegation without grant = %v, want unauthorized", err)
 	}
 	allowed := dispatchDecision(t, "owner", "actor", "request", auth.OperationDispatch, auth.OperationInvoke)
 	ctx := bindDecision(t, authority, allowed)

@@ -528,6 +528,18 @@ type memoryStore struct {
 	records  map[shoal.ID]Stored
 	keys     map[shoal.ID][32]byte
 	applyErr error
+	// gets counts descriptor lookups, so a test can assert that a refusal
+	// happened without one. A caller-only authorization failure must not
+	// reach the store at all — that is what makes its honest error safe,
+	// rather than an existence oracle (#536).
+	gets int
+}
+
+// getCount reports how many descriptor lookups have been made.
+func (s *memoryStore) getCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gets
 }
 
 func newMemoryStore() *memoryStore {
@@ -565,6 +577,7 @@ func (s *memoryStore) Apply(_ context.Context, mutation Mutation) (Stored, error
 func (s *memoryStore) Get(_ context.Context, id shoal.ID) (Stored, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.gets++
 	stored, ok := s.records[id]
 	if !ok {
 		return Stored{}, shoal.NewError(shoal.ErrorNotFound, "not found")

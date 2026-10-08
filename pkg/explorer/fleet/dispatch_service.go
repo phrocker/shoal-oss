@@ -2781,6 +2781,44 @@ func (s *Service) resolveActionBinding(
 	// revocation by s.active regardless of generation.
 	pinned bool,
 ) (Descriptor, Action, any, error) {
+	// Caller-only authorization first, before anything is looked up.
+	//
+	// These two checks ask whether *this caller* may act at all: does it hold
+	// the operation, and — if it is acting for someone else — may it delegate.
+	// Neither question involves the agent, so neither needs it to exist, and
+	// running them first is what stops their answers disclosing whether it
+	// does (#536).
+	//
+	// The resource they authorize against is built from the request and the
+	// decision only. That matters: it used to take AuthorizationDomain from
+	// the descriptor the lookup returned, so reordering naively would have
+	// quietly changed what is being authorized. The domain here is the
+	// decision's own, and the descriptor's is still required to equal it
+	// below — so the conjunction is unchanged and only its order moved.
+	//
+	// AuthorizeObject conceals some of its own refusals and not others, and
+	// its doc says which: a source or policy projection denial becomes
+	// ObjectNotFound, while "whole-request failures remain unauthorized". A
+	// missing operation or delegate grant is a whole-request failure, and
+	// both may now answer honestly — because at this point there is nothing
+	// to disclose.
+	callerResource := auth.ResourceRequest{
+		AuthorizationDomain: decision.AuthorizationDomain(),
+		SourceID:            sourceID,
+		PolicyID:            policyID,
+		ObjectID:            objectID,
+	}
+	if err := decision.AuthorizeObject(
+		operation, callerResource, now); err != nil {
+		return Descriptor{}, Action{}, nil, err
+	}
+	if len(decision.OnBehalfOf()) > 0 {
+		if err := decision.AuthorizeObject(
+			auth.OperationDelegate, callerResource, now); err != nil {
+			return Descriptor{}, Action{}, nil, err
+		}
+	}
+
 	descriptor, err := s.active(ctx, agentID, now)
 	if err != nil || (pinned && descriptor.Generation != generation) {
 		return Descriptor{}, Action{}, nil, auth.ObjectNotFound()
@@ -2797,18 +2835,6 @@ func (s *Service) resolveActionBinding(
 	}
 	if !scopeFound {
 		return Descriptor{}, Action{}, nil, auth.ObjectNotFound()
-	}
-	resource := auth.ResourceRequest{
-		AuthorizationDomain: descriptor.AuthorizationDomain, SourceID: sourceID,
-		PolicyID: policyID, ObjectID: objectID,
-	}
-	if err := decision.AuthorizeObject(operation, resource, now); err != nil {
-		return Descriptor{}, Action{}, nil, err
-	}
-	if len(decision.OnBehalfOf()) > 0 {
-		if err := decision.AuthorizeObject(auth.OperationDelegate, resource, now); err != nil {
-			return Descriptor{}, Action{}, nil, err
-		}
 	}
 	var selected *Action
 	for _, capability := range descriptor.Capabilities {
