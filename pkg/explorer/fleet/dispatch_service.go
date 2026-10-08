@@ -307,11 +307,18 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 		}
 		return ActionRecord{}, ErrActionConflict
 	}
-	// Each of the three remaining answers is the real reason for a caller with
-	// standing or a record Pull already shows, and the answer an absent action
-	// gets otherwise. The live-claimed branch had no such check at all until a
-	// review found it: Pull withholds a live-claimed record, so claiming one by
-	// a guessed ID was returning a distinguishable conflict.
+	// The three remaining answers are each the real reason for a caller with
+	// standing, and the answer an absent action gets otherwise. The
+	// live-claimed branch had no such check at all until a review found it:
+	// Pull withholds a live-claimed record, so claiming one by a guessed ID
+	// was returning a distinguishable conflict.
+	//
+	// concealFrom's observable-through-Pull disjunct is dead in all three,
+	// because each branch's own condition already implies Pull withholds the
+	// record. Only the version mismatch above exercises it. They use the same
+	// predicate anyway so that the rule is stated once rather than three times
+	// with one of them subtly different, which is how the live-claimed branch
+	// came to have no check in the first place.
 	if current.State == DispatchClaimed && now.Before(current.ClaimLeaseUntil) {
 		if concealFrom(decision, current, now) {
 			return ActionRecord{}, auth.ObjectNotFound()
@@ -472,6 +479,33 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if !sameActionPrincipal(decision, claimed) {
 		return ActionRecord{}, shoal.NewError(shoal.ErrorUnauthorized, "execution identity does not match queued action")
 	}
+	// And the caller must hold the claim it is about to execute, not merely be
+	// the record's principal.
+	//
+	// This is the same gate completeClaim applies, and it has to be here too
+	// because Invoke reaches a terminal write without going through
+	// completeClaim at all: it calls Claim, and on a record already claimed at
+	// the presented ClaimID it calls straight through to here. So narrowing
+	// only the completion path left the hole open through a second door, which
+	// a review found by walking the entry points rather than the predicate.
+	//
+	// What it closed: an enqueuer reads the live ClaimID off Status — which
+	// Status discloses to every co-principal — and Invokes with it while a
+	// worker holds the claim. The in-process executor runs, the record goes
+	// terminal, and the worker's own report is then recognised by the replay
+	// branch and answered with a 200 carrying the enqueuer's output. A worker
+	// that performed the work is told it was recorded, as something else.
+	//
+	// Verified by execution, and only reachable where an in-process executor
+	// is bound: a gateway reference is deliberately remote-bound, so
+	// ExecuteClaim refuses it earlier for want of an ActionExecutor. That
+	// makes this a pre-existing hazard for ordinary in-process actions rather
+	// than a gateway one, which is also why two earlier attempts to reproduce
+	// it against a gateway fixture came back clean.
+	if !holdsClaimOn(decision, claimed) {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "execution identity does not hold the claim")
+	}
 	_, action, executor, err := s.registry.resolveAction(
 		ctx, decision, claimed.AgentID, claimed.AgentGeneration,
 		claimed.Capability, claimed.Action, claimed.SourceID, claimed.PolicyID,
@@ -538,6 +572,19 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	}
 	if !sameActionPrincipal(invocationDecision, current) {
 		return ActionRecord{}, shoal.NewError(shoal.ErrorUnauthorized, "invocation identity changed")
+	}
+	// Re-checked against the record as stored. The entry gate above compares
+	// against a record the caller handed in, so on any path where that record
+	// is not the one this service just loaded, this is the check that binds.
+	//
+	// Either one alone refuses the reachable cases, so a mutation deleting one
+	// of them survives and only deleting both is caught — the same property
+	// the sameActionPrincipal pair above it has. That is what defence in depth
+	// looks like under mutation testing, and it is the reason to say so here:
+	// neither is dead code, and the next reader should delete neither.
+	if !holdsClaimOn(invocationDecision, current) {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorUnauthorized, "invocation identity does not hold the claim")
 	}
 	_, action, executor, err = s.registry.resolveAction(
 		ctx, invocationDecision, current.AgentID, current.AgentGeneration,
@@ -1640,9 +1687,21 @@ func (s *DispatchService) claimableBy(
 	return false, nil
 }
 
-// observableThroughPull reports whether Pull would return this record to a
-// caller authorized to execute its descriptor. It mirrors the filter in Pull
-// exactly, and the two must not drift.
+// observableThroughPull reports whether Pull's *state* filter would return
+// this record.
+//
+// It mirrors that filter and the two must not drift. It is not the whole of
+// Pull's selection: Pull also drops admission records and applies claimableBy
+// per record, and this takes no decision so it structurally cannot express the
+// second. An earlier version of this comment said "mirrors the filter in Pull
+// exactly", which invited a future caller where the difference would matter.
+//
+// Neither omission is reachable from the callers it has. Claim refuses an
+// admission with auth.ObjectNotFound() before any branch that consults this,
+// and by the time one is reached authorizedClaimant has already succeeded —
+// which is strictly stronger than claimableBy, since it resolves the same
+// binding and additionally authorizes the record's own ID. A caller admitted
+// through the invoke fallback is the enqueuer, so standingOn holds regardless.
 //
 // It is the discriminator for whether concealing a refusal buys anything. A
 // record Pull already hands this caller cannot be concealed by any answer
@@ -1684,9 +1743,14 @@ func concealFrom(
 // to have performed the work, and the only principal that can have done so is
 // the one holding the claim.
 //
-// The enqueuer is admitted only when the record carries no claimant at all,
-// which happens for exactly one reason — the claim was taken by a build that
-// had no such field, and the claimant was by construction the enqueuer.
+// The enqueuer is admitted only when the record carries no claimant at all.
+// Nothing this build writes produces that: applyClaim is the only writer of
+// those fields and auth.NewDecision requires a non-empty Subject. So in
+// practice it means the claim was taken by a build that had no such field,
+// where the claimant was by construction the enqueuer. It is not an invariant
+// the type enforces — ActionRecord.Validate accepts an empty claimant on a
+// claimed record, deliberately, so a stored record from that build still
+// decodes and still validates.
 func holdsClaimOn(decision auth.Decision, record ActionRecord) bool {
 	if sameClaimantPrincipal(decision, record) {
 		return true

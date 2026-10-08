@@ -736,6 +736,15 @@ func TestARevokedExecutorCannotCommitItsOutcome(t *testing.T) {
 		t.Fatalf("the refusal does not tell the caller its effect is "+
 			"unreconciled, which is the only thing it can act on: %v", err)
 	}
+	// Specifically the fault arm, not the authorization verdict below it. Both
+	// return ErrExecutionAmbiguous, so asserting only that let the fault arm be
+	// deleted with the suite green — the verdict arm caught the same case and
+	// produced its own message. That is the defect this test's sibling was
+	// split off to fix, left standing in the other half.
+	if strings.Contains(err.Error(), "terminal execution identity changed") {
+		t.Fatalf("refused by the authorization verdict rather than by the "+
+			"fault arm, so the fault arm is still uncovered: %v", err)
+	}
 
 	// Put the descriptor back before reading the record. The executor broke it
 	// permanently, and Status resolves the binding too — so without this the
@@ -1280,5 +1289,152 @@ func TestCloningARecordDoesNotShareTheClaimantChain(t *testing.T) {
 	// simply absent from the clone.
 	if clone.ClaimantSubject != "holder" || clone.ClaimantActor != "holder-actor" {
 		t.Fatalf("the clone did not carry the claimant identity: %+v", clone)
+	}
+}
+
+// inProcessExecutor runs and returns a fixed result, changing nothing else.
+//
+// Needed because the fixture's default executor is remote-bound — which is what
+// a gateway reference is, deliberately — so ExecuteClaim refuses it before any
+// identity check. Two attempts to reproduce the defect below came back clean for
+// exactly that reason, and then for a second: breakingExecutor broke its own
+// descriptor, so the refusal came from the post-effect check instead. A fixture
+// that refuses for the wrong reason reads exactly like a fixed bug.
+type inProcessExecutor struct{}
+
+func (*inProcessExecutor) Execute(
+	_ context.Context, _ Invocation,
+) (ExecutionResult, error) {
+	return ExecutionResult{Output: json.RawMessage(`{"ok":false}`)}, nil
+}
+
+// TestInvokeCannotExecuteOverAnotherPrincipalsClaim closes the second door into
+// a terminal write, which narrowing completeClaim alone left open.
+//
+// Invoke does not go through completeClaim. It calls Claim, and for a record
+// already claimed at the ClaimID it presents it calls straight through to
+// ExecuteClaim — whose only identity gate was sameActionPrincipal. So the
+// enqueuer could still commit over a live foreign claim, with the same
+// prerequisite as before (Status discloses the claim ID to every co-principal)
+// and the same consequence: the worker's own report is recognised by the replay
+// branch and answered with a 200 carrying the enqueuer's output.
+//
+// Only reachable where an in-process executor is bound. A gateway reference is
+// remote-bound, so ExecuteClaim refuses it earlier for want of an
+// ActionExecutor — which makes this an ordinary-dispatch hazard rather than a
+// gateway one, and is why it survived two rounds of review of the gateway path.
+func TestInvokeCannotExecuteOverAnotherPrincipalsClaim(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	fixture.bindExecutor(t, &inProcessExecutor{})
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the worker could not claim: %v", err)
+	}
+
+	// The enqueuer reads the claim ID off its own Status call, which is the
+	// disclosure this attack needs and which is by design.
+	status, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(status.ClaimID, []byte("worker-claim")) {
+		t.Fatalf("Status did not disclose the claim ID (%q), so this test is "+
+			"not exercising the path it describes", status.ClaimID)
+	}
+
+	if _, err := fixture.service.Invoke(fixture.enqueuer, InvokeRequest{
+		Enqueue: dispatchEnqueue(fixture.now, "request"),
+		ClaimID: status.ClaimID, Lease: time.Minute,
+	}); err == nil {
+		t.Fatal("the enqueuer executed over a live foreign claim through " +
+			"Invoke, and the worker would then receive a success receipt for " +
+			"an outcome it did not produce")
+	}
+
+	// The record is untouched and the worker still records its own outcome.
+	after, err := fixture.service.Status(fixture.enqueuer, StatusRequest{
+		ID: fixture.queued.ID, Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != DispatchClaimed {
+		t.Fatalf("the refused invoke still moved the record to %s", after.State)
+	}
+	done, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("worker-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the claim's holder was refused: %v", err)
+	}
+	if string(done.Output) != `{"ok":true}` {
+		t.Fatalf("the holder's own outcome was not recorded: %s", done.Output)
+	}
+}
+
+// TestTheEnqueuerStillInvokesItsOwnWork is the other side of the gate above,
+// and the reason it is holdsClaimOn rather than a refusal of the enqueuer.
+//
+// The synchronous path is the enqueuer claiming and executing its own action in
+// one call. That must keep working: it is what every in-process action uses,
+// and a gate that refused it would break the common case to close an edge one.
+func TestTheEnqueuerStillInvokesItsOwnWork(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	fixture.bindExecutor(t, &inProcessExecutor{})
+
+	result, err := fixture.service.Invoke(fixture.enqueuer, InvokeRequest{
+		Enqueue: dispatchEnqueue(fixture.now, "request"),
+		ClaimID: []byte("own-claim"), Lease: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("the enqueuer could not invoke its own work: %v", err)
+	}
+	if result.State != DispatchSucceeded {
+		t.Fatalf("the synchronous path did not complete: state=%s", result.State)
+	}
+	if string(result.Output) != `{"ok":false}` {
+		t.Fatalf("the executor's result was not recorded: %s", result.Output)
+	}
+}
+
+// TestAnEnqueuerCannotReplayAnotherPrincipalsClaim covers the replay-branch half
+// of the narrowing, which had no test of its own.
+//
+// Claim's replay branch asks holdsClaimOn rather than standingOn, and the two
+// differ only for the enqueuer on a claim a worker holds. Swapping the
+// predicate back left the suite green, because the existing replay test uses a
+// stranger and a stranger is refused by either.
+func TestAnEnqueuerCannotReplayAnotherPrincipalsClaim(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	if _, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("the worker could not claim: %v", err)
+	}
+
+	// Exactly the request the worker would replay, from the enqueuer.
+	replayed, err := fixture.service.Claim(fixture.enqueuer, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "request"),
+	})
+	if err == nil {
+		t.Fatalf("the replay branch handed the enqueuer a live claim it does "+
+			"not hold: state=%s claim=%q", replayed.State, replayed.ClaimID)
 	}
 }
