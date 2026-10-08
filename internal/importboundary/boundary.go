@@ -4,7 +4,9 @@
 // in docs/gateways.md ("Core and extensions") over source files, without the
 // go command, so it holds with GOWORK=off and for modules CI does not build.
 //
-//   - Rule A: no package of the root module imports extensions/.
+//   - Rule A: no package of the root module, or of any nested module outside
+//     extensions/, imports extensions/; and neither the root go.mod nor
+//     go.work wires extension code in (see checkWorkspace).
 //   - Rule B: every extension module (any go.mod under extensions/, at any
 //     depth) imports from this repository only the public allowlist: pkg/sdk,
 //     pkg/collector, pkg/collector/api, pkg/decision/api and pkg/shoal. Its
@@ -62,15 +64,20 @@ func internalPath(p string) bool {
 	return strings.Contains("/"+p+"/", "/internal/")
 }
 
-// goMod is the subset of a go.mod file the rules need.
+// goMod is the subset of a go.mod or go.work file the rules need.
 type goMod struct {
 	module   string
+	requires []string    // required module paths
 	replaces [][2]string // old path (version stripped), new path
+	uses     []string    // go.work use directories
 }
 
-// goModVerbs are the directives the go command accepts. Anything else fails
-// closed rather than being skipped.
-var goModVerbs = []string{"module", "go", "toolchain", "godebug", "require", "replace", "exclude", "retract", "tool", "ignore"}
+// goModVerbs and goWorkVerbs are the directives the go command accepts in
+// each file. Anything else fails closed rather than being skipped.
+var (
+	goModVerbs  = []string{"module", "go", "toolchain", "godebug", "require", "replace", "exclude", "retract", "tool", "ignore"}
+	goWorkVerbs = []string{"go", "toolchain", "godebug", "use", "replace"}
+)
 
 // goModFields splits one line, separating parentheses glued to tokens
 // ("replace(") and unquoting quoted tokens. A quote that does not wrap a
@@ -96,6 +103,19 @@ func goModFields(line string) ([]string, error) {
 // anywhere but a block opener or closer, so an unusual spelling cannot hide a
 // replace from the rules.
 func parseGoMod(fsys fs.FS, name string) (goMod, error) {
+	out, err := parseModFile(fsys, name, goModVerbs)
+	if err == nil && out.module == "" {
+		err = fmt.Errorf("%s: no module directive", name)
+	}
+	return out, err
+}
+
+// parseGoWork reads a go.work file with the same fail-closed rules.
+func parseGoWork(fsys fs.FS, name string) (goMod, error) {
+	return parseModFile(fsys, name, goWorkVerbs)
+}
+
+func parseModFile(fsys fs.FS, name string, verbs []string) (goMod, error) {
 	raw, err := fs.ReadFile(fsys, name)
 	if err != nil {
 		return goMod{}, err
@@ -123,7 +143,7 @@ func parseGoMod(fsys fs.FS, name string) (goMod, error) {
 			block = ""
 			continue
 		case block == "" && len(fields) == 2 && fields[1] == "(":
-			if !slices.Contains(goModVerbs, fields[0]) {
+			if !slices.Contains(verbs, fields[0]) {
 				return bad("unknown directive " + fields[0])
 			}
 			block = fields[0]
@@ -133,6 +153,9 @@ func parseGoMod(fsys fs.FS, name string) (goMod, error) {
 		}
 		if slices.Contains(fields, "(") || slices.Contains(fields, ")") {
 			return bad("unexpected parenthesis")
+		}
+		if !slices.Contains(verbs, fields[0]) {
+			return bad("unknown directive " + fields[0])
 		}
 		switch fields[0] {
 		case "module":
@@ -147,10 +170,16 @@ func parseGoMod(fsys fs.FS, name string) (goMod, error) {
 				return bad("malformed replace directive")
 			}
 			out.replaces = append(out.replaces, [2]string{fields[1], fields[arrow+1]})
-		default:
-			if !slices.Contains(goModVerbs, fields[0]) {
-				return bad("unknown directive " + fields[0])
+		case "require":
+			if len(fields) != 3 {
+				return bad("malformed require directive")
 			}
+			out.requires = append(out.requires, fields[1])
+		case "use":
+			if len(fields) != 2 {
+				return bad("malformed use directive")
+			}
+			out.uses = append(out.uses, fields[1])
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -158,9 +187,6 @@ func parseGoMod(fsys fs.FS, name string) (goMod, error) {
 	}
 	if block != "" {
 		return goMod{}, fmt.Errorf("%s: unterminated %s block", name, block)
-	}
-	if out.module == "" {
-		return goMod{}, fmt.Errorf("%s: no module directive", name)
 	}
 	return out, nil
 }
@@ -236,6 +262,39 @@ func walkGo(fsys fs.FS, root string, skip func(dir string) bool, visit func(file
 	})
 }
 
+// FixtureRoot holds this checker's own fixtures, deliberately violating
+// trees. It is the one directory exempt from the rules.
+const FixtureRoot = "internal/importboundary/testdata"
+
+// NestedModules returns every directory outside extensions/ that holds its
+// own go.mod (wal-quorum-sidecar, for example). Their code can be linked into
+// core through go.mod requires or go.work, so rule A covers them too. The
+// repository .git, FixtureRoot, and separate checkouts (a directory with its
+// own .git entry, such as an editor's worktree) are not part of this
+// repository and are skipped.
+func NestedModules(fsys fs.FS) ([]string, error) {
+	var dirs []string
+	err := fs.WalkDir(fsys, ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() || name == "." {
+			return nil
+		}
+		if name == ".git" || name == "extensions" || name == FixtureRoot {
+			return fs.SkipDir
+		}
+		if _, err := fs.Lstat(fsys, path.Join(name, ".git")); err == nil {
+			return fs.SkipDir
+		}
+		if info, err := fs.Lstat(fsys, path.Join(name, "go.mod")); err == nil && info.Mode().IsRegular() {
+			dirs = append(dirs, name)
+		}
+		return nil
+	})
+	return dirs, err
+}
+
 // Extensions returns every go.mod under extensions/, at any depth.
 func Extensions(fsys fs.FS) ([]string, error) {
 	var mods []string
@@ -254,6 +313,65 @@ func Extensions(fsys fs.FS) ([]string, error) {
 	return mods, err
 }
 
+// underExtensions reports whether a local replace or use target, relative to
+// the repository root, lies in extensions/.
+func underExtensions(target string) bool {
+	if !strings.HasPrefix(target, "./") && !strings.HasPrefix(target, "../") && target != "." {
+		return false
+	}
+	clean := path.Clean(target)
+	return clean == "extensions" || strings.HasPrefix(clean, "extensions/")
+}
+
+// checkWorkspace applies rule A to the root go.mod and go.work, which can
+// link code into core without any import inside the root module's tree.
+//
+//   - The root go.mod may not require an extension module, replace one, or
+//     replace anything with a directory under extensions/.
+//   - go.work may not replace anything, and may use only the root, extension
+//     modules and nested modules. Using an extension module is harmless
+//     only because rule A forbids every import of it; using a nested module
+//     is harmless only because rule A walks it.
+//
+// Either file failing to parse is a violation.
+func checkWorkspace(fsys fs.FS, extensionDirs map[string]bool, nested []string) []Violation {
+	var out []Violation
+	extensions := Module + "/extensions"
+	root, err := parseGoMod(fsys, "go.mod")
+	if err != nil {
+		return []Violation{{"A", "go.mod", "(malformed go.mod: " + err.Error() + ")"}}
+	}
+	for _, r := range root.requires {
+		if within(r, extensions) {
+			out = append(out, Violation{"A", "go.mod", "require " + r})
+		}
+	}
+	for _, r := range root.replaces {
+		if within(r[0], extensions) || underExtensions(r[1]) {
+			out = append(out, Violation{"A", "go.mod", "replace " + r[0] + " => " + r[1]})
+		}
+	}
+	if _, err := fs.Stat(fsys, "go.work"); err != nil {
+		return out
+	}
+	work, err := parseGoWork(fsys, "go.work")
+	if err != nil {
+		return append(out, Violation{"A", "go.work", "(malformed go.work: " + err.Error() + ")"})
+	}
+	for _, r := range work.replaces {
+		out = append(out, Violation{"A", "go.work", "replace " + r[0] + " => " + r[1]})
+	}
+	for _, use := range work.uses {
+		relative := use == "." || strings.HasPrefix(use, "./") || strings.HasPrefix(use, "../")
+		dir := path.Clean(use)
+		if relative && (dir == "." || extensionDirs[dir] || slices.Contains(nested, dir)) {
+			continue
+		}
+		out = append(out, Violation{"A", "go.work", "use " + use})
+	}
+	return out
+}
+
 // Check applies all three rules to the repository rooted at fsys.
 func Check(fsys fs.FS) ([]Violation, error) {
 	root, err := modulePath(fsys, "go.mod")
@@ -267,19 +385,29 @@ func Check(fsys fs.FS) ([]Violation, error) {
 	extensions := Module + "/extensions"
 
 	// Rule A covers every package of the root module, not just pkg/,
-	// internal/ and cmd/. Nested modules (wal-quorum-sidecar, extensions) are
-	// skipped by walkGo; extensions/ is checked under rule B.
-	// The repository's .git directory is never part of a module: Go rejects
-	// import path elements that begin with a dot.
-	if err := walkGo(fsys, ".", func(dir string) bool { return dir == "extensions" || dir == ".git" }, func(file string, list []string) error {
+	// internal/ and cmd/, and every nested module outside extensions/ (each
+	// walked on its own, since walkGo stops at module boundaries).
+	// extensions/ is checked under rule B. The repository's .git directory is
+	// never part of a module: Go rejects import path elements that begin with
+	// a dot.
+	nested, err := NestedModules(fsys)
+	if err != nil {
+		return nil, err
+	}
+	ruleA := func(file string, list []string) error {
 		for _, p := range list {
 			if within(p, extensions) {
 				out = append(out, Violation{"A", file, p})
 			}
 		}
 		return nil
-	}, func(name string) { out = append(out, Violation{"A", name, "(symlink)"}) }); err != nil {
-		return nil, err
+	}
+	linkA := func(name string) { out = append(out, Violation{"A", name, "(symlink)"}) }
+	for _, dir := range append([]string{"."}, nested...) {
+		skip := func(d string) bool { return d == "extensions" || d == ".git" || d == FixtureRoot }
+		if err := walkGo(fsys, dir, skip, ruleA, linkA); err != nil {
+			return nil, err
+		}
 	}
 
 	mods, err := Extensions(fsys)
@@ -290,6 +418,7 @@ func Check(fsys fs.FS) ([]Violation, error) {
 	for _, mod := range mods {
 		moduleDirs[path.Dir(mod)] = true
 	}
+	out = append(out, checkWorkspace(fsys, moduleDirs, nested)...)
 	// Go files under extensions/ outside every extension module would belong
 	// to the root module and escape rule B.
 	if _, statErr := fs.Stat(fsys, "extensions"); statErr == nil {

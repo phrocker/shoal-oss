@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -76,12 +77,21 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 		"extension-underscore-impl":  {{"B", "extensions/e/_impl/impl.go", m + "/internal/engine"}},
 		"extension-testdata-package": {{"B", "extensions/e/testdata/x/x.go", m + "/internal/engine"}},
 		"core-underscore-package":    {{"A", "pkg/_x/x.go", m + "/extensions/good/lines"}},
-		"symlinked-extension-dir": {
-			{"A", "pkg/alias", "(symlink)"},
-			{"B", "extensions/e/impl", "(symlink)"},
+		"gomod-glued-paren":          {{"B", "extensions/e/go.mod", "replace " + m + " => ../../../evil"}},
+		"gomod-unknown-directive":    {{"B", "extensions/e/go.mod", "(malformed go.mod: extensions/e/go.mod:5: unknown directive substitute)"}},
+		// Core links an extension through a nested module outside
+		// extensions/, wired by the root go.mod or by go.work alone.
+		"nested-module-bridge": {
+			{"A", "go.mod", "replace example.com/shim => ./extensions/e"},
+			{"A", "go.mod", "replace " + m + "/extensions/e => ./extensions/e"},
+			{"A", "go.mod", "require " + m + "/extensions/e"},
+			{"A", "hidden/bridge/bridge.go", m + "/extensions/e"},
 		},
-		"gomod-glued-paren":       {{"B", "extensions/e/go.mod", "replace " + m + " => ../../../evil"}},
-		"gomod-unknown-directive": {{"B", "extensions/e/go.mod", "(malformed go.mod: extensions/e/go.mod:5: unknown directive substitute)"}},
+		"gowork-bridge": {
+			{"A", "go.work", "replace " + m + "/extensions/e => ./extensions/e"},
+			{"A", "go.work", "use ../outside"},
+			{"A", "hidden/bridge/bridge.go", m + "/extensions/e"},
+		},
 	}
 	for name, want := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -93,5 +103,62 @@ func TestFixturesDetectEachDirection(t *testing.T) {
 				t.Fatalf("got %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+// copyTree copies a fixture into dir. Symlinks are not committed, because a
+// checkout without symlink support turns them into text files; tests create
+// them here instead.
+func copyTree(t *testing.T, src, dir string) {
+	t.Helper()
+	err := fs.WalkDir(os.DirFS(src), ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dir, filepath.FromSlash(name))
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		raw, err := os.ReadFile(filepath.Join(src, filepath.FromSlash(name)))
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, raw, 0o644)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSymlinksAreViolations(t *testing.T) {
+	dir := t.TempDir()
+	copyTree(t, filepath.Join("testdata", "symlinked-extension-dir"), dir)
+	for link, target := range map[string]string{
+		"extensions/e/impl": "../../internal/secret",
+		"pkg/alias":         "../internal/secret",
+	} {
+		if err := os.Symlink(target, filepath.Join(dir, filepath.FromSlash(link))); err != nil {
+			t.Skipf("platform refuses symlinks: %v", err)
+		}
+	}
+	want := []Violation{
+		{"A", "pkg/alias", "(symlink)"},
+		{"B", "extensions/e/impl", "(symlink)"},
+	}
+	if got := check(t, os.DirFS(dir)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+// An unparseable Go file is an error from Check, which every caller (these
+// tests, and so CI) treats as a failure rather than as a clean result.
+func TestUnparseableSourceFailsCheck(t *testing.T) {
+	dir := t.TempDir()
+	copyTree(t, filepath.Join("testdata", "clean"), dir)
+	if err := os.WriteFile(filepath.Join(dir, "pkg", "sdk", "broken.go"), []byte("package sdk\nimport (\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Check(os.DirFS(dir)); err == nil {
+		t.Fatal("unparseable source passed")
 	}
 }

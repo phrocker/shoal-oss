@@ -175,7 +175,15 @@ observations belongs to the decision track (#418).
 so it works with `GOWORK=off`) and fails when:
 
 - A. any package in the root module (not only `pkg/`, `internal/` and
-  `cmd/`) imports `extensions/`;
+  `cmd/`) or in any nested module outside `extensions/` (such as
+  `wal-quorum-sidecar`) imports `extensions/`; or the root `go.mod` requires
+  or replaces an extension module, or replaces anything with a directory
+  under `extensions/`; or `go.work` has any `replace`, or a `use` other than
+  the root, an extension module or a nested module. Nested modules are
+  covered because a `require`/`replace` or a `go.work` `use` can link them,
+  and through them extension code, into core. Using an extension module in
+  `go.work` is harmless only because no core or nested-module package may
+  import it;
 - B. an extension module (any `go.mod` under `extensions/`, at any depth)
   imports a repository package outside `pkg/sdk`, `pkg/collector`,
   `pkg/collector/api`, `pkg/decision/api`, `pkg/shoal`; or declares a module
@@ -188,21 +196,31 @@ so it works with `GOWORK=off`) and fails when:
 
 The scan descends into every directory, including `testdata`, `vendor` and
 names beginning with `_` or `.`. `go build ./...` skips those, but Go still
-compiles them when a package imports them by explicit path. The only
-directories skipped are nested modules (those with their own `go.mod`) and the
-repository's `.git`. The checker's fixtures need no special case, because each
-fixture tree is a nested module. Any symlink in the root module or under
-`extensions/` is a violation. The walk does not follow symlinks, but the go
-command and `go.work` do. The repository currently contains none.
+compiles them when a package imports them by explicit path. Each module is
+walked on its own, stopping at the next module boundary. Three things are
+skipped:
 
-An extension's `go.mod` is parsed with every known directive recognized and
+- the repository's `.git`;
+- the checker's own fixture root, `internal/importboundary/testdata`
+  (`importboundary.FixtureRoot`), the one explicit exemption;
+- separate checkouts nested in the working tree, meaning directories with
+  their own `.git` entry, such as editor worktrees.
+
+Any symlink in a checked module or under `extensions/` is a violation. The
+walk does not follow symlinks, but the go command and `go.work` do. The
+repository contains none. The symlink fixture's links are created at test
+time in a temporary copy rather than committed, so a checkout without
+symlink support still runs the test, or skips it if the platform refuses.
+
+The root `go.mod`, `go.work` and every extension `go.mod` are parsed with every known directive recognized and
 parentheses split from adjacent tokens (`replace(` counts the same as
 `replace (`). An unknown directive, an unbalanced or nested block, or any
 other line the parser cannot read exactly is reported as a violation, never
 skipped.
 
 Fixtures under `internal/importboundary/testdata` prove each rule detects a
-violation. CI also vets and tests every module under `extensions/` on its own
+violation. A source file that does not parse makes `Check` return an error,
+which the test (and so CI) reports as a failure, not a pass. CI also vets and tests every module under `extensions/` on its own
 `go.mod`, and fails if a core package links `golang.org/x/crypto/ssh`, an RDP
 library or Guacamole (a failing `go list` fails that check rather than passing
 it).
