@@ -273,20 +273,52 @@ the no-proxy, no-jar and no-redirect rules.
 
 ## Completion: lost responses, and the wire as found on main
 
-**Lost response (permanent).** On a transport error, or a 503 with
-`Shoal-Commit-Outcome: indeterminate`, the report may have committed. The
-client resends the identical body once; the completion route's replay branch
-answers it with the committed record. If the resend's answer is lost too, the
-client returns `indeterminate` — never the first attempt's status, which
-describes a request whose outcome the resend was sent to learn. A definite
-answer to the resend (409, 404, …) is returned as it is. A #492-shaped 400 or
-500 after a lost first attempt is *not* definite — the first attempt may have
-committed and that answer hides the record — so the record is read once more
-through the replay branch, and an unanswered read is `indeterminate`. The same
-holds after a 400 or 500 with no loss before it: the first may have been a
-genuine error that committed nothing while the resend committed and answered
-400/500, so a resend answered 400/500 is always followed by a third read, and
-only a returned record settles it.
+**Lost or unreadable response (permanent).** The report may have committed
+after any of these first answers:
+
+- a transport error, or a 503 with `Shoal-Commit-Outcome: indeterminate`;
+- a 502 or 504 — a proxy in front of the explorer can answer either after the
+  explorer processed the request;
+- a 2xx whose body does not decode, or does not describe this claim's terminal
+  record at exactly the reported version plus one — the route answered
+  success, so something committed, and `protocol` alone would hide it.
+
+The client resends the identical body once; the completion route's replay
+branch answers it with the committed record.
+
+**Every 503 is possibly committed (interim, until #505).** Today
+`ErrExecutionAmbiguous` and `ErrActionCommitted` (a durable write whose
+publication failed) reach the wire as bare 503s with no
+`Shoal-Commit-Outcome` header, so a header-less 503 from `/complete` may hide a
+committed write. The client therefore treats *any* 503 from `/complete` like a
+lost response. `ErrRecordingUnavailable` is also a bare 503; on the dispatch
+surface every audit precedes its store write, so it is in fact a clean
+refusal, but nothing on the wire tells it apart and the client never reads
+error-message text. (The "committed" in `MarkCommittedInteraction` is about an
+interaction record, not the action.) When #505 marks the genuinely
+indeterminate sentinels, a header-less 503 means a clean refusal before any
+write, and the trigger narrows back to the header; the resend on a genuinely
+lost response stays.
+
+**After a possibly-committed answer, only a record is definite.** Once the
+first answer was any of the above, any 503, or a #492-shaped 400/500, the
+client returns the committed record or `indeterminate`, nothing else:
+
+| resend answered | result |
+|---|---|
+| 2xx with the record | the record (`recorded_otherwise` rules apply) |
+| transport error, any 503, 502 or 504 | `indeterminate` |
+| anything else — 409, 404, 400, 500, a 2xx that is not this report's record, … | one third read through the replay branch; a record settles it, anything else is `indeterminate` |
+
+It never returns the first attempt's status, which describes a request whose
+outcome the resend was sent to learn. A 409 or 404 answering the resend is not
+definite: `ErrExecutionAmbiguous` means the first write may still be in flight
+when the resend reads the record, which can then see the claim at the old
+version with its lease lapsed and answer 409 for a report that commits a moment
+later. A #492 400/500 answering the resend is not definite either: the first
+answer may have been a genuine error that committed nothing while the resend
+committed and had its record discarded. With nothing possibly committed before
+it, a first-attempt 409 or 404 is definite and returned as it is.
 
 **Recorded otherwise (permanent).** The committed record is compared with the
 report — state, error code, and for a success the output as a JSON value. Any
@@ -309,6 +341,17 @@ When #492 lands the two pins flip to 2xx and the 400/500 trigger is removed.
 
 `not-found` from `Claim` means re-pull, never "gone": the loser of a claim race
 is told not-found deliberately.
+
+`repull` from `Claim` is every answer after which the claim may have
+committed: a transport error, any 503 (with or without the indeterminate
+header), or a 502 or 504 that a proxy can answer after the explorer processed
+the claim. It is never reported as a definite failure; but `Claim` returns no
+action, so the caller holds no claim, executes nothing, and re-pulls. A claim
+that did commit lapses at its lease and reappears on the pull page; a
+completion against a claim the worker does not hold is refused. The original
+error, with its kind, is the cause. The bare-503 case is interim: today
+`ErrActionCommitted` reaches the wire as a bare 503, and after #505 a
+header-less 503 is a clean refusal and narrows back to `unavailable`.
 
 ## Logging policy
 
@@ -351,5 +394,8 @@ another fails if a field is added to the log record outside the policy.
 - **Field names must be spelled exactly**, in the route table and the action's
   input, and the startup check also compares `input_schema`.
 - **A DELETE route takes no body**, matching its `InputSchema()`.
-- **The completion resend** recovers a lost response (permanent) and, until
-  #492, a 400 or 500; a lost resend is `indeterminate`. Not in the design.
+- **The completion resend** recovers a lost or unreadable response — transport
+  error, indeterminate 503, 502, 504, or a 2xx that is not this report's
+  record (permanent) — and, until #505, any 503, and until #492 a 400 or 500;
+  after any of these only a record is definite, and everything else is
+  `indeterminate`. Not in the design.

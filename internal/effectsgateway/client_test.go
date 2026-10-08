@@ -320,9 +320,18 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 			[]func() (*http.Response, error){reply(503, `{}`, indeterminate...), reply(400, `{}`),
 				reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
 			DispatchRecordedOtherwise, 3},
-		// The resend's own definite answer describes the record now.
-		{"lost then conflict", success,
-			[]func() (*http.Response, error){lost, reply(409, `{"code":"conflict"}`)}, DispatchConflict, 2},
+		// A refusal answering the resend is not definite after a
+		// possibly-committed first attempt: the first write may still be in
+		// flight (ErrExecutionAmbiguous). One third read; only a record
+		// settles it.
+		{"lost then conflict then conflict", success,
+			[]func() (*http.Response, error){lost, reply(409, `{"code":"conflict"}`), reply(409, `{"code":"conflict"}`)},
+			DispatchIndeterminate, 3},
+		{"lost then conflict then the record", success,
+			[]func() (*http.Response, error){lost, reply(409, `{"code":"conflict"}`), reply(200, successRecord)}, "", 3},
+		{"500 then conflict then conflict", failure,
+			[]func() (*http.Response, error){reply(500, `{}`), reply(409, `{}`), reply(409, `{}`)},
+			DispatchIndeterminate, 3},
 		// The first 500 may have been a genuine error that committed nothing
 		// while the resend committed and answered 500 (#492): not definite.
 		{"500 then 500 then 500", failure,
@@ -337,9 +346,43 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 			[]func() (*http.Response, error){reply(500, `{}`), reply(400, `{}`),
 				reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
 			DispatchRecordedOtherwise, 3},
-		// Not a lost response: nothing is resent.
-		{"plain 503", success, []func() (*http.Response, error){reply(503, `{}`)}, DispatchUnavailable, 1},
+		// Interim until #505: a 503 without the indeterminate header may
+		// hide a committed write (ErrExecutionAmbiguous, ErrActionCommitted),
+		// so it is resent like a lost response and never returned as a
+		// refusal.
+		{"plain 503 then the committed record", success,
+			[]func() (*http.Response, error){reply(503, `{"code":"unavailable"}`), reply(200, successRecord)}, "", 2},
+		{"plain 503 then the record otherwise", success,
+			[]func() (*http.Response, error){reply(503, `{}`),
+				reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
+			DispatchRecordedOtherwise, 2},
+		{"plain 503 twice", failure,
+			[]func() (*http.Response, error){reply(503, `{}`), reply(503, `{}`)}, DispatchIndeterminate, 2},
+		{"plain 503 then indeterminate 503", failure,
+			[]func() (*http.Response, error){reply(503, `{}`), reply(503, `{}`, indeterminate...)}, DispatchIndeterminate, 2},
+		{"plain 503 then lost", failure,
+			[]func() (*http.Response, error){reply(503, `{}`), lost}, DispatchIndeterminate, 2},
+		{"lost then plain 503", success,
+			[]func() (*http.Response, error){lost, reply(503, `{}`)}, DispatchIndeterminate, 2},
+		{"500 then plain 503", failure,
+			[]func() (*http.Response, error){reply(500, `{}`), reply(503, `{}`)}, DispatchIndeterminate, 2},
+		{"plain 503 then conflict then conflict", success,
+			[]func() (*http.Response, error){reply(503, `{}`), reply(409, `{"code":"conflict"}`), reply(409, `{"code":"conflict"}`)},
+			DispatchIndeterminate, 3},
+		{"plain 503 then conflict then the record", failure,
+			[]func() (*http.Response, error){reply(503, `{}`), reply(409, `{}`), reply(200, failedRecord)}, "", 3},
+		{"plain 503 then conflict then plain 503", failure,
+			[]func() (*http.Response, error){reply(503, `{}`), reply(409, `{}`), reply(503, `{}`)}, DispatchIndeterminate, 3},
+		{"plain 503 then 404 then 404", success,
+			[]func() (*http.Response, error){reply(503, `{}`), reply(404, `{}`), reply(404, `{}`)}, DispatchIndeterminate, 3},
+		{"plain 503 then 500 then the recorded failure", failure,
+			[]func() (*http.Response, error){reply(503, `{}`), reply(500, `{}`), reply(200, failedRecord)}, "", 3},
+		{"plain 503 then 400 then 400", success,
+			[]func() (*http.Response, error){reply(503, `{}`), reply(400, `{}`), reply(400, `{}`)}, DispatchIndeterminate, 3},
+		// No possibly-committed answer before it: a refusal is definite and
+		// nothing is resent.
 		{"404", success, []func() (*http.Response, error){reply(404, `{}`)}, DispatchNotFound, 1},
+		{"409", success, []func() (*http.Response, error){reply(409, `{"code":"conflict"}`)}, DispatchConflict, 1},
 		// Recorded otherwise: every reported field is compared.
 		{"failure recorded with another code", failure,
 			[]func() (*http.Response, error){reply(200, committed(t, 3, fleet.DispatchFailed, "outcome_unknown", ""))},
@@ -351,13 +394,56 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 			[]func() (*http.Response, error){reply(400, `{}`), reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
 			DispatchRecordedOtherwise, 2},
 		// 200 comes only at exactly ExpectedVersion+1; anything else is not
-		// this report's record.
-		{"version past the report", failure,
-			[]func() (*http.Response, error){reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", ""))},
-			DispatchProtocol, 1},
-		{"version not past the report", failure,
-			[]func() (*http.Response, error){reply(200, committed(t, 2, fleet.DispatchFailed, "target_rejected_422", ""))},
-			DispatchProtocol, 1},
+		// this report's record. But the route answered success, so something
+		// committed: resend and read the record through the replay branch,
+		// never protocol alone.
+		{"version past the report then the record", failure,
+			[]func() (*http.Response, error){reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", "")),
+				reply(200, failedRecord)}, "", 2},
+		{"version past the report twice then the record", failure,
+			[]func() (*http.Response, error){reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", "")),
+				reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", "")), reply(200, failedRecord)}, "", 3},
+		{"version not past the report, three times", failure,
+			[]func() (*http.Response, error){reply(200, committed(t, 2, fleet.DispatchFailed, "target_rejected_422", "")),
+				reply(200, committed(t, 2, fleet.DispatchFailed, "target_rejected_422", "")),
+				reply(200, committed(t, 2, fleet.DispatchFailed, "target_rejected_422", ""))},
+			DispatchIndeterminate, 3},
+		{"undecodable 2xx then the record", success,
+			[]func() (*http.Response, error){reply(200, `not json`), reply(200, successRecord)}, "", 2},
+		{"undecodable 2xx then the record otherwise", success,
+			[]func() (*http.Response, error){reply(201, `{"id":"!!"}`),
+				reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
+			DispatchRecordedOtherwise, 2},
+		{"undecodable 2xx then lost", success,
+			[]func() (*http.Response, error){reply(200, `not json`), lost}, DispatchIndeterminate, 2},
+		{"undecodable 2xx then 409 then 409", success,
+			[]func() (*http.Response, error){reply(200, `{}`), reply(409, `{}`), reply(409, `{}`)}, DispatchIndeterminate, 3},
+		{"undecodable 2xx three times", success,
+			[]func() (*http.Response, error){reply(200, `[]`), reply(200, `[]`), reply(200, `[]`)}, DispatchIndeterminate, 3},
+		{"lost then undecodable 2xx then the record", failure,
+			[]func() (*http.Response, error){lost, reply(200, `nope`), reply(200, failedRecord)}, "", 3},
+		// A proxy can answer 502 or 504 after the explorer processed the
+		// request: possibly committed, like a lost response.
+		{"502 then the record", failure,
+			[]func() (*http.Response, error){reply(502, `<html>bad gateway</html>`), reply(200, failedRecord)}, "", 2},
+		{"502 twice", success,
+			[]func() (*http.Response, error){reply(502, ``), reply(502, ``)}, DispatchIndeterminate, 2},
+		{"502 then 409 then 409", success,
+			[]func() (*http.Response, error){reply(502, ``), reply(409, `{}`), reply(409, `{}`)}, DispatchIndeterminate, 3},
+		{"502 then 409 then the record", success,
+			[]func() (*http.Response, error){reply(502, ``), reply(409, `{}`), reply(200, successRecord)}, "", 3},
+		{"504 then the record", success,
+			[]func() (*http.Response, error){reply(504, ``), reply(200, successRecord)}, "", 2},
+		{"504 then 504", failure,
+			[]func() (*http.Response, error){reply(504, ``), reply(504, ``)}, DispatchIndeterminate, 2},
+		{"504 then 404 then 404", failure,
+			[]func() (*http.Response, error){reply(504, ``), reply(404, `{}`), reply(404, `{}`)}, DispatchIndeterminate, 3},
+		{"lost then 502", success,
+			[]func() (*http.Response, error){lost, reply(502, ``)}, DispatchIndeterminate, 2},
+		{"500 then 504", failure,
+			[]func() (*http.Response, error){reply(500, `{}`), reply(504, ``)}, DispatchIndeterminate, 2},
+		{"plain 503 then 502", failure,
+			[]func() (*http.Response, error){reply(503, `{}`), reply(502, ``)}, DispatchIndeterminate, 2},
 	} {
 		transport := &scriptedTransport{replies: row.replies}
 		base, _ := url.Parse("https://explorer.invalid")
@@ -383,6 +469,63 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 		}
 		if row.kind == DispatchRecordedOtherwise && action.State == "" {
 			t.Errorf("%s: recorded_otherwise without the committed record", row.name)
+		}
+	}
+}
+
+// Every answer after which a claim may have committed — any 503 (a bare one
+// may hide ErrActionCommitted until #505), a proxy's 502 or 504, a transport
+// error — is a re-pull signal, never a definite failure, and the caller still
+// holds nothing: no Action, and nothing is resent. The original kind is kept
+// as the cause.
+func TestClaimPossiblyCommittedIsARepullSignal(t *testing.T) {
+	for _, row := range []struct {
+		name  string
+		reply func() (*http.Response, error)
+		kind  DispatchErrorKind
+	}{
+		{"plain 503", reply(503, `{"code":"unavailable"}`), DispatchRepull},
+		{"503 with another outcome header", reply(503, `{}`, "Shoal-Commit-Outcome", "committed"), DispatchRepull},
+		{"indeterminate 503", reply(503, `{}`, indeterminate...), DispatchRepull},
+		{"502", reply(502, `<html>bad gateway</html>`), DispatchRepull},
+		{"504", reply(504, ``), DispatchRepull},
+		{"lost", lost, DispatchRepull},
+		{"lost the race", reply(404, `{}`), DispatchNotFound},
+		{"version moved", reply(409, `{}`), DispatchConflict},
+		{"500", reply(500, `{}`), DispatchStatus},
+	} {
+		transport := &scriptedTransport{replies: []func() (*http.Response, error){row.reply}}
+		base, _ := url.Parse("https://explorer.invalid")
+		client, err := NewDispatchClient(base, &http.Client{Transport: transport},
+			func() (string, error) { return "token", nil }, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		action, err := client.Claim(context.Background(), []byte("action"), ClaimRequest{
+			Context: RequestContext{RequestID: []byte("r"), ReasonCode: "gateway_claim",
+				Deadline: time.Now().Add(time.Minute)},
+			ExpectedVersion: 1, ClaimID: []byte("claim"), Lease: time.Minute,
+		})
+		if DispatchKind(err) != row.kind {
+			t.Errorf("%s: %v (kind %q), want kind %q", row.name, err, DispatchKind(err), row.kind)
+		}
+		if action.ID != nil || action.State != "" || action.ClaimID != nil {
+			t.Errorf("%s: a failed claim returned an action", row.name)
+		}
+		if len(transport.bodies) != 1 {
+			t.Errorf("%s: %d requests, want 1", row.name, len(transport.bodies))
+		}
+		var dispatchErr *DispatchError
+		if row.kind == DispatchRepull {
+			if !errors.As(err, &dispatchErr) || dispatchErr.Op != "claim" {
+				t.Fatalf("%s: %#v", row.name, err)
+			}
+			original := errors.Unwrap(err)
+			var cause *DispatchError
+			if !errors.As(original, &cause) || cause.Kind == DispatchRepull ||
+				!answerLost(cause) || cause.Status != dispatchErr.Status {
+				t.Errorf("%s: repull error lost its original kind: %#v", row.name, original)
+			}
 		}
 	}
 }
