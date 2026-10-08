@@ -197,6 +197,12 @@ func (*stubDispatchProvider) Invoke(context.Context, fleet.InvokeRequest) (fleet
 	return fleet.ActionRecord{}, nil
 }
 
+func (*stubDispatchProvider) ExtendClaim(
+	context.Context, fleet.ExtendRequest,
+) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
+
 func (p *stubDispatchProvider) ReportAmbiguity(
 	_ context.Context, request fleet.AmbiguityRequest,
 ) (fleet.ActionRecord, error) {

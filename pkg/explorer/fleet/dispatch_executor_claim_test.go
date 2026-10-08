@@ -2527,6 +2527,51 @@ func TestAnAmbiguityReportAuditsItsOwnPhaseAndOperation(t *testing.T) {
 	}
 }
 
+// TestARenewalAuditsItsOwnOperationAcrossAnUpgrade is the defence ExtendClaim
+// was missing and both its siblings have.
+//
+// ReportAmbiguity audits the operation that authorized the call. ExecuteClaim
+// keeps the record's and falls back to invoke when it is empty. ExtendClaim
+// read the record's field with no fallback, so a record claimed by a build
+// before TransitionOperation existed audited an empty operation — which
+// RecordAction validates first and refuses, joined with
+// ErrRecordingUnavailable and answered as a 503.
+//
+// The consequence is the one the route exists to prevent: a worker mid-long-
+// operation across an upgrade cannot renew, loses its claim, and ends up in
+// the ambiguity case holding an effect it can no longer report through the
+// completion path.
+func TestARenewalAuditsItsOwnOperationAcrossAnUpgrade(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	stored.TransitionOperation = ""
+	fixture.dispatchStore.records[string(fixture.queued.ID)] = stored
+
+	if _, err := fixture.service.ExtendClaim(worker, ExtendRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("worker-claim"), Lease: 2 * time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("a record with no recorded transition operation cannot be "+
+			"renewed, so every live claim across an upgrade is lost: %v", err)
+	}
+	if got := fixture.recorder.recordedOperation(
+		"claim_extension"); got != auth.OperationExecute {
+		t.Fatalf("the renewal was audited under %q rather than the operation "+
+			"that authorized it", got)
+	}
+}
+
 // TestAStaleGenerationCannotCommitOntoALiveOne is the ABA break a second
 // review found in the first attempt at the stranding fix, and the reason this
 // route binds on the fence rather than on a widened version comparison.
@@ -2806,6 +2851,431 @@ func TestAClaimHolderChainIsBoundedInBytes(t *testing.T) {
 	holder.OnBehalfOf = []shoal.ID{shoal.ID(strings.Repeat("d", 512))}
 	if err := holder.validate(); err != nil {
 		t.Fatalf("a chain well inside the byte bound was refused: %v", err)
+	}
+}
+
+// TestARenewalExtendsTheLeaseWithoutMovingTheFence is #430's central
+// invariant, and the one the gateway design depends on.
+//
+// ClaimFence identifies *which* claim. A renewal changes only its deadline, so
+// incrementing the fence would invalidate the fence the claimant is holding and
+// break the report-under-the-same-fence contract — the worker would renew its
+// lease and lose the ability to complete under it.
+func TestARenewalExtendsTheLeaseWithoutMovingTheFence(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the worker could not claim: %v", err)
+	}
+
+	// Part way through the lease, as a worker renewing at L/2 would be.
+	fixture.advance(t, 30*time.Second)
+	extended, err := fixture.service.ExtendClaim(worker, ExtendRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the claim holder could not renew: %v", err)
+	}
+
+	if extended.ClaimFence != claimed.ClaimFence {
+		t.Fatalf("the renewal moved the fence from %d to %d, which invalidates "+
+			"the fence the claimant reports under",
+			claimed.ClaimFence, extended.ClaimFence)
+	}
+	if !bytes.Equal(extended.ClaimID, claimed.ClaimID) {
+		t.Fatalf("the renewal changed the claim ID from %q to %q",
+			claimed.ClaimID, extended.ClaimID)
+	}
+	if !extended.ClaimLeaseUntil.After(claimed.ClaimLeaseUntil) {
+		t.Fatalf("the lease did not move forward: %s then %s",
+			claimed.ClaimLeaseUntil, extended.ClaimLeaseUntil)
+	}
+	if extended.Version != claimed.Version+1 {
+		t.Fatalf("version = %d, want %d", extended.Version, claimed.Version+1)
+	}
+	if extended.State != DispatchClaimed {
+		t.Fatalf("the renewal moved the state to %s", extended.State)
+	}
+
+	// And the claimant can still complete under the same fence and claim,
+	// which is the whole point of not advancing either.
+	if _, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: extended.Version,
+		ClaimID: []byte("worker-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("the claimant cannot complete after renewing: %v", err)
+	}
+}
+
+// TestARenewalCoversAnOperationLongerThanTheLeaseCeiling is the capability
+// #430 adds, stated as the thing that was impossible before it.
+//
+// MaxActionClaimTTL is five minutes and the service refuses a larger lease
+// rather than clamping it, so the fenced window used to be capped at five
+// minutes total. Renewal makes that a heartbeat interval instead: the total
+// budget is the action's Deadline, which already existed and already clamps.
+func TestARenewalCoversAnOperationLongerThanTheLeaseCeiling(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	// A lease at the ceiling. A larger one is refused, which is what makes
+	// renewal the only way to outlast it.
+	if _, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("too-long"), Lease: MaxActionClaimTTL + time.Second,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err == nil {
+		t.Fatal("a lease past MaxActionClaimTTL was accepted, so this test " +
+			"is not describing the constraint renewal exists for")
+	}
+
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: MaxActionClaimTTL,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the worker could not claim at the ceiling: %v", err)
+	}
+
+	// Renew at half the lease, repeatedly, past the point where the original
+	// claim would have expired.
+	version := claimed.Version
+	fence := claimed.ClaimFence
+	for round := 0; round < 4; round++ {
+		fixture.advance(t, MaxActionClaimTTL/2)
+		extended, err := fixture.service.ExtendClaim(worker, ExtendRequest{
+			ID: fixture.queued.ID, ExpectedVersion: version,
+			ClaimID: []byte("worker-claim"), Lease: MaxActionClaimTTL,
+			Context: dispatchContext(fixture.now, "worker-request"),
+		})
+		if err != nil {
+			t.Fatalf("renewal %d failed: %v", round, err)
+		}
+		if extended.ClaimFence != fence {
+			t.Fatalf("renewal %d moved the fence to %d",
+				round, extended.ClaimFence)
+		}
+		version = extended.Version
+	}
+
+	// Past the original lease's expiry, still holding the claim.
+	if !fixture.now.After(claimed.ClaimLeaseUntil) {
+		t.Fatalf("the clock (%s) has not passed the original lease (%s), so "+
+			"this test does not outlast it", fixture.now, claimed.ClaimLeaseUntil)
+	}
+	if _, err := fixture.service.CompleteClaim(worker, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: version,
+		ClaimID: []byte("worker-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("after outlasting its original lease by renewal, the worker "+
+			"cannot complete: %v", err)
+	}
+}
+
+// TestALeaseIsNotRenewableOnceItHasLapsed is the semantics the issue calls the
+// point rather than a limitation.
+//
+// Once ClaimLeaseUntil has passed, the action may already have been reclaimed
+// under a new ClaimID and fence, so renewing would hand two workers a live
+// claim. The refusal is ErrClaimLost and not a transport-shaped error, because
+// a worker must be able to tell "my claim is gone, treat this as ambiguous"
+// from "retry the renewal" — the first means it is in the #438 case.
+func TestALeaseIsNotRenewableOnceItHasLapsed(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Nanosecond,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the worker could not claim: %v", err)
+	}
+	fixture.advance(t, time.Second)
+
+	_, err = fixture.service.ExtendClaim(worker, ExtendRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err == nil {
+		t.Fatal("a lapsed lease was renewed, so two workers can hold one claim")
+	}
+	if !errors.Is(err, ErrClaimLost) {
+		t.Fatalf("the refusal does not tell the worker its claim is gone, so "+
+			"it cannot distinguish that from a renewal worth retrying: %v", err)
+	}
+
+	// And the worker's recourse is the #438 route, under the fence it held.
+	if _, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimFence: claimed.ClaimFence, Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("a worker whose renewal was refused cannot report the "+
+			"ambiguity that refusal creates: %v", err)
+	}
+}
+
+// TestOnlyTheClaimHolderMayRenew pins that a claim ID is necessary and not
+// sufficient.
+//
+// Status publishes ClaimID to every co-principal and Pull returns it on a
+// lapsed claim to every execute-holder in the scope, so it identifies a claim
+// rather than who holds it — the same reasoning that made the completion path
+// require the claimant's principal chain.
+func TestOnlyTheClaimHolderMayRenew(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	holder := fixture.namedWorker(t, "holder", auth.OperationExecute)
+	stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(holder, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("holder-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "holder-request"),
+	})
+	if err != nil {
+		t.Fatalf("the holder could not claim: %v", err)
+	}
+
+	for _, probe := range []struct {
+		name     string
+		caller   context.Context
+		claimID  []byte
+		notFound bool
+	}{
+		{
+			name:   "a stranger presenting the right claim ID",
+			caller: stranger, claimID: []byte("holder-claim"), notFound: true,
+		},
+		{
+			name:   "the enqueuer presenting the right claim ID",
+			caller: fixture.enqueuer, claimID: []byte("holder-claim"),
+			notFound: true,
+		},
+		{
+			name:   "the holder presenting the wrong claim ID",
+			caller: holder, claimID: []byte("not-the-claim"), notFound: true,
+		},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			request := dispatchContext(fixture.now, "holder-request")
+			if probe.caller == stranger {
+				request = dispatchContext(fixture.now, "stranger-request")
+			} else if probe.caller == fixture.enqueuer {
+				request = dispatchContext(fixture.now, "request")
+			}
+			_, err := fixture.service.ExtendClaim(probe.caller, ExtendRequest{
+				ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+				ClaimID: probe.claimID, Lease: time.Minute,
+				Context: request,
+			})
+			if err == nil {
+				t.Fatal("the renewal was accepted")
+			}
+			if probe.notFound && !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				t.Fatalf("refusal is distinguishable from an absent action, "+
+					"which tells an execute-holder the action exists: %v", err)
+			}
+		})
+	}
+
+	// The holder with the right claim ID still renews, so the refusals above
+	// are about standing rather than the route being broken.
+	if _, err := fixture.service.ExtendClaim(holder, ExtendRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("holder-claim"), Lease: 2 * time.Minute,
+		Context: dispatchContext(fixture.now, "holder-request"),
+	}); err != nil {
+		t.Fatalf("the holder was refused: %v", err)
+	}
+}
+
+// TestARenewalIsRefusedWhenItWouldNotMoveTheLeaseForward covers the shortening
+// decision, which the issue asks to be made explicitly either way.
+//
+// A lease moving ClaimLeaseUntil backwards is a worker bug, and honouring it
+// costs the claim the worker was trying to keep. Refused, so the worker finds
+// out while it still holds it.
+//
+// The same check covers the case where the Deadline clamp makes an extension a
+// no-op: once ClaimLeaseUntil has reached Deadline there is nothing left to
+// extend, and reporting success would tell a worker it had bought time it did
+// not get.
+func TestARenewalIsRefusedWhenItWouldNotMoveTheLeaseForward(t *testing.T) {
+	t.Run("a shorter lease", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+		claimed, err := fixture.service.Claim(worker, ClaimRequest{
+			ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+			ClaimID: []byte("worker-claim"), Lease: 2 * time.Minute,
+			Context: dispatchContext(fixture.now, "worker-request"),
+		})
+		if err != nil {
+			t.Fatalf("the worker could not claim: %v", err)
+		}
+		_, err = fixture.service.ExtendClaim(worker, ExtendRequest{
+			ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+			ClaimID: []byte("worker-claim"), Lease: time.Second,
+			Context: dispatchContext(fixture.now, "worker-request"),
+		})
+		if err == nil {
+			t.Fatal("a renewal that shortens the lease was accepted")
+		}
+		if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("the refusal is not an argument error: %v", err)
+		}
+	})
+
+	t.Run("a lease already clamped to the deadline", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+		// The action's deadline is an hour out and the ceiling is five
+		// minutes, so claim at the ceiling and advance until the clamp binds.
+		claimed, err := fixture.service.Claim(worker, ClaimRequest{
+			ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+			ClaimID: []byte("worker-claim"), Lease: MaxActionClaimTTL,
+			Context: dispatchContext(fixture.now, "worker-request"),
+		})
+		if err != nil {
+			t.Fatalf("the worker could not claim: %v", err)
+		}
+		version := claimed.Version
+		// Renew until ClaimLeaseUntil reaches Deadline. The action's deadline
+		// is an hour out and each round advances MaxActionClaimTTL/2, so the
+		// clamp binds at round 23 — computed rather than guessed, because an
+		// earlier version of this loop stopped at 20 and concluded the clamp
+		// was never reached.
+		for round := 0; round < 30; round++ {
+			fixture.advance(t, MaxActionClaimTTL/2)
+			extended, err := fixture.service.ExtendClaim(worker, ExtendRequest{
+				ID: fixture.queued.ID, ExpectedVersion: version,
+				ClaimID: []byte("worker-claim"), Lease: MaxActionClaimTTL,
+				Context: dispatchContext(fixture.now, "worker-request"),
+			})
+			if err != nil {
+				// Refused once the clamp leaves nothing to extend, which is
+				// the behaviour under test.
+				if shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+					return
+				}
+				t.Fatalf("renewal %d failed for an unexpected reason: %v",
+					round, err)
+			}
+			if extended.ClaimLeaseUntil.After(extended.Deadline) {
+				t.Fatalf("the renewal pushed the lease past the deadline: "+
+					"%s > %s", extended.ClaimLeaseUntil, extended.Deadline)
+			}
+			version = extended.Version
+		}
+		t.Fatal("the lease never reached the deadline clamp, so this case " +
+			"does not exercise it")
+	})
+}
+
+// TestARenewalPublishesNoLifecycleEvent pins the decision not to emit one.
+//
+// A heartbeat on a long operation would publish an event every few minutes per
+// action and drown the event log in liveness. ClaimLeaseUntil and Version
+// already carry the renewal and Status already exposes them. It also keeps a
+// renewal out of the outbox, which matters beyond volume: an outbox row that
+// only one principal can publish is the mixed-identity wedge #480 records.
+func TestARenewalPublishesNoLifecycleEvent(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the worker could not claim: %v", err)
+	}
+	before := len(fixture.dispatchStore.transitions)
+
+	fixture.advance(t, 30*time.Second)
+	if _, err := fixture.service.ExtendClaim(worker, ExtendRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("the renewal failed: %v", err)
+	}
+
+	if after := len(fixture.dispatchStore.transitions); after != before {
+		t.Fatalf("the renewal enqueued %d outbox rows, so a long operation "+
+			"publishes a liveness event every heartbeat and a row only its "+
+			"claimant can drain", after-before)
+	}
+}
+
+// TestAnAdmissionClaimCannotBeRenewed keeps the admission namespace out of the
+// renewal route.
+//
+// An admission's grant is not a claim a worker renews — it is reported through
+// AdmissionService.Report, and an expired one is abandoned rather than
+// reclaimable. Refused as not-found for the same reason every other dispatch
+// route refuses an admission: the IDs are computable from a principal tuple, so
+// a distinguishable answer is a probe.
+//
+// This exists because a mutation removing the check survived: no other test
+// puts an admission in front of this route.
+func TestAnAdmissionClaimCannotBeRenewed(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the worker could not claim: %v", err)
+	}
+	// Renewal works first, so the refusal below is about the marker and not
+	// about the fixture being in a state no renewal would accept.
+	fixture.advance(t, 30*time.Second)
+	extended, err := fixture.service.ExtendClaim(worker, ExtendRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("the renewal failed before the marker was set: %v", err)
+	}
+
+	// Marked by the durable field isAdmission reads, rather than by identity:
+	// the reserved span held ordinary actions before it was reserved, which is
+	// a distinction the dispatch service already makes deliberately.
+	stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	stored.AdmittedEffects = Effects{EffectReadsCorpus}
+	fixture.dispatchStore.records[string(fixture.queued.ID)] = stored
+
+	_, err = fixture.service.ExtendClaim(worker, ExtendRequest{
+		ID: fixture.queued.ID, ExpectedVersion: extended.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err == nil {
+		t.Fatal("an admission grant was renewed as if it were a dispatch claim")
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("an admission is refused distinguishably: %v", err)
 	}
 }
 

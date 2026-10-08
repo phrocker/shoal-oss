@@ -1831,6 +1831,12 @@ func (*httpFleetToolService) Pull(
 	return fleet.ActionPage{}, nil
 }
 
+func (*httpFleetToolService) ExtendClaim(
+	context.Context, fleet.ExtendRequest,
+) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
+
 func (*httpFleetToolService) ReportAmbiguity(
 	context.Context, fleet.AmbiguityRequest,
 ) (fleet.ActionRecord, error) {

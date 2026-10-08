@@ -784,6 +784,24 @@ type CompletionRequest struct {
 	Context RequestContext
 }
 
+// ExtendRequest renews a live claim's lease without changing the claim.
+type ExtendRequest struct {
+	ID              []byte
+	ExpectedVersion uint64
+	// ClaimID must equal the claim currently held. It is necessary and not
+	// sufficient: the caller must also be the claim's holder, because ClaimID
+	// is published to co-principals on Status and to every execute-holder on
+	// Pull once a lease lapses, so it identifies a claim and not who holds it.
+	ClaimID []byte
+	// Lease is the new silence budget from now, bounded per call by
+	// MaxActionClaimTTL and in total by the action's Deadline. Renewal splits
+	// the two things one number used to conflate: how long a worker may be
+	// silent before it is assumed gone, and how long the whole operation may
+	// take.
+	Lease   time.Duration
+	Context RequestContext
+}
+
 // AmbiguityRequest is a worker recording an effect it may have performed
 // without being able to report the outcome through CompleteClaim.
 type AmbiguityRequest struct {
