@@ -49,18 +49,31 @@ const (
 	// list refuses instead of dropping, because a report is evidence an
 	// operator is going to read and silently discarding the first one is worse
 	// than refusing the ninth.
-	MaxActionClaimHistory     = 8
+	MaxActionClaimHistory = 8
+	// MaxClaimHolderChainBytes bounds one retained holder's delegation chain
+	// in total bytes, not only in entries. Without it the chains dominate the
+	// record's worst-case size by an order of magnitude over everything else
+	// the history and the reports contribute.
+	MaxClaimHolderChainBytes  = 4096
 	MaxActionAmbiguityReports = 8
 	// MaxAmbiguityTargetBytes bounds the worker's identifier for the third
 	// party it was talking to, and MaxAmbiguityReferenceBytes the opaque
 	// handle that party returned.
 	//
 	// Both are deliberately small. They describe an interaction with a system
-	// Shoal does not control, so the bytes are target-controlled: they reach
-	// the durable record, action.* events and the team overview. A closed
+	// Shoal does not control, so the bytes are target-controlled. A closed
 	// shape with tight bounds gives a hostile or merely verbose target
 	// nothing, which is the same reasoning docs/gateway-proxy-design.md
 	// applies to Output.
+	//
+	// Where they actually reach: the durable record, fleetActionWire, and the
+	// MCP tool result, which marshals ActionRecord whole. An earlier version
+	// of this said "action.* events and the team overview" — neither is true.
+	// fleetevents.Event carries no record content and this route publishes no
+	// event at all, and teamoverview projects state counts and derived rows
+	// with no ActionRecord in its response, which its own guard test pins.
+	// The claim was inherited from the design doc's equivalent note about
+	// Output, where it is also wrong.
 	MaxAmbiguityTargetBytes    = 256
 	MaxAmbiguityReferenceBytes = 256
 )
@@ -101,16 +114,19 @@ type EvidenceRef struct {
 	Visibility []string
 }
 
-// ActionRecord is the durable source of truth for one dispatch.
+// AmbiguityOutcome, ClaimHolder and AmbiguityReport are the #438 types. The
+// ActionRecord documentation that used to sit here moved down to the
+// declaration it describes, having been orphaned when these were inserted
+// above it.
 // AmbiguityOutcome is what a worker observed before it lost the right to
 // report through complete.
 //
 // Closed rather than free text, for the reason the design doc gives for
 // Output: this value describes an interaction with a third party, so a string
-// field is a channel for target-controlled bytes into the durable record, the
-// action.* event stream and the team overview. An operator reconciling under
-// time pressure needs to sort records into groups, which an enumeration does
-// and prose does not.
+// field is a channel for target-controlled bytes into the durable record and
+// every surface that returns it. An operator reconciling under time pressure
+// needs to sort records into groups, which an enumeration does and prose does
+// not.
 //
 // The three cases are the three an operator acts on differently, and the
 // distinction the design doc records as missing from the existing error
@@ -208,11 +224,25 @@ func (h ClaimHolder) validate() error {
 			shoal.ErrorInvalidArgument,
 			"claim holder delegation chain exceeds its bound")
 	}
+	// Bounded in aggregate bytes as well as in entries, which the entry count
+	// alone does not do. A measurement of the worst case found the delegation
+	// chains were 89% of the record's growth — eight holders with maximal
+	// chains reach 18% of the encoding ceiling on their own, and combined with
+	// a maximal input, output and evidence set they pushed a record past the
+	// limit encodeAction enforces. That is the brick the cap exists to
+	// prevent, so bounding the count and not the size left the hole open.
+	chainBytes := 0
 	for _, identity := range h.OnBehalfOf {
 		if err := shoal.ValidateRequiredID(
 			"claim holder delegation identity", identity); err != nil {
 			return err
 		}
+		chainBytes += len(identity)
+	}
+	if chainBytes > MaxClaimHolderChainBytes {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"claim holder delegation chain exceeds its byte bound")
 	}
 	if err := validateOpaque("claim holder claim ID", h.ClaimID, false); err != nil {
 		return err
@@ -275,17 +305,32 @@ func (r AmbiguityReport) validate() error {
 	return nil
 }
 
+// validateAmbiguityText refuses anything that is not plainly printable.
+//
+// unicode.IsControl alone was not enough, and the comment that accompanied it
+// claimed "printable and single-line" while checking neither. IsControl is
+// false for U+202E RIGHT-TO-LEFT OVERRIDE, the U+2066..U+2069 isolates,
+// U+200E/U+200F, the zero-width characters and U+FEFF — all of which were
+// accepted into the durable record. U+202E is precisely the case the bound's
+// own rationale names: a value that is at worst a terminal escape in whatever
+// renders it.
+//
+// So the test is IsPrint, which admits letters, marks, numbers, punctuation,
+// symbols and the ASCII space and excludes every control, format, surrogate
+// and unassigned codepoint. Refused rather than sanitised, because a silently
+// rewritten target or reference is worse than none: an operator would take it
+// to the other system and get nothing.
 func validateAmbiguityText(name, value string) error {
-	for _, codepoint := range value {
-		if unicode.IsControl(codepoint) {
-			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				name+" contains a control character")
-		}
-	}
 	if !utf8.ValidString(value) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, name+" is not valid UTF-8")
+	}
+	for _, codepoint := range value {
+		if !unicode.IsPrint(codepoint) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				name+" contains a non-printable character")
+		}
 	}
 	return nil
 }

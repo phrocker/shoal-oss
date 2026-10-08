@@ -445,6 +445,12 @@ func applyClaim(
 		action.Effects.contains(EffectEgressesContent) {
 		record.EffectPossible = true
 	}
+	// Read before the assignment below, because the history retains the
+	// *outgoing* holder. An earlier version of this block ran after
+	// record.ClaimID had already been overwritten, so every retained holder
+	// carried its successor's claim ID — no authorization consequence, since
+	// heldClaimAt keys on the fence, but wrong in evidence an operator reads.
+	outgoingClaimID := append([]byte(nil), record.ClaimID...)
 	record.ClaimID = append([]byte(nil), claimID...)
 	// The outgoing holder is retained before the incoming one overwrites it.
 	//
@@ -465,7 +471,7 @@ func applyClaim(
 			Actor:      record.ClaimantActor,
 			ClientID:   record.ClaimantClientID,
 			OnBehalfOf: append([]shoal.ID(nil), record.ClaimantOnBehalfOf...),
-			ClaimID:    append([]byte(nil), record.ClaimID...),
+			ClaimID:    outgoingClaimID,
 			ClaimFence: record.ClaimFence,
 			HeldAt:     now,
 		})
@@ -644,7 +650,14 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		}
 		return cloneActionRecord(current), nil
 	}
-	if current.Version != claimed.Version ||
+	// Version drift that only ambiguity reports can explain is tolerated, for
+	// the reason completeClaim's own gate records: a report advances the
+	// version while leaving the claim, the fence, the state and the lease
+	// alone, and this caller's right to execute comes from those. Without
+	// this, a lapsed holder's report between Claim and ExecuteClaim would
+	// strand a synchronous invoke the same way it stranded a completion.
+	if (current.Version != claimed.Version &&
+		!onlyAmbiguityReportsAdvanced(current, claimed.Version)) ||
 		current.ClaimFence != claimed.ClaimFence ||
 		!bytes.Equal(current.ClaimID, claimed.ClaimID) ||
 		current.State != DispatchClaimed || !now.Before(current.ClaimLeaseUntil) {
@@ -697,7 +710,10 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if current.Version != claimed.Version ||
+	// Re-read immediately before the effect, and tolerant of the same drift
+	// for the same reason as the gate above it.
+	if (current.Version != claimed.Version &&
+		!onlyAmbiguityReportsAdvanced(current, claimed.Version)) ||
 		current.ClaimFence != claimed.ClaimFence ||
 		!bytes.Equal(current.ClaimID, claimed.ClaimID) ||
 		current.State != DispatchClaimed || !executionNow.Before(current.ClaimLeaseUntil) ||
@@ -877,7 +893,6 @@ func (s *DispatchService) completeClaim(
 	// late reporter the cancelled record and a 200 — telling it the work it
 	// performed was recorded, when the record says the opposite.
 	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
-		current.Version == request.ExpectedVersion+1 &&
 		bytes.Equal(current.ClaimID, request.ClaimID) {
 		if err := s.publishTransition(
 			context.WithoutCancel(ctx), actionEventKind(current), current,
@@ -886,7 +901,36 @@ func (s *DispatchService) completeClaim(
 		}
 		return cloneActionRecord(current), nil
 	}
-	if current.Version != request.ExpectedVersion ||
+	// The claim, not the version.
+	//
+	// A completion's right to write this record comes from holding its claim:
+	// the ClaimID matches, the state is still Claimed, the lease is still live
+	// (checked below), the caller is the claimant (checked above), and the
+	// store asserts ExpectedFence unchanged. The record version added "and
+	// nothing else changed", which is a stronger claim than a completion needs
+	// and one that a *non-transitioning* write breaks.
+	//
+	// #438's ambiguity route is exactly such a write. It advances the version
+	// while leaving the state, the claim, the fence and the lease alone — so a
+	// lapsed holder filing a report moved the version out from under a live
+	// claimant, whose completion then failed with ErrClaimLost while it held
+	// the claim at the right fence. Verified by execution before this change.
+	//
+	// That worker had no recourse: Status requires OperationDispatch and the
+	// record's own principal, Pull withholds live-claimed records, and this
+	// route has no replay branch of its own. So an effect it had actually
+	// performed became permanently unreportable, which is the precise harm
+	// #438 exists to prevent — caused by #438.
+	//
+	// ExpectedVersion stays on the request as an optional pin for a caller
+	// that wants strictness, and the replay branch above no longer keys on it
+	// for the same reason: a terminal state carrying this caller's ClaimID
+	// means this caller's own write landed, whatever the version has since
+	// done. Only applyExecutionResult produces succeeded or failed, and Cancel
+	// lands on cancelled, which that branch excludes deliberately.
+	if (request.ExpectedVersion != 0 &&
+		current.Version != request.ExpectedVersion &&
+		!onlyAmbiguityReportsAdvanced(current, request.ExpectedVersion)) ||
 		!bytes.Equal(current.ClaimID, request.ClaimID) ||
 		current.State != DispatchClaimed {
 		return ActionRecord{}, ErrClaimLost
@@ -1262,7 +1306,8 @@ func (s *DispatchService) ReportAmbiguity(
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "ambiguity reference exceeds its bound")
 	}
-	current, _, _, err := s.authorizedClaimant(ctx, decision, request.ID, now)
+	current, _, authorizing, err := s.authorizedClaimant(
+		ctx, decision, request.ID, now)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -1310,8 +1355,15 @@ func (s *DispatchService) ReportAmbiguity(
 		Actor:      decision.Actor(),
 		ReportedAt: now,
 	})
+	// The operation that authorized *this* call, not the one the record's last
+	// transition carried. A report is its own authorized act, and
+	// authorizedClaimant has just told us which route admitted it — reading
+	// the record's field instead would attribute the report to whatever
+	// claimed the action, and would pass an empty operation for a record
+	// claimed by a build without the field, which RecordAction validates
+	// first and refuses as a 503.
 	if err := s.recorder.RecordAction(ctx, ActionAudit{
-		Phase: "ambiguity_report", Operation: current.TransitionOperation,
+		Phase: "ambiguity_report", Operation: authorizing,
 		Record: next,
 	}); err != nil {
 		return ActionRecord{}, errors.Join(ErrRecordingUnavailable, err)
@@ -1332,14 +1384,54 @@ func (s *DispatchService) ReportAmbiguity(
 	return cloneActionRecord(stored), nil
 }
 
+// onlyAmbiguityReportsAdvanced reports whether the record's version has moved
+// past what a caller expected by no more than the number of ambiguity reports
+// it carries.
+//
+// This is what lets a pinning caller keep its pin without being stranded by
+// someone else's lost-fence report. A report is the only write on this surface
+// that advances the version while leaving the state, the claim, the fence and
+// the lease untouched, so a drift it can account for is a drift that cannot
+// have affected this caller's claim.
+//
+// Deliberately an upper bound rather than an exact accounting. It does not
+// prove *which* writes moved the version — it proves the drift is within what
+// reports alone could explain, and every other write on this surface changes
+// something the gate beside this one already checks.
+func onlyAmbiguityReportsAdvanced(
+	current ActionRecord, expected uint64,
+) bool {
+	if current.Version <= expected {
+		return false
+	}
+	return current.Version-expected <= uint64(len(current.AmbiguityReports))
+}
+
 // refuseAmbiguityAdmission keeps the admission namespace out of this route.
 func refuseAmbiguityAdmission(record ActionRecord) bool {
 	return record.isAdmission()
 }
 
-// ambiguityMutationKey makes the store token stable for one reporter's one
-// report of one attempt, so a retried request after a lost response is
-// recognised as the same write rather than appending a second report.
+// ambiguityMutationKey derives the store token's discriminator from
+// everything that distinguishes one report from another.
+//
+// It is not a replay guard, and an earlier version of this comment claimed it
+// was. A byte-identical retry does not reach the store at all: the service's
+// own version handling answers first, so the token's stability is never what
+// deduplicates a lost response. What the token must do is differ whenever two
+// reports differ, so that transitionToken cannot fold two distinct writes into
+// one.
+//
+// No test can currently observe that, and that is worth saying rather than
+// contriving one. transitionToken folds in next.Version, which differs for
+// every report because each advances the version — so collapsing this whole
+// function to a constant leaves the suite green. The injectivity here is
+// defence against a future caller that derives a token without the version,
+// not something load-bearing today.
+//
+// Which also means the real protection is the version, and if that ever stops
+// being part of the token this function becomes load-bearing immediately. It
+// is written to be correct now so that it does not have to be discovered then.
 //
 // Every component is length-prefixed through writeDispatchTupleField rather
 // than joined with a delimiter. A first version of this concatenated the
@@ -1360,6 +1452,13 @@ func ambiguityMutationKey(
 	writeDispatchTupleField(
 		digest, binary.BigEndian.AppendUint64(nil, request.ClaimFence))
 	writeDispatchTupleField(digest, []byte(request.Outcome))
+	// Target and Reference are part of what makes two reports different. An
+	// earlier version omitted them, so two reports sharing the principal, the
+	// fence and the outcome produced one key — the exact collision the
+	// length-prefixing above was adopted to avoid. It was masked rather than
+	// prevented, because transitionToken folds in the record version.
+	writeDispatchTupleField(digest, []byte(request.Target))
+	writeDispatchTupleField(digest, []byte(request.Reference))
 	return digest.Sum(nil)
 }
 

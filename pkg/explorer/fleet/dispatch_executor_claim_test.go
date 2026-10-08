@@ -31,6 +31,7 @@ type executorClaimFixture struct {
 	authority     *auth.Authority
 	registryStore *memoryStore
 	dispatchStore *memoryDispatchStore
+	recorder      *dispatchRecorder
 	executors     executorMap
 	now           time.Time
 	// clock is what the service and the authority both read, so advancing it
@@ -60,6 +61,7 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	registryStore := newMemoryStore()
 	executors := executorMap{"exec": &remoteBoundExecutor{}}
 	dispatchStore := newMemoryDispatchStore()
+	recorder := &dispatchRecorder{}
 	registry, err := NewService(Config{
 		Store: registryStore, Resolver: authority.Resolver(), Recorder: &memoryRecorder{},
 		Snapshots: fixedSnapshot{now},
@@ -74,7 +76,7 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	registryStore.records["agent"] = Stored{Descriptor: descriptor}
 	service, err := NewDispatchService(DispatchConfig{
 		Store: dispatchStore, Registry: registry,
-		Resolver: authority.Resolver(), Recorder: &dispatchRecorder{},
+		Resolver: authority.Resolver(), Recorder: recorder,
 		Events: dispatchEvents{}, Clock: func() time.Time { return *clock },
 	})
 	if err != nil {
@@ -90,7 +92,8 @@ func newExecutorClaimFixture(t *testing.T) *executorClaimFixture {
 	return &executorClaimFixture{
 		service: service, queued: queued, enqueuer: enqueuer,
 		authority: authority, registryStore: registryStore, now: now,
-		executors: executors, dispatchStore: dispatchStore, clock: clock,
+		executors: executors, dispatchStore: dispatchStore,
+		recorder: recorder, clock: clock,
 	}
 }
 
@@ -1678,10 +1681,16 @@ func TestAnUpgradeFindsARecordWithNoTransitionOperation(t *testing.T) {
 	}
 }
 
-// ambiguityFixture takes an action to the state this route exists for: a
-// worker claimed it, started an effect, and lost its lease — then a second
-// worker took the record, so the first can no longer complete and the record
-// no longer names it as claimant.
+// lapsedClaimant claims an action with a one-nanosecond lease and advances the
+// clock past it, returning the worker, the fence it held, and the record as it
+// stood after the claim.
+//
+// It leaves the worker as the record's *current* claimant with a lapsed lease.
+// It does not reclaim the record, so a test needing the history path — where
+// the claimant fields name someone else — must take the record with a second
+// worker itself. An earlier version of this comment claimed the helper did
+// that, and named a function that does not exist; five tests that read it were
+// exercising a still-current claimant rather than the path they described.
 func (f *executorClaimFixture) lapsedClaimant(
 	t *testing.T, name string,
 ) (context.Context, uint64, ActionRecord) {
@@ -2012,6 +2021,11 @@ func TestTheClaimHistoryIsBoundedAndDropsTheOldest(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
 	version := fixture.queued.Version
 	var firstFence uint64
+	// The most recent holder that is *not* the current claimant — one behind
+	// the final iteration — which is what the history lookup exists for.
+	var priorWorker context.Context
+	var priorFence uint64
+	var priorName string
 	var lastWorker context.Context
 	var lastFence uint64
 	var lastName string
@@ -2035,6 +2049,7 @@ func TestTheClaimHistoryIsBoundedAndDropsTheOldest(t *testing.T) {
 		if index == 0 {
 			firstFence = claimed.ClaimFence
 		}
+		priorWorker, priorFence, priorName = lastWorker, lastFence, lastName
 		lastWorker, lastFence, lastName = worker, claimed.ClaimFence, name
 		fixture.advance(t, time.Second)
 	}
@@ -2056,17 +2071,33 @@ func TestTheClaimHistoryIsBoundedAndDropsTheOldest(t *testing.T) {
 				"history is full, so the cap drops the wrong end", firstFence)
 		}
 	}
-	// And the most recent prior holder can still report, which is the whole
+	// The most recent *prior* holder can still report, which is the whole
 	// point of retaining any of them.
+	//
+	// Prior, not current. An earlier version of this used the final loop
+	// iteration's worker, which is the record's current claimant at the
+	// current fence — so it passed through sameClaimantPrincipal and never
+	// consulted the history at all. Disabling the entire history lookup in
+	// heldClaimAt left it green.
+	if priorWorker == nil {
+		t.Fatal("the loop did not retain a prior holder, so this case checks " +
+			"nothing")
+	}
+	if priorFence == current.ClaimFence {
+		t.Fatalf("the prior holder's fence (%d) is the current one, so this "+
+			"reaches the claimant branch rather than the history",
+			priorFence)
+	}
 	if _, err := fixture.service.ReportAmbiguity(
-		lastWorker, AmbiguityRequest{
-			ID: fixture.queued.ID, ExpectedVersion: current.Version,
-			ClaimFence: lastFence, Outcome: AmbiguityOutcomeUnknown,
+		priorWorker, AmbiguityRequest{
+			ID: fixture.queued.ID, ClaimFence: priorFence,
+			Outcome: AmbiguityOutcomeUnknown,
 			// The request context's ID must match the reporting decision's,
 			// which is minted per worker name.
-			Context: dispatchContext(fixture.now, lastName+"-request"),
+			Context: dispatchContext(fixture.now, priorName+"-request"),
 		}); err != nil {
-		t.Fatalf("the most recent prior holder cannot report: %v", err)
+		t.Fatalf("the most recent prior holder cannot report, so retaining "+
+			"the history buys nothing: %v", err)
 	}
 
 	// The dropped holder cannot, and is refused the same way a stranger is.
@@ -2228,5 +2259,226 @@ func TestALapsedClaimantReportsWithoutKnowingTheVersion(t *testing.T) {
 	}
 	if !bytes.Equal(current.ClaimID, []byte("second-claim")) {
 		t.Fatalf("the report disturbed the live claim: %q", current.ClaimID)
+	}
+}
+
+// TestAReportDoesNotStrandALiveClaimant is this route's central safety
+// property, and the first version of it asserted the wrong thing.
+//
+// A report advances the record version while leaving the state, the claim, the
+// fence and the lease alone. The completion path keyed on the version, so a
+// lapsed holder filing a report moved it out from under a live claimant, whose
+// completion then failed with ErrClaimLost while it held the claim at the right
+// fence and claim ID.
+//
+// That worker had no recourse: Status requires OperationDispatch and the
+// record's own principal, Pull withholds live-claimed records, and this route
+// has no replay branch. So an effect it had actually performed became
+// permanently unreportable — the precise harm #438 exists to prevent, caused by
+// #438.
+//
+// The original test checked the fence, the claim ID and EffectPossible and
+// never that a live claimant could still complete, which is the only assertion
+// that would have caught it. Asserted here from the live claimant's side.
+func TestAReportDoesNotStrandALiveClaimant(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	lapsed, fence, claimedByLapsed := fixture.lapsedClaimant(t, "lapsed")
+
+	// A second worker takes over and holds a live claim.
+	live := fixture.namedWorker(t, "live", auth.OperationExecute)
+	claimedByLive, err := fixture.service.Claim(live, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimedByLapsed.Version,
+		ClaimID: []byte("live-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "live-request"),
+	})
+	if err != nil {
+		t.Fatalf("the live worker could not take the lapsed claim: %v", err)
+	}
+
+	// The lapsed holder reports, which is this route working as intended.
+	if _, err := fixture.service.ReportAmbiguity(lapsed, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "lapsed-request"),
+	}); err != nil {
+		t.Fatalf("the lapsed holder could not report: %v", err)
+	}
+
+	// The live claimant completes with the version it was handed at claim
+	// time, which is the only version it has — Status is closed to it and Pull
+	// withholds its own live-claimed record.
+	done, err := fixture.service.CompleteClaim(live, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimedByLive.Version,
+		ClaimID: []byte("live-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "live-request"),
+	})
+	if err != nil {
+		t.Fatalf("another principal's report stranded the live claimant, so an "+
+			"effect it performed is permanently unreportable: %v", err)
+	}
+	if done.State != DispatchSucceeded ||
+		string(done.Output) != `{"ok":true}` {
+		t.Fatalf("the completion recorded the wrong outcome: state=%s output=%s",
+			done.State, done.Output)
+	}
+	// And the report survived the completion, so tolerating the drift did not
+	// cost the evidence.
+	if len(done.AmbiguityReports) != 1 {
+		t.Fatalf("the completion discarded the report: %+v", done.AmbiguityReports)
+	}
+}
+
+// TestAReportDoesNotStrandASynchronousInvoke is the same hazard on the
+// in-process path. ExecuteClaim re-reads the record twice and both gates keyed
+// on the version, so a report landing between Claim and execution stranded a
+// synchronous invoke exactly as it stranded a completion.
+func TestAReportDoesNotStrandASynchronousInvoke(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	fixture.bindExecutor(t, &inProcessExecutor{})
+	lapsed, fence, claimedByLapsed := fixture.lapsedClaimant(t, "lapsed")
+
+	// The enqueuer claims it next, which is the identity the in-process path
+	// requires: ExecuteClaim needs its caller to be both the record's
+	// principal and its claimant.
+	claimed, err := fixture.service.Claim(fixture.enqueuer, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimedByLapsed.Version,
+		ClaimID: []byte("own-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatalf("the enqueuer could not claim: %v", err)
+	}
+
+	if _, err := fixture.service.ReportAmbiguity(lapsed, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityRequestNotSent,
+		Context: dispatchContext(fixture.now, "lapsed-request"),
+	}); err != nil {
+		t.Fatalf("the lapsed holder could not report: %v", err)
+	}
+
+	// ExecuteClaim is handed the record as it was at claim time.
+	result, err := fixture.service.ExecuteClaim(fixture.enqueuer, claimed)
+	if err != nil {
+		t.Fatalf("a report stranded the in-process execution path: %v", err)
+	}
+	if result.State != DispatchSucceeded {
+		t.Fatalf("the execution did not complete: state=%s", result.State)
+	}
+}
+
+// TestADriftLargerThanTheReportsIsStillRefused keeps the tolerance from
+// becoming "ignore the version".
+//
+// The allowance is an upper bound on what reports alone could explain. A
+// version that has moved further than that has moved for some other reason,
+// and every other write on this surface changes something the gate beside it
+// already checks — so a caller pinning a version that stale must still be
+// refused.
+func TestADriftLargerThanTheReportsIsStillRefused(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	lapsed, fence, claimedByLapsed := fixture.lapsedClaimant(t, "lapsed")
+	live := fixture.namedWorker(t, "live", auth.OperationExecute)
+	claimedByLive, err := fixture.service.Claim(live, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: claimedByLapsed.Version,
+		ClaimID: []byte("live-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "live-request"),
+	})
+	if err != nil {
+		t.Fatalf("the live worker could not claim: %v", err)
+	}
+	// One report, so exactly one version of drift is explainable.
+	if _, err := fixture.service.ReportAmbiguity(lapsed, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "lapsed-request"),
+	}); err != nil {
+		t.Fatalf("the lapsed holder could not report: %v", err)
+	}
+
+	// A pin two versions behind the record, with only one report to account
+	// for it. The second version moved because of the *claim*, which is a
+	// write this caller must not be allowed to ignore.
+	stale := claimedByLive.Version - 1
+	if stale == 0 {
+		t.Fatalf("the fixture cannot express a non-zero stale pin: version %d",
+			claimedByLive.Version)
+	}
+	if _, err := fixture.service.CompleteClaim(live, CompletionRequest{
+		ID: fixture.queued.ID, ExpectedVersion: stale,
+		ClaimID: []byte("live-claim"),
+		Result:  ExecutionResult{Output: json.RawMessage(`{"ok":true}`)},
+		Context: dispatchContext(fixture.now, "live-request"),
+	}); !errors.Is(err, ErrClaimLost) {
+		t.Fatalf("a pin whose drift exceeds the reports was accepted: %v", err)
+	}
+}
+
+// TestAnAmbiguityReportWritesNoOutboxRow pins the PR's claim that this route
+// publishes no event, which nothing asserted.
+//
+// It is not only about log volume. An outbox row for a report would be
+// publishable by whoever filed it and by nobody else, which is the
+// mixed-identity outbox #480 records as leavable undrainable by any principal.
+// A lapsed claimant is exactly the principal least able to drain one.
+func TestAnAmbiguityReportWritesNoOutboxRow(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, _ := fixture.lapsedClaimant(t, "worker")
+	before := len(fixture.dispatchStore.transitions)
+
+	if _, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("the report failed: %v", err)
+	}
+
+	if after := len(fixture.dispatchStore.transitions); after != before {
+		t.Fatalf("the report enqueued %d outbox rows; a row only its filer "+
+			"can publish is the mixed-identity outbox #480 describes",
+			after-before)
+	}
+}
+
+// TestAnAmbiguityReportAuditsItsOwnPhaseAndOperation covers the two audit
+// fields nothing pinned.
+//
+// The phase distinguishes this write in the audit trail from the five that
+// transition the action. The operation must be the one that authorized *this*
+// call rather than the record's last transition — reading the record's field
+// would attribute the report to whatever claimed the action, and would pass an
+// empty operation for a record claimed by a build without the field, which
+// RecordAction validates first and refuses as a 503.
+func TestAnAmbiguityReportAuditsItsOwnPhaseAndOperation(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, _ := fixture.lapsedClaimant(t, "worker")
+
+	// The record was claimed by this worker under execute, so a correct audit
+	// names execute. Clearing the record's own field proves the audit does not
+	// read it — a record from a build without the field must still report.
+	stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	stored.TransitionOperation = ""
+	fixture.dispatchStore.records[string(fixture.queued.ID)] = stored
+
+	if _, err := fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+		ID: fixture.queued.ID, ClaimFence: fence,
+		Outcome: AmbiguityOutcomeUnknown,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); err != nil {
+		t.Fatalf("a record with no recorded transition operation cannot be "+
+			"reported on, which is a 503 across an upgrade: %v", err)
+	}
+
+	var found bool
+	for _, phase := range fixture.recorder.phases {
+		if phase == "ambiguity_report" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no ambiguity_report audit phase was recorded: %v",
+			fixture.recorder.phases)
 	}
 }
