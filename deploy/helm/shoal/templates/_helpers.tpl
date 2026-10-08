@@ -88,6 +88,12 @@ release name shortens the stem rather than overflowing the name.
 {{- printf "%s-explorer-headless" (include "shoal.explorerStem" .) -}}
 {{- end -}}
 
+{{- /* The approver mapping ConfigMap (#451, #526): stem plus -approvers, 55
+       characters at most. */ -}}
+{{- define "shoal.explorerApproversName" -}}
+{{- printf "%s-approvers" (include "shoal.explorerStem" .) -}}
+{{- end -}}
+
 {{- define "shoal.explorerSelectorLabels" -}}
 app.kubernetes.io/name: shoal-explore-web
 app.kubernetes.io/instance: {{ .Release.Name }}

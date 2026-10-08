@@ -83,6 +83,7 @@ therefore reports three things: `state`, what the request effectively is now;
 | `unresolvable` | `target_moved` | the agent's generation moved, or the agent is gone |
 | `unresolvable` | `policy_generation_moved` | the policy generation in force (read from the generation authority, not the caller's token) moved since the request |
 | `unresolvable` | `approver_mapping_moved` | stored approved, but the operator approver mapping in force is not the one the approval was given under; it can never materialize |
+| `unresolvable` | `identity_scheme_moved` | stored pending or approved, but made under an identity scheme other than the one in force (#526); it can never be decided or materialize, and only expires |
 | `unresolvable` | `deadline_passed` | the action deadline passed; it can no longer be re-requested |
 | `refused` / `expired` | — | final |
 
@@ -143,7 +144,8 @@ asked as an approver:
   independence from them.
 
   For an OIDC approver this is **one comparison, not two**. A mapped approver
-  is minted with actor = subject (`oidc:<iss>#<sub>`, below), so the subject
+  is minted with actor = subject (`oidc:<iss>#<sub>`, or
+  `oidcid:<iss>#<value>` under a stable identity claim; below), so the subject
   and actor checks test the same identity, and the separation margin is
   exactly "the approver's subject must not overlap anyone involved". That is
   not a weakening: before the mapping every OIDC token's actor was the
@@ -152,6 +154,13 @@ asked as an approver:
   approver overlap every OIDC requester. No OIDC approver could approve any
   OIDC request; the flow failed closed, under a refusal ("approver is not
   independent of the request") that misdescribed the cause.
+- The same identity scheme (#526). The approver must be named under the
+  scheme the request was stamped with; a request made before the issuer
+  switched to a stable identity claim cannot be decided
+  (`identity_scheme_moved`). And while a stable claim is in force, no
+  involved identity may be in a legacy namespace for the issuer
+  (`oidc:<iss>#`, or `entra:`): the refusal names the namespace. See
+  "Switching an issuer to the stable identity claim".
 - No delegation. A decision carrying `OnBehalfOf` is refused.
 - The approver must **fail** `dispatch`, `invoke` and `execute` on the scope.
   Under shared scopes, which every OIDC-minted principal has, holding approve
@@ -194,17 +203,25 @@ means no approvers.** It is never in ATPL: ATPL is written by registrants,
 and letting a registrant name who approves its own agents' work is the
 conflict of interest #419 forbids.
 
-**Supported issuers, in this slice.** Approvers work only with an issuer
-that advertises public subject identifiers and nothing else, and that puts
-`azp` on its access tokens. Startup checks the first from the issuer's
-discovery document and every mint checks the second, so an issuer that does
-not qualify is refused rather than trusted. The per-issuer notes below
+**Supported issuers.** Independence is judged by identity, so an approver
+mapping is only as sound as the promise that one human has one identity on
+the workspace branch and on the approver branch. There are two ways to keep
+that promise, and every issuer needs one of them:
+
+1. **Public subjects.** Without `-oidc-identity-claim`, identities are
+   `oidc:<iss>#<sub>`, and startup refuses the mapping unless the issuer's
+   discovery states `subject_types_supported` as exactly `["public"]` (below).
+   Auth0 is expected to qualify this way; Okta too once the operator adds an
+   `azp` claim.
+2. **A stable identity claim (#526).** With `-oidc-identity-claim`, both
+   branches name every principal `oidcid:<iss>#<value>`, read from the claim
+   the flag names by one shared derivation, and the subject-type statement is
+   waived. This is how Microsoft Entra ID and Keycloak are supported.
+
+Either way every approver mint requires `azp`. The per-issuer notes below
 describe expected behaviour; they were not verified against each vendor, so
 confirm your issuer's discovery document and a sample token before relying
-on them. Auth0 is expected to qualify; Okta only once the operator adds an
-`azp` claim (below). **Keycloak and Microsoft Entra ID are
-unsupported** until the stable-identity follow-up (#526); startup refuses
-both.
+on them.
 
 ```json
 {
@@ -229,38 +246,99 @@ this mapping documented `idtyp` absent, and a Keycloak service-account token
 passed it — Keycloak never emits `idtyp`, and its client-credentials tokens
 (like Entra's and Auth0's) have `sub != azp`. Per issuer:
 
-- **Auth0: expected to qualify.** Discovery is expected to state `["public"]` and access tokens
-  carry `azp`. Add the human assertion with a post-login Action that sets a
-  namespaced claim (as in the example). A post-login Action does not run for
-  `client_credentials` grants, which run the `credentials-exchange` trigger
-  instead, so machine tokens never carry the claim. Those tokens also carry
-  `gty: client-credentials`, which is refused anyway.
-- **Okta: expected to qualify only with an `azp` claim the operator adds.** Okta access
-  tokens identify the client as `cid` (and the user as `uid`), not `azp`.
-  This slice does not accept `cid`, so an Okta approver token is refused
-  unless the authorization server has a custom claim named `azp` whose value
-  is the client ID (`app.clientId`). Put the human assertion on a custom
-  claim that only user tokens get, for example one included only for a user
-  group.
-- **Keycloak: not supported for approvers in this slice** (follow-up #526).
-  Keycloak's discovery always advertises
-  `subject_types_supported: ["public", "pairwise"]`, whatever mappers a realm
-  has: `OIDCWellKnownProvider` sets it unconditionally. A realm can issue
-  pairwise `sub` values, and nothing in a token says which kind a `sub` is,
-  so startup refuses every Keycloak realm.
-- **Microsoft Entra ID: not supported for approvers in this slice**
-  (follow-up #526). Entra issues pairwise `sub` values (a different `sub` per
-  application) and says so in discovery. The same person would be a
-  different `oidc:<iss>#<sub>` as requester and as approver. Startup refuses
-  it.
+- **Auth0: expected to qualify on public subjects.** Discovery is expected to
+  state `["public"]` and access tokens carry `azp`. Add the human assertion
+  with a post-login Action that sets a namespaced claim (as in the example).
+  A post-login Action does not run for `client_credentials` grants, which run
+  the `credentials-exchange` trigger instead, so machine tokens never carry
+  the claim. Those tokens also carry `gty: client-credentials`, which is
+  refused anyway.
+- **Okta: expected to qualify on public subjects, with an `azp` claim the
+  operator adds.** Okta access tokens identify the client as `cid` (and the
+  user as `uid`), not `azp`. `cid` is not accepted, so an Okta approver token
+  is refused unless the authorization server has a custom claim named `azp`
+  whose value is the client ID (`app.clientId`). Put the human assertion on a
+  custom claim that only user tokens get, for example one included only for a
+  user group.
+- **Microsoft Entra ID: supported with `-oidc-identity-claim '["oid"]'` on a
+  tenant issuer.** Entra issues pairwise `sub` values — a different `sub` per
+  application — and says so in discovery, so on `sub` the same person would be
+  two people. `oid` is the user's object ID: one value per user in a tenant,
+  the same in every application's token, and not editable by the user. It is
+  unique only within a tenant, so the issuer must be the tenant-specific
+  `https://login.microsoftonline.com/<tenant-id>/v2.0`; an issuer whose path
+  names `common`, `organizations` or `{tenantid}` is refused at startup.
+  Entra v2.0 access tokens carry `azp`. Replace legacy Entra mode
+  (`-entra-*`), which names principals `entra:<oid>` and cannot be combined
+  with an approver mapping or with this flag.
+- **Keycloak: supported with a stable claim from a User Property mapper.**
+  Keycloak's discovery advertises `subject_types_supported: ["public",
+  "pairwise"]` for every realm (`OIDCWellKnownProvider` sets it
+  unconditionally), so it can never qualify on public subjects. Add a
+  **User Property** protocol mapper for the user's `id` property, to the
+  access token, with a token claim name such as `user_id`, on a **client scope
+  shared by both clients** — the workspace client and the approval console —
+  so both tokens carry the same claim the same way; then set
+  `-oidc-identity-claim '["user_id"]'`. The user ID is assigned by Keycloak
+  and never changes. **Never use a user attribute a user can edit** (a User
+  Attribute mapper over an attribute exposed in the account console, or
+  `email`, `preferred_username` and the like): whoever can edit the value can
+  choose an identity, including someone else's. The flag refuses the common
+  mutable claim names, but cannot know which custom attributes are editable;
+  that is the operator's assertion.
 
-The follow-up (#526) is a stable identity claim, such as Entra's `oid`,
-used identically on the workspace and approver branches.
+**The stable identity claim is an operator assertion.** Code cannot prove a
+claim is the same for one human across clients and never reused; the operator
+asserts it by choosing the claim, per issuer as above. What the code
+guarantees:
 
-**The issuer must state public subject identifiers only.** The approval
-service separates people by `oidc:<iss>#<sub>`. Under the pairwise subject
-type one human has a different `sub` per client and could approve their own
-request. So the server refuses to start with an approver mapping unless the
+- **One derivation, both branches.** The workspace (requester) principal and
+  the approver principal are both named `oidcid:<iss>#<value>` by the same
+  helper. The value must be present and be a string of 1 to 256 bytes with no
+  control character and no leading or trailing whitespace; it is never
+  trimmed. Missing, `null`, empty, padded, too long, a number, an array or an
+  object is the generic authentication denial on either branch. The flag is a
+  JSON array of path segments, validated like the mapping's `claim`: a dotted
+  string is refused, and a segment containing a dot names a key containing a
+  dot, never a path.
+- **A namespace of its own.** `oidcid:` cannot equal or prefix an `oidc:` or
+  `entra:` identity, so a stable identity never collides with a sub-derived
+  one, whatever either value is. The issuer is the one configured, so a value
+  containing `#` is still one identity.
+- **Approvers.** Actor = subject = the stable identity. The client is still
+  `oidc:<iss>#<azp>`, and `sub != azp` is still checked on the raw `sub`.
+  `GrantProvenance` keeps the raw `sub` as `Subject` and records the claim
+  path as `IdentityClaimPath`, appended to the authorization fingerprint only
+  when present, so every existing fingerprint is unchanged.
+- **Refused at startup:** `["sub"]` (that is the subject the claim replaces);
+  a path ending in `email`, `preferred_username`, `upn`, `unique_name` or
+  `name`, in any case; and the flag together with a non-default
+  `-oidc-subject-claim`, legacy Entra mode, `-oidc-actor-claim` or
+  `-oidc-delegation-claim`. Each of those would put a second, possibly
+  per-client identity into the decision, and the approval service counts
+  every identity a request carries as involved.
+- **The mapping restates it.** The approver mapping file's `identity_claim`
+  must equal the flag segment for segment, byte for byte, whenever either is
+  set, and it is part of the mapping digest (only when present, so a mapping
+  without it keeps its digest). A changed claim therefore also moves every
+  approval pinned to the old mapping to `approver_mapping_moved`.
+- **The subject-type check is waived only with the claim.** Without the flag
+  the public-subjects check below applies unchanged. With it, discovery must
+  still be readable: an issuer whose discovery cannot be fetched is refused
+  either way.
+
+**`-oidc-subject-claim oid` is not this.** `-oidc-subject-claim` names
+identities `oidc:<iss>#<value>` — the same namespace `sub` derives into — so a
+deployment that changes it, or two that differ, can give one human's `oid`
+and another human's `sub` the same identity. That overlap is latent today and
+tracked separately; it is why the approver mapping still refuses a non-default
+subject claim, and why the stable claim has a namespace of its own.
+
+**The issuer must state public subject identifiers only — without the stable
+claim.** Without `-oidc-identity-claim` the approval service separates people
+by `oidc:<iss>#<sub>`. Under the pairwise subject type one human has a
+different `sub` per client and could approve their own request. So the server
+refuses to start with an approver mapping and no stable claim unless the
 issuer's discovery document states `subject_types_supported` as exactly
 `["public"]`. A missing statement, any other list, or a discovery document
 that cannot be read is a refusal; there is no override. Every approver mint
@@ -275,11 +353,55 @@ is empty; any string has leading or trailing whitespace or a control
 character; `claim` is not a list of path segments (a dotted string is refused,
 and a segment containing a dot names a key containing a dot, never a path);
 `max_values` is outside 1–1024; `human_assertion` is missing or has no
-`equals` (an `absent` key is an unknown field). The mapping also requires the
-default OIDC identity (subject claim `sub`, identities `oidc:<iss>#<sub>`) and
-refuses the legacy Entra identity mode, in which the same human would carry an
-`entra:` identity as a requester and an `oidc:` one as an approver and could
-approve their own request.
+`equals` (an `absent` key is an unknown field); `identity_claim` does not
+restate `-oidc-identity-claim` exactly (above). The mapping also requires the
+default subject claim (`sub`) and refuses the legacy Entra identity mode, in
+which the same human would carry an `entra:` identity as a requester and an
+`oidc:` one as an approver and could approve their own request.
+
+### Switching an issuer to the stable identity claim
+
+Changing how principals are named changes every identity, and an identity
+under the old scheme cannot be compared with one under the new: the same
+human can hold one of each. Independence therefore has to hold across the
+switch, and three things make it hold.
+
+- **The scheme is recorded.** Every OIDC deployment writes a digest of its
+  identity scheme — the issuer, the claim path and the identity format — to
+  the `identity-scheme` row for its issuer in the coordination store, beside
+  the policy generation, the first time it starts, and checks it on every
+  start after. A replica whose scheme differs refuses to start, so one human
+  cannot request through a replica on `sub` and approve through one on the
+  stable claim. Changing the scheme needs `-oidc-identity-scheme-migrate`
+  for the one start that records the new scheme; leave it off afterwards, or
+  a misconfigured replica could rewrite the record. A deployment whose row
+  was never written (upgrading from a build before #526) records the scheme
+  it starts with.
+- **Requests are stamped.** Each request records the scheme its requester
+  was named under (`ApprovalRecord.IdentityScheme`, set once at request time;
+  the store refuses any write that changes it). A record written before the
+  stamp existed decodes with it empty, which is the sub-derived scheme those
+  records were made under, so a deployment that does not switch decides every
+  old request exactly as before. After a switch, a request made under the old
+  scheme cannot be decided — `decide` answers `409` (`identity_scheme_moved`,
+  `ErrIdentitySchemeMoved`), Pending skips it, an approver's Status answers
+  as for a missing ID, and the requester's Status reports `unresolvable` /
+  `identity_scheme_moved`. It can only expire. The requester makes a new
+  request under their new identity.
+- **Legacy registrations block approval.** While the stable scheme is in
+  force, `eligibility` refuses an approval when any involved identity — the
+  requester, the delegation chain, the agent, its registrant, or any
+  ancestor's ID or registrant — is in a legacy namespace for the issuer:
+  `oidc:<iss>#`, or `entra:` (every `entra:` identity is legacy once the
+  stable scheme is on, since the two modes cannot be combined). Otherwise
+  someone who registered an agent as `oidc:<iss>#<sub>` could approve work on
+  it as `oidcid:`. The refusal names the namespace, never the identity, and
+  fails closed. **Adoption (#526, PR2) is how approvals resume**: an adoption
+  route will move a descriptor subtree from the legacy namespace to the new
+  one, proved by the legacy subject the same workspace token yields, and
+  audited with both identities. Until it ships, work on an agent registered
+  before the switch cannot be approved; work on an agent registered under the
+  new identity can.
 
 **Minting is decided by audience and fails closed.** A token on a workspace
 audience is minted by the workspace mappings, which never grant approve. A
@@ -305,11 +427,14 @@ audience every one of these is required:
   values maps to `-oidc-fleet-values` (the human holds dispatch).
 
 Every failure is the same generic authentication denial. The decision grants
-`action_approve` and nothing else, with subject = actor = `oidc:<iss>#<sub>`,
-client `oidc:<iss>#<azp>`, no `OnBehalfOf`, the workspace policy generation,
-and an `auth.GrantProvenance` of issuer, subject, claim path, matched value
-and the mapping digest. The provenance is appended to the authorization
-fingerprint only when present, so every existing fingerprint is unchanged.
+`action_approve` and nothing else, with subject = actor = `oidc:<iss>#<sub>`
+(or `oidcid:<iss>#<value>` under a stable identity claim), client
+`oidc:<iss>#<azp>`, no `OnBehalfOf`, the workspace policy generation, and an
+`auth.GrantProvenance` of issuer, raw subject, claim path, matched value, the
+mapping digest and, under a stable claim, the identity claim path. The
+provenance is appended to the authorization fingerprint only when present, and
+the identity claim path within it only when present, so every existing
+fingerprint is unchanged.
 
 **The mapping digest is pinned, not the generation.** The workspace policy
 generation stays fixed configuration: deriving it from a hash of the mapping
@@ -448,6 +573,17 @@ heartbeat interval; this is the same property queued dispatch work already has.
   zero, and a previous build reads a record that has them by skipping them.
   `Validate` refuses either on an undecided record and a digest that is not
   its provenance's.
+- `ApprovalRecord.IdentityScheme` (#526) is an additive gob field, written
+  once at request time. A record a previous build wrote decodes with it zero,
+  which is the sub-derived scheme, never "a scheme that differs from every
+  other"; a previous build reads a stamped record by skipping it. The
+  approval store refuses any write that changes it, or the request, its
+  digest, generation, request time or expiry, or — once written — the
+  decision or the materialization time (`refuseRewrittenApproval`, the
+  approval record's counterpart of #461's action invariant).
+- The `identity-scheme` coordination row (`coordination.IdentitySchemeRow`,
+  value `IdentitySchemeV1`) is new; both encodings are pinned by golden
+  fixtures. A build without it ignores the row.
 - `approval.*` event kinds are reserved: the public publish route refuses them
   and no operation may publish them through the trusted path. No approval
   events are published in this slice.
@@ -546,9 +682,9 @@ tests remain the right tool for service-level properties below the transport.
 - Dataset export of approvals and refusals as adjudications (#401, #419). Every
   field it needs is stored on the approval record.
 - Approval lifecycle events (needs #480 item 1).
-- A stable identity claim (for example `oid`) used identically on the
-  workspace and approver branches (#526). This would let Keycloak and Entra,
-  which advertise pairwise subjects, back an approver mapping.
+- #526 PR2: the adoption route that moves a descriptor subtree from a legacy
+  identity namespace to the stable one (until then, legacy registrations
+  block approval under the stable scheme), and retiring legacy Entra mode.
 - Approver pools per action or descriptor (a later ATPL version may only
   reference an operator-defined pool), a second approver-only issuer, and
   quorum.

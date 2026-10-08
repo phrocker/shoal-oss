@@ -89,6 +89,33 @@
 {{- fail "explorer.allowedHosts needs at least one non-blank value: the workspace binds a non-loopback address in a pod, and with no allow-list every request is refused with 421 Misdirected Request. List the external authority clients actually send (usually the port-less ingress name)" -}}
 {{- end -}}
 
+{{- /* The approver mapping and the stable identity claim (#451, #526). The
+       claim is a list of path segments, never a dotted string, and the
+       mapping must restate it as identity_claim exactly when it is set: the
+       workspace refuses to start otherwise, so a values file that disagrees
+       with itself is refused here instead of in a pod log. Control and
+       line-separator characters in either are refused by the line-break walk
+       below, as in every other value. */ -}}
+{{- $identityClaim := default (list) $oidc.identityClaim -}}
+{{- if not (kindIs "slice" $identityClaim) -}}
+{{- fail (printf "explorer.auth.oidc.identityClaim must be a list of path segments, such as [oid] (got %v): a dotted string is one claim whose name contains a dot, never a path" $oidc.identityClaim) -}}
+{{- end -}}
+{{- range $identityClaim -}}
+{{- if not (and (kindIs "string" .) (trim (toString .))) -}}
+{{- fail "explorer.auth.oidc.identityClaim has a blank or non-string segment: each segment names one claim key, and the workspace refuses the flag at startup" -}}
+{{- end -}}
+{{- end -}}
+{{- $approverMapping := default (dict) $oidc.approverMapping -}}
+{{- if not (kindIs "map" $approverMapping) -}}
+{{- fail "explorer.auth.oidc.approverMapping must be the shoal.approvers/v1 document as a map: the chart renders it into the file the workspace reads" -}}
+{{- end -}}
+{{- if $approverMapping -}}
+{{- $restated := default (list) (get $approverMapping "identity_claim") -}}
+{{- if ne (toJson $restated) (toJson $identityClaim) -}}
+{{- fail (printf "explorer.auth.oidc.approverMapping.identity_claim (%s) must restate explorer.auth.oidc.identityClaim (%s) exactly, and be present exactly when it is set: the mapping digest pins the identity scheme approvers are named under, and the workspace refuses to start when the two disagree" (toJson $restated) (toJson $identityClaim)) -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* Placeholders are not configuration. The shipped profile leaves these
        empty so the guards above fire, but a values file copied from the docs
        can still carry the marker text through, and a pod that authenticates

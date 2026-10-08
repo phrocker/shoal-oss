@@ -62,6 +62,8 @@ type oidcApprovalWorld struct {
 	edit   func(*oidcConfig)
 	authn  atomic.Pointer[oidcAuthenticator]
 	digest atomic.Value // auth.Digest
+	// migrate is -oidc-identity-scheme-migrate for the next open (#526).
+	migrate bool
 
 	// server is a real listener. Its handler is rebuilt for every request
 	// from the service currently open, so a restart (h.reopen) and a
@@ -83,7 +85,21 @@ func newOIDCApprovalWorld(
 	t *testing.T, edit func(*oidcConfig), registrant jwt.MapClaims,
 ) *oidcApprovalWorld {
 	t.Helper()
+	return newOIDCApprovalWorldWith(t, edit, registrant, nil, approverMappingDocument)
+}
+
+// newOIDCApprovalWorldWith is newOIDCApprovalWorld with the issuer's
+// discovery subject types (nil keeps ["public"]) and the mapping document
+// chosen by the caller.
+func newOIDCApprovalWorldWith(
+	t *testing.T, edit func(*oidcConfig), registrant jwt.MapClaims,
+	subjectTypes []string, document func(issuer string) map[string]any,
+) *oidcApprovalWorld {
+	t.Helper()
 	w := &oidcApprovalWorld{t: t, issuer: newFakeOIDCIssuer(t), edit: edit}
+	if subjectTypes != nil {
+		w.issuer.subjectTypes = subjectTypes
+	}
 	h := &approvalHarness{t: t, root: t.TempDir()}
 	h.clock.Store(time.Now().UTC().Add(time.Minute).Truncate(time.Second).UnixNano())
 	authority, err := auth.NewAuthorityWithClock(h.now)
@@ -94,7 +110,7 @@ func newOIDCApprovalWorld(
 	h.reader = &mutableFleetGeneration{}
 	h.reader.value.Store(workspacePolicyGeneration)
 	w.h = h
-	w.configure(approverMappingDocument(w.issuer.server.URL))
+	w.configure(document(w.issuer.server.URL))
 	h.mapping = func(context.Context) (auth.Digest, error) {
 		return w.digest.Load().(auth.Digest), nil
 	}
@@ -136,6 +152,11 @@ func (w *oidcApprovalWorld) configure(document map[string]any) {
 	authenticator := newTestOIDCAuthenticator(w.t, config)
 	w.authn.Store(authenticator)
 	w.digest.Store(authenticator.approverMappingDigest())
+	// The identity scheme the binary would stamp and enforce (#526), taking
+	// effect at the next open, as the mapping does.
+	w.h.scheme = &identitySchemeConfig{
+		scheme: authenticator.identityScheme(), migrate: w.migrate,
+	}
 }
 
 func (w *oidcApprovalWorld) sign(claims jwt.MapClaims) string {

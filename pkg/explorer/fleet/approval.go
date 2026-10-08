@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/rand/v2"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -77,6 +78,13 @@ var (
 	// changed, or the mapping changed between the approval and its use.
 	ErrApproverMappingMoved = errors.New(
 		"fleet approval: approver mapping has moved since the decision")
+	// ErrIdentitySchemeMoved reports a decision on a request made under an
+	// identity scheme other than the approver's (#526): the host changed how
+	// it names principals between the request and the decision, so the
+	// requester and the approver are not named in one identity space and
+	// cannot be compared for independence. Such a request can only expire.
+	ErrIdentitySchemeMoved = errors.New(
+		"fleet approval: identity scheme has moved since the request")
 )
 
 // approvalRequired is what enqueue and invoke return for an action that
@@ -197,6 +205,16 @@ type ApprovalRecord struct {
 	// still the digest in force. Neither ever holds token bytes.
 	ApproverMappingDigest auth.Digest
 	ApproverProvenance    auth.GrantProvenance
+	// IdentityScheme is the identity scheme the requester was named under
+	// when the request was made (#526): IdentityScheme.Digest when the
+	// requester's subject is in the scheme in force, and zero otherwise. It
+	// is creation-time requester state, not approver provenance, and the
+	// durable store refuses any write that changes it. It is additive: a
+	// record written before it existed decodes with it zero, which is the
+	// legacy scheme — the one every such record was in fact made under — and
+	// never "different from every scheme", which would strand every pending
+	// request on upgrade.
+	IdentityScheme auth.Digest
 	// MaterializedAt is when the approved request was committed to become
 	// work. It is written by the approved → enqueued compare-and-set, before
 	// the ActionRecord exists, and is the UpdatedAt the ActionRecord is
@@ -504,6 +522,92 @@ type ApprovalConfig struct {
 	// Window is how long a request stays decidable. Zero means
 	// DefaultApprovalWindow. It is clamped to each request's deadline.
 	Window time.Duration
+	// IdentityScheme is how the host names its principals (#526). The zero
+	// value is the legacy scheme, which is what every host that does not
+	// configure a stable identity claim runs under.
+	IdentityScheme IdentityScheme
+}
+
+// IdentityScheme describes the identity scheme in force (#526).
+//
+// Separation of duty compares identities, so it is only meaningful while the
+// requester and the approver are named in one identity space. A host that
+// changes how it names principals — from a per-client sub to a stable claim,
+// say — changes every identity, and an identity under the old scheme cannot
+// be compared with one under the new: the same human can hold one of each.
+type IdentityScheme struct {
+	// Digest identifies the scheme in force. Zero is the legacy scheme.
+	Digest auth.Digest
+	// Prefix begins every identity the scheme in force mints. Required when
+	// Digest is set; a decision whose subject does not begin with it is not
+	// under the scheme in force.
+	Prefix string
+	// Legacy are the namespaces (identity prefixes) of schemes no longer in
+	// force. While a scheme is in force, an approval that involves any
+	// identity in one of them is refused: the human behind it may be the
+	// approver under the new name. Adoption (#526 PR2) moves a registration
+	// from a legacy namespace to the new one; until then approvals for it
+	// fail closed. Empty when Digest is zero.
+	Legacy []string
+}
+
+func (s IdentityScheme) validate() error {
+	if s.Digest == (auth.Digest{}) {
+		if s.Prefix != "" || len(s.Legacy) > 0 {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"the legacy identity scheme has no prefix or legacy namespaces")
+		}
+		return nil
+	}
+	if s.Prefix == "" {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "identity scheme prefix is required")
+	}
+	for _, namespace := range s.Legacy {
+		if namespace == "" || strings.HasPrefix(s.Prefix, namespace) ||
+			strings.HasPrefix(namespace, s.Prefix) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"a legacy identity namespace must be disjoint from the scheme in force")
+		}
+	}
+	return nil
+}
+
+// of is the scheme an identity was minted under: Digest when it is in the
+// scheme in force, and the legacy scheme otherwise.
+func (s IdentityScheme) of(identity shoal.ID) auth.Digest {
+	if s.Digest != (auth.Digest{}) && strings.HasPrefix(string(identity), s.Prefix) {
+		return s.Digest
+	}
+	return auth.Digest{}
+}
+
+// legacyNamespace returns the first legacy namespace, in configured order,
+// that any of the identities is in, or "".
+func (s IdentityScheme) legacyNamespace(identities map[shoal.ID]struct{}) string {
+	for _, namespace := range s.Legacy {
+		for identity := range identities {
+			if strings.HasPrefix(string(identity), namespace) {
+				return namespace
+			}
+		}
+	}
+	return ""
+}
+
+func cloneIdentityScheme(s IdentityScheme) IdentityScheme {
+	s.Legacy = append([]string(nil), s.Legacy...)
+	return s
+}
+
+func identitySchemeMoved() error {
+	return shoal.WrapError(
+		shoal.ErrorConflict,
+		"the request was made under an identity scheme that is no longer in "+
+			"force; it cannot be decided and will expire",
+		ErrIdentitySchemeMoved)
 }
 
 type ApprovalService struct {
@@ -514,6 +618,7 @@ type ApprovalService struct {
 	generations auth.GenerationReader
 	mapping     func(context.Context) (auth.Digest, error)
 	window      time.Duration
+	scheme      IdentityScheme
 }
 
 func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
@@ -530,11 +635,14 @@ func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument, "approval window is outside its bound")
 	}
+	if err := config.IdentityScheme.validate(); err != nil {
+		return nil, err
+	}
 	return &ApprovalService{
 		dispatch: config.Dispatch, store: config.Store,
 		recorder: config.Recorder, narrowed: config.Narrowed,
 		generations: config.Generations, mapping: config.ApproverMapping,
-		window: window,
+		window: window, scheme: cloneIdentityScheme(config.IdentityScheme),
 	}, nil
 }
 
@@ -602,6 +710,10 @@ const (
 	// The approval can never materialize; a pending request is unaffected
 	// until it is decided.
 	ApprovalConditionApproverMappingMoved ApprovalCondition = "approver_mapping_moved"
+	// ApprovalConditionIdentitySchemeMoved: pending or approved, but made
+	// under an identity scheme other than the one in force (#526). Nobody
+	// can decide or materialize it; it can only expire.
+	ApprovalConditionIdentitySchemeMoved ApprovalCondition = "identity_scheme_moved"
 	// ApprovalConditionDeadlinePassed: the request's action deadline has
 	// passed, so it can no longer be re-requested and so never materialized.
 	ApprovalConditionDeadlinePassed ApprovalCondition = "deadline_passed"
@@ -785,6 +897,9 @@ func (s *ApprovalService) hold(
 		Request: cloneActionRecord(base), RequestDigest: digest,
 		PolicyGeneration: base.PolicyGeneration,
 		RequestedAt:      now, ExpiresAt: expires, UpdatedAt: now,
+		// Stamped once, here, from the requester's own decision; the store
+		// refuses any later write that changes it.
+		IdentityScheme: s.scheme.of(decision.Subject()),
 	}
 	stored, err := s.commit(
 		ctx, "approval_request", auth.OperationDispatch, decision, record, 0)
@@ -861,6 +976,13 @@ func (s *ApprovalService) advance(
 				shoal.ErrorConflict,
 				"the policy generation an approval was given under is no "+
 					"longer in force", ErrApprovalSuperseded)
+		}
+		// The identity scheme first: under a moved scheme the requester and
+		// the approver were never compared in one identity space, which makes
+		// the mapping comparison below meaningless. The row stays approved,
+		// and Status reports identity_scheme_moved.
+		if s.scheme.Digest != current.IdentityScheme {
+			return ApprovalReceipt{}, identitySchemeMoved()
 		}
 		// And so must the approver mapping. The approver was an approver
 		// because a mapping said so; if the operator has changed it since,
@@ -1267,7 +1389,8 @@ func (s *ApprovalService) eligibleApprover(
 	// therefore answers exactly as an absent record does.
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
-			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
+			errors.Is(err, ErrIdentitySchemeMoved) {
 			return Descriptor{}, auth.ObjectNotFound()
 		}
 		return Descriptor{}, err
@@ -1316,6 +1439,14 @@ func (s *ApprovalService) eligibility(
 			shoal.ErrorUnauthorized,
 			"an approval cannot be made on behalf of another identity")
 	}
+	// The approver and the request must be named under one identity scheme
+	// (#526), or the identity comparison below compares two unrelated name
+	// spaces and proves nothing. An empty stamp is a record written before
+	// schemes existed, which is the legacy scheme, so a host that has not
+	// switched decides every old request exactly as before.
+	if s.scheme.of(decision.Subject()) != record.IdentityScheme {
+		return Descriptor{}, identitySchemeMoved()
+	}
 	involved := map[shoal.ID]struct{}{
 		request.Subject: {}, request.Actor: {},
 		request.AgentID: {}, descriptor.Subject: {}, descriptor.Actor: {},
@@ -1337,6 +1468,19 @@ func (s *ApprovalService) eligibility(
 		involved[ancestor.ID] = struct{}{}
 		involved[ancestor.Subject] = struct{}{}
 		involved[ancestor.Actor] = struct{}{}
+	}
+	// Under a stable identity scheme (#526), an identity still in a legacy
+	// namespace is one this approver cannot be compared with: the human
+	// who registered an agent as oidc:<iss>#<sub> may be this approver under
+	// oidcid:. Refuse, naming the namespace and never the identity. Adoption
+	// (#526 PR2) moves a registration to the new namespace, which is how
+	// approvals for it resume.
+	if namespace := s.scheme.legacyNamespace(involved); namespace != "" {
+		return Descriptor{}, shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"an identity involved in the request is in the legacy namespace "+
+				namespace+"; it must be adopted into the identity scheme in "+
+				"force before the request can be approved")
 	}
 	// Read this loop as one comparison for an OIDC approver, not two. A
 	// mapped approver's decision is minted with actor = subject
@@ -1421,7 +1565,8 @@ func (s *ApprovalService) Status(
 		// request's generation. An approver therefore sees a request only
 		// while it is decidable in principle, and the requester always.
 		if _, err := s.eligibleApprover(ctx, decision, current, now); err != nil {
-			if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			if shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
+				errors.Is(err, ErrIdentitySchemeMoved) {
 				return ApprovalStatus{}, auth.ObjectNotFound()
 			}
 			if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
@@ -1486,6 +1631,11 @@ func (s *ApprovalService) effectiveState(
 	}
 	if condition != ApprovalConditionNone {
 		return ApprovalUnresolvable, condition, nil
+	}
+	// Above the mapping: under a moved scheme the mapping comparison means
+	// nothing (see advance).
+	if s.scheme.Digest != current.IdentityScheme {
+		return ApprovalUnresolvable, ApprovalConditionIdentitySchemeMoved, nil
 	}
 	if current.State == ApprovalApproved {
 		mapping, err := s.approverMapping(ctx)
@@ -1571,7 +1721,8 @@ func (s *ApprovalService) Pending(
 		}
 		if _, err := s.eligibleApprover(ctx, decision, record, now); err != nil {
 			if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
-				shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
+				errors.Is(err, ErrIdentitySchemeMoved) {
 				continue
 			}
 			return PendingApprovalsPage{}, err

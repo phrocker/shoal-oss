@@ -216,6 +216,24 @@ explorer:
       # Optional browser Authorization Code + PKCE login.
       browserClientID: ""
       browserScope: ""
+      # The approver mapping (#451; docs/approval.md, "The OIDC approver
+      # mapping"): the shoal.approvers/v1 document itself, as a map. Empty
+      # means no approvers — no token may approve. The chart renders it into a
+      # ConfigMap it owns, mounts it read-only, and passes
+      # -oidc-approver-mapping-file; a checksum annotation rolls the pod when
+      # it changes, because the workspace reads it once at startup.
+      approverMapping: {}
+      # A stable identity claim (#526) as a list of path segments, for example
+      # [oid] for Entra on a tenant issuer. Requesters and approvers are then
+      # named oidcid:<issuer>#<value> on both branches. approverMapping must
+      # restate it as identity_claim. Switching an existing deployment to it
+      # is a scheme change, which the workspace refuses to start on without
+      # identitySchemeMigrate; see docs/approval.md.
+      identityClaim: []
+      # -oidc-identity-scheme-migrate: accept and record a changed identity
+      # scheme. Set it for the one rollout that switches, then unset it, so a
+      # misconfigured later rollout is refused rather than recorded.
+      identitySchemeMigrate: false
   # Disclosure posture. Both settings are deployment choices, not defaults to
   # inherit silently: see docs/shoal-explore-web-deploy.md and #372.
   disclosure:

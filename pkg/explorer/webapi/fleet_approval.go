@@ -190,6 +190,16 @@ func fleetApprovalError(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	// Above the approver mapping and the generic conflict arm (#526): a
+	// moved identity scheme makes the mapping comparison meaningless, and a
+	// caller must be told that the request can only expire, not that it
+	// conflicts.
+	case errors.Is(err, fleet.ErrIdentitySchemeMoved):
+		if shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			return err
+		}
+		return shoal.WrapError(
+			shoal.ErrorConflict, "fleet approval identity scheme moved", err)
 	case errors.Is(err, fleet.ErrApprovalConflict),
 		errors.Is(err, fleet.ErrApprovalExpired),
 		errors.Is(err, fleet.ErrApprovalSuperseded),

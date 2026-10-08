@@ -1,6 +1,7 @@
 {{- if eq (include "shoal.explorerEnabled" .) "true" }}
 {{- $explorer := .Values.explorer -}}
 {{- $oidc := $explorer.auth.oidc -}}
+{{- $approverMappingDir := "/etc/shoal/approvers" -}}
 {{- /* Every value-derived string in this template is a quoted scalar: the
        container arguments as whole arguments, and the image, pull policy,
        credential references, mount path and storage request each on its own.
@@ -43,6 +44,13 @@ spec:
       labels:
         {{- include "shoal.explorerSelectorLabels" . | nindent 8 }}
         app.kubernetes.io/part-of: shoal-platform
+      {{- with $oidc.approverMapping }}
+      # The approver mapping is the one setting that is a file rather than an
+      # argument (it is a document, and the workspace reads it from disk), so
+      # it carries the checksum that rolls the pod when it changes.
+      annotations:
+        checksum/approver-mapping: {{ toJson . | sha256sum | quote }}
+      {{- end }}
     spec:
       # Every setting is an argument on this pod spec rather than a ConfigMap.
       # A changed argument changes the pod template and rolls the pod on its
@@ -131,6 +139,15 @@ spec:
             {{- with $oidc.browserScope }}
             - {{ printf "-oidc-browser-scope=%v" (.) | quote }}
             {{- end }}
+            {{- if $oidc.approverMapping }}
+            - {{ printf "-oidc-approver-mapping-file=%s/approvers.json" $approverMappingDir | quote }}
+            {{- end }}
+            {{- with $oidc.identityClaim }}
+            - {{ printf "-oidc-identity-claim=%s" (toJson .) | quote }}
+            {{- end }}
+            {{- if eq (toString $oidc.identitySchemeMigrate) "true" }}
+            - "-oidc-identity-scheme-migrate=true"
+            {{- end }}
             {{- with $explorer.chat.provider }}
             - {{ printf "-chat-provider=%v" (.) | quote }}
             - {{ printf "-chat-model=%v" ($explorer.chat.model) | quote }}
@@ -199,6 +216,11 @@ spec:
             # working without giving the rest of the root back.
             - name: tmp
               mountPath: /tmp
+            {{- if $oidc.approverMapping }}
+            - name: approver-mapping
+              mountPath: {{ $approverMappingDir | quote }}
+              readOnly: true
+            {{- end }}
           # Both probes address the health port, never the workspace port. The
           # workspace refuses any request whose Host is not an exactly
           # configured authority, and a kubelet addresses the pod by its
@@ -236,6 +258,11 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if $oidc.approverMapping }}
+        - name: approver-mapping
+          configMap:
+            name: {{ include "shoal.explorerApproversName" . | quote }}
+        {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: state

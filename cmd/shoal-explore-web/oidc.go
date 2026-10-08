@@ -274,6 +274,10 @@ type oidcConfig struct {
 	// approverMappingFile names the operator approver mapping (#451). Empty
 	// means no approvers: no token mints OperationActionApprove.
 	approverMappingFile string
+	// identityClaim is -oidc-identity-claim (#526): a JSON array of path
+	// segments naming a stable identity claim. Empty means identities are
+	// derived from the subject claim, as before.
+	identityClaim string
 
 	// httpClient and clock are injected by tests; production leaves them nil.
 	httpClient *http.Client
@@ -293,7 +297,8 @@ func (c oidcConfig) configured() bool {
 		len(c.contributorValues) > 0 || len(c.fleetValues) > 0 ||
 		c.browserClientID != "" ||
 		c.browserScope != "" || c.authorizationEndpoint != "" ||
-		c.tokenEndpoint != "" || c.approverMappingFile != ""
+		c.tokenEndpoint != "" || c.approverMappingFile != "" ||
+		c.identityClaim != ""
 }
 
 // oidcAuthenticator validates bearer tokens against the issuer's JWKS
@@ -330,6 +335,10 @@ type oidcAuthenticator struct {
 	// decides which branch a token is minted on.
 	approver           *approverMapping
 	workspaceAudiences map[string]struct{}
+	// identityClaim is the stable identity claim path (#526), or nil. When
+	// set, every principal on both branches is oidcid:<iss>#<value>, derived
+	// by stableIdentity and by nothing else.
+	identityClaim []string
 }
 
 func newOIDCAuthenticator(
@@ -413,9 +422,19 @@ func newOIDCAuthenticator(
 				"-oidc-contributor-values, or -oidc-fleet-values mapping is required")
 	}
 
+	identityClaim, err := parseIdentityClaimFlag(config.identityClaim)
+	if err != nil {
+		return nil, err
+	}
+	if identityClaim != nil {
+		if err := refuseIdentityClaimCombination(config, issuer); err != nil {
+			return nil, err
+		}
+	}
+
 	var approver *approverMapping
 	if path := strings.TrimSpace(config.approverMappingFile); path != "" {
-		approver, err = loadApproverMapping(path, issuer, audiences)
+		approver, err = loadApproverMapping(path, issuer, audiences, identityClaim)
 		if err != nil {
 			return nil, err
 		}
@@ -527,6 +546,7 @@ func newOIDCAuthenticator(
 		tokenEndpoint:              strings.TrimSpace(config.tokenEndpoint),
 		approver:                   approver,
 		workspaceAudiences:         workspaceAudiences,
+		identityClaim:              identityClaim,
 	}, nil
 }
 
@@ -877,14 +897,8 @@ func (a *oidcAuthenticator) mint(
 func (a *oidcAuthenticator) mintWorkspace(
 	claims jwt.MapClaims, correlationID shoal.ID,
 ) (auth.Decision, error) {
-	subject, err := requiredStringClaim(claims, a.subjectClaim)
-	if errors.Is(err, errMissingMappedClaim) && a.subjectFallbackClaim != "" {
-		subject, err = requiredStringClaim(claims, a.subjectFallbackClaim)
-	}
+	subject, err := a.workspaceSubject(claims)
 	if err != nil {
-		if err == errMissingMappedClaim {
-			return auth.Decision{}, errMissingSubject
-		}
 		return auth.Decision{}, err
 	}
 	expiration, err := claims.GetExpirationTime()
@@ -947,7 +961,7 @@ func (a *oidcAuthenticator) mintWorkspace(
 		return auth.Decision{}, err
 	}
 	decision, err := auth.NewDecision(auth.DecisionConfig{
-		Subject:             a.identity(subject),
+		Subject:             subject,
 		Actor:               actor,
 		ClientID:            clientID,
 		OnBehalfOf:          onBehalfOf,
@@ -968,6 +982,27 @@ func (a *oidcAuthenticator) mintWorkspace(
 		return auth.Decision{}, err
 	}
 	return decision, nil
+}
+
+// workspaceSubject is the workspace principal's subject: the stable identity
+// when one is configured (#526), and otherwise the subject claim (or the
+// legacy fallback) under the configured identity prefix, as before.
+func (a *oidcAuthenticator) workspaceSubject(claims jwt.MapClaims) (shoal.ID, error) {
+	if a.identityClaim != nil {
+		identity, _, err := a.stableIdentity(claims)
+		return identity, err
+	}
+	subject, err := requiredStringClaim(claims, a.subjectClaim)
+	if errors.Is(err, errMissingMappedClaim) && a.subjectFallbackClaim != "" {
+		subject, err = requiredStringClaim(claims, a.subjectFallbackClaim)
+	}
+	if err != nil {
+		if err == errMissingMappedClaim {
+			return "", errMissingSubject
+		}
+		return "", err
+	}
+	return a.identity(subject), nil
 }
 
 // authority maps configured claim values to operations and corpus grants. It
