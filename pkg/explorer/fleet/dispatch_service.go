@@ -1157,7 +1157,29 @@ func (s *DispatchService) applyExecutionResult(
 	next.TransitionOperation = authorizing
 	next.Version++
 	next.UpdatedAt = finishNow
-	next.EffectPossible = true
+	// Carried forward, not asserted.
+	//
+	// This was `next.EffectPossible = true`, unconditional on every
+	// completion — which overwrote the claim path's careful narrowing a few
+	// hundred lines above. applyClaim sets the flag only for an action
+	// declaring EffectMutatesExternal or EffectEgressesContent, with a
+	// comment explaining that an action which "neither mutates externally nor
+	// transmits leaves its whole outcome in Shoal's own record, so nothing
+	// has to be assumed about it". Completion then assumed it anyway, so
+	// every terminal record claimed an effect may have happened and the flag
+	// carried no information where an operator actually reads it (#510).
+	//
+	// cloneActionRecord carries the claim's value, which is the right one:
+	// true for a declaring action from the moment it was claimable, false for
+	// one whose whole outcome is in this record. The store enforces that it
+	// can only ever rise (#461), so a completion cannot withdraw it.
+	//
+	// What this does *not* give: a declaring action whose request demonstrably
+	// never left still reads as possibly-effected, because the claim set it
+	// and monotonicity forbids lowering it. That is correct — once claimed, a
+	// worker may act at any time — and the only way to assert the negative is
+	// an ambiguity report whose outcome is request_not_sent, which is a
+	// statement by the worker rather than an inference by the service.
 	// Whose code this is, decided by which branch below writes it rather than
 	// by anything the caller said. A code present on entry came from the
 	// executor; every assignment below is the service adjudicating, and each
