@@ -86,26 +86,59 @@ func dispatchStateCases(t *testing.T) []valueCase {
 	return out
 }
 
+// originLabel names an error code origin in a case name.
+func originLabel(origin fleet.ErrorCodeOrigin) string {
+	if origin == fleet.ErrorCodeOriginUnknown {
+		return "omitted"
+	}
+	return string(origin)
+}
+
 // dispatchErrorCases renders a failed action for every gateway and fleet
-// error code in source, including every target-rejected status, keeping the
-// reason and next-step sentences that vary with the code; the rest of a
-// failed action is pinned by dispatch_states.
+// error code in source, including every target-rejected status, and an
+// executor's own code, under every error code origin in source: the reason
+// and next-step sentences, which vary with the code and the origin. The
+// outcome and the failing transition vary with the origin alone, so they are
+// rendered once per origin. The rest of a failed action is pinned by
+// dispatch_states. An origin this build does not know is not pinned here:
+// TestAnUnknownOriginIsNeverTheExecutors requires it to render exactly as an
+// omitted one.
 func dispatchErrorCases(t *testing.T) []valueCase {
 	var out []valueCase
-	for _, code := range sourceErrorCodes(t) {
-		record := action(fleet.DispatchFailed)
-		record.ErrorCode = code
+	for _, s := range sourceErrorCodeOrigins(t) {
+		origin := fleet.ErrorCodeOrigin(s)
+		for _, code := range append(sourceErrorCodes(t), "made up by an executor") {
+			record := failedWith(code, origin)
+			out = append(out, valueCase{
+				name: "failed code=" + code + " origin=" + originLabel(origin),
+				run: func(r *Renderer) ([]Sentence, error) {
+					sentences, err := r.Action(record, Options{})
+					var kept []Sentence
+					for _, s := range sentences {
+						if s.Role == RoleReason || s.Role == RoleNext {
+							kept = append(kept, s)
+						}
+					}
+					return kept, err
+				},
+			})
+		}
+		record := failedWith(GatewayOutcomeUnknown, origin)
 		out = append(out, valueCase{
-			name: "failed code=" + code,
+			name: "failed outcome origin=" + originLabel(origin),
 			run: func(r *Renderer) ([]Sentence, error) {
 				sentences, err := r.Action(record, Options{})
-				var kept []Sentence
-				for _, s := range sentences {
-					if s.Role == RoleReason || s.Role == RoleNext {
-						kept = append(kept, s)
-					}
+				if err != nil || len(sentences) == 0 {
+					return nil, err
 				}
-				return kept, err
+				return sentences[:1], nil
+			},
+		}, valueCase{
+			name: "failed transition origin=" + originLabel(origin),
+			run: func(r *Renderer) ([]Sentence, error) {
+				return r.ActionHistory([]fleet.ActionTransition{
+					{ID: []byte("t1"), Kind: "action.failed", Record: record},
+				}, Options{})
 			},
 		})
 	}

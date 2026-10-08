@@ -31,6 +31,14 @@ const (
 	AttributedToRequester Attribution = "requester"
 	// AttributedToExecutor is text an executor or target returned.
 	AttributedToExecutor Attribution = "executor"
+	// AttributedToService is a value the Shoal service itself recorded, such
+	// as an error code a record says the service assigned.
+	AttributedToService Attribution = "service"
+	// AttributedToExecutorOrService is an error code on a record that does
+	// not say whether the executor reported it or the service assigned it
+	// (a record written before ErrorCodeOrigin existed, or one whose origin
+	// this build does not recognize).
+	AttributedToExecutorOrService Attribution = "executor_or_service"
 	// AttributedToPredictor is text a decision predictor returned.
 	AttributedToPredictor Attribution = "predictor"
 	// AttributedToPredictorOrService is a whole-request decision reason:

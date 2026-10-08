@@ -59,6 +59,7 @@ func (b *builder) actionArgs(record fleet.ActionRecord) Args {
 		"claimant":   b.principal(string(record.ClaimantActor), string(record.ClaimantSubject)),
 		"reporter":   b.reporter(record),
 		"claimed":    yesNo(record.ClaimFence > 0),
+		"origin":     errorOrigin(record.ErrorCodeOrigin),
 	}
 }
 
@@ -91,12 +92,20 @@ func withArgs(base Args, extra Args) Args {
 }
 
 // errorCode presents a recorded error code: a code from a closed set as
-// itself, anything else as the executor's quoted text.
-func (b *builder) errorCode(code string) Fragment {
-	if _, _, ok := errorCodeKey(code); ok {
-		return Fragment{text: code}
+// itself, anything else as quoted text attributed to whoever the record's
+// origin says assigned it — and, where the record does not say, to neither.
+func (b *builder) errorCode(record fleet.ActionRecord) Fragment {
+	if _, _, ok := errorCodeKey(record.ErrorCode); ok {
+		return Fragment{text: record.ErrorCode}
 	}
-	return b.quote(AttributedToExecutor, "", code)
+	attribution := AttributedToExecutorOrService
+	switch errorOrigin(record.ErrorCodeOrigin) {
+	case OriginService:
+		attribution = AttributedToService
+	case OriginExecutor:
+		attribution = AttributedToExecutor
+	}
+	return b.quote(attribution, "", record.ErrorCode)
 }
 
 func principalRef(actor, subject string) []Ref {
@@ -169,9 +178,12 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 
 	// Why.
 	if state == fleet.DispatchFailed {
+		// The reason template is chosen by who the record says assigned the
+		// code, never by the code itself (#508).
 		stem, status, _ := errorCodeKey(record.ErrorCode)
-		b.add(RoleReason, stem, withArgs(args, Args{
-			"status": status, "code": b.errorCode(record.ErrorCode),
+		origin := errorOrigin(record.ErrorCodeOrigin)
+		b.add(RoleReason, stem+"."+string(origin), withArgs(args, Args{
+			"status": status, "code": b.errorCode(record),
 		}), reporterRefs(record)...)
 	}
 	if state == fleet.DispatchCanceled && !admission && record.ClaimFence > 0 {
@@ -425,7 +437,7 @@ func (r *Renderer) ActionHistory(transitions []fleet.ActionTransition, opts Opti
 		}
 		extra := Args{}
 		if edge.Name == "fail" {
-			extra["code"] = b.errorCode(t.Record.ErrorCode)
+			extra["code"] = b.errorCode(t.Record)
 		}
 		b.add(RoleHistory, "dispatch.transition."+edge.Name, withArgs(args, extra), refs...)
 		prev = string(t.Record.State)

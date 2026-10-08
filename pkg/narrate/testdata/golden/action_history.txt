@@ -7,6 +7,6 @@ history dispatch.transition.claim_run
   record=action:act-1 transition=t2 transition=t3 transition=t4 principal=worker-1 claim=claim-1 principal=worker-2 claim=claim-1 principal=worker-2 claim=claim-1
   identifiers worker-1 worker-2
 history dispatch.transition.fail
-  At 2026-10-08 12:15:00 UTC, worker-2 reported failure with retry_exhausted.
+  At 2026-10-08 12:15:00 UTC, it was recorded as failed with retry_exhausted after worker-2 reported its outcome; the record does not say whether worker-2 or Shoal assigned the code.
   record=action:act-1 transition=t5 principal=worker-2 claim=claim-1
-  identifiers worker-2
+  identifiers worker-2 worker-2

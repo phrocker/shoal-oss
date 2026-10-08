@@ -137,7 +137,7 @@ func TestCatalogLoadRules(t *testing.T) {
 		t.Fatalf("English does not load: %v", err)
 	}
 	for name, edit := range map[string]func(*CatalogFile){
-		"missing key": func(f *CatalogFile) { delete(f.Messages, "dispatch.error.outcome_unknown") },
+		"missing key": func(f *CatalogFile) { delete(f.Messages, "dispatch.error.outcome_unknown.either") },
 		"extra key":   func(f *CatalogFile) { f.Messages["dispatch.error.made_up"] = "x" },
 		"bad pattern": func(f *CatalogFile) { f.Messages["dispatch.next.none"] = "{oops" },
 		"bad locale":  func(f *CatalogFile) { f.Locale = "not a locale!" },
