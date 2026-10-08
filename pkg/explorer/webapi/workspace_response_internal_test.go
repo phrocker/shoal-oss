@@ -71,6 +71,11 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 		// happened. Telling its caller nothing committed would be the worst
 		// answer this surface can give.
 		{http.MethodPost, "/api/v1/fleet/actions/action/ambiguity"},
+		// A renewal writes the new lease before its response is encoded. An
+		// over-budget response reported as a clean failure would tell a worker
+		// its claim is gone while the extension actually landed, so it would
+		// abandon work it still holds the fence for.
+		{http.MethodPost, "/api/v1/fleet/actions/action/extend"},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel"},
 		// A request commits the grant or the refusal, and a report commits the
 		// terminal record for a call the caller has already made. Losing
@@ -150,6 +155,10 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		// completion it sits between. Unlisted, a workspace-scoped worker was
 		// refused before the handler ran.
 		{http.MethodPost, "/api/v1/fleet/actions/action/ambiguity", auth.OperationInvoke, true},
+		// And the renewal, for the same reason. A long operation is precisely
+		// the case a renewal exists for, so a workspace-scoped worker that
+		// cannot renew loses its claim mid-operation with no way to keep it.
+		{http.MethodPost, "/api/v1/fleet/actions/action/extend", auth.OperationInvoke, true},
 		// All three admission routes, for the same reason: unlisted here, a
 		// caller sending a workspace ID is refused before the handler runs, so
 		// the whole surface is invisible to any workspace-scoped client.

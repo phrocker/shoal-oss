@@ -176,6 +176,12 @@ func (*fleetToolService) Pull(context.Context, fleet.PullActionsRequest) (fleet.
 	return fleet.ActionPage{}, nil
 }
 
+func (*fleetToolService) ExtendClaim(
+	context.Context, fleet.ExtendRequest,
+) (fleet.ActionRecord, error) {
+	return fleet.ActionRecord{}, nil
+}
+
 func (*fleetToolService) ReportAmbiguity(
 	context.Context, fleet.AmbiguityRequest,
 ) (fleet.ActionRecord, error) {
