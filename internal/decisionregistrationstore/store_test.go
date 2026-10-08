@@ -16,6 +16,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/decisionstore"
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
+	"github.com/phrocker/shoal-oss/pkg/collector"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -24,7 +25,7 @@ func fixture() (Scope, Frozen, []byte, time.Time) {
 	now := time.Date(2026, 10, 8, 18, 0, 0, 0, time.UTC)
 	blob := []byte(`{"trusted":"host-validated canonical artifact envelope"}`)
 	s := Scope{Domain: []byte{255, 0}, SubjectID: shoal.ID(string([]byte{254, 0})), ActorID: shoal.ID(string([]byte{253, 0})), ClientID: shoal.ID(string([]byte{252, 0})), OnBehalfOf: []shoal.ID{shoal.ID(string([]byte{251, 0}))}}
-	f := Frozen{SelectionSHA256: strings.Repeat("a", 64), ProfileID: "profile", ProfileRevisionID: "profile-v1", BuilderID: "builder", RequestID: "request", TaskID: "task", PictureID: "picture", PredictorID: "predictor", Sources: []SourcePin{{CollectorID: "collector", ObservationID: "observation", ArtifactID: "artifact", EnrollmentID: "enrollment", AuthorityPolicyID: "policy", Generation: 1, ArtifactSHA256: strings.Repeat("b", 64), SourceSHA256: strings.Repeat("c", 64), ReceivedAt: now.Add(-time.Second)}}, AcceptedAt: now, AuthenticationExpiresAt: now.Add(time.Hour), AuthorizationFingerprint: "auth-sha256:" + strings.Repeat("d", 64), RecordSHA256: hash(blob), RecordBytes: len(blob)}
+	f := Frozen{SelectionSHA256: strings.Repeat("a", 64), ProfileID: "profile", ProfileRevisionID: "profile-v1", BuilderID: "builder", RequestID: "request", TaskID: "task", PictureID: "picture", PredictorID: "predictor", Sources: []SourcePin{{Mode: collector.Imported, CollectorID: "collector", ObservationID: "observation", ArtifactID: "artifact", EnrollmentID: "enrollment", AuthorityPolicyID: "policy", Generation: 1, ArtifactSHA256: strings.Repeat("b", 64), SourceSHA256: strings.Repeat("c", 64), ReceivedAt: now.Add(-time.Second)}}, AcceptedAt: now, AuthenticationExpiresAt: now.Add(time.Hour), AuthorizationFingerprint: "auth-sha256:" + strings.Repeat("d", 64), RecordSHA256: hash(blob), RecordBytes: len(blob)}
 	return s, f, blob, now
 }
 
@@ -340,5 +341,39 @@ func TestConcurrentExactRetriesAndOptionalOpaqueActor(t *testing.T) {
 		if !reflect.DeepEqual(first, r) || r.State != Ready || r.Scope.ActorID != "" || r.Scope.ClientID != "" {
 			t.Fatal("different exact winner")
 		}
+	}
+}
+
+func TestSourceAcquisitionModeIsMandatoryAndFrozen(t *testing.T) {
+	scope, f, b, now := fixture()
+	m := &memoryCAS{}
+	s := openMemory(t, m, &now)
+	ctx := context.Background()
+	for _, mode := range []collector.Mode{"", "unknown"} {
+		bad := f
+		bad.Sources = append([]SourcePin(nil), f.Sources...)
+		bad.Sources[0].Mode = mode
+		if _, e := s.Begin(ctx, scope, []byte("key"), bad, b); e == nil || m.writes != 0 {
+			t.Fatalf("invalid mode %q persisted: %v", mode, e)
+		}
+	}
+	imported, e := s.Begin(ctx, scope, []byte("key"), f, b)
+	if e != nil {
+		t.Fatal(e)
+	}
+	observed := f
+	observed.Sources = append([]SourcePin(nil), f.Sources...)
+	observed.Sources[0].Mode = collector.ServerObserved
+	if _, e = s.Begin(ctx, scope, []byte("key"), observed, b); !errors.Is(e, ErrConflict) {
+		t.Fatalf("mode substitution accepted: %v", e)
+	}
+	got, _, e := s.LoadPrepared(ctx, scope, []byte("key"))
+	if e != nil || got.Frozen.Sources[0].Mode != collector.Imported || got.FrozenSHA256 != imported.FrozenSHA256 {
+		t.Fatalf("original acquisition mode lost: %v", e)
+	}
+	scope.SubjectID = "other-subject"
+	separate, e := s.Begin(ctx, scope, []byte("key"), observed, b)
+	if e != nil || separate.FrozenSHA256 == imported.FrozenSHA256 {
+		t.Fatalf("modes collapse: %v", e)
 	}
 }
