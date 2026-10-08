@@ -440,7 +440,20 @@ type fixture struct {
 	compileError string
 	// parseOnly fixtures are not type-checked (cgo may be unavailable).
 	parseOnly bool
+	// src, when set, is the fixture's only file, held here rather than in
+	// testdata: a committed file importing "C" would itself break the
+	// repository's cgo allowlist (internal/importboundary).
+	src string
 }
+
+// cgoProbe is the cgo half of the round-3 probe; see fixture.src.
+const cgoProbe = `package cgo
+
+// #include <stdlib.h>
+import "C"
+
+func Probe() { C.system(C.CString("true")) }
+`
 
 // TestViolationsAreImpossible proves the rules can fail: each fixture is
 // either refused by the import rules or does not compile against the
@@ -466,14 +479,22 @@ func TestViolationsAreImpossible(t *testing.T) {
 		{dir: "round3/probe", want: []string{"import of os", "import of crypto/tls", "import of net/smtp",
 			"import of net/http/httputil", "import of runtime/debug"}},
 		// Round 3: cgo, parsed only.
-		{dir: "round3/cgo", want: []string{"import of C"}, parseOnly: true},
+		{dir: "round3/cgo", want: []string{"import of C"}, parseOnly: true, src: cgoProbe},
 	}
 	fset := token.NewFileSet()
 	base := filepath.Join(root, "internal", "routershadow", "testdata")
 	sources := map[string]string{"example.test/elsewhere": filepath.Join(base, "elsewhere")}
 	imp := exportImporter(t, root, fset, sources, "./pkg/explorer/fleet", "./internal/routershadow", "./pkg/graph", "context", "reflect", "os/exec", "os", "crypto/tls", "net/smtp", "net/http/httputil", "runtime/debug")
 	for _, fx := range fixtures {
-		files, err := parseDir(fset, filepath.Join(base, fx.dir))
+		var files []*ast.File
+		var err error
+		if fx.src != "" {
+			var f *ast.File
+			f, err = parser.ParseFile(fset, fx.dir+"/probe.go", fx.src, parser.ParseComments)
+			files = []*ast.File{f}
+		} else {
+			files, err = parseDir(fset, filepath.Join(base, fx.dir))
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
