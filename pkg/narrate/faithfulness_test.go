@@ -33,10 +33,11 @@ import (
 //     code — request_not_sent included;
 //   - clear, with a gateway code: the code implies a target was involved, so
 //     the declaration is contradicted and it still starts with reconciling;
-//   - clear, with one of fleet's own codes at service origin: reconciliation
-//     is dropped, on the condition that the declaration is accurate;
-//   - clear, with anything else: reconcile if the action reached any external
-//     system.
+//   - clear, with anything else — fleet's own codes at any origin included,
+//     since fleet assigns them after the worker acted: reconcile if the
+//     action reached any external system.
+//
+// No failure ever drops reconciliation.
 func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 	r := New(nil)
 	families := sourceCodeFamilies(t)
@@ -67,17 +68,14 @@ func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 							if !strings.HasPrefix(text, "reconcile with the target before") {
 								t.Errorf("%s: next step does not start with reconciliation: %s", what, s.Text)
 							}
-						case families[code] == "fleet" && wantOrigin[origin] == OriginService:
-							if strings.Contains(text, "reconcile with the target") ||
-								!strings.Contains(text, "if the action’s declaration is accurate, no reconciliation with the target is needed") {
-								t.Errorf("%s: reconciliation is not dropped on the declaration's "+
-									"condition: %s", what, s.Text)
-							}
 						default:
 							if !strings.HasPrefix(text, "reconcile with the target if the action reached any external system") {
-								t.Errorf("%s: a code the renderer cannot place does not keep "+
+								t.Errorf("%s: a failure on a clear flag does not keep "+
 									"reconciliation: %s", what, s.Text)
 							}
+						}
+						if strings.Contains(text, "no reconciliation") {
+							t.Errorf("%s: a failure drops reconciliation: %s", what, s.Text)
 						}
 						for _, unsafe := range []string{"without repeating", "safe to", "can be requested again"} {
 							if strings.Contains(text, unsafe) {

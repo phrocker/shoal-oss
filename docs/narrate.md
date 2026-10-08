@@ -224,9 +224,10 @@ The origin is credited with the code, and only the code:
   {reporter} reported its outcome" for Shoal's, and otherwise says the record
   does not say whether the reporter or Shoal assigned the code.
 - **The next step** is to reconcile with the target before requesting the
-  work again, whatever the code and whoever assigned it, unless
-  `EffectPossible` is clear and nothing on the record implies a target (see
-  "Whether the action declared an external effect" below). Three change with
+  work again, whatever the code and whoever assigned it. With
+  `EffectPossible` clear and a code that is not the gateway's, it reconciles
+  if the action reached any external system (see "Whether the action declared
+  an external effect" below); no failure drops reconciliation. Three change with
   the origin, because their wording presumed who assigned the code:
   `request_not_sent` and `input_invalid` said "the report says nothing was
   sent, but the record cannot establish that". For an executor's code that
@@ -260,13 +261,12 @@ that implies a target overrides it.
 | --- | --- | --- | --- | --- |
 | claimed | true | — | "The action declares an external or egress effect and is claimed, so an effect may already have happened." (gap) | unchanged |
 | succeeded, failed, canceled | true | any | "An external effect may have occurred; reconcile with the target." (gap) | unchanged: a failure, and a canceled record that was claimed, reconcile with the target |
-| failed | false | a gateway code (`request_not_sent`, `outcome_unknown`, `retry_exhausted`, `input_invalid`, `target_rejected_NNN`) | "The failure’s code implies an external target was involved, although the action declares no external or egress effect; the declaration may be wrong, and an external effect may have occurred." (gap) | unchanged: reconcile with the target |
-| succeeded | false | none | "This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record." (reason) | unchanged (a success never advised reconciling) |
-| failed | false | a fleet code (`invalid_executor_output`, `invalid_executor_evidence`, `invalid_executor_error`, `executor_error`) at `service` origin | the same conditional sentence | reconciliation dropped on the declaration's condition: "…; if the action’s declaration is accurate, no reconciliation with the target is needed." |
-| failed | false | anything else: free text, or a fleet code not at `service` origin | the same conditional sentence | "Reconcile with the target if the action reached any external system before requesting the work again …" |
+| succeeded | false | none | `dispatch.effect.declared_none`: "This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record." (reason) | unchanged (a success never advised reconciling) |
+| failed | false | a gateway code (`request_not_sent`, `outcome_unknown`, `retry_exhausted`, `input_invalid`, `target_rejected_NNN`) | `dispatch.gap.effect_contradicted`: "The failure’s code implies an external target was involved, although the action declares no external or egress effect; the declaration may be wrong, and an external effect may have occurred." (gap) | unchanged: reconcile with the target |
+| failed | false | anything else, fleet's own codes at any origin included | `dispatch.effect.declared_none_unsure`: "This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record." (reason) | "Reconcile with the target if the action reached any external system before requesting the work again …" |
 | canceled | false | — | none | unchanged: decided by the claim fence |
 
-Why reconciliation is dropped (conditionally) only there:
+Reconciliation is never dropped on a failure:
 
 - **A gateway code contradicts the declaration.** The effects gateway assigns
   its codes only once a request to a target was being bound or attempted, so
@@ -274,17 +274,21 @@ Why reconciliation is dropped (conditionally) only there:
   contradict itself. Membership is the gateway's closed set
   (`GatewayErrorCodes` and `TargetRejectedStatus`), the same family
   `errorCodeKey` uses, not string matching.
-- **Fleet's own codes at service origin adjudicate the executor, not a
-  target.** Fleet assigns them itself and refuses them from an executor
-  (#529): the executor's output, evidence or error code was refused, or it
-  failed without a code. Nothing in them implies a target, so if the
-  declaration is accurate there is nothing to reconcile. At any other origin
-  the record does not establish that Shoal assigned them.
-- **A code the renderer cannot interpret keeps reconciliation**, conditioned
-  on the action having reached an external system: the renderer cannot tell
-  whether the code implies a target.
-- **A success with no code** never advised reconciling; the sentence only
-  adds the conditional declaration.
+- **Fleet's own codes are assigned after the worker acted.** In
+  `applyExecutionResult`, `invalid_executor_output` follows a reported
+  success whose output failed the schema (a gateway worker that got a 2xx
+  ends there), `invalid_executor_error` overwrites a worker's own code that
+  was malformed (`"target_rejected_409 "`, with a trailing space, say), and
+  `executor_error` replaces a failure reported without a code. None of them
+  says the work did not reach a target, whoever the origin says assigned it.
+- **A code the renderer cannot interpret** cannot be placed either.
+
+So a clear flag on a failure says only what the action declared, and
+reconciles if the action reached any external system. Only a **success with
+no code** says "its whole outcome is in this record", and only on the
+declaration's condition. No failure says it even then:
+`invalid_executor_output` discards the output and `invalid_executor_evidence`
+the evidence, so neither failure's outcome is wholly in the record.
 
 The rest of the rule:
 
@@ -306,8 +310,9 @@ The rest of the rule:
   unhedged affirmation and for an unconditional "could not have", "no
   external effect" or "no reconciliation".
   `TestNoPageBothContactsATargetAndDropsReconciliation` checks that no page
-  carries a gateway code and "no reconciliation", and that reconciliation is
-  dropped only where the table allows it.
+  carries a gateway code and "no reconciliation", that every failure's next
+  step reconciles with the target, and that only a success with no code says
+  its whole outcome is in the record.
 - **The flag is never inferred.** Not from the declaration (an admission's
   admitted effects are on the record, but a declaration is not the flag), and
   not from the outcome. The code only ever widens it: `request_not_sent`

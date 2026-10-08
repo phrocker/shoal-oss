@@ -79,17 +79,6 @@ func isGatewayCode(code string) bool {
 	return false
 }
 
-// isFleetCode reports whether code is one the dispatch service assigns
-// itself.
-func isFleetCode(code string) bool {
-	for _, known := range FleetErrorCodes {
-		if code == known {
-			return true
-		}
-	}
-	return false
-}
-
 // Who assigned an error code, as the renderer narrates it (#508, #529).
 //
 // The three are the only template decisions there are: a code Shoal itself

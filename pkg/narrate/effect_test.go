@@ -25,7 +25,10 @@ import (
 //     effect. Not that none happened: a descriptor may declare less than its
 //     binding permits, so a remote worker on a non-declaring action can still
 //     do real work. Every sentence is attributed to the declaration and
-//     conditional on it, and a gateway code on the record contradicts it.
+//     conditional on it. Only a success with no code says its whole outcome
+//     is in the record; a failure keeps reconciliation (fleet assigns even
+//     its own codes after the worker acted), and a gateway code contradicts
+//     the declaration.
 //     No record written before #538 has a clear flag here: Validate required
 //     it on both states;
 //   - canceled, clear: nothing is said. The record may never have been
@@ -36,6 +39,7 @@ import (
 
 const (
 	effectDeclaredKey     = "dispatch.effect.declared_none"
+	effectUnsureKey       = "dispatch.effect.declared_none_unsure"
 	effectContradictedKey = "dispatch.gap.effect_contradicted"
 	effectMayKey          = "dispatch.gap.effect_may"
 	effectOpenKey         = "dispatch.gap.effect_possible"
@@ -64,7 +68,7 @@ func effectKeys(sentences []Sentence) []string {
 	var keys []string
 	for _, s := range sentences {
 		switch s.Key {
-		case effectDeclaredKey, effectContradictedKey, effectMayKey, effectOpenKey:
+		case effectDeclaredKey, effectUnsureKey, effectContradictedKey, effectMayKey, effectOpenKey:
 			keys = append(keys, s.Key)
 		}
 	}
@@ -205,29 +209,38 @@ func pages(t *testing.T, r *Renderer) map[string]fleet.ActionRecord {
 // TestNoPageBothContactsATargetAndDropsReconciliation: a gateway code says a
 // request to a target was bound or attempted, so a page carrying one may not
 // also say no reconciliation is needed, whatever the flag says. More broadly,
-// reconciliation is dropped only where nothing on the record implies a
-// target: a success with no code, or one of fleet's own codes at service
-// origin — and then only on the declaration's condition.
+// nothing is dropped except on a success with no code: every failure keeps
+// reconciliation, because even fleet's own codes are assigned after the
+// worker acted (an output refused after a reported success, a worker's code
+// refused as malformed, a failure reported without a code). And only a
+// success says "its whole outcome is in this record": a refused output or
+// evidence is discarded, so no failure's outcome is wholly in it.
 func TestNoPageBothContactsATargetAndDropsReconciliation(t *testing.T) {
 	r := New(nil)
 	families := sourceCodeFamilies(t)
-	dropped := 0
+	failures, contacts := 0, 0
 	for what, record := range pages(t, r) {
 		sentences, err := r.Action(record, Options{Now: t0.Add(30 * time.Minute)})
 		if err != nil {
 			t.Fatal(err)
 		}
 		contact := record.State == fleet.DispatchFailed && families[record.ErrorCode] == "gateway"
-		allowed := !record.EffectPossible &&
-			((record.State == fleet.DispatchSucceeded && record.ErrorCode == "") ||
-				(record.State == fleet.DispatchFailed && families[record.ErrorCode] == "fleet" &&
-					wantOrigin[record.ErrorCodeOrigin] == OriginService))
+		if contact {
+			contacts++
+		}
+		allowed := !record.EffectPossible && record.State == fleet.DispatchSucceeded && record.ErrorCode == ""
+		reconciles := false
 		for _, s := range sentences {
 			text := strings.ToLower(s.Text)
+			if s.Role == RoleNext && strings.Contains(text, "reconcile with the target") {
+				reconciles = true
+			}
+			if strings.Contains(text, "whole outcome is in this record") && !allowed {
+				t.Errorf("%s: %s says the whole outcome is in the record: %s", what, s.Key, s.Text)
+			}
 			if !strings.Contains(text, "no reconciliation") {
 				continue
 			}
-			dropped++
 			if contact {
 				t.Errorf("%s: the code says a target was contacted, and %s drops reconciliation: %s",
 					what, s.Key, s.Text)
@@ -237,12 +250,18 @@ func TestNoPageBothContactsATargetAndDropsReconciliation(t *testing.T) {
 					what, s.Key, s.Text)
 			}
 		}
+		if record.State == fleet.DispatchFailed {
+			failures++
+			if !reconciles {
+				t.Errorf("%s: a failure's next step does not reconcile with the target", what)
+			}
+		}
 		if contact && !record.EffectPossible && !hasKey(sentences, effectContradictedKey) {
 			t.Errorf("%s: a gateway code on a clear flag does not say the declaration is contradicted", what)
 		}
 	}
-	if dropped == 0 {
-		t.Fatal("no page drops reconciliation, so this test checks nothing")
+	if failures == 0 || contacts == 0 {
+		t.Fatalf("%d failures and %d target contacts checked", failures, contacts)
 	}
 }
 

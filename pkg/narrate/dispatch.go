@@ -74,13 +74,13 @@ const (
 	// only an effects gateway assigns, so a target was involved. The
 	// declaration is contradicted and the record reads as possible.
 	effectContradicted Selector = "contradicted"
-	// effectDeclaredNone: the flag is clear and nothing on the record
-	// implies a target. If the declaration is accurate, no reconciliation is
-	// needed, and the sentence says it on that condition.
+	// effectDeclaredNone: the flag is clear on a success with no code. If
+	// the declaration is accurate the whole outcome is in the record, and
+	// the sentence says it on that condition. A success never advised
+	// reconciling, so no next step changes.
 	effectDeclaredNone Selector = "none"
-	// effectUnsure: the flag is clear but the record's code is one the
-	// renderer cannot place: reconcile if the action reached any external
-	// system.
+	// effectUnsure: the flag is clear on a failure whose code is not a
+	// gateway code: reconcile if the action reached any external system.
 	effectUnsure Selector = "unsure"
 )
 
@@ -107,20 +107,26 @@ const (
 //
 // Only the flag can make a record anything but possible. A declaration on the
 // record (an admission's admitted effects) is never read for this. A clear
-// flag is then narrowed further by the code, and reconciliation is dropped
-// (conditionally) only where nothing on the record implies a target:
+// flag is then read with the state and the code:
 //
-//   - succeeded, with no code;
-//   - failed with one of fleet's own codes (FleetErrorCodes: the executor's
-//     output, evidence or error code refused, or no code given) at service
-//     origin. Fleet assigns these itself and refuses them from an executor
-//     (#529); each adjudicates what the executor returned, not a target.
-//
-// A gateway code (GatewayErrorCodes, target_rejected_NNN) on a clear flag
-// contradicts the declaration: it is assigned only after a request to a
-// target was bound or attempted. That reads as possible. Anything else — a
-// code the renderer does not recognize, or a fleet code not at service
-// origin — keeps reconciliation, conditioned on reaching an external system.
+//   - succeeded, with no code: the conditional declaration, "its whole
+//     outcome is in this record" if the declaration is accurate. No failure
+//     says that, because none is true of a failure even under an accurate
+//     declaration: invalid_executor_output discards the output and
+//     invalid_executor_evidence the evidence.
+//   - failed, with a gateway code (GatewayErrorCodes, target_rejected_NNN):
+//     the code contradicts the declaration, since the gateway assigns it only
+//     once a request to a target was bound or attempted. That reads as
+//     possible: reconcile with the target.
+//   - failed, with any other code — fleet's own codes at any origin
+//     included: the declaration, without the outcome claim, and reconcile if
+//     the action reached any external system. Fleet assigns its codes after
+//     the worker acted (applyExecutionResult): invalid_executor_output after
+//     a reported success whose output was refused, invalid_executor_error
+//     over a worker's own code (a malformed "target_rejected_409 ", say),
+//     executor_error over a failure reported without one. So none of them
+//     says the work did not reach a target, and reconciliation is never
+//     dropped on a failure.
 //
 // A canceled record is not narrowed: it may never have been claimed, so a
 // clear flag there says only that no claim set it, and claims before #396 did
@@ -136,12 +142,8 @@ func effectMode(record fleet.ActionRecord) Selector {
 		}
 		return effectUnsure
 	case fleet.DispatchFailed:
-		switch {
-		case isGatewayCode(record.ErrorCode):
+		if isGatewayCode(record.ErrorCode) {
 			return effectContradicted
-		case isFleetCode(record.ErrorCode) &&
-			errorOrigin(record.ErrorCodeOrigin) == OriginService:
-			return effectDeclaredNone
 		}
 		return effectUnsure
 	}
@@ -294,8 +296,11 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 	// set flag is "may", and a clear one is attributed to the declaration and
 	// conditional on it.
 	mode := effectMode(record)
-	if mode == effectDeclaredNone || mode == effectUnsure {
+	switch mode {
+	case effectDeclaredNone:
 		b.add(RoleReason, "dispatch.effect.declared_none", args)
+	case effectUnsure:
+		b.add(RoleReason, "dispatch.effect.declared_none_unsure", args)
 	}
 
 	// What the record cannot establish.

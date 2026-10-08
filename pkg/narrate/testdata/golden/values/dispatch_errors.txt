@@ -4501,8 +4501,8 @@ next dispatch.error.executor_error.next
 reason dispatch.error.executor_error.either
   The failure was recorded as executor_error, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the executor failed without giving an error code.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.executor_error.next
   Reconcile with the target if the action reached any external system before requesting the work again.
@@ -4523,8 +4523,8 @@ next dispatch.error.invalid_executor_error.next
 reason dispatch.error.invalid_executor_error.either
   The failure was recorded as invalid_executor_error, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the executor’s own error code was refused as malformed.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.invalid_executor_error.next
   Reconcile with the target if the action reached any external system before requesting the work again, then fix the executor’s error reporting.
@@ -4545,8 +4545,8 @@ next dispatch.error.invalid_executor_evidence.next
 reason dispatch.error.invalid_executor_evidence.either
   The failure was recorded as invalid_executor_evidence, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the executor’s evidence was malformed or outside its time bounds.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.invalid_executor_evidence.next
   Reconcile with the target if the action reached any external system before requesting the work again, then fix the executor.
@@ -4567,8 +4567,8 @@ next dispatch.error.invalid_executor_output.next
 reason dispatch.error.invalid_executor_output.either
   The failure was recorded as invalid_executor_output, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the executor’s output did not match the action’s output schema.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.invalid_executor_output.next
   Reconcile with the target if the action reached any external system before requesting the work again, then fix the executor.
@@ -4591,8 +4591,8 @@ reason dispatch.error.unrecognized.either
   The failure was recorded with an error code this renderer does not recognize, which either the executor reported or Shoal assigned; the record does not say which: “made up by an executor”.
   record=action:act-1 principal=worker-1 claim=claim-1
   quote executor_or_service
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.unrecognized.next
   Reconcile with the target if the action reached any external system before requesting the work again; this renderer cannot interpret the code.
@@ -9113,8 +9113,8 @@ next dispatch.error.executor_error.next
 reason dispatch.error.executor_error.executor
   The failure was reported as executor_error, which, if accurate, means the executor failed without giving an error code.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.executor_error.next
   Reconcile with the target if the action reached any external system before requesting the work again.
@@ -9135,8 +9135,8 @@ next dispatch.error.invalid_executor_error.next
 reason dispatch.error.invalid_executor_error.executor
   The failure was reported as invalid_executor_error, which, if accurate, means the executor’s own error code was refused as malformed.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.invalid_executor_error.next
   Reconcile with the target if the action reached any external system before requesting the work again, then fix the executor’s error reporting.
@@ -9157,8 +9157,8 @@ next dispatch.error.invalid_executor_evidence.next
 reason dispatch.error.invalid_executor_evidence.executor
   The failure was reported as invalid_executor_evidence, which, if accurate, means the executor’s evidence was malformed or outside its time bounds.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.invalid_executor_evidence.next
   Reconcile with the target if the action reached any external system before requesting the work again, then fix the executor.
@@ -9179,8 +9179,8 @@ next dispatch.error.invalid_executor_output.next
 reason dispatch.error.invalid_executor_output.executor
   The failure was reported as invalid_executor_output, which, if accurate, means the executor’s output did not match the action’s output schema.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.invalid_executor_output.next
   Reconcile with the target if the action reached any external system before requesting the work again, then fix the executor.
@@ -9203,8 +9203,8 @@ reason dispatch.error.unrecognized.executor
   The failure was reported with an error code Shoal does not define: “made up by an executor”.
   record=action:act-1 principal=worker-1 claim=claim-1
   quote executor
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.unrecognized.next
   Reconcile with the target if the action reached any external system before requesting the work again; Shoal cannot interpret the code.
@@ -13725,11 +13725,11 @@ next dispatch.error.executor_error.next
 reason dispatch.error.executor_error.service
   Shoal recorded the failure as executor_error, which means the executor failed without giving an error code.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.executor_error.next
-  If the action’s declaration is accurate, no reconciliation with the target is needed before requesting the work again.
+  Reconcile with the target if the action reached any external system before requesting the work again.
   record=action:act-1
 
 == failed code=invalid_executor_error origin=service
@@ -13747,11 +13747,11 @@ next dispatch.error.invalid_executor_error.next
 reason dispatch.error.invalid_executor_error.service
   Shoal recorded the failure as invalid_executor_error, which means the executor’s own error code was refused as malformed.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.invalid_executor_error.next
-  Fix the executor’s error reporting before requesting the work again; if the action’s declaration is accurate, no reconciliation with the target is needed.
+  Reconcile with the target if the action reached any external system before requesting the work again, then fix the executor’s error reporting.
   record=action:act-1
 
 == failed code=invalid_executor_evidence origin=service
@@ -13769,11 +13769,11 @@ next dispatch.error.invalid_executor_evidence.next
 reason dispatch.error.invalid_executor_evidence.service
   Shoal recorded the failure as invalid_executor_evidence, which means the executor’s evidence was malformed or outside its time bounds.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.invalid_executor_evidence.next
-  Fix the executor before requesting the work again; if the action’s declaration is accurate, no reconciliation with the target is needed.
+  Reconcile with the target if the action reached any external system before requesting the work again, then fix the executor.
   record=action:act-1
 
 == failed code=invalid_executor_output origin=service
@@ -13791,11 +13791,11 @@ next dispatch.error.invalid_executor_output.next
 reason dispatch.error.invalid_executor_output.service
   Shoal recorded the failure as invalid_executor_output, which means the executor’s output did not match the action’s output schema.
   record=action:act-1 principal=worker-1 claim=claim-1
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.invalid_executor_output.next
-  Fix the executor before requesting the work again; if the action’s declaration is accurate, no reconciliation with the target is needed.
+  Reconcile with the target if the action reached any external system before requesting the work again, then fix the executor.
   record=action:act-1
 
 == failed code=made up by an executor origin=service
@@ -13815,8 +13815,8 @@ reason dispatch.error.unrecognized.service
   Shoal recorded the failure as “made up by an executor”, an error code this renderer does not recognize.
   record=action:act-1 principal=worker-1 claim=claim-1
   quote service
-reason dispatch.effect.declared_none
-  This action declares no external or egress effect, so if that declaration is accurate its whole outcome is in this record.
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
   record=action:act-1
 next dispatch.error.unrecognized.next
   Reconcile with the target if the action reached any external system before requesting the work again; this renderer cannot interpret the code.
