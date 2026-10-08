@@ -45,11 +45,18 @@ const (
 	// one long operation.
 	//
 	// "Far inside that ceiling" is what this said, and a measurement
-	// disagreed: eight holders with maximal delegation chains and eight
-	// maximal reports reach 18% of the limit on their own, and a record also
-	// carrying a maximal input, output and evidence set lands at 86% — which
-	// is why MaxClaimHolderChainBytes below exists. Eight is a bound on how
-	// many, and the bound on how large is separate.
+	// disagreed: eight holders with *unbounded* delegation chains and eight
+	// maximal reports reached 18% of the limit on their own, and a record also
+	// carrying a maximal input, output and evidence set landed at 86%. That is
+	// why MaxClaimHolderChainBytes below exists. Eight is a bound on how many,
+	// and the bound on how large is separate.
+	//
+	// Those figures describe what motivated the bound, not what ships. With
+	// the chain bound in place, eight holders carry at most 8 × 4096 = 32 KB
+	// of delegation chain against the 512 KB that 64 maximal entries each
+	// would have reached — a factor of sixteen — and the encoding ceiling is
+	// 3 MB (3 × MaxActionPayloadBytes). So "far inside" is now true, and it is
+	// true because of the second bound rather than in spite of its absence.
 	//
 	// The claim history drops its oldest entry on overflow: the most recent
 	// claimants are the ones whose effects may be unreconciled. The report
@@ -62,10 +69,19 @@ const (
 	// in total bytes, not only in entries.
 	//
 	// Measured, because the entry bound alone left the record brickable: the
-	// chains are roughly eleven times everything else the history and the
-	// reports contribute — 524 KB against 47 KB — so bounding how many
-	// holders are retained without bounding how large each may be left the
-	// dominant term unbounded.
+	// unbounded chains were roughly eleven times everything else the history
+	// and the reports contribute — 512 KB against 47 KB — so bounding how
+	// many holders are retained without bounding how large each may be left
+	// the dominant term unbounded. Those are the pre-bound numbers, which is
+	// the point of recording them.
+	//
+	// It is also enforced where a claimant *enters* the record, in applyClaim,
+	// not only on the retained holder. Bounding one and not the other was a
+	// brick of its own: ClaimantOnBehalfOf on the live record is capped by
+	// entry count alone, so a claimant whose chain fell between the two caps
+	// claimed successfully and then the next claim produced a record
+	// ActionRecord.Validate refuses — leaving the action unclaimable by
+	// anyone, forever.
 	MaxClaimHolderChainBytes = 4096
 	// MaxAmbiguityTargetBytes bounds the worker's identifier for the third
 	// party it was talking to, and MaxAmbiguityReferenceBytes the opaque
@@ -233,11 +249,17 @@ func (h ClaimHolder) validate() error {
 	}
 	// Bounded in aggregate bytes as well as in entries, which the entry count
 	// alone does not do. A measurement of the worst case found the delegation
-	// chains were 89% of the record's growth — eight holders with maximal
-	// chains reach 18% of the encoding ceiling on their own, and combined with
-	// a maximal input, output and evidence set they pushed a record past the
-	// limit encodeAction enforces. That is the brick the cap exists to
+	// chains were 89% of the record's growth — eight holders with *unbounded*
+	// chains reached 18% of the encoding ceiling on their own, and combined
+	// with a maximal input, output and evidence set they pushed a record past
+	// the limit encodeAction enforces. That is the brick the cap exists to
 	// prevent, so bounding the count and not the size left the hole open.
+	//
+	// applyClaim applies the same bound to the incoming claimant, which is
+	// what makes this one safe to enforce here: bounding only the retained
+	// copy meant a legal claim could produce an illegal record, and then the
+	// refusal landed on whoever claimed next rather than on whoever claimed
+	// too widely.
 	chainBytes := 0
 	for _, identity := range h.OnBehalfOf {
 		if err := shoal.ValidateRequiredID(
@@ -287,9 +309,14 @@ func (r AmbiguityReport) validate() error {
 			shoal.ErrorInvalidArgument, "ambiguity reference exceeds its bound")
 	}
 	// Printable and single-line. Both values are target-controlled and both
-	// reach the team overview and the event stream, where a control character
-	// is at best unreadable and at worst a terminal escape in whatever renders
-	// it.
+	// reach the durable record, fleetActionWire, and the MCP tool result,
+	// which marshals ActionRecord whole — where a control character is at best
+	// unreadable and at worst a terminal escape in whatever renders it.
+	//
+	// Not the team overview and not the event stream. That claim was corrected
+	// on MaxAmbiguityTargetBytes above and this third copy of it was left
+	// standing, which is the same mistake twice: a correction that fixes the
+	// sentence it was written beside and not the ones that repeat it.
 	if err := validateAmbiguityText("ambiguity target", r.Target); err != nil {
 		return err
 	}

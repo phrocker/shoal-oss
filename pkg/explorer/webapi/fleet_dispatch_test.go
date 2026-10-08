@@ -153,10 +153,11 @@ func TestNewFleetHandlerRequiresBothProviders(t *testing.T) {
 }
 
 type stubDispatchProvider struct {
-	ambiguity fleet.AmbiguityRequest
-	resolver  auth.Resolver
-	enqueued  bool
-	actionID  []byte
+	ambiguity  fleet.AmbiguityRequest
+	completion fleet.CompletionRequest
+	resolver   auth.Resolver
+	enqueued   bool
+	actionID   []byte
 }
 
 func (p *stubDispatchProvider) Enqueue(ctx context.Context, request fleet.EnqueueRequest) (fleet.ActionRecord, error) {
@@ -177,7 +178,10 @@ func (p *stubDispatchProvider) Enqueue(ctx context.Context, request fleet.Enqueu
 func (*stubDispatchProvider) Claim(context.Context, fleet.ClaimRequest) (fleet.ActionRecord, error) {
 	return fleet.ActionRecord{}, nil
 }
-func (*stubDispatchProvider) CompleteClaim(context.Context, fleet.CompletionRequest) (fleet.ActionRecord, error) {
+func (p *stubDispatchProvider) CompleteClaim(
+	_ context.Context, request fleet.CompletionRequest,
+) (fleet.ActionRecord, error) {
+	p.completion = request
 	return fleet.ActionRecord{}, nil
 }
 func (*stubDispatchProvider) Cancel(context.Context, fleet.CancelRequest) (fleet.ActionRecord, error) {
@@ -540,4 +544,105 @@ func TestTheActionWireCarriesReportsButNotTheClaimHistory(t *testing.T) {
 				"this record: %s", absent, encoded)
 		}
 	}
+}
+
+// TestTheCompletionRouteCarriesTheClaimFence is the seam the fence fix was
+// missing, and without it the whole of #438's stranding fix was unreachable.
+//
+// completeClaim binds a completion to its claim generation when a fence is
+// supplied and falls back to comparing the record version exactly when none is
+// — the strandable branch, kept only for a caller written against the older
+// contract. fleetCompletionWire had no claim_fence field and the handler never
+// set one, so *every* remote worker took the fallback. The service-side fix
+// shipped with no way for the only surface that can file an ambiguity report to
+// use it.
+//
+// Worse than unreachable: a worker that tried to send the fence it was handed
+// on /claim got a 400, because decodeRequest sets DisallowUnknownFields. So the
+// correct client behaviour was the one the server rejected. That second
+// assertion is here because the first would pass against a wire that accepted
+// the field and discarded it.
+func TestTheCompletionRouteCarriesTheClaimFence(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor", AuthorizationDomain: []byte("domain"),
+		AllowedOperations:  []auth.Operation{auth.OperationInvoke},
+		PermittedSourceIDs: [][]byte{[]byte("source")},
+		PermittedPolicyIDs: [][]byte{[]byte("policy")}, PolicyGeneration: 1,
+		AuthenticationExpires: now.Add(time.Hour), RequestID: "request",
+		CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewAuthenticatedHandler(&stubWorkspaceService{},
+		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		authority.Binder(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &stubDispatchProvider{resolver: authority.Resolver()}
+	if err := handler.MountFleetDispatch(provider); err != nil {
+		t.Fatal(err)
+	}
+
+	actionID := []byte{'a', 0, 255}
+	route := "http://example.test/api/v1/fleet/actions/" +
+		base64.RawURLEncoding.EncodeToString(actionID) + "/complete"
+	contextWire := fleetRequestContextWire{
+		RequestID: encodeFleetID("request"), ReasonCode: "operator_request",
+		CorrelationID: encodeFleetID("correlation"),
+		Deadline:      now.Add(time.Minute),
+	}
+
+	body, _ := json.Marshal(fleetCompletionWire{
+		Context: contextWire, ExpectedVersion: 7, ClaimFence: 3,
+		ClaimID: base64.RawURLEncoding.EncodeToString([]byte("claim")),
+		Output:  json.RawMessage(`{"ok":true}`),
+	})
+	request := httptest.NewRequest(http.MethodPost, route, bytes.NewReader(body))
+	request.Host = "example.test"
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if got := provider.completion.ClaimFence; got != 3 {
+		t.Fatalf("the route dropped the claim fence (got %d): every remote "+
+			"worker then takes completeClaim's strandable exact-version "+
+			"branch, so #438's stranding fix never applies over HTTP", got)
+	}
+
+	// And the field must be accepted by name, not merely tolerated by a struct
+	// that happens to have it. DisallowUnknownFields turns an unrecognised
+	// claim_fence into a 400, which is what a correct worker would have hit.
+	raw := `{"context":` + mustJSON(t, contextWire) + `,` +
+		`"expected_version":7,"claim_fence":5,"claim_id":"` +
+		base64.RawURLEncoding.EncodeToString([]byte("claim")) + `"}`
+	request = httptest.NewRequest(
+		http.MethodPost, route, bytes.NewReader([]byte(raw)))
+	request.Host = "example.test"
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("a body naming claim_fence was refused (status=%d): %s",
+			response.Code, response.Body.String())
+	}
+	if got := provider.completion.ClaimFence; got != 5 {
+		t.Fatalf("claim_fence decoded to %d, want 5", got)
+	}
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }

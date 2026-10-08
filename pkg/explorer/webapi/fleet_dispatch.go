@@ -187,7 +187,8 @@ func mountFleetDispatch(mux *http.ServeMux, provider FleetDispatchProvider) {
 		}
 		result, err := provider.CompleteClaim(r.Context(), fleet.CompletionRequest{
 			ID: actionID, ExpectedVersion: wire.ExpectedVersion, ClaimID: claimID,
-			Failed: wire.Failed, Context: contextValue,
+			ClaimFence: wire.ClaimFence,
+			Failed:     wire.Failed, Context: contextValue,
 			Result: fleet.ExecutionResult{
 				Output: wire.Output, ErrorCode: wire.ErrorCode,
 				EvidenceSnapshotID:   snapshotID,
@@ -377,15 +378,29 @@ type fleetAmbiguityWire struct {
 }
 
 type fleetCompletionWire struct {
-	Context              fleetRequestContextWire `json:"context"`
-	ExpectedVersion      uint64                  `json:"expected_version"`
-	ClaimID              string                  `json:"claim_id"`
-	Output               json.RawMessage         `json:"output,omitempty"`
-	ErrorCode            string                  `json:"error_code,omitempty"`
-	Failed               bool                    `json:"failed,omitempty"`
-	EvidenceSnapshotID   string                  `json:"evidence_snapshot_id,omitempty"`
-	EvidenceSnapshotAsOf time.Time               `json:"evidence_snapshot_as_of,omitempty"`
-	Evidence             []fleetEvidenceWire     `json:"evidence,omitempty"`
+	Context         fleetRequestContextWire `json:"context"`
+	ExpectedVersion uint64                  `json:"expected_version"`
+	ClaimID         string                  `json:"claim_id"`
+	// ClaimFence is what binds this completion to the claim generation the
+	// worker was handed, and this field is why the binding exists at all.
+	//
+	// Without it a remote worker is structurally unable to supply a fence, so
+	// every HTTP completion takes completeClaim's legacy exact-version branch
+	// — the strandable one that #438's ambiguity route made reachable. The
+	// service-side fix shipped with no way for the only surface that can file
+	// a report to use it, and a worker that tried to send the fence it was
+	// handed on /claim got a 400, because decodeRequest sets
+	// DisallowUnknownFields.
+	//
+	// Optional on the wire so a worker written against the previous shape
+	// still completes, with the behaviour it was written against.
+	ClaimFence           uint64              `json:"claim_fence,omitempty"`
+	Output               json.RawMessage     `json:"output,omitempty"`
+	ErrorCode            string              `json:"error_code,omitempty"`
+	Failed               bool                `json:"failed,omitempty"`
+	EvidenceSnapshotID   string              `json:"evidence_snapshot_id,omitempty"`
+	EvidenceSnapshotAsOf time.Time           `json:"evidence_snapshot_as_of,omitempty"`
+	Evidence             []fleetEvidenceWire `json:"evidence,omitempty"`
 }
 
 type fleetAmbiguityReportWire struct {

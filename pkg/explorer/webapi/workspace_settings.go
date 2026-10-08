@@ -359,20 +359,32 @@ func workspaceOperationForRequest(
 			path == "/api/v1/fleet/actions/pull" ||
 			(strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
 				(strings.HasSuffix(path, "/claim") ||
-					// An ambiguity report is filed by the claim's holder
-					// between claiming and completing, and goes through
-					// beginClaimant, which prefers execute and falls back to
-					// invoke. So invoke is the authority a workspace-scoped
-					// holder must be bound under — the same one its claim and
-					// its completion are bound under, which is what makes the
-					// sequence usable at all.
+					// The route a claim's holder uses between claiming and
+					// completing, under the same authority as the claim and
+					// the completion on either side of it.
 					//
-					// Unlisted, this route was not a 404 but a refusal: a
-					// caller sending a workspace ID was told the route is not
-					// registered before the handler ran, so the one route
-					// whose whole purpose is to let a worker report an effect
-					// it could not otherwise report was unreachable by a
-					// workspace-scoped worker.
+					// Unlisted, it was not a 404: applyWorkspaceSettings
+					// consults this table before dispatching, so a caller
+					// sending a workspace ID was refused "workspace settings
+					// are not registered for this route" before the handler
+					// ran — on the one route whose whole purpose is to let a
+					// worker report an effect it could not otherwise report.
+					//
+					// Invoke, because beginClaimant prefers execute and falls
+					// back to invoke, and because that is what /claim and
+					// /complete are already listed under. Binding a different
+					// operation here would break the sequence in the middle.
+					//
+					// What this does *not* do, because an earlier version of
+					// this comment claimed it did: make the route reachable
+					// for an execute-only caller. ApplyForOperation calls
+					// decision.Authorize with the operation named here, so a
+					// workspace-scoped worker must actually hold invoke. An
+					// execute-only worker is still refused — now at the
+					// authorization step rather than as an unregistered route.
+					// That is pre-existing and identical for /claim and
+					// /complete, so the sequence is consistent; it is not
+					// complete for the execute-only holder #437 introduced.
 					strings.HasSuffix(path, "/ambiguity") ||
 					strings.HasSuffix(path, "/complete")))):
 		return auth.OperationInvoke, true

@@ -66,6 +66,11 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 		// indeterminate, not that nothing committed: a deterministic failure
 		// invites a retry of an external effect that already happened.
 		{http.MethodPost, "/api/v1/fleet/actions/action/complete"},
+		// A report writes the record before its response is encoded, on a
+		// route whose entire purpose is recording that an effect may have
+		// happened. Telling its caller nothing committed would be the worst
+		// answer this surface can give.
+		{http.MethodPost, "/api/v1/fleet/actions/action/ambiguity"},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel"},
 		// A request commits the grant or the refusal, and a report commits the
 		// terminal record for a call the caller has already made. Losing

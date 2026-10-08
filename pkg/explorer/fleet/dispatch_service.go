@@ -418,6 +418,41 @@ func applyClaim(
 	authorizing auth.Operation,
 	now time.Time,
 ) (ActionRecord, error) {
+	// The incoming claimant's chain is bounded here, by the bound a *retained*
+	// holder's chain is subject to, because this is where the asymmetry between
+	// the two became a brick.
+	//
+	// ClaimantOnBehalfOf on the live record is bounded only by entry count
+	// (auth.MaxOnBehalfOfEntries, each up to shoal.MaxIDBytes — 64 KB in the
+	// worst case), while a retained ClaimHolder's chain is additionally bounded
+	// at MaxClaimHolderChainBytes. A claimant whose chain fell between the two
+	// therefore claimed successfully, and then the *next* claim produced a
+	// record that ActionRecord.Validate refuses — so encodeAction refused the
+	// write, and every subsequent claim by anyone was refused the same way,
+	// forever, on an action stuck in DispatchClaimed with a dead lease.
+	//
+	// Verified by execution: a five-entry 5120-byte chain claims, lapses, and
+	// then the next worker is refused "claim holder delegation chain exceeds
+	// its byte bound" with the record still at the claimed version. That is
+	// precisely the brick MaxClaimHolderChainBytes was added to prevent,
+	// caused by MaxClaimHolderChainBytes.
+	//
+	// Refusing here rather than truncating the retained chain, because
+	// heldClaimAt compares the retained chain element for element: a truncated
+	// or omitted chain would silently deny the ambiguity route to exactly the
+	// delegated worker whose claim was taken over, which is the one caller
+	// that route exists for. A chain that cannot be retained is a chain whose
+	// holder could never be recognised, so refusing the claim is the honest
+	// answer and it arrives before any effect.
+	chainBytes := 0
+	for _, identity := range decision.OnBehalfOf() {
+		chainBytes += len(identity)
+	}
+	if chainBytes > MaxClaimHolderChainBytes {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"claimant delegation chain exceeds its byte bound")
+	}
 	record.State = DispatchClaimed
 	record.TransitionOperation = authorizing
 	// An external-effect action is possibly-effected from the moment it is
@@ -473,7 +508,14 @@ func applyClaim(
 			OnBehalfOf: append([]shoal.ID(nil), record.ClaimantOnBehalfOf...),
 			ClaimID:    outgoingClaimID,
 			ClaimFence: record.ClaimFence,
-			HeldAt:     now,
+			// When that holder took the claim, not when its successor did.
+			// HeldAt was `now` — the incoming claimant's time — so every
+			// retained holder's timestamp recorded the moment it was
+			// *displaced*. The same category as the claim ID this block was
+			// just fixed to read before overwriting: no authorization
+			// consequence, because heldClaimAt keys on the fence, and wrong in
+			// evidence an operator reads.
+			HeldAt: record.ClaimLeaseUntil.Add(-record.ClaimLease),
 		})
 	}
 	// Who holds the claim, as distinct from which claim is held. A re-claim
@@ -767,29 +809,35 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 // at dispatch as the alternative; this is the half of dispatch that makes the
 // alternative reachable.
 //
-// Every check ExecuteClaim performs, this performs. The decision is resolved
-// and matched to the queued principal, the action is re-resolved through the
-// registry against the current generation and lease, and the claim fence and
-// version are confirmed before anything is written. The result then goes
+// Every check ExecuteClaim performs, this performs. The decision is resolved,
+// the caller is matched to the claim's holder, the action is re-resolved
+// through the registry against the current generation and lease, and the claim
+// generation is confirmed before anything is written. The result then goes
 // through applyExecutionResult, the same terminal transition the in-process
 // path uses, which revalidates the fence after the fact and reports a loss as
 // ambiguity rather than overwriting whatever committed in the meantime.
 //
-// Reporting twice is safe. A worker that commits and then loses its response
-// replays the request and gets the committed record back, exactly as a repeated
-// ExecuteClaim does, because the terminal state at the expected version under
-// the same claim is recognised as the reporter's own work rather than a
-// conflict.
-// CompleteClaim is the dispatch surface's completion. It refuses an admission,
-// which the admission surface closes through its own path.
+// The generation, not the version. This said "the claim fence and version are
+// confirmed", which described the predicate before the fence bound it: when a
+// fence is supplied the version is not compared at all, because #438's
+// ambiguity route can advance it while leaving the claim intact and comparing
+// it exactly is what stranded a live claimant. A caller that supplies no fence
+// keeps the exact-version comparison, which is the contract it was written
+// against.
 //
-// This is not only about a reclaimed record. An admission token carries the
-// action ID, the claim ID and the version, which is everything this request
-// needs — so the caller that holds a live grant could always have completed it
-// here instead of reporting, skipping the one-shot rule, the exact-replay
-// comparison and the malformed-report rejection that the admission path exists
-// to apply. The expiry the review traced is one way in; holding your own token
-// is the other, and it needs no expiry at all.
+// Reporting twice is safe. A worker that commits and then loses its response
+// replays the request and gets the committed record back, exactly as a
+// repeated ExecuteClaim does, because a terminal state under the reporter's own
+// claim generation is recognised as its own work rather than a conflict.
+//
+// It refuses an admission, which the admission surface closes through its own
+// path. That is not only about a reclaimed record: an admission token carries
+// the action ID, the claim ID and the version, which is everything this
+// request needs — so the caller that holds a live grant could always have
+// completed it here instead of reporting, skipping the one-shot rule, the
+// exact-replay comparison and the malformed-report rejection that the
+// admission path exists to apply. The expiry the review traced is one way in;
+// holding your own token is the other, and it needs no expiry at all.
 func (s *DispatchService) CompleteClaim(ctx context.Context, request CompletionRequest) (ActionRecord, error) {
 	return s.completeClaim(ctx, request, true)
 }
@@ -881,26 +929,30 @@ func (s *DispatchService) completeClaim(
 	if !holdsClaimOn(decision, current) {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
-	// A replayed report. The action is already terminal at the version this
-	// reporter expected to produce, under this reporter's own claim, so the
-	// work is committed and the response was lost. Republish and return it
-	// rather than reporting a conflict against the reporter's own write.
+	// A replayed report: the action is already terminal under this reporter's
+	// own claim generation, so the work is committed and the response was
+	// lost. Republish and return it rather than reporting a conflict against
+	// the reporter's own write.
+	//
+	// Keyed on the generation, not the version. The sentence this replaces
+	// said "terminal at the version this reporter expected to produce", which
+	// was true of the old predicate and is false on the fence path, where the
+	// version is not compared at all — two comments were left stacked here,
+	// the first describing the code the second had replaced.
+	//
+	// Dropping the version without putting the fence in its place was the
+	// second defect of the first attempt at this: terminal plus a matching
+	// ClaimID is true of a *later* generation's completion, so a worker
+	// reusing one ClaimID was handed attempt two's committed outcome as though
+	// it were attempt one's. Verified by execution, and covered by nothing in
+	// the repository.
 	//
 	// Only succeeded and failed count, because only applyExecutionResult
 	// produces those and only it could have been this reporter's write. Cancel
-	// also lands on a terminal state at exactly version+1 while preserving the
-	// ClaimID it cancelled, so accepting any terminal state here would hand a
-	// late reporter the cancelled record and a 200 — telling it the work it
+	// also lands on a terminal state while preserving the ClaimID it
+	// cancelled, so accepting any terminal state here would hand a late
+	// reporter the cancelled record and a 200 — telling it the work it
 	// performed was recorded, when the record says the opposite.
-	// A replayed report, keyed on the claim generation for the same reason the
-	// gate below is.
-	//
-	// Dropping the version here without putting the fence in its place was
-	// the second defect of the first attempt: terminal plus a matching
-	// ClaimID is true of a *later* generation's completion, so a worker
-	// reusing one ClaimID was handed attempt two's committed outcome as
-	// though it were attempt one's. Verified by execution, and covered by
-	// nothing in the repository.
 	if (current.State == DispatchSucceeded || current.State == DispatchFailed) &&
 		bytes.Equal(current.ClaimID, request.ClaimID) &&
 		replayMatchesGeneration(current, request) {
@@ -940,6 +992,14 @@ func (s *DispatchService) completeClaim(
 	// all when it is supplied. A caller that does not supply a fence keeps
 	// the old exact-version behaviour, which is strandable but is the
 	// contract it was written against.
+	//
+	// Two of the three conditions in the fence branch are defence in depth and
+	// are deliberately uncovered: removing `current.State != DispatchClaimed`
+	// or the ClaimID comparison each leaves the package green, because the
+	// lease check below masks the first and holdsClaimOn above masks the
+	// second. Neither is exploitable alone. They are kept because each masking
+	// check is a separate decision that could move, and said here because the
+	// convention in this file is to say which clauses no test can fail on.
 	if request.ClaimFence != 0 {
 		if current.ClaimFence != request.ClaimFence ||
 			!bytes.Equal(current.ClaimID, request.ClaimID) ||
@@ -2186,26 +2246,6 @@ func standingOn(decision auth.Decision, record ActionRecord) bool {
 		sameClaimantPrincipal(decision, record)
 }
 
-// sameClaimantPrincipal reports whether the caller is the principal that holds
-// the record's claim.
-//
-// This is the gate #437 removed without replacing. Claiming and completing
-// were both authorized under OperationInvoke and both additionally required
-// sameActionPrincipal, so the claimant was the enqueuer and the enqueuer's
-// chain was on the record. Relaxing claiming to OperationExecute left the
-// completion predicate as version, state and ClaimID — and ClaimID is
-// caller-supplied, unconstrained in entropy, and published to co-principals on
-// Status and to every execute-holder on Pull once a lease lapses. So a second
-// execute-holder that had never claimed anything could present another
-// worker's ClaimID and commit a fabricated outcome; worse, the replay branch
-// then handed the real worker a success receipt carrying the fabrication,
-// which is the one failure a worker cannot detect.
-//
-// A record claimed before this field existed has an empty chain, and an empty
-// chain matches nothing — shoal.ID("") is not a valid principal and no
-// decision carries it. That is the right default for a gob-decoded record from
-// an older build: it refuses the completion rather than accepting it, and the
-// worker's recourse is to re-claim, which writes the field.
 // appendClaimHolder adds a holder, dropping the oldest entry past the bound.
 //
 // A holder already present at the same fence is not duplicated: Claim's replay
@@ -2271,6 +2311,26 @@ func heldClaimAt(
 	return false
 }
 
+// sameClaimantPrincipal reports whether the caller is the principal that holds
+// the record's claim.
+//
+// This is the gate #437 removed without replacing. Claiming and completing
+// were both authorized under OperationInvoke and both additionally required
+// sameActionPrincipal, so the claimant was the enqueuer and the enqueuer's
+// chain was on the record. Relaxing claiming to OperationExecute left the
+// completion predicate as version, state and ClaimID — and ClaimID is
+// caller-supplied, unconstrained in entropy, and published to co-principals on
+// Status and to every execute-holder on Pull once a lease lapses. So a second
+// execute-holder that had never claimed anything could present another
+// worker's ClaimID and commit a fabricated outcome; worse, the replay branch
+// then handed the real worker a success receipt carrying the fabrication,
+// which is the one failure a worker cannot detect.
+//
+// A record claimed before this field existed has an empty chain, and an empty
+// chain matches nothing — shoal.ID("") is not a valid principal and no
+// decision carries it. That is the right default for a gob-decoded record from
+// an older build: it refuses the completion rather than accepting it, and the
+// worker's recourse is to re-claim, which writes the field.
 func sameClaimantPrincipal(decision auth.Decision, record ActionRecord) bool {
 	if record.ClaimantSubject == "" {
 		return false
