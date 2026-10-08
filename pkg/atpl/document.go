@@ -145,32 +145,50 @@ type Capability struct {
 }
 
 // Action declares one action, or with Inherit copies the same-named action of
-// the same-named parent capability: its schemas and effects, exactly.
+// the same-named parent capability: its schemas, effects and approval
+// requirement, exactly.
+//
+// Approval, when present, must be {"required": true}: the action holds every
+// new request for a human decision (#451, docs/approval.md). Absent means not
+// required; an explicit false is refused, so each meaning has one spelling and
+// nothing in a file reads as switching a requirement off. An inherited action
+// may carry Approval to add the requirement to what it inherits; nothing can
+// remove a parent's, because no spelling for removing one exists.
 type Action struct {
 	Name         string          `json:"name"`
 	Inherit      bool            `json:"inherit,omitempty"`
 	Effects      []string        `json:"effects,omitempty"`
 	InputSchema  json.RawMessage `json:"input_schema,omitempty"`
 	OutputSchema json.RawMessage `json:"output_schema,omitempty"`
+	Approval     *Approval       `json:"approval,omitempty"`
 }
 
-// MarshalJSON emits an inherited action as its reference alone and a declared
-// action with its effect list even when empty.
+// Approval is an action's approval requirement. Required must be true.
+type Approval struct {
+	Required bool `json:"required"`
+}
+
+// MarshalJSON emits an inherited action as its reference alone, plus any
+// approval it adds, and a declared action with its effect list even when
+// empty. Approval is written only when declared, so a document without it
+// encodes exactly as it did before approval existed.
 func (a Action) MarshalJSON() ([]byte, error) {
 	if a.Inherit {
 		return json.Marshal(struct {
-			Name    string `json:"name"`
-			Inherit bool   `json:"inherit"`
-		}{Name: a.Name, Inherit: true})
+			Name     string    `json:"name"`
+			Inherit  bool      `json:"inherit"`
+			Approval *Approval `json:"approval,omitempty"`
+		}{Name: a.Name, Inherit: true, Approval: a.Approval})
 	}
 	return json.Marshal(struct {
 		Name         string          `json:"name"`
 		Effects      []string        `json:"effects"`
 		InputSchema  json.RawMessage `json:"input_schema"`
 		OutputSchema json.RawMessage `json:"output_schema"`
+		Approval     *Approval       `json:"approval,omitempty"`
 	}{
 		Name: a.Name, Effects: nonNil(a.Effects),
-		InputSchema: a.InputSchema, OutputSchema: a.OutputSchema,
+		InputSchema: a.InputSchema, OutputSchema: a.OutputSchema, Approval: a.Approval,
 	})
 }
 
@@ -238,9 +256,12 @@ func nonNil(values []string) []string {
 
 // reserved names fields ATPL defines that this version does not compile, with
 // the reason each is refused. A name refused generically would read as a typo;
-// these are deliberate, and the message says why.
+// these are deliberate, and the message says why. A reserved name an object
+// permits explicitly (approval, on an action) is accepted there and refused
+// everywhere else.
 var reserved = map[string]string{
-	"approval": "requires a later ATPL version (#451)",
+	"approval": "is declared per action only, as " +
+		"agents[].capabilities[].actions[].approval: {\"required\": true} (docs/atpl.md)",
 	"obligations": "is not declared in policy: admission obligations are computed per " +
 		"request at admission, and expressing them here is deferred (see docs/atpl.md, \"Deferred\")",
 	"attestation": "requires a later ATPL version (#446)",
@@ -666,7 +687,8 @@ func decodeAction(name, capabilityPath string, index int, raw json.RawMessage) (
 		return Action{}, err
 	}
 	object.path = capabilityPath + ".actions" + selector("name", actionName, index)
-	if err := object.only("name", "inherit", "effects", "input_schema", "output_schema"); err != nil {
+	if err := object.only("name", "inherit", "effects", "input_schema", "output_schema",
+		"approval"); err != nil {
 		return Action{}, err
 	}
 	if err := object.require("name"); err != nil {
@@ -676,10 +698,14 @@ func decodeAction(name, capabilityPath string, index int, raw json.RawMessage) (
 	if action.Inherit, err = object.boolean("inherit"); err != nil {
 		return Action{}, err
 	}
+	if action.Approval, err = decodeApproval(object); err != nil {
+		return Action{}, err
+	}
 	if action.Inherit {
 		// An inherited action is a reference, not a declaration. Accepting a
 		// local declaration beside it would leave a reader guessing which one
-		// registers.
+		// registers. Approval is the exception: it can only add a requirement
+		// to what is inherited, which narrows, so nothing is left to guess.
 		for _, key := range []string{"effects", "input_schema", "output_schema"} {
 			if _, present := object.fields[key]; present {
 				return Action{}, refuse(name, object.path+"."+key,
@@ -710,6 +736,41 @@ func decodeAction(name, capabilityPath string, index int, raw json.RawMessage) (
 	}
 	return action, nil
 }
+
+// decodeApproval reads an action's approval object: exactly
+// {"required": true}. An explicit false is refused rather than read as
+// absent, so a file has one spelling for "not required" (omission) and nothing
+// in it reads as switching off a requirement a parent or the live registry
+// holds.
+func decodeApproval(action object) (*Approval, error) {
+	raw, present := action.fields["approval"]
+	if !present {
+		return nil, nil
+	}
+	approval, err := decodeObject(action.file, action.child("approval"), raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := approval.only("required"); err != nil {
+		return nil, err
+	}
+	if err := approval.require("required"); err != nil {
+		return nil, err
+	}
+	required, err := approval.boolean("required")
+	if err != nil {
+		return nil, err
+	}
+	if !required {
+		return nil, refuse(approval.file, approval.child("required"), approvalNotRequired)
+	}
+	return &Approval{Required: true}, nil
+}
+
+// approvalNotRequired is the refusal for "required": false, from Decode and,
+// for documents built in code, from Compile.
+const approvalNotRequired = "must be true; omit approval for an action that does not " +
+	"require it (a policy file cannot switch a requirement off)"
 
 // object is one decoded JSON object with the path refusals about it carry.
 type object struct {
@@ -744,6 +805,9 @@ func (o object) only(allowed ...string) error {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
+		if _, ok := permitted[key]; ok {
+			continue
+		}
 		if reason, ok := reserved[key]; ok {
 			return refuse(o.file, o.child(key), reason)
 		}

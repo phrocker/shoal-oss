@@ -237,9 +237,13 @@ heartbeat interval; this is the same property queued dispatch work already has.
 - `approval.*` event kinds are reserved: the public publish route refuses them
   and no operation may publish them through the trusted path. No approval
   events are published in this slice.
-- ATPL: export refuses an approval-required action by path, and plan refuses a
-  managed agent whose live actions require approval (`refused-approval`)
-  rather than planning it as unchanged or as a narrowing (`docs/atpl.md`).
+- ATPL (#452): a policy file declares the requirement per action as
+  `"approval": {"required": true}`, which compiles to `requires_approval`.
+  Inheritance carries it and delegation cannot drop it; plan treats adding it
+  as a narrowing and omitting a live one as a refused widening; export writes
+  it, and the export recompiles to the same policy digest. A policy without
+  approval keeps the digest it had before (`docs/atpl.md`). The earlier
+  `refused-approval` plan kind and the export refusal are gone.
 
 ## Clock skew between replicas
 
@@ -322,4 +326,3 @@ transition reconciled on a lagging replica has the same property.
   through the replay branch.
 - A claim-time generation re-check (after #438/#430).
 - Requester withdrawal of a held request, and a sweeper for stranded rows.
-- `approval: {required: true}` in ATPL policy files (#452).

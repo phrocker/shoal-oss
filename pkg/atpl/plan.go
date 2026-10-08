@@ -66,14 +66,6 @@ const (
 	// does not rewrite would then exceed. The registry refuses the first and
 	// silently hides the child in the second.
 	KindRefusedDelegation Kind = "refused-delegation"
-	// KindRefusedApproval is a live agent with an action that requires
-	// approval (#451). This version cannot express approval in a policy file,
-	// so a policy managing the agent cannot say whether it keeps the
-	// requirement: planning it as unchanged would claim the file describes
-	// the agent when it omits its control, and planning it as a narrowing
-	// would rewrite it without the flag, which the registry refuses as a
-	// widening. Accepting approval in policy files is #452.
-	KindRefusedApproval Kind = "refused-approval"
 	// KindUnmanaged is a live agent the policy does not declare. Apply leaves
 	// it alone; it does not revoke.
 	KindUnmanaged Kind = "unmanaged"
@@ -100,7 +92,7 @@ func (k Kind) Symbol() string {
 // Refused reports whether the kind blocks apply.
 func (k Kind) Refused() bool {
 	return k == KindRefusedWidening || k == KindRefusedParentMigration ||
-		k == KindRefusedDelegation || k == KindRefusedApproval
+		k == KindRefusedDelegation
 }
 
 // Writes reports whether apply registers the agent.
@@ -210,17 +202,6 @@ func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor, registry string) P
 			entry.Kind = KindRefusedParentMigration
 			entry.Reason = fmt.Sprintf("live parent is %s, policy parent is %s; the registry denies parent migration",
 				parentLabel(current.ParentID), parentLabel(spec.ParentID))
-		case len(approvalActions(current)) > 0:
-			entry.Kind = KindRefusedApproval
-			entry.Reason = "live actions require approval, which this ATPL " +
-				"version cannot express; the policy cannot describe this agent " +
-				"without dropping the control (approval in policy files is #452)"
-			for _, path := range approvalActions(current) {
-				entry.Changes = append(entry.Changes, Change{
-					Op: "-", Path: path + ".approval",
-					Detail: "required live; not expressible in this policy version",
-				})
-			}
 		default:
 			if widening := wideningChanges(spec, current); len(widening) > 0 {
 				entry.Kind = KindRefusedWidening
@@ -317,7 +298,8 @@ func Diff(policy *Policy, live map[shoal.ID]fleet.Descriptor, registry string) P
 }
 
 // ContentDigest identifies what a policy governs in a live registration:
-// parent, domain, scopes, executor and capabilities. Generation, subject,
+// parent, domain, scopes, executor and capabilities, approval requirements
+// included. Generation, subject,
 // actor, lease and update time are left out, because a heartbeat moves them
 // without changing any of that. Every value is hashed as hex of its bytes,
 // since a live value need not be UTF-8 and encoding/json would silently
@@ -328,6 +310,12 @@ func ContentDigest(descriptor fleet.Descriptor) string {
 		Effects []string `json:"effects"`
 		Input   string   `json:"input_schema"`
 		Output  string   `json:"output_schema"`
+		// Omitted unless set, so a registration without approval keeps the
+		// content digest it had before approval existed. When set, it moves
+		// the digest: a plan reviewed against an agent without the
+		// requirement no longer applies once someone adds it, or removes it,
+		// and apply's retry stops instead of writing over the change.
+		RequiresApproval bool `json:"requires_approval,omitempty"`
 	}
 	type capability struct {
 		Name    string   `json:"name"`
@@ -362,6 +350,7 @@ func ContentDigest(descriptor fleet.Descriptor) string {
 			hashed.Actions = append(hashed.Actions, action{
 				Name: text([]byte(declared.Name)), Effects: effects,
 				Input: text(declared.InputSchema), Output: text(declared.OutputSchema),
+				RequiresApproval: declared.RequiresApproval,
 			})
 		}
 		body.Capabilities = append(body.Capabilities, hashed)
@@ -477,6 +466,9 @@ func creationChanges(spec fleet.Spec, ttl time.Duration) []Change {
 	for _, capability := range spec.Capabilities {
 		for _, action := range capability.Actions {
 			add(actionLabel(capability.Name, action.Name), "effects "+effectList(action.Effects))
+			if action.RequiresApproval {
+				add(actionLabel(capability.Name, action.Name)+".approval", "required")
+			}
 		}
 	}
 	return changes
@@ -518,6 +510,13 @@ func wideningChanges(spec fleet.Spec, live fleet.Descriptor) []Change {
 					changes = append(changes, Change{Op: "+", Path: path + ".effects", Detail: string(effect)})
 				}
 			}
+			// Dropping a live requirement widens: the registry refuses it
+			// (capabilitiesSubset), and plan says so rather than letting a
+			// policy that omits approval rewrite the agent without it.
+			if current.RequiresApproval && !action.RequiresApproval {
+				changes = append(changes, Change{Op: "-", Path: path + ".approval",
+					Detail: "required live; the policy omits it, which would remove the control"})
+			}
 		}
 	}
 	return changes
@@ -553,21 +552,13 @@ func narrowingChanges(spec fleet.Spec, live fleet.Descriptor) []Change {
 					changes = append(changes, Change{Op: "-", Path: path + ".effects", Detail: string(effect)})
 				}
 			}
-		}
-	}
-	return changes
-}
-
-// approvalActions names every live action that requires approval, in
-// declaration order.
-func approvalActions(descriptor fleet.Descriptor) []string {
-	var result []string
-	for _, capability := range descriptor.Capabilities {
-		for _, action := range capability.Actions {
-			if action.RequiresApproval {
-				result = append(result, actionLabel(capability.Name, action.Name))
+			// Adding a requirement narrows: the registry accepts it as an
+			// update. It holds every new request for this action, and the
+			// new generation stops records queued before it from resolving.
+			if current.RequiresApproval && !action.RequiresApproval {
+				changes = append(changes, Change{Op: "+", Path: path + ".approval", Detail: "required"})
 			}
 		}
 	}
-	return result
+	return changes
 }

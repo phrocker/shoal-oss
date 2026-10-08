@@ -30,8 +30,15 @@
 //
 // A file declares executors and agents. An agent compiles to exactly one
 // fleet.Spec: identity, parent, authorization domain, scopes, executor
-// reference, capabilities with declared effects, and a lease TTL that becomes
-// an absolute lease at one shared compile time. Validation calls the registry's
+// reference, capabilities with declared effects and approval requirements,
+// and a lease TTL that becomes an absolute lease at one shared compile time.
+//
+// An action may declare "approval": {"required": true}, which compiles to
+// fleet.Action.RequiresApproval (#451). It is accepted on an action only;
+// omission means not required, and an explicit false is refused. Inheritance
+// carries a parent's requirement, and a delegated action may add one but
+// never drop its parent's. Plan treats adding a requirement as a narrowing and
+// dropping one as a refused widening; Export writes it. Validation calls the registry's
 // own validators (pkg/explorer/fleet/policy_export.go) and re-composes the
 // delegation conditions Register applies, so a file is refused for what the
 // API would refuse, with the offending path, before anything is applied.
@@ -48,11 +55,9 @@
 // evaluated against attributed outcomes, not a policy field. See
 // docs/gateways.md, "What comes from ATPL".
 //
-// ATPL's approval (marginal outcome) and runtime attestation are adopted but
-// not yet compiled. The registry can require approval per action (#451), and
-// accepting it in policy files is #452; until then Export refuses an
-// approval-required action rather than writing it without the requirement.
-// Attestation waits on recorded runtime attestation (#446). Admission obligations are
+// ATPL's approval (marginal outcome) is adopted as the per-action
+// requirement above. Runtime attestation is adopted but not yet compiled; it
+// waits on recorded runtime attestation (#446). Admission obligations are
 // computed per request at admission rather than declared per agent, and how a
 // policy would constrain them is deferred. Those fields are refused by name, so
 // a file never appears to grant something it does not.
