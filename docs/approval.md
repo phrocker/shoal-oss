@@ -274,6 +274,15 @@ transition reconciled on a lagging replica has the same property.
   check and the commit leaves the approval `enqueued` under someone else's
   action, which Status reports as `unresolvable` / `identity_taken`. A conflict on request also reveals that something exists at
   an identity. Both are the existing dispatch identity properties.
+- **An in-scope approver can learn that an approval ID exists.** Without a
+  narrowing, a caller that holds `action_approve` on a request's scope but is
+  ineligible to decide it — not independent of it, holding dispatch, invoke or
+  execute, or acting on someone's behalf — is told why (`401`), where a
+  missing ID or a request outside its scope answers `404`. This is kept
+  deliberately: such a caller already holds approve on that scope, and the
+  specific refusal is what lets it see that it is the wrong approver. Only a
+  narrowed caller is concealed, because the narrowing is what it could vary to
+  probe.
 - **Stranded rows.** A request whose target generation or policy generation
   moves, or whose deadline passes, stays in its stored state forever; nothing
   sweeps it. Status reports it as `unresolvable`, Pending omits it, and neither
