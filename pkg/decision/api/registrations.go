@@ -210,7 +210,7 @@ func ValidateRegistrationReceipt(r RegistrationReceipt) error {
 		}
 	}
 	s := r.Snapshot
-	if len(s.Sources) == 0 || len(s.Sources) > MaxRegistrationSources || !outcomeDigest(s.SelectionSHA256) || !outcomeDigest(s.RecordSHA256) || s.RecordBytes < 1 || s.RecordBytes > 48<<20 || !strings.HasPrefix(s.AuthorizationFingerprint, "auth-sha256:") || !outcomeDigest(strings.TrimPrefix(s.AuthorizationFingerprint, "auth-sha256:")) {
+	if len(s.Sources) == 0 || len(s.Sources) > MaxRegistrationSources || r.ID != s.RequestID || !outcomeDigest(s.SelectionSHA256) || !outcomeDigest(s.RecordSHA256) || s.RecordBytes < 1 || s.RecordBytes > 48<<20 || !strings.HasPrefix(s.AuthorizationFingerprint, "auth-sha256:") || !outcomeDigest(strings.TrimPrefix(s.AuthorizationFingerprint, "auth-sha256:")) {
 		return invalidRegistrationProtocol()
 	}
 	for _, id := range snapshotIDs(&s) {

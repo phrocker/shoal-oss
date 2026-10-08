@@ -15,7 +15,7 @@ func registrationFixture() (RegistrationSelection, RegistrationReceipt) {
 	now := time.Date(2026, 10, 8, 18, 0, 0, 0, time.UTC)
 	id := shoal.ID("observation:" + strings.Repeat("a", 64))
 	s := RegistrationSelection{ProfileID: "profile", ProfileRevisionID: "revision", Sources: []RegistrationSourceInput{{id, []byte{0, 255, 1}}}}
-	r := RegistrationReceipt{ID: shoal.ID("decision-registration:" + strings.Repeat("b", 64)), State: "ready", Version: 2, Scope: RegistrationScope{Domain: []byte{0, 255}, SubjectID: shoal.ID(string([]byte{254, 0})), ActorID: "", ClientID: shoal.ID(string([]byte{253, 0})), OnBehalfOf: []shoal.ID{shoal.ID(string([]byte{252, 0}))}}, Snapshot: RegistrationSnapshot{SelectionSHA256: strings.Repeat("c", 64), ProfileID: s.ProfileID, ProfileRevisionID: s.ProfileRevisionID, BuilderID: "builder", RequestID: "request", TaskID: "task", PictureID: "picture", PredictorID: "predictor", Sources: []RegistrationSourcePin{{CollectorID: "collector", ObservationID: id, ArtifactID: "artifact", EnrollmentID: "enrollment", AuthorityPolicyID: "source-policy", Mode: "server_observed", Generation: 1, ArtifactSHA256: registrationHash(s.Sources[0].Bytes), SourceSHA256: strings.Repeat("d", 64), ReceivedAt: now.Add(-time.Second)}}, AcceptedAt: now, AuthenticationExpiresAt: now.Add(time.Hour), AuthorizationFingerprint: "auth-sha256:" + strings.Repeat("e", 64), RecordSHA256: strings.Repeat("f", 64), RecordBytes: 999}, FrozenSHA256: strings.Repeat("1", 64), CreatedAt: now, UpdatedAt: now.Add(time.Second), ReadyAt: now.Add(time.Second)}
+	r := RegistrationReceipt{ID: shoal.ID("decision-registration:" + strings.Repeat("b", 64)), State: "ready", Version: 2, Scope: RegistrationScope{Domain: []byte{0, 255}, SubjectID: shoal.ID(string([]byte{254, 0})), ActorID: "", ClientID: shoal.ID(string([]byte{253, 0})), OnBehalfOf: []shoal.ID{shoal.ID(string([]byte{252, 0}))}}, Snapshot: RegistrationSnapshot{SelectionSHA256: strings.Repeat("c", 64), ProfileID: s.ProfileID, ProfileRevisionID: s.ProfileRevisionID, BuilderID: "builder", RequestID: shoal.ID("decision-registration:" + strings.Repeat("b", 64)), TaskID: "task", PictureID: "picture", PredictorID: "predictor", Sources: []RegistrationSourcePin{{CollectorID: "collector", ObservationID: id, ArtifactID: "artifact", EnrollmentID: "enrollment", AuthorityPolicyID: "source-policy", Mode: "server_observed", Generation: 1, ArtifactSHA256: registrationHash(s.Sources[0].Bytes), SourceSHA256: strings.Repeat("d", 64), ReceivedAt: now.Add(-time.Second)}}, AcceptedAt: now, AuthenticationExpiresAt: now.Add(time.Hour), AuthorizationFingerprint: "auth-sha256:" + strings.Repeat("e", 64), RecordSHA256: strings.Repeat("f", 64), RecordBytes: 999}, FrozenSHA256: strings.Repeat("1", 64), CreatedAt: now, UpdatedAt: now.Add(time.Second), ReadyAt: now.Add(time.Second)}
 	return s, r
 }
 func TestRegistrationCodecOpaqueAndEmptySources(t *testing.T) {
@@ -105,6 +105,15 @@ func TestRegistrationMatchCompleteSelection(t *testing.T) {
 		})
 	}
 }
+
+func TestRegistrationReceiptBindsPublicAndFrozenRequestIDs(t *testing.T) {
+	_, r := registrationFixture()
+	r.Snapshot.RequestID = shoal.ID("decision-registration:" + strings.Repeat("c", 64))
+	if ValidateRegistrationReceipt(r) == nil {
+		t.Fatal("accepted receipt with mismatched public and frozen request IDs")
+	}
+}
+
 func TestRegistrationReceiptRejectsMalformedAndNonready(t *testing.T) {
 	_, r := registrationFixture()
 	raw, _ := EncodeRegistrationReceipt(r)
