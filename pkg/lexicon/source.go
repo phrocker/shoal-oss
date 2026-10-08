@@ -103,7 +103,17 @@ type Input struct {
 	Scope         Scope
 	Nodes         []graph.Node
 	Relationships []ontology.RelationshipDefinition
+	// DeriveInitialisms adds, for each name or title of at least
+	// MinInitialismTokens tokens, the initialism of its tokens as a term with
+	// OriginDerived. It is off by default: short initialisms collide across
+	// many nodes, and since limits fail the build rather than drop, a large
+	// graph would otherwise exceed MaxPostingsPerTerm on derived terms alone.
+	// The setting is recorded in the bundle, so it is part of the ID.
+	DeriveInitialisms bool
 }
+
+// MinInitialismTokens is the shortest name an initialism is derived from.
+const MinInitialismTokens = 3
 
 // Origin records where a term came from. Lower values are stronger: when one
 // node reaches the same term several ways, the posting keeps the lowest.
@@ -114,8 +124,8 @@ const (
 	OriginTitle     Origin = 2
 	OriginEntityKey Origin = 3
 	OriginAlias     Origin = 4
-	// OriginDerived is an initialism derived from a name or title of two or
-	// more tokens.
+	// OriginDerived is an initialism derived from a name or title of at
+	// least MinInitialismTokens tokens, when Input.DeriveInitialisms is set.
 	OriginDerived Origin = 5
 )
 

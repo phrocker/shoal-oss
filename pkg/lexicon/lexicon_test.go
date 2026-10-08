@@ -22,6 +22,7 @@ package lexicon_test
 import (
 	"bytes"
 	"flag"
+	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -29,11 +30,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/lexicon"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 var updateGolden = flag.Bool("update", false, "rewrite testdata golden files")
@@ -241,10 +245,14 @@ func TestGoldenBundleDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got != string(want) {
-		t.Fatalf("bundle ID = %s, golden = %s; the canonical encoding, the "+
-			"normalization or the Unicode tables changed. If intended, bump "+
-			"NormalizationVersion where tokenization changed and rerun with -update",
-			got, want)
+		t.Fatalf("bundle ID = %s, golden = %s.\n"+
+			"Either the canonical encoding or tokenization changed (bump "+
+			"NormalizationVersion), or the Unicode tables did: x/text picks its "+
+			"tables by Go toolchain version (15.0.0 before go1.27, 17.0.0 from "+
+			"go1.27), and this build uses x/text norm %s, cases %s, stdlib unicode "+
+			"%s. Every bundle ID changes with them, by design. If intended, rerun "+
+			"with -args -update.",
+			got, want, norm.Version, cases.UnicodeVersion, unicode.Version)
 	}
 }
 
@@ -365,6 +373,8 @@ func TestOnlyPinnedBundlesShip(t *testing.T) {
 func TestCandidatesReportEveryOverlap(t *testing.T) {
 	bundle := mustBuild(t, newFixture(t).input(fixedScope))
 	text := "does the Billing-Gateway (payments api) call PayGW? pa"
+	// "pa" would be the initialism of "Payments API", but derivation is off
+	// by default and needs three tokens when on.
 	got := bundle.Candidates(text)
 	type summary struct {
 		span  lexicon.Span
@@ -383,7 +393,6 @@ func TestCandidatesReportEveryOverlap(t *testing.T) {
 		{lexicon.Span{Start: 2, End: 4}, "Billing-Gateway", []shoal.ID{"svc-payments"}},
 		{lexicon.Span{Start: 4, End: 6}, "payments api", []shoal.ID{"svc-payments"}},
 		{lexicon.Span{Start: 7, End: 8}, "PayGW", []shoal.ID{"svc-ledger", "svc-payments"}},
-		{lexicon.Span{Start: 8, End: 9}, "pa", []shoal.ID{"svc-payments"}},
 	}
 	if !reflect.DeepEqual(summaries, want) {
 		t.Fatalf("candidates = %#v\nwant %#v", summaries, want)
@@ -569,5 +578,86 @@ func TestCandidatesMatchBruteForce(t *testing.T) {
 		if len(distinct) > bound {
 			t.Fatalf("round %d: %d candidates exceed bound %d", round, len(distinct), bound)
 		}
+	}
+}
+
+// sharedInitialNodes gives count nodes whose names have tokens tokens each and
+// all share the same initials.
+func sharedInitialNodes(count, tokens int) []graph.Node {
+	nodes := make([]graph.Node, count)
+	for index := range nodes {
+		parts := make([]string, tokens)
+		for position := range parts {
+			parts[position] = fmt.Sprintf("%c%03d", 'p'+position, index)
+		}
+		nodes[index] = graph.Node{
+			ID:         shoal.ID(fmt.Sprintf("node-%03d", index)),
+			Properties: shoal.Metadata{"name": strings.Join(parts, " ")},
+		}
+	}
+	return nodes
+}
+
+func TestInitialismsAreOptIn(t *testing.T) {
+	limits := lexicon.Limits{MaxPostingsPerTerm: 8}
+	// Common two-word collisions never fail the default build, and with the
+	// option on, two-token names still derive nothing.
+	for _, derive := range []bool{false, true} {
+		bundle, err := lexicon.Build(lexicon.Input{
+			Snapshot: fixedSnapshot, Scope: fixedScope,
+			Nodes: sharedInitialNodes(100, 2), DeriveInitialisms: derive,
+		}, limits)
+		if err != nil {
+			t.Fatalf("derive=%v: two-word collisions failed the build: %v", derive, err)
+		}
+		if bundle.TermCount() != 100 || bundle.DerivesInitialisms() != derive {
+			t.Fatalf("derive=%v: terms = %d", derive, bundle.TermCount())
+		}
+		if got := bundle.Candidates("pq"); got != nil {
+			t.Fatalf("derive=%v: two-token initialism derived: %#v", derive, got)
+		}
+	}
+	// Three-token names collide only when derivation is asked for, and then
+	// a collision beyond the limit fails the build rather than drop.
+	threeWord := sharedInitialNodes(9, 3)
+	if _, err := lexicon.Build(lexicon.Input{
+		Snapshot: fixedSnapshot, Scope: fixedScope, Nodes: threeWord,
+	}, limits); err != nil {
+		t.Fatalf("default build failed: %v", err)
+	}
+	if _, err := lexicon.Build(lexicon.Input{
+		Snapshot: fixedSnapshot, Scope: fixedScope, Nodes: threeWord,
+		DeriveInitialisms: true,
+	}, limits); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("opt-in collision beyond the limit: err = %v", err)
+	}
+	within := sharedInitialNodes(8, 3)
+	derived, err := lexicon.Build(lexicon.Input{
+		Snapshot: fixedSnapshot, Scope: fixedScope, Nodes: within,
+		DeriveInitialisms: true,
+	}, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := derived.Candidates("PQR")
+	if len(candidates) != 1 || len(candidates[0].NodeIDs) != 8 {
+		t.Fatalf("opt-in initialism = %#v", candidates)
+	}
+}
+
+func TestInitialismOptionChangesID(t *testing.T) {
+	nodes := []graph.Node{{ID: "n", Properties: shoal.Metadata{"name": "Core Platform"}}}
+	in := lexicon.Input{Snapshot: fixedSnapshot, Scope: fixedScope, Nodes: nodes}
+	off := mustBuild(t, in)
+	in.DeriveInitialisms = true
+	on := mustBuild(t, in)
+	// Nothing is derived from a two-token name, so only the recorded option
+	// differs, and it alone changes the ID.
+	if off.TermCount() != on.TermCount() || off.ID() == on.ID() {
+		t.Fatalf("option not in the ID: terms %d/%d", off.TermCount(), on.TermCount())
+	}
+	reloaded, err := lexicon.Load(shipped(t, on))
+	if err != nil || !reloaded.DerivesInitialisms() {
+		t.Fatalf("option lost on load: %v", err)
 	}
 }

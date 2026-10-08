@@ -88,6 +88,13 @@ func TestLoadRefusesDecodableNonCanonicalContents(t *testing.T) {
 		"sentinel node": func(c *contents) {
 			c.nodes[0].id = SentinelIDPrefix + "a"
 		},
+		"derived term without the option": func(c *contents) {
+			c.flags = 0
+			c.terms[0].postings[0].origin = OriginDerived
+		},
+		"unknown flag": func(c *contents) {
+			c.flags = 0x80
+		},
 		"forged template": func(c *contents) {
 			c.templates = []Template{{
 				ID: "lookup:x:out", RelationKey: "x", Direction: DirectionOut,

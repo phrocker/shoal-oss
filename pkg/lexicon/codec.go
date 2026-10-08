@@ -37,6 +37,7 @@ import (
 //	magic            16 bytes "shoal-lexicon-v1"
 //	normalization    uint32 NormalizationVersion
 //	unicode tables   string
+//	build flags      uint8 (bit 0: initialisms derived)
 //	snapshot ID      string
 //	snapshot frontier uint64
 //	snapshot as-of   int64 Unix nanoseconds, UTC
@@ -73,7 +74,14 @@ type term struct {
 	postings []posting
 }
 
+// Build flags recorded in the header. Unknown bits are refused.
+const (
+	flagDeriveInitialisms uint8 = 1 << 0
+	knownFlags                  = flagDeriveInitialisms
+)
+
 type contents struct {
+	flags     uint8
 	snapshot  Snapshot
 	scope     Scope
 	tokens    []string
@@ -109,6 +117,7 @@ func encode(c *contents) ([]byte, error) {
 	e.buf = append(e.buf, magic...)
 	e.u32(NormalizationVersion)
 	e.str(unicodeTables)
+	e.u8(c.flags)
 	e.str(c.snapshot.ID)
 	e.u64(c.snapshot.Frontier)
 	e.u64(uint64(c.snapshot.AsOf.UTC().UnixNano()))
@@ -260,7 +269,10 @@ func decode(data []byte) (*contents, error) {
 		return nil, invalid(
 			"lexicon bundle was built with another normalization version")
 	}
-	c := &contents{}
+	c := &contents{flags: d.u8()}
+	if c.flags&^knownFlags != 0 {
+		return nil, malformed()
+	}
 	c.snapshot.ID = d.str()
 	c.snapshot.Frontier = d.u64()
 	c.snapshot.AsOf = time.Unix(0, int64(d.u64())).UTC()
@@ -327,6 +339,7 @@ func decode(data []byte) (*contents, error) {
 		for position := range t.postings {
 			p := posting{node: d.u32(), origin: Origin(d.u8())}
 			if d.bad || int(p.node) >= len(c.nodes) || !p.origin.valid() ||
+				(p.origin == OriginDerived && c.flags&flagDeriveInitialisms == 0) ||
 				(position > 0 && p.node <= t.postings[position-1].node) {
 				return nil, malformed()
 			}

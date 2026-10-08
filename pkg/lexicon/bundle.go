@@ -64,6 +64,12 @@ func (b *Bundle) Snapshot() Snapshot { return b.contents.snapshot }
 // Scope is ScopeServerFiltered or ScopePinned.
 func (b *Bundle) Scope() Scope { return b.contents.scope }
 
+// DerivesInitialisms reports whether the bundle was built with
+// Input.DeriveInitialisms.
+func (b *Bundle) DerivesInitialisms() bool {
+	return b.contents.flags&flagDeriveInitialisms != 0
+}
+
 // TermCount is the number of distinct terms.
 func (b *Bundle) TermCount() int { return len(b.contents.terms) }
 

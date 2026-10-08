@@ -9,8 +9,9 @@ caller's current authorization.
 
 - **Terms.** For each node: `name` (else `title`), `shoal.ontology.entity_key`,
   and every `shoal.lexicon.alias.<n>` property (a reserved key prefix; any
-  non-empty suffix). A `name` or `title` of two or more tokens also gives an
-  initialism, tagged `origin=derived`. Labels are not used yet. Each term keeps
+  non-empty suffix). With `Input.DeriveInitialisms` set (off by default), a
+  `name` or `title` of three or more tokens also gives an initialism, tagged
+  `origin=derived`. Labels are not used yet. Each term keeps
   its node IDs, node kinds and strongest origin
   (name < title < entity_key < alias < derived).
 - **Lookup templates.** From ontology `RelationshipDefinition`s: two per directed
@@ -18,7 +19,8 @@ caller's current authorization.
   relation (`both`). Each holds the relation key, subject and answer concept IDs,
   and a phrase key. The wording belongs in a renderer catalog, not in the bundle.
 - **Pin.** Snapshot `(ID, Frontier, AsOf)`, the normalization version, the
-  Unicode table versions, and the scope.
+  Unicode table versions, the build flags (whether initialisms were derived),
+  and the scope. Two builds that differ only in a flag have different IDs.
 
 ## Normalization
 
@@ -37,18 +39,27 @@ tables is refused at load. Typos and inflections are not matched; they abstain.
 `Build(Input, Limits)` gives byte-identical output for the same content in any
 order of nodes, properties and relationships. The encoding is fixed-width
 big-endian with length-prefixed strings: magic `shoal-lexicon-v1`, versions,
-pin, scope, a sorted token table, a sorted node table, terms sorted by token
+build flags, pin, scope, a sorted token table, a sorted node table, terms sorted by token
 sequence with sorted postings, and sorted templates. The bundle ID is the
 SHA-256 of those bytes. `Load` checks every ordering and reference invariant,
 re-encodes, and refuses anything that is not byte-for-byte the canonical
 encoding. The matcher is then rebuilt from the decoded terms. `LoadVerified`
 also checks the bytes against an expected ID. A golden ID is pinned in
-`pkg/lexicon/testdata`.
+`pkg/lexicon/testdata`. It depends on the Unicode tables, which x/text selects
+by Go toolchain version (15.0.0 before go1.27, 17.0.0 from go1.27), so the
+move to go1.27 changes it, and every bundle ID, by design.
 
 Limits **fail the build**; nothing is dropped. A lexicon that quietly omitted
 an entity would make that entity look unknown, and in a server-filtered bundle
 whether something was dropped would depend on hidden nodes. Defaults: 8 tokens
 per term and 8 postings per term. The hard caps are 16 and 64.
+
+Initialisms are the exception that would make this rule fail in practice:
+short names collide quickly (every "Payments API" and "Public Access" gives
+`pa`), so a large graph would exceed 8 postings per term on derived terms
+alone. Derivation is therefore opt-in, and when enabled it uses only names of
+three or more tokens. A collision beyond the limit among those still fails the
+build.
 
 ## Matching
 
@@ -94,19 +105,21 @@ one hidden node (unambiguous), a hidden longer alias over a visible shorter one
 (the shorter matches), a rule change or revocation after the snapshot (dropped),
 and a scoped build holding no hidden bytes.
 
-**Residue.** Store traffic is fixed, but per-ID work is not. The memory store
-clones each registration it finds, and the client evaluates its rule. A sentinel
-or unknown ID is a miss. On the benchmark host a matched hidden node costs a
-few microseconds more than an unknown name. Closing this needs a store read whose
-cost does not depend on presence, which is a follow-up. #374 measures the
-related residue in grounded responses.
+## Disclosure residuals
 
-**Initialisms at scale.** Derived initialisms of short names collide quickly
-(every "Payments API" and "Public Access" gives `pa`). Because limits fail
-rather than drop, a large graph can exceed 8 postings per term on derived terms
-alone. Possible fixes include raising the limit (which raises the padded batch),
-deriving only from longer names, or making derivation opt-in. This is a design
-decision, not yet taken.
+Two known ways a hidden node still differs from an unknown name. Both are
+accepted for slice 1 and belong with the residue #374 measures.
+
+- **Timing.** Store traffic is fixed (one call, 2048 IDs), but per-ID work is
+  not. The memory store clones each registration it finds, and the client
+  evaluates its rule; a sentinel or unknown ID is a miss. On the benchmark host
+  a matched hidden node costs a few microseconds more than an unknown name.
+  Closing this needs a store read whose cost does not depend on presence.
+- **Corrupt rules.** If evaluating a found node's rule fails with anything
+  other than "unauthorized", `ResolveMentions` returns the existing internal
+  "inconsistent data" error, as every other authorized read does. A node the
+  store does not know never reaches that check, so with a corrupt catalog a
+  hidden node and an unknown name can produce different errors.
 
 ## Measurements
 

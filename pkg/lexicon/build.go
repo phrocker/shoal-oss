@@ -144,7 +144,8 @@ func Build(in Input, limits Limits) (*Bundle, error) {
 				return nil, err
 			}
 			addTerm(entry.terms, tokens, surface.origin)
-			if surface.origin > OriginTitle || len(tokens) < 2 {
+			if !in.DeriveInitialisms || surface.origin > OriginTitle ||
+				len(tokens) < MinInitialismTokens {
 				continue
 			}
 			if initialism, ok := deriveInitialism(tokens); ok {
@@ -222,7 +223,12 @@ func Build(in Input, limits Limits) (*Bundle, error) {
 		return nil, limitExceeded("template")
 	}
 
+	var flags uint8
+	if in.DeriveInitialisms {
+		flags |= flagDeriveInitialisms
+	}
 	encoded, err := encode(&contents{
+		flags:     flags,
 		snapshot:  in.Snapshot,
 		scope:     in.Scope,
 		tokens:    tokens,
