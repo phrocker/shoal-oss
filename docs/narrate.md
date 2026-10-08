@@ -63,13 +63,14 @@ with `ParseCatalog`; no Go changes.
 {
   "locale": "en",
   "formats": { "time": "2006-01-02 15:04:05 UTC", "group": ",", "decimal": "." },
-  "messages": { "dispatch.error.outcome_unknown": "The failure was reported as …" }
+  "messages": { "dispatch.error.outcome_unknown.executor": "The failure was reported as …" }
 }
 ```
 
 Keys are `<record kind>.<part>.<outcome>[.<condition>]`, for example
-`approval.outcome.unresolvable.target_moved`, `dispatch.error.target_rejected`
-and its `.next`, `decision.reason.failed.deadline_exceeded`. Messages use a
+`approval.outcome.unresolvable.target_moved`, `dispatch.error.target_rejected.service`
+(one per error code origin) and `dispatch.error.target_rejected.next`,
+`decision.reason.failed.deadline_exceeded`. Messages use a
 subset of ICU MessageFormat, implemented in the package (no new dependency;
 plural categories come from `golang.org/x/text/feature/plural`, already in
 `go.mod`):
@@ -113,7 +114,7 @@ a template. It is enforced three ways:
   sentence, fail at run time, or print a value the record does not hold.
 - **Parity with source.** The vocabularies are read from their owners' source
   by AST, never from this package's lists: `DispatchState`, `ApprovalState`,
-  `ApprovalCondition`, the kinds `NewActionTransition` accepts and every
+  `ApprovalCondition`, `ErrorCodeOrigin`, the kinds `NewActionTransition` accepts and every
   value assigned to an `ErrorCode` in `pkg/explorer/fleet` (literals and
   constants; any other expression fails the test, except a copy of another
   `ErrorCode` field); `ResultStatus`,
@@ -137,7 +138,8 @@ a template. It is enforced three ways:
 - **By rendering.** `TestCoverage*` renders a record for every value read from
   source — every dispatch state, with and without admission and at five
   clock positions; every effects-gateway code including `target_rejected_400`
-  to `_599`; every fleet-written code; every dispatch transition edge; every
+  to `_599`; every fleet-written code, each under every `ErrorCodeOrigin` in
+  source and under one no build writes; every dispatch transition edge; every
   approval status row from every stored state it can arise from; every result
   status, service reason, answer kind, abstention, disposition and inspection
   reason — and fails if any falls back. `TestCoverageEveryKeyIsReachable`
@@ -151,7 +153,8 @@ gateway and checks `ValidErrorCode` agrees on every candidate code.
 Golden files under `pkg/narrate/testdata/golden` fix the wording. The
 scenario goldens cover representative records; the value goldens under
 `testdata/golden/values` (`TestGoldenValues`) render every value of every
-enumerated set — each dispatch state, error code, transition, approval status
+enumerated set — each dispatch state, error code under each error code origin,
+transition, approval status
 and condition, decision result and abstention reason, disposition and
 inspection reason — from the same source-read lists the coverage tests use, one
 file per family. Coverage proves which key a value renders; the value goldens
@@ -167,21 +170,76 @@ unknown dispatch state, transition kind or approval state is rendered by an
 built by `pkg/decision`'s validating constructors, so an unknown value there
 means the two packages are out of step, and the renderer returns an error.
 
-An `ErrorCode` outside the gateway and fleet sets is the executor's own text:
-an executor may record any bounded string. It is quoted, attributed to the
-executor, and its next step is to reconcile with the target. The same holds for
-a predictor's own whole-request or per-answer reason.
+An `ErrorCode` outside the gateway and fleet sets is free text: an executor may
+record any bounded string. It is quoted, attributed to whoever the record's
+`ErrorCodeOrigin` says assigned it (`executor`, `service`, or
+`executor_or_service` when the record does not say), and its next step is to
+reconcile with the target. The same holds for a predictor's own whole-request
+or per-answer reason.
+
+### Who assigned an error code
+
+Since #529 an action record says who decided its `ErrorCode`:
+`ErrorCodeOrigin` (`error_code_origin` on the wire) is `service` when the
+dispatch service adjudicated — it refused the executor's output, evidence or
+error code, or the executor failed without a code — and `executor` when the
+code is the executor's own account. Fleet derives it from the code path that
+wrote the field, never from the request, and refuses the codes it assigns
+itself (`invalid_executor_output`, `invalid_executor_evidence`,
+`invalid_executor_error`, `executor_error`) when an executor reports them. A
+record written before #529 has no origin.
+
+The renderer keys **only on the origin**, never on the code: the reserved-code
+list is closed, the origin field is not. Each code's reason has one template
+per origin rendering, `dispatch.error.<code>.<service|executor|either>`:
+
+| Origin | Reason | Example |
+| --- | --- | --- |
+| `service` | Shoal's determination, stated as such | "Shoal recorded the failure as invalid_executor_output, which means the executor’s output did not match the action’s output schema." |
+| `executor` | the executor's account: a report, its meaning conditional | "The failure was reported as outcome_unknown, which, if accurate, means …" |
+| omitted, or any value this build does not know | attributed to neither, its meaning conditional | "The failure was recorded as outcome_unknown, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means …" |
+
+An omitted origin is never read as the executor's: a pre-#529
+`invalid_executor_output` may be Shoal's adjudication, and attributing it to
+the worker is the error #508 describes. An origin this build does not know —
+a record from a newer build — renders exactly as an omitted one, so the
+fail-safe claims nothing. `errorCodeOrigins` (vocab.go) records the decision for
+each origin; `TestParityErrorCodeOrigins` reads fleet's `ErrorCodeOrigin`
+constants from source, so a new one fails until it is given a row and its
+templates are decided.
+
+The origin is credited with the code, and only the code:
+
+- **The outcome** reads "was reported as failed by {reporter}" only for an
+  executor's code. Otherwise it reads "was recorded as failed at …, after
+  {reporter} reported its outcome": under a service origin the executor may
+  have reported *success* (its output then refused as
+  `invalid_executor_output`), and the failure itself may still be the
+  executor's (`executor_error` is Shoal's code for a failure reported without
+  one), so the outcome names neither Shoal nor a reported failure.
+- **The failing transition** reads "{reporter} reported failure with {code}"
+  for an executor's code, "Shoal recorded the failure as {code} after
+  {reporter} reported its outcome" for Shoal's, and otherwise says the record
+  does not say whether the reporter or Shoal assigned the code.
+- **The next step** is still always to reconcile with the target before
+  requesting the work again, whatever the code and whoever assigned it, since
+  `EffectPossible` says nothing on a terminal record (#510). Three change with
+  the origin, because their wording presumed who assigned the code:
+  `request_not_sent` and `input_invalid` said "the report says nothing was
+  sent, but the record cannot establish that". For an executor's code that
+  stands; for an unknown origin it says "the code says", since it may not be a
+  report; for Shoal's own code the clause is dropped, because it would call
+  Shoal's determination a report and then doubt it. `unrecognized` said "Shoal
+  cannot interpret the code", which is false if Shoal assigned it; under a
+  service or unknown origin it says this renderer cannot interpret it. Every
+  other next step means the same whoever assigned the code and is unchanged.
+
+The service rendering is chosen by the origin even for a code fleet does not
+assign today (a gateway code, say): if fleet ever records one as its own, the
+sentence says so, and the parity tests on error codes flag the new
+assignment.
 
 ### Reports are not findings
-
-Fleet checks only an `ErrorCode`'s length and whitespace, so an executor can
-report any code, including a gateway code or one fleet itself writes
-(`invalid_executor_output`, `executor_error`). The record does not say who
-assigned it (#508). Every error sentence is therefore phrased as a report — "The
-failure was reported as outcome_unknown, which, if accurate, means …" — and
-never states a gateway or fleet meaning as fact. A failure's next step is
-always to reconcile with the target before requesting the work again, whatever
-the code says.
 
 `EffectPossible` is not evidence on a completed record. Completion sets it
 unconditionally and `ActionRecord.Validate` refuses a terminal record without
@@ -198,9 +256,11 @@ is attributed to "the predictor or the service" (`predictor_or_service` on a
 quote), its meaning is conditional ("if accurate"), and its next step starts
 "If …". A per-answer abstention is the predictor's own and is attributed to it.
 
-A success or failure is "reported as succeeded (failed) by" whoever reported
-it: the claimant, or, for an admission, the identity that requested it, which
-is also who an admission's history, references and output quote name.
+A success, or a failure whose code the executor gave, is "reported as
+succeeded (failed) by" whoever reported it: the claimant, or, for an admission,
+the identity that requested it, which is also who an admission's history,
+references and output quote name. Any other failure "was recorded as failed …
+after" that identity "reported its outcome" (see above).
 
 ### Router proposals
 
@@ -297,11 +357,11 @@ selectors by import path to deny `Now`, `Since`, `Until`, `After`, `Tick`,
   `ActionRecord` on main; aggregation uses the claim fence. When attempt
   history lands (#438/#430), add an `ActionRecord` history sentence per
   attempt.
-- Neither `ErrorCode` nor a decision result records who assigned the code or
-  reason: #508 (fleet: an action record doesn't say who assigned its error
-  code) and #509 (decision: a result doesn't say whether the service or the
-  predictor set its reason). Once they are resolved, codes and reasons Shoal
-  itself assigned can be narrated as Shoal's determinations.
+- A decision result does not record who assigned its whole-request reason
+  (#509: the service or the predictor). Once it does, reasons the service
+  assigned can be narrated as Shoal's determinations, as error codes now are.
+  The `ErrorCode` half of this note (#508) is resolved by #529's
+  `ErrorCodeOrigin`; see "Who assigned an error code".
 - The source state of each `DispatchEdges` edge is checked against fleet's
   guards by review, not by test: the guards are spread through fleet's
   services. A transition table exported by fleet would let the test check them.

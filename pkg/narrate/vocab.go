@@ -63,11 +63,50 @@ var FleetErrorCodes = []string{
 	"executor_error",
 }
 
-// errorCodeKey maps a recorded error code to its catalog stem. A known code
-// is still only what was reported: the record does not say who assigned it
-// (#508), so its templates state the meaning conditionally. ok is false
-// for a code outside both closed sets: an executor may record any bounded
-// string, and such a code is shown only as a quotation.
+// Who assigned an error code, as the renderer narrates it (#508, #529).
+//
+// The three are the only template decisions there are: a code Shoal itself
+// assigned is narrated as Shoal's determination; a code the executor reported
+// is narrated as the executor's hedged account; and a code whose origin the
+// record does not establish is attributed to neither. They are chosen from
+// ActionRecord.ErrorCodeOrigin alone, never from the code: the reserved-code
+// list is closed, the origin field is not.
+const (
+	OriginService  Selector = "service"
+	OriginExecutor Selector = "executor"
+	OriginEither   Selector = "either"
+)
+
+// ErrorOrigins lists the origin renderings, each of which has its own
+// reason template for every error code.
+var ErrorOrigins = []Selector{OriginService, OriginExecutor, OriginEither}
+
+// errorCodeOrigins is the decision made for every fleet.ErrorCodeOrigin. A
+// parity test reads fleet's source, so a constant added there fails until it
+// is given a row here. A value not in this table — a record from a newer
+// build — renders as OriginEither: the fail-safe is to claim nothing about
+// who assigned the code, never to name the executor or Shoal.
+var errorCodeOrigins = map[fleet.ErrorCodeOrigin]Selector{
+	// Written before the field existed: the code may be either's.
+	fleet.ErrorCodeOriginUnknown:  OriginEither,
+	fleet.ErrorCodeOriginService:  OriginService,
+	fleet.ErrorCodeOriginExecutor: OriginExecutor,
+}
+
+// errorOrigin is how a record's error code origin is narrated.
+func errorOrigin(origin fleet.ErrorCodeOrigin) Selector {
+	if s, ok := errorCodeOrigins[origin]; ok {
+		return s
+	}
+	return OriginEither
+}
+
+// errorCodeKey maps a recorded error code to its catalog stem; the reason
+// template is the stem plus the origin rendering (errorOrigin), so who the
+// sentence says assigned the code depends on the record's origin field and
+// never on the code. ok is false for a code outside both closed sets: an
+// executor may record any bounded string, and such a code is shown only as a
+// quotation.
 func errorCodeKey(code string) (stem string, status int, ok bool) {
 	if s, isRejected := TargetRejectedStatus(code); isRejected {
 		return "dispatch.error.target_rejected", s, true

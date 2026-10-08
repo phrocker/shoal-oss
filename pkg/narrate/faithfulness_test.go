@@ -13,61 +13,65 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// A failed record's ErrorCode is whatever the executor reported: fleet checks
-// only its length and whitespace, so an executor can report a gateway code or
-// one fleet itself writes (#508). Every error sentence is therefore a report,
-// never a finding. EffectPossible carries no information on a completed
-// record — completion sets it unconditionally and Validate requires it on a
-// failure (#510) — so retry advice never depends on it: a failure's next step
-// is always to reconcile with the target, and nothing a terminal record says
-// cites EffectPossible.
+// A failed record's ErrorCode was written by the service or by the executor,
+// and since #529 ErrorCodeOrigin says which; a record written before it does
+// not. Who a reason sentence says assigned the code follows the origin alone,
+// never the code (#508):
+//
+//   - service: Shoal's own determination, stated as such ("Shoal recorded the
+//     failure as …, which means …");
+//   - executor: the executor's account, a report whose meaning is conditional
+//     ("reported as …, which, if accurate, means …");
+//   - omitted, or a value this build does not know: attributed to neither, and
+//     conditional.
+//
+// EffectPossible carries no information on a completed record — completion
+// sets it unconditionally and Validate requires it on a failure (#510) — so
+// retry advice never depends on it: a failure's next step is always to
+// reconcile with the target, whoever assigned the code, and nothing a
+// terminal record says cites EffectPossible.
 func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 	r := New(nil)
 	codes := append(sourceErrorCodes(t), "made up by an executor")
-	for _, code := range codes {
-		var nexts []string
-		for _, effect := range []bool{true, false} {
-			record := action(fleet.DispatchFailed)
-			record.ErrorCode = code
-			record.EffectPossible = effect
-			sentences, err := r.Action(record, Options{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, s := range sentences {
-				text := strings.ToLower(s.Text)
-				if strings.Contains(text, "effect as possible") || strings.Contains(text, "may already have happened") {
-					t.Errorf("%s: a terminal record cites EffectPossible: %s", code, s.Text)
+	for _, origin := range errorCodeOriginCases(t) {
+		for _, code := range codes {
+			what := code + " origin=" + string(origin)
+			var nexts []string
+			for _, effect := range []bool{true, false} {
+				record := failedWith(code, origin)
+				record.EffectPossible = effect
+				sentences, err := r.Action(record, Options{})
+				if err != nil {
+					t.Fatal(err)
 				}
-				if !strings.HasPrefix(s.Key, "dispatch.error.") {
-					continue
-				}
-				switch s.Role {
-				case RoleReason:
-					if !strings.Contains(text, "reported") {
-						t.Errorf("%s: reason is not phrased as a report: %s", code, s.Text)
+				for _, s := range sentences {
+					text := strings.ToLower(s.Text)
+					if strings.Contains(text, "effect as possible") || strings.Contains(text, "may already have happened") {
+						t.Errorf("%s: a terminal record cites EffectPossible: %s", what, s.Text)
 					}
-					if _, _, known := errorCodeKey(code); known && !strings.Contains(text, "if accurate") {
-						t.Errorf("%s: meaning is stated as fact: %s", code, s.Text)
+					if !strings.HasPrefix(s.Key, "dispatch.error.") {
+						continue
 					}
-					if len(s.Refs) == 0 {
-						t.Errorf("%s: reason does not name the reporter", code)
-					}
-				case RoleNext:
-					nexts = append(nexts, s.Text)
-					if !strings.HasPrefix(text, "reconcile with the target") {
-						t.Errorf("%s: next step does not start with reconciliation: %s", code, s.Text)
-					}
-					for _, unsafe := range []string{"without repeating", "safe to", "can be requested again"} {
-						if strings.Contains(text, unsafe) {
-							t.Errorf("%s: next step advises a retry: %s", code, s.Text)
+					switch s.Role {
+					case RoleReason:
+						reasonIsFaithful(t, what, code, wantOrigin[origin], s)
+					case RoleNext:
+						nexts = append(nexts, s.Text)
+						if !strings.HasPrefix(text, "reconcile with the target") {
+							t.Errorf("%s: next step does not start with reconciliation: %s", what, s.Text)
 						}
+						for _, unsafe := range []string{"without repeating", "safe to", "can be requested again"} {
+							if strings.Contains(text, unsafe) {
+								t.Errorf("%s: next step advises a retry: %s", what, s.Text)
+							}
+						}
+						nextIsFaithful(t, what, wantOrigin[origin], text)
 					}
 				}
 			}
-		}
-		if len(nexts) != 2 || nexts[0] != nexts[1] {
-			t.Errorf("%s: next step depends on EffectPossible: %q", code, nexts)
+			if len(nexts) != 2 || nexts[0] != nexts[1] {
+				t.Errorf("%s: next step depends on EffectPossible: %q", what, nexts)
+			}
 		}
 	}
 	// A succeeded record says nothing about EffectPossible either.
@@ -86,13 +90,248 @@ func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 	}
 }
 
+// reasonIsFaithful checks a failure's reason sentence says who assigned the
+// code exactly as the origin establishes, and no more.
+func reasonIsFaithful(t *testing.T, what, code string, want Selector, s Sentence) {
+	t.Helper()
+	text := strings.ToLower(s.Text)
+	_, _, known := errorCodeKey(code)
+	if len(s.Refs) == 0 {
+		t.Errorf("%s: reason does not name the reporter", what)
+	}
+	attribution := AttributedToExecutorOrService
+	switch want {
+	case OriginService:
+		attribution = AttributedToService
+		if !strings.HasPrefix(text, "shoal recorded the failure") {
+			t.Errorf("%s: Shoal's own code is not stated as Shoal's: %s", what, s.Text)
+		}
+		if strings.Contains(text, "if accurate") || strings.Contains(text, "reported") {
+			t.Errorf("%s: Shoal's own code is hedged as a report: %s", what, s.Text)
+		}
+	case OriginExecutor:
+		attribution = AttributedToExecutor
+		if !strings.Contains(text, "reported") || strings.Contains(text, "shoal recorded") {
+			t.Errorf("%s: the executor's code is not phrased as its report: %s", what, s.Text)
+		}
+		if known && !strings.Contains(text, "if accurate") {
+			t.Errorf("%s: the executor's meaning is stated as fact: %s", what, s.Text)
+		}
+	default:
+		if !strings.Contains(text, "either the executor reported or shoal assigned") ||
+			!strings.Contains(text, "does not say which") {
+			t.Errorf("%s: a code of unknown origin is not attributed to neither: %s", what, s.Text)
+		}
+		if strings.Contains(text, "shoal recorded") || strings.Contains(text, "was reported as") {
+			t.Errorf("%s: a code of unknown origin is attributed to one side: %s", what, s.Text)
+		}
+		if known && !strings.Contains(text, "if accurate") {
+			t.Errorf("%s: a code of unknown origin is stated as fact: %s", what, s.Text)
+		}
+	}
+	for _, q := range s.Quotes {
+		if q.Attribution != attribution {
+			t.Errorf("%s: code quoted as %s's, want %s's", what, q.Attribution, attribution)
+		}
+	}
+	if known == (len(s.Quotes) > 0) {
+		t.Errorf("%s: a known code is quoted, or an unknown one is not: %s", what, s.Text)
+	}
+}
+
+// nextIsFaithful checks a failure's next step does not contradict who the
+// origin says assigned the code: only the executor's code is "the report",
+// a code of unknown origin is only "the code", and Shoal's own code is
+// neither second-guessed nor said to be beyond Shoal.
+func nextIsFaithful(t *testing.T, what string, want Selector, text string) {
+	t.Helper()
+	var wrong []string
+	switch want {
+	case OriginService:
+		wrong = []string{"the report says", "the code says", "shoal cannot interpret"}
+	case OriginExecutor:
+		wrong = []string{"the code says", "this renderer"}
+	default:
+		wrong = []string{"the report says", "shoal cannot interpret"}
+	}
+	for _, phrase := range wrong {
+		if strings.Contains(text, phrase) {
+			t.Errorf("%s: next step says %q under a %s origin: %s", what, phrase, want, text)
+		}
+	}
+}
+
+// failureSentences renders a failed record and the transition that failed it.
+func failureSentences(t *testing.T, r *Renderer, record fleet.ActionRecord) []Sentence {
+	t.Helper()
+	sentences, err := r.Action(record, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := r.ActionHistory([]fleet.ActionTransition{
+		{ID: []byte("t1"), Kind: "action.failed", Record: record},
+	}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(sentences, history...)
+}
+
+// TestAnUnknownOriginIsNeverTheExecutors: a record written before #529 has no
+// origin, and its code may have been the service's (invalid_executor_output,
+// say) or the executor's. Reading it as the executor's would put Shoal's
+// adjudication in the worker's mouth, or a worker's claim in nobody's, so it
+// is attributed to neither — and so is any origin this build does not know,
+// which is how a record from a newer build arrives.
+func TestAnUnknownOriginIsNeverTheExecutors(t *testing.T) {
+	r := New(nil)
+	unknown := []fleet.ErrorCodeOrigin{
+		fleet.ErrorCodeOriginUnknown, futureOrigin,
+		"Executor", " executor", "executor\x00", "service ",
+	}
+	for _, origin := range unknown {
+		if got := errorOrigin(origin); got != OriginEither {
+			t.Errorf("origin %q is narrated as %q, not as either", origin, got)
+		}
+	}
+	for _, code := range append(sourceErrorCodes(t), "made up by an executor") {
+		omitted := failureSentences(t, r, failedWith(code, fleet.ErrorCodeOriginUnknown))
+		executor := failureSentences(t, r, failedWith(code, fleet.ErrorCodeOriginExecutor))
+		if len(omitted) != len(executor) {
+			t.Fatalf("%s: %d sentences, %d for the executor's", code, len(omitted), len(executor))
+		}
+		for i, s := range omitted {
+			text := strings.ToLower(s.Text)
+			for _, phrase := range []string{"reported as failed by", "reported failure with", "was reported as", "shoal recorded"} {
+				if strings.Contains(text, phrase) {
+					t.Errorf("%s: an omitted origin is attributed (%q): %s", code, phrase, s.Text)
+				}
+			}
+			for _, q := range s.Quotes {
+				if q.Attribution == AttributedToExecutor || q.Attribution == AttributedToService {
+					t.Errorf("%s: an omitted origin's code is quoted as %s's", code, q.Attribution)
+				}
+			}
+			// Where the executor's account reads differently, the omitted
+			// one must not read like it: the outcome, the reason and the
+			// failing transition.
+			switch s.Role {
+			case RoleOutcome, RoleReason:
+				if s.Text == executor[i].Text {
+					t.Errorf("%s: an omitted origin reads as the executor's: %s", code, s.Text)
+				}
+			case RoleHistory:
+				if s.Key == "dispatch.transition.fail" && s.Text == executor[i].Text {
+					t.Errorf("%s: an omitted origin reads as the executor's: %s", code, s.Text)
+				}
+			}
+		}
+		for _, origin := range unknown[1:] {
+			other := failureSentences(t, r, failedWith(code, origin))
+			if dump(other) != dump(omitted) {
+				t.Errorf("%s: origin %q renders differently from an omitted one:\n%s\n---\n%s",
+					code, origin, dump(other), dump(omitted))
+			}
+		}
+	}
+}
+
+// TestShoalIsCreditedOnlyWithTheCode: an origin of service says Shoal
+// assigned the error code, and nothing more. In particular it does not say
+// the executor reported a failure — it may have reported success, with
+// output Shoal then refused (invalid_executor_output) — and it does not say
+// Shoal decided the work failed: executor_error is Shoal's code for a
+// failure the executor reported without one.
+//
+// The checks are positive, not a list of banned phrases: each service reason
+// begins with one fixed form, the service transition is one exact sentence,
+// no other service-origin sentence names Shoal, and every "Shoal" any failure
+// sentence says, under any origin, is followed by "recorded" or is one of the
+// few non-crediting forms shoalOnlyRecords lists.
+func TestShoalIsCreditedOnlyWithTheCode(t *testing.T) {
+	r := New(nil)
+	at := "2026-10-08 12:03:00 UTC"
+	codes := append(sourceErrorCodes(t), "made up by an executor")
+	for _, code := range codes {
+		shown := code
+		if _, _, known := errorCodeKey(code); !known {
+			shown = "“" + code + "”"
+		}
+		for _, s := range failureSentences(t, r, failedWith(code, fleet.ErrorCodeOriginService)) {
+			switch {
+			case s.Role == RoleReason:
+				prefix := "Shoal recorded the failure as " + shown + ", "
+				if !strings.HasPrefix(s.Text, prefix) {
+					t.Errorf("%s: service reason does not begin %q: %s", code, prefix, s.Text)
+				}
+			case s.Key == "dispatch.transition.fail":
+				want := "At " + at + ", Shoal recorded the failure as " + shown +
+					" after worker-1 reported its outcome."
+				if s.Text != want {
+					t.Errorf("%s: service transition\n got %s\nwant %s", code, s.Text, want)
+				}
+			case strings.Contains(s.Text, "Shoal"):
+				t.Errorf("%s: %s names Shoal: %s", code, s.Key, s.Text)
+			}
+		}
+	}
+	for _, origin := range errorCodeOriginCases(t) {
+		for _, code := range codes {
+			for _, s := range failureSentences(t, r, failedWith(code, origin)) {
+				shoalOnlyRecords(t, code+" origin="+string(origin), wantOrigin[origin], s.Text)
+			}
+		}
+	}
+}
+
+// shoalOnlyRecords requires every "Shoal" in text to be followed by
+// "recorded", or to be one of the forms that credit Shoal with nothing: the
+// disjunction an unknown origin uses ("… or Shoal assigned; the record does
+// not say which") and the negations in the executor's unrecognized-code
+// sentences ("Shoal does not define", "Shoal cannot interpret").
+func shoalOnlyRecords(t *testing.T, what string, origin Selector, text string) {
+	t.Helper()
+	allowed := map[Selector][]string{
+		OriginEither:   {"or Shoal assigned"},
+		OriginExecutor: {"Shoal does not define", "Shoal cannot interpret"},
+	}[origin]
+	for i := 0; ; {
+		j := strings.Index(text[i:], "Shoal")
+		if j < 0 {
+			return
+		}
+		i += j
+		ok := strings.HasPrefix(text[i+len("Shoal"):], " recorded ")
+		for _, form := range allowed {
+			start := i - strings.Index(form, "Shoal")
+			ok = ok || (start >= 0 && strings.HasPrefix(text[start:], form))
+		}
+		if !ok {
+			word, _, _ := strings.Cut(strings.TrimSpace(text[i+len("Shoal"):]), " ")
+			t.Errorf("%s: Shoal is paired with %q: %s", what, word, text)
+		}
+		i += len("Shoal")
+	}
+}
+
 // Admissions are reported by the identity that requested them; histories and
 // outcomes name it, never an unrecorded claimant.
 func TestAdmissionReporterIsTheRequester(t *testing.T) {
 	r := New(nil)
 	granted := admission(fleet.DispatchClaimed)
-	for _, end := range []fleet.DispatchState{fleet.DispatchSucceeded, fleet.DispatchFailed} {
+	for _, c := range []struct {
+		end     fleet.DispatchState
+		origin  fleet.ErrorCodeOrigin
+		outcome string
+	}{
+		{fleet.DispatchSucceeded, "", "reported as succeeded by alice"},
+		{fleet.DispatchFailed, fleet.ErrorCodeOriginExecutor, "reported as failed by alice"},
+		{fleet.DispatchFailed, fleet.ErrorCodeOriginService, "after alice reported its outcome"},
+		{fleet.DispatchFailed, fleet.ErrorCodeOriginUnknown, "after alice reported its outcome"},
+	} {
+		end := c.end
 		finished := admission(end)
+		finished.ErrorCodeOrigin = c.origin
 		finished.Version = granted.Version + 1
 		kind := "action.completed"
 		if end == fleet.DispatchFailed {
@@ -124,7 +363,7 @@ func TestAdmissionReporterIsTheRequester(t *testing.T) {
 				}
 			}
 		}
-		if !strings.Contains(sentences[0].Text, "reported as "+string(end)+" by alice") {
+		if !strings.Contains(sentences[0].Text, c.outcome) {
 			t.Errorf("%s: outcome %q", end, sentences[0].Text)
 		}
 	}

@@ -50,7 +50,10 @@ var requiredKeySet = sync.OnceValue(func() map[string]bool {
 	codes := append(append([]string{}, GatewayErrorCodes...), FleetErrorCodes...)
 	codes = append(codes, "target_rejected", "unrecognized")
 	for _, code := range codes {
-		add("dispatch.error."+code, "dispatch.error."+code+".next")
+		for _, origin := range ErrorOrigins {
+			add("dispatch.error." + code + "." + string(origin))
+		}
+		add("dispatch.error." + code + ".next")
 	}
 	add("dispatch.reason.canceled_after_lapse", "dispatch.evidence",
 		"dispatch.gap.effect_possible", "dispatch.gap.no_evidence",

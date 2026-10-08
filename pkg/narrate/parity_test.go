@@ -442,3 +442,22 @@ func TestParityDispatchDestinations(t *testing.T) {
 		t.Fatal("dispatch reader found nothing; it is stale")
 	}
 }
+
+// sourceErrorCodeOrigins reads every fleet.ErrorCodeOrigin constant, the
+// empty value written before the field existed included.
+func sourceErrorCodeOrigins(t *testing.T) []string {
+	return values(typedConsts(t, fleetDir, "ErrorCodeOrigin"))
+}
+
+// TestParityErrorCodeOrigins requires a template decision for every origin
+// fleet defines: a constant added there fails here until errorCodeOrigins
+// says how it is narrated. Until then a record carrying it renders as one
+// whose origin is unknown, which claims nothing.
+func TestParityErrorCodeOrigins(t *testing.T) {
+	decided := make([]string, 0, len(errorCodeOrigins))
+	for origin := range errorCodeOrigins {
+		decided = append(decided, string(origin))
+	}
+	sameSet(t, "ErrorCodeOrigin (each needs a row in errorCodeOrigins)",
+		sourceErrorCodeOrigins(t), decided)
+}

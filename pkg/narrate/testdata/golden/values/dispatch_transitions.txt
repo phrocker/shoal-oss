@@ -104,21 +104,21 @@ history dispatch.transition.claim
   record=action:act-1 transition=t-from principal=worker-1 claim=claim-1
   identifiers worker-1
 history dispatch.transition.fail
-  At 2026-10-08 12:03:00 UTC, worker-1 reported failure with outcome_unknown.
+  At 2026-10-08 12:03:00 UTC, it was recorded as failed with outcome_unknown after worker-1 reported its outcome; the record does not say whether worker-1 or Shoal assigned the code.
   record=action:act-1 transition=t-edge principal=worker-1 claim=claim-1
-  identifiers worker-1
+  identifiers worker-1 worker-1
 
 == edge fail alone
 history dispatch.transition.fail
-  At 2026-10-08 12:03:00 UTC, worker-1 reported failure with outcome_unknown.
+  At 2026-10-08 12:03:00 UTC, it was recorded as failed with outcome_unknown after worker-1 reported its outcome; the record does not say whether worker-1 or Shoal assigned the code.
   record=action:act-1 transition=t-edge principal=worker-1 claim=claim-1
-  identifiers worker-1
+  identifiers worker-1 worker-1
 
 == edge fail alone after a lapsed claim
 history dispatch.transition.fail
-  At 2026-10-08 12:03:00 UTC, worker-1 reported failure with outcome_unknown.
+  At 2026-10-08 12:03:00 UTC, it was recorded as failed with outcome_unknown after worker-1 reported its outcome; the record does not say whether worker-1 or Shoal assigned the code.
   record=action:act-1 transition=t-edge principal=worker-1 claim=claim-1
-  identifiers worker-1
+  identifiers worker-1 worker-1
 
 == edge reclaim
 history dispatch.transition.claim_run

@@ -114,29 +114,72 @@ func sourceErrorCodes(t *testing.T) []string {
 	return append(codes, sourceFleetErrorCodes(t)...)
 }
 
+// futureOrigin is an origin no build of fleet writes today: what a record
+// from a newer build could carry. It must render as an omitted origin does.
+const futureOrigin = fleet.ErrorCodeOrigin("gateway")
+
+// wantOrigin is the rendering each origin must take. It is written out here
+// rather than read from errorCodeOrigins, so that changing a decision there —
+// in particular, letting an omitted origin read as the executor's — fails.
+var wantOrigin = map[fleet.ErrorCodeOrigin]Selector{
+	fleet.ErrorCodeOriginUnknown:  OriginEither,
+	fleet.ErrorCodeOriginService:  OriginService,
+	fleet.ErrorCodeOriginExecutor: OriginExecutor,
+	futureOrigin:                  OriginEither,
+}
+
+// errorCodeOriginCases is every ErrorCodeOrigin in fleet's source, read from
+// source, then futureOrigin. An origin fleet adds fails here until wantOrigin
+// (and errorCodeOrigins, by the parity test) decides how it is narrated.
+func errorCodeOriginCases(t *testing.T) []fleet.ErrorCodeOrigin {
+	var out []fleet.ErrorCodeOrigin
+	for _, origin := range sourceErrorCodeOrigins(t) {
+		if _, ok := wantOrigin[fleet.ErrorCodeOrigin(origin)]; !ok {
+			t.Errorf("fleet defines error code origin %q, and nothing here says "+
+				"how it is narrated: decide its templates", origin)
+		}
+		out = append(out, fleet.ErrorCodeOrigin(origin))
+	}
+	return append(out, futureOrigin)
+}
+
+func failedWith(code string, origin fleet.ErrorCodeOrigin) fleet.ActionRecord {
+	record := action(fleet.DispatchFailed)
+	record.ErrorCode = code
+	record.ErrorCodeOrigin = origin
+	return record
+}
+
 func TestCoverageErrorCodes(t *testing.T) {
 	r := newObserved(t)
-	for _, code := range sourceErrorCodes(t) {
-		record := action(fleet.DispatchFailed)
-		record.ErrorCode = code
-		sentences, err := r.Action(record, Options{})
-		noFallback(t, code, sentences, err)
-		found := false
-		for _, s := range sentences {
-			if s.Role == RoleReason && strings.HasPrefix(s.Key, "dispatch.error.") {
-				found = true
-				if !strings.Contains(s.Text, code) {
-					t.Errorf("%s: reason does not name the code: %s", code, s.Text)
+	for _, origin := range errorCodeOriginCases(t) {
+		want := wantOrigin[origin]
+		for _, code := range sourceErrorCodes(t) {
+			what := fmt.Sprintf("%s origin=%q", code, origin)
+			record := failedWith(code, origin)
+			sentences, err := r.Action(record, Options{})
+			noFallback(t, what, sentences, err)
+			stem, _, _ := errorCodeKey(code)
+			found := false
+			for _, s := range sentences {
+				if s.Role == RoleReason && strings.HasPrefix(s.Key, "dispatch.error.") {
+					found = true
+					if s.Key != stem+"."+string(want) {
+						t.Errorf("%s: reason %s, want the %s template", what, s.Key, want)
+					}
+					if !strings.Contains(s.Text, code) {
+						t.Errorf("%s: reason does not name the code: %s", what, s.Text)
+					}
 				}
 			}
+			if !found {
+				t.Errorf("%s: no error reason", what)
+			}
+			history, err := r.ActionHistory([]fleet.ActionTransition{
+				{ID: []byte("t1"), Kind: "action.failed", Record: record},
+			}, Options{})
+			noFallbackHistory(t, what, history, err)
 		}
-		if !found {
-			t.Errorf("%s: no error reason", code)
-		}
-		history, err := r.ActionHistory([]fleet.ActionTransition{
-			{ID: []byte("t1"), Kind: "action.failed", Record: record},
-		}, Options{})
-		noFallbackHistory(t, code, history, err)
 	}
 }
 
@@ -422,11 +465,11 @@ func coverRecords(t *testing.T, r *observed) {
 			}
 		}
 	}
-	for _, code := range sourceErrorCodes(t) {
-		record := action(fleet.DispatchFailed)
-		record.ErrorCode = code
-		if _, err := r.Action(record, Options{}); err != nil {
-			t.Fatal(err)
+	for _, origin := range errorCodeOriginCases(t) {
+		for _, code := range append(sourceErrorCodes(t), "made up by an executor") {
+			if _, err := r.Action(failedWith(code, origin), Options{}); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	for _, edge := range DispatchEdges {
