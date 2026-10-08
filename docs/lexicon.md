@@ -125,6 +125,10 @@ Inside the module, the hook is guarded twice. The sealer is set once:
 `pkg/lexicon` installs it at init, and any later `Install` panics. A test
 walks every Go file in the module and fails if any package other than
 `pkg/lexicon` and `pkg/explorer/authorized` imports `internal/lexiconscope`.
+The walk skips only `.git` and nested modules. It scans `testdata/`,
+`node_modules/`, `vendor/` and dot directories, because Go builds a package
+there when something imports it by path. A synthetic-module test proves an
+importer in each of those places is caught.
 
 **Only a freshly built bundle ships.** `ForShipping` succeeds only for a bundle
 that `Build` made from `ScopedNodes` in this process. A bundle obtained through

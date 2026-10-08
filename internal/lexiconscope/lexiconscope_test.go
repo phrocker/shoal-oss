@@ -63,9 +63,12 @@ func moduleRoot(t *testing.T) string {
 }
 
 // importers lists the module-relative directories of every Go file under
-// root that imports this package. Nested modules (their own go.mod) cannot
-// import a module-internal package and are skipped, as are hidden, testdata
-// and vendor directories.
+// root that imports this package. Only .git and nested modules (directories
+// with their own go.mod, which cannot import a module-internal package) are
+// skipped: Go builds packages under testdata/, node_modules/, vendor/ and dot
+// directories when they are imported by explicit path, so those are scanned.
+// A file whose header does not fully parse still has its parsed imports
+// checked.
 func importers(t *testing.T, root string) []string {
 	t.Helper()
 	found := map[string]bool{}
@@ -76,8 +79,7 @@ func importers(t *testing.T, root string) []string {
 		}
 		if entry.IsDir() {
 			name := entry.Name()
-			if path != root && (strings.HasPrefix(name, ".") || name == "testdata" ||
-				name == "vendor" || name == "node_modules") {
+			if path != root && name == ".git" {
 				return filepath.SkipDir
 			}
 			if path != root {
@@ -90,14 +92,15 @@ func importers(t *testing.T, root string) []string {
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		file, err := parser.ParseFile(fileSet, path, nil, parser.ImportsOnly)
-		if err != nil {
-			return err
+		file, _ := parser.ParseFile(fileSet, path, nil, parser.ImportsOnly)
+		if file == nil {
+			return nil
 		}
 		for _, spec := range file.Imports {
 			imported, err := strconv.Unquote(spec.Path.Value)
 			if err != nil {
-				return err
+				// A spec the parser could not read names no package.
+				continue
 			}
 			if imported == importPath {
 				rel, err := filepath.Rel(root, filepath.Dir(path))
@@ -133,6 +136,48 @@ func TestOnlyLexiconAndAuthorizedImportLexiconScope(t *testing.T) {
 		if !slices.Contains(dirs, dir) {
 			t.Errorf("scan did not find the import in %s; found %q", dir, dirs)
 		}
+	}
+}
+
+// TestImporterWalkCoversDirectoriesGoBuildsByPath runs the walk over a
+// synthetic module with importers where a skip list would miss them.
+func TestImporterWalkCoversDirectoriesGoBuildsByPath(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	importer := func(pkg string) string {
+		return "package " + pkg + "\n\nimport _ \"" + importPath + "\"\n"
+	}
+	write("go.mod", "module example.test\n\ngo 1.25\n")
+	write("pkg/lexicon/ok.go", importer("lexicon"))
+	write("pkg/graph/testdata/evil/evil.go", importer("evil"))
+	write(".hidden/evil/evil.go", importer("evil"))
+	write("web/node_modules/evil/evil.go", importer("evil"))
+	write("vendor/evil/evil.go", importer("evil"))
+	// The import header itself is malformed after the import that matters;
+	// the parser still reports the imports it read.
+	write("broken/evil.go", "package evil\n\nimport (\n\t_ \""+importPath+"\"\n\t!!\n")
+	// Not scanned: .git, and a nested module, which cannot import this
+	// module's internal packages.
+	write(".git/evil/evil.go", importer("evil"))
+	write("nested/go.mod", "module example.test/nested\n")
+	write("nested/evil/evil.go", importer("evil"))
+
+	got := importers(t, root)
+	want := []string{
+		".hidden/evil", "broken", "pkg/graph/testdata/evil", "pkg/lexicon",
+		"vendor/evil", "web/node_modules/evil",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("importers = %q, want %q", got, want)
 	}
 }
 
