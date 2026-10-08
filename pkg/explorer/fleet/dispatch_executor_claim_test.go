@@ -4049,3 +4049,136 @@ func TestAnIdenticalAmbiguityReportIsAReplay(t *testing.T) {
 		})
 	}
 }
+
+// TestAClaimDoesNotRecordTheClaimantsDelegationAsTheEnqueuesIs the secondary
+// half of #460.
+//
+// decisionOperations appends OperationDelegate whenever the decision carries a
+// non-empty OnBehalfOf, and the claim path widened AuthorizedOperations with
+// its whole result. So a delegated worker claiming an action it did not
+// enqueue permanently added delegate to that record — asserting the enqueue
+// was delegated on the strength of who later picked the work up.
+//
+// AuthorizedOperations is the one authorization field still written per
+// transition rather than at creation, which is what makes this reachable;
+// #443 removed the other such write (record.Actor) for closely related
+// reasons. The audit trail is what an operator reads when an external effect
+// may or may not have happened, so a record misdescribing the authority an
+// irreversible action was taken under is the defect, not untidiness.
+func TestAClaimDoesNotRecordTheClaimantsDelegationAsTheEnqueues(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+
+	// The enqueuer is not delegated: the fixture's queued record must not
+	// already carry delegate, or this test cannot tell what the claim added.
+	if containsOperationForTest(
+		fixture.queued.AuthorizedOperations, auth.OperationDelegate) {
+		t.Fatalf("the queued record already records delegation (%v), so this "+
+			"test cannot attribute it to the claim",
+			fixture.queued.AuthorizedOperations)
+	}
+
+	// A worker holding execute and acting on someone's behalf. It holds
+	// delegate as well, because a delegated caller without that standing
+	// cannot learn the action exists at all (#539) — so this is the only
+	// shape the defect occurs in, and the decision legitimately carrying
+	// delegate is exactly why the record wrongly absorbed it.
+	worker, err := fixture.authority.Binder().Bind(
+		context.Background(),
+		dispatchDecisionFor(t, principal{
+			subject: "worker-subject", actor: "worker-actor",
+			request: "worker-request", clientID: "worker-client",
+			onBehalfOf: []shoal.ID{"worker-delegator"},
+		}, auth.OperationExecute, auth.OperationDelegate))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := fixture.service.Claim(worker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	})
+	if err != nil {
+		t.Fatalf("a delegated worker holding execute could not claim: %v", err)
+	}
+
+	if containsOperationForTest(
+		claimed.AuthorizedOperations, auth.OperationDelegate) {
+		t.Fatalf("the claim recorded the claimant's delegation on the "+
+			"record's own authority (%v): the enqueue was not delegated, and "+
+			"this is the field an operator reads to learn under what "+
+			"authority the action was authorized",
+			claimed.AuthorizedOperations)
+	}
+
+	// The operation that did authorize the claim is there, and has to be: the
+	// publisher authorizes a claim event against TransitionOperation and
+	// refuses a publication whose operation is absent from this set, which
+	// comes back as ErrActionCommitted — committed work whose worker is told
+	// to reconcile.
+	if !containsOperationForTest(
+		claimed.AuthorizedOperations, auth.OperationExecute) {
+		t.Fatalf("the claim did not record the operation that authorized it "+
+			"(%v), so its lifecycle events cannot publish",
+			claimed.AuthorizedOperations)
+	}
+	if claimed.TransitionOperation != auth.OperationExecute {
+		t.Fatalf("transition operation = %q, want %q",
+			claimed.TransitionOperation, auth.OperationExecute)
+	}
+
+	// Cancel is not affected and deliberately not changed. It resolves
+	// through authorizedCurrent with requirePrincipal true, so only the
+	// record's own principal reaches it: a delegated canceller is the
+	// delegated enqueuer, whose delegation is already on the record from
+	// creation. A probe here was written, could not be made to reach the
+	// path — a canceller differing from the enqueuer in client ID or chain
+	// gets object_not_found — and was removed rather than weakened into one
+	// that passes without proving anything.
+
+	// And the enqueuer's own delegation is still recorded where it belongs.
+	// Without this the change would read as "delegation is never recorded",
+	// which is a different and wrong fix.
+	delegated := newExecutorClaimFixture(t)
+	enqueuer, err := delegated.authority.Binder().Bind(
+		context.Background(),
+		dispatchDecisionFor(t, principal{
+			subject: "owner", actor: "owner-actor", request: "owner-request",
+			onBehalfOf: []shoal.ID{"owner-delegator"},
+		}, auth.OperationInvoke, auth.OperationDispatch, auth.OperationDelegate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := delegated.service.Enqueue(enqueuer, EnqueueRequest{
+		ID: []byte("delegated-action"), IdempotencyKey: []byte("delegated-key"),
+		AgentID:         delegated.queued.AgentID,
+		AgentGeneration: delegated.queued.AgentGeneration,
+		Capability:      delegated.queued.Capability,
+		Action:          delegated.queued.Action,
+		SourceID:        []byte("source"), PolicyID: []byte("policy"),
+		ObjectID: delegated.queued.ObjectID,
+		Input:    json.RawMessage(`{"value":1}`),
+		Context:  dispatchContext(delegated.now, "owner-request"),
+	})
+	if err != nil {
+		t.Fatalf("a delegated enqueue was refused: %v", err)
+	}
+	if !containsOperationForTest(
+		queued.AuthorizedOperations, auth.OperationDelegate) {
+		t.Fatalf("a delegated enqueue did not record its delegation (%v): "+
+			"creation is where that belongs, because there the delegating "+
+			"decision is the enqueuer's own",
+			queued.AuthorizedOperations)
+	}
+}
+
+func containsOperationForTest(
+	values []auth.Operation, wanted auth.Operation,
+) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
