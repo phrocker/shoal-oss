@@ -1,6 +1,6 @@
 name: Helm chart
 
-# The explorer and llm-proxy templates exist to make a misconfiguration fail at
+# The explorer and llm-gateway templates exist to make a misconfiguration fail at
 # render rather than at runtime in a pod log. A guard that stops firing is
 # invisible: the chart still renders, still installs, and produces a workspace
 # that denies everything or answers nothing — or an enforcement plane that

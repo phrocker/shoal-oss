@@ -1,19 +1,19 @@
-{{- if eq (include "shoal.llmProxyEnabled" .) "true" }}
+{{- if eq (include "shoal.llmGatewayEnabled" .) "true" }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "shoal.llmProxyName" . }}
+  name: {{ include "shoal.llmGatewayName" . }}
   labels:
     {{- include "shoal.labels" . | nindent 4 }}
-    app.kubernetes.io/component: llm-proxy
-  {{- with .Values.llmProxy.service.annotations }}
+    app.kubernetes.io/component: llm-gateway
+  {{- with .Values.llmGateway.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.llmProxy.service.type }}
+  type: {{ .Values.llmGateway.service.type }}
   selector:
-    {{- include "shoal.llmProxySelectorLabels" . | nindent 4 }}
+    {{- include "shoal.llmGatewaySelectorLabels" . | nindent 4 }}
   # One port, and it is not the health port. The probe surface exists for the
   # kubelet, which reaches the pod directly; publishing it would make an
   # unauthenticated endpoint routable in-cluster for no reason. It is also the
@@ -21,6 +21,6 @@ spec:
   # the fewer things that can reach it, the better.
   ports:
     - name: http
-      port: {{ .Values.llmProxy.servicePort }}
+      port: {{ .Values.llmGateway.servicePort }}
       targetPort: http
 {{- end }}

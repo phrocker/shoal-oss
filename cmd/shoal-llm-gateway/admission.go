@@ -49,10 +49,10 @@ import (
 // one is a policy outcome and the other is an outage, and to the caller,
 // because a caller told "denied" will not retry while one told "unavailable"
 // should.
-var ErrPlaneUnreachable = errors.New("shoal-llm-proxy: decision plane unreachable")
+var ErrPlaneUnreachable = errors.New("shoal-llm-gateway: decision plane unreachable")
 
 // ErrDenied means Shoal refused the call.
-var ErrDenied = errors.New("shoal-llm-proxy: admission denied")
+var ErrDenied = errors.New("shoal-llm-gateway: admission denied")
 
 // admissionOutcome mirrors the three answers the seam can give. The proxy
 // compares against these strings rather than importing the fleet package, so a
@@ -206,7 +206,7 @@ func (c *admissionClient) request(
 		Context: requestContextWire{
 			RequestID:     identity.RequestID,
 			CorrelationID: identity.CorrelationID,
-			ReasonCode:    "llm_proxy_call",
+			ReasonCode:    "llm_gateway_call",
 			Deadline:      now.Add(c.lease),
 		},
 		ID:              identity.AdmissionID,
@@ -291,7 +291,7 @@ func (c *admissionClient) report(
 		Context: requestContextWire{
 			RequestID:     identity.RequestID,
 			CorrelationID: identity.CorrelationID,
-			ReasonCode:    "llm_proxy_report",
+			ReasonCode:    "llm_gateway_report",
 			Deadline:      now.Add(c.lease),
 		},
 		Token: token,
@@ -416,7 +416,7 @@ func absoluteURL(raw string) (*url.URL, error) {
 // planeURL applies absoluteURL to the admission plane, with the one
 // acknowledged exception.
 //
-// The chart already has llmProxy.admission.allowPlaintext for a mesh that
+// The chart already has llmGateway.admission.allowPlaintext for a mesh that
 // supplies the transport authentication the scheme would, and asserts that
 // configuration renders — but nothing carried the acknowledgement into the
 // process, so absoluteURL refused it at startup and the documented mesh

@@ -151,7 +151,7 @@ func newTestProxy(t *testing.T, plane *fakePlane, upstream *fakeUpstream) (*prox
 		credential:      func() (string, error) { return "plane-token", nil },
 		agentID:         "agent",
 		agentGeneration: 1,
-		capability:      "llm.proxy", action: "complete",
+		capability:      "llm.gateway", action: "complete",
 		sourceID: []byte("source"), policyID: []byte("policy"),
 		lease: time.Minute,
 	}
@@ -899,7 +899,7 @@ func TestAStreamedResponseReachesTheCallerAsItArrives(t *testing.T) {
 			credential:      func() (string, error) { return "plane-token", nil },
 			agentID:         "agent",
 			agentGeneration: 1,
-			capability:      "llm.proxy", action: "complete",
+			capability:      "llm.gateway", action: "complete",
 			sourceID: []byte("source"), policyID: []byte("policy"),
 			lease: time.Minute,
 		},

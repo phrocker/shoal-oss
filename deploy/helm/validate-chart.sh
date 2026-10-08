@@ -4,10 +4,10 @@
 #
 # Three things are verified, and the third is the one that matters. Rendering
 # and schema-validating the chart proves it produces well-formed Kubernetes
-# objects. But the explorer and llm-proxy templates exist to make a
+# objects. But the explorer and llm-gateway templates exist to make a
 # misconfiguration fail at render rather than at runtime in a pod log, and a
 # guard that stops firing is invisible: the chart renders, installs, and
-# produces a workspace that denies everything or answers nothing — or a proxy
+# produces a workspace that denies everything or answers nothing — or a gateway
 # that passes every probe and refuses every call. So each guard is asserted to
 # refuse, and each valid configuration is asserted to render.
 #
@@ -46,26 +46,26 @@ valid_explorer=(
 # not install as-is. Filling it is what an operator does; this is that.
 explorer_base=(-f "$chart/values-explorer.yaml" "${valid_explorer[@]}")
 
-# A valid LLM proxy configuration, on the same principle: every refusal case
+# A valid LLM gateway configuration, on the same principle: every refusal case
 # below breaks exactly one thing in it.
 #
 # The scope identities are real base64url ("source" and "policy"), because the
 # chart checks the encoding — a stand-in like "src" would make the valid case
 # fail for a reason that has nothing to do with the case under test.
-valid_llm_proxy=(
-  --set llmProxy.enabled=true
-  --set 'llmProxy.allowedHosts={llm.example.test}'
-  --set llmProxy.admission.url=https://shoal.example.test
-  --set llmProxy.admission.credentialSecretName=shoal-admission-token
-  --set llmProxy.upstream.baseURL=https://api.example.test/v1
-  --set llmProxy.upstream.credentialSecretName=shoal-upstream-key
-  --set llmProxy.identity.agentID=Z292ZXJuZWQtcHJveHk
-  --set llmProxy.identity.capability=chat.completions
-  --set llmProxy.identity.action=complete
-  --set llmProxy.identity.sourceID=c291cmNl
-  --set llmProxy.identity.policyID=cG9saWN5
+valid_llm_gateway=(
+  --set llmGateway.enabled=true
+  --set 'llmGateway.allowedHosts={llm.example.test}'
+  --set llmGateway.admission.url=https://shoal.example.test
+  --set llmGateway.admission.credentialSecretName=shoal-admission-token
+  --set llmGateway.upstream.baseURL=https://api.example.test/v1
+  --set llmGateway.upstream.credentialSecretName=shoal-upstream-key
+  --set llmGateway.identity.agentID=Z292ZXJuZWQtcHJveHk
+  --set llmGateway.identity.capability=chat.completions
+  --set llmGateway.identity.action=complete
+  --set llmGateway.identity.sourceID=c291cmNl
+  --set llmGateway.identity.policyID=cG9saWN5
 )
-llm_proxy_base=(-f "$chart/values-llm-proxy.yaml" "${valid_llm_proxy[@]}")
+llm_gateway_base=(-f "$chart/values-llm-gateway.yaml" "${valid_llm_gateway[@]}")
 
 # The same configuration with the admission token coming from a file instead of
 # an environment variable, as a projected ServiceAccount token.
@@ -76,12 +76,12 @@ llm_proxy_base=(-f "$chart/values-llm-proxy.yaml" "${valid_llm_proxy[@]}")
 # is refused, since nothing in the projected form reads it, and leaving it set
 # would make every case below pass or fail for that reason instead of its own.
 valid_token_file=(
-  --set llmProxy.admission.credentialSecretName=
-  --set llmProxy.admission.tokenFile=/var/run/secrets/shoal/token
-  --set llmProxy.admission.tokenAudience=shoal
-  --set llmProxy.serviceAccountName=shoal-llm-proxy
+  --set llmGateway.admission.credentialSecretName=
+  --set llmGateway.admission.tokenFile=/var/run/secrets/shoal/token
+  --set llmGateway.admission.tokenAudience=shoal
+  --set llmGateway.serviceAccountName=shoal-llm-gateway
 )
-token_file_base=("${llm_proxy_base[@]}" "${valid_token_file[@]}")
+token_file_base=("${llm_gateway_base[@]}" "${valid_token_file[@]}")
 
 renders() {
   local description="$1"; shift
@@ -182,7 +182,7 @@ done
 # as INFO and still exits 0 — a check that cannot fail and would also break
 # outright under a helm version that treats it as an error.
 helm lint "$chart" "${explorer_base[@]}" >/dev/null || fail "helm lint values-explorer.yaml"
-helm lint "$chart" "${llm_proxy_base[@]}" >/dev/null || fail "helm lint values-llm-proxy.yaml"
+helm lint "$chart" "${llm_gateway_base[@]}" >/dev/null || fail "helm lint values-llm-gateway.yaml"
 
 note "== every profile renders =="
 for values in values.yaml values-single.yaml values-distributed.yaml values-accumulo.yaml; do
@@ -191,13 +191,13 @@ done
 renders "values-explorer.yaml, filled in" "${explorer_base[@]}"
 renders "storage tier plus explorer" -f "$chart/values.yaml" "${valid_explorer[@]}"
 refuses "values-explorer.yaml as shipped" -f "$chart/values-explorer.yaml"
-renders "values-llm-proxy.yaml, filled in" "${llm_proxy_base[@]}"
-renders "storage tier plus llm proxy" -f "$chart/values.yaml" "${valid_llm_proxy[@]}"
-renders "explorer plus llm proxy" "${explorer_base[@]}" "${valid_llm_proxy[@]}"
-refuses "values-llm-proxy.yaml as shipped" -f "$chart/values-llm-proxy.yaml"
+renders "values-llm-gateway.yaml, filled in" "${llm_gateway_base[@]}"
+renders "storage tier plus llm gateway" -f "$chart/values.yaml" "${valid_llm_gateway[@]}"
+renders "explorer plus llm gateway" "${explorer_base[@]}" "${valid_llm_gateway[@]}"
+refuses "values-llm-gateway.yaml as shipped" -f "$chart/values-llm-gateway.yaml"
 
 note "== the storage profiles are unchanged by the enforcement plane =="
-# The standing guarantee for this chart: work on the explorer and the proxy
+# The standing guarantee for this chart: work on the explorer and the gateway
 # changes nothing for an operator who has not enabled them. Both are off by
 # default and independent of `mode`, so each storage profile must render
 # byte-identically to the baseline — not merely "still render", which is what
@@ -239,14 +239,14 @@ if command -v kubeconform >/dev/null 2>&1; then
     kubeconform -strict -summary - >/dev/null || fail "kubeconform values-explorer.yaml"
   helm template shoal "$chart" -f "$chart/values.yaml" "${valid_explorer[@]}" |
     kubeconform -strict -summary - >/dev/null || fail "kubeconform storage tier plus explorer"
-  helm template shoal "$chart" "${llm_proxy_base[@]}" |
-    kubeconform -strict -summary - >/dev/null || fail "kubeconform values-llm-proxy.yaml"
-  helm template shoal "$chart" "${explorer_base[@]}" "${valid_llm_proxy[@]}" |
-    kubeconform -strict -summary - >/dev/null || fail "kubeconform explorer plus llm proxy"
+  helm template shoal "$chart" "${llm_gateway_base[@]}" |
+    kubeconform -strict -summary - >/dev/null || fail "kubeconform values-llm-gateway.yaml"
+  helm template shoal "$chart" "${explorer_base[@]}" "${valid_llm_gateway[@]}" |
+    kubeconform -strict -summary - >/dev/null || fail "kubeconform explorer plus llm gateway"
   # The file form renders a volume, a mount and an fsGroup the env form does
   # not, so it is a different object shape and needs its own schema pass.
   helm template shoal "$chart" "${token_file_base[@]}" |
-    kubeconform -strict -summary - >/dev/null || fail "kubeconform llm proxy with a projected token"
+    kubeconform -strict -summary - >/dev/null || fail "kubeconform llm gateway with a projected token"
 else
   note "  skipped: kubeconform is not on PATH"
 fi
@@ -389,119 +389,134 @@ assert_renders "both ceilings on separate references" "\-fleet-external-egress-e
 assert_renders "the ask executor beside a gateway" "\-fleet-external-executor-refs=deploy\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
 assert_renders "and the ask binding survives it" "\-fleet-ask-executor-ref=ask\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
 
-note "== llm proxy guards refuse =="
-# The proxy's failure mode is not a crash. It is required to fail closed, so
+note "== llm gateway guards refuse =="
+# The gateway's failure mode is not a crash. It is required to fail closed, so
 # nearly every misconfiguration below renders a pod that passes every probe and
 # denies every call — which from outside is a total outage of whatever is
 # configured to go through it. That is what these move to render time.
-refuses "no admission URL"              "${llm_proxy_base[@]}" --set llmProxy.admission.url=
-refuses "blank admission URL"           "${llm_proxy_base[@]}" --set llmProxy.admission.url=" "
-refuses "admission URL with no scheme"  "${llm_proxy_base[@]}" --set llmProxy.admission.url=shoal.example.test
-refuses "plaintext remote admission"    "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://shoal.example.test
-refuses "no admission token env"        "${llm_proxy_base[@]}" --set llmProxy.admission.tokenEnv=
-refuses "blank admission token env"     "${llm_proxy_base[@]}" --set llmProxy.admission.tokenEnv=" "
-refuses "no admission credential"       "${llm_proxy_base[@]}" --set llmProxy.admission.credentialSecretName=
-refuses "blank admission credential"    "${llm_proxy_base[@]}" --set llmProxy.admission.credentialSecretName=" "
-refuses "no admission credential key"   "${llm_proxy_base[@]}" --set llmProxy.admission.credentialSecretKey=
+refuses_citing "llmProxy has been renamed to llmGateway" \
+  "the pre-rename llmProxy key still enabled" -f "$chart/values.yaml" --set llmProxy.enabled=true
+refuses_citing "llmProxy has been renamed to llmGateway" \
+  "settings left under llmProxy beside an enabled llmGateway" "${llm_gateway_base[@]}" \
+  --set llmProxy.upstream.requestTimeout=30s
+refuses_citing "llmProxy has been renamed to llmGateway" \
+  "a scalar llmProxy" -f "$chart/values.yaml" --set llmProxy=true
+renders "a null llmProxy is ignored"     "${llm_gateway_base[@]}" --set llmProxy=null
+renders "an empty llmProxy is ignored"   "${llm_gateway_base[@]}" --set-json 'llmProxy={}'
+renders "a disabled llmProxy is ignored" "${llm_gateway_base[@]}" --set llmProxy.enabled=false
+renders "an old values dump with llmProxy disabled is ignored" "${llm_gateway_base[@]}" \
+  --set llmProxy.enabled=false,llmProxy.replicas=2,llmProxy.upstream.requestTimeout=30s
+refuses_citing "llmProxy has been renamed to llmGateway" \
+  "a string enabled under llmProxy is not a disabled one" -f "$chart/values.yaml" \
+  --set-string llmProxy.enabled=false
+refuses "no admission URL"              "${llm_gateway_base[@]}" --set llmGateway.admission.url=
+refuses "blank admission URL"           "${llm_gateway_base[@]}" --set llmGateway.admission.url=" "
+refuses "admission URL with no scheme"  "${llm_gateway_base[@]}" --set llmGateway.admission.url=shoal.example.test
+refuses "plaintext remote admission"    "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://shoal.example.test
+refuses "no admission token env"        "${llm_gateway_base[@]}" --set llmGateway.admission.tokenEnv=
+refuses "blank admission token env"     "${llm_gateway_base[@]}" --set llmGateway.admission.tokenEnv=" "
+refuses "no admission credential"       "${llm_gateway_base[@]}" --set llmGateway.admission.credentialSecretName=
+refuses "blank admission credential"    "${llm_gateway_base[@]}" --set llmGateway.admission.credentialSecretName=" "
+refuses "no admission credential key"   "${llm_gateway_base[@]}" --set llmGateway.admission.credentialSecretKey=
 # MaxActionClaimTTL is five minutes and the admission surface refuses a request
 # outside it, so a longer lease is not a longer lease — it is every call denied.
-refuses "lease above MaxActionClaimTTL" "${llm_proxy_base[@]}" --set llmProxy.admission.lease=10m
-refuses "lease at 5m plus a second"     "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m1s
-refuses "zero lease"                    "${llm_proxy_base[@]}" --set llmProxy.admission.lease=0s
+refuses "lease above MaxActionClaimTTL" "${llm_gateway_base[@]}" --set llmGateway.admission.lease=10m
+refuses "lease at 5m plus a second"     "${llm_gateway_base[@]}" --set llmGateway.admission.lease=5m1s
+refuses "zero lease"                    "${llm_gateway_base[@]}" --set llmGateway.admission.lease=0s
 # The duration parser, from both sides. Each of these is a value whose leading
 # characters do parse — "30sec" scans as 30s, "1.5m" as 5m — so dropping the
 # parser's refusal makes them render rather than trip a neighbouring guard.
 # That is what makes them attribute to the parser and not to something else.
-refuses "unparseable lease"             "${llm_proxy_base[@]}" --set llmProxy.admission.lease=30sec
-refuses "fractional lease"              "${llm_proxy_base[@]}" --set llmProxy.admission.lease=1.5m
-refuses "unparseable request timeout"   "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=30sec
-refuses "unitless lease"                "${llm_proxy_base[@]}" --set llmProxy.admission.lease=30
-refuses "no upstream base URL"          "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=
-refuses "blank upstream base URL"       "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=" "
-refuses "upstream URL with no scheme"   "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=api.example.test/v1
-refuses "no upstream api key env"       "${llm_proxy_base[@]}" --set llmProxy.upstream.apiKeyEnv=
-refuses "remote upstream, no credential" "${llm_proxy_base[@]}" --set llmProxy.upstream.credentialSecretName=
-refuses "upstream credential, no key"   "${llm_proxy_base[@]}" --set llmProxy.upstream.credentialSecretKey=
+refuses "unparseable lease"             "${llm_gateway_base[@]}" --set llmGateway.admission.lease=30sec
+refuses "fractional lease"              "${llm_gateway_base[@]}" --set llmGateway.admission.lease=1.5m
+refuses "unparseable request timeout"   "${llm_gateway_base[@]}" --set llmGateway.upstream.requestTimeout=30sec
+refuses "unitless lease"                "${llm_gateway_base[@]}" --set llmGateway.admission.lease=30
+refuses "no upstream base URL"          "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=
+refuses "blank upstream base URL"       "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=" "
+refuses "upstream URL with no scheme"   "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=api.example.test/v1
+refuses "no upstream api key env"       "${llm_gateway_base[@]}" --set llmGateway.upstream.apiKeyEnv=
+refuses "remote upstream, no credential" "${llm_gateway_base[@]}" --set llmGateway.upstream.credentialSecretName=
+refuses "upstream credential, no key"   "${llm_gateway_base[@]}" --set llmGateway.upstream.credentialSecretKey=
 # A call that outlives its lease is performed under a token that can no longer
 # be reported against: the admission is abandoned, not resolved.
-refuses "timeout outlives the lease"    "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=90s
-refuses "unbounded upstream request"    "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=0s
-refuses "no allowed hosts"              "${llm_proxy_base[@]}" --set llmProxy.allowedHosts=null
-refuses "blank allowed host only"       "${llm_proxy_base[@]}" --set 'llmProxy.allowedHosts={ }'
-refuses "no agent id"                   "${llm_proxy_base[@]}" --set llmProxy.identity.agentID=
-refuses "blank agent id"                "${llm_proxy_base[@]}" --set llmProxy.identity.agentID=" "
-refuses "no capability"                 "${llm_proxy_base[@]}" --set llmProxy.identity.capability=
-refuses "no action"                     "${llm_proxy_base[@]}" --set llmProxy.identity.action=
-refuses "no source id"                  "${llm_proxy_base[@]}" --set llmProxy.identity.sourceID=
-refuses "no policy id"                  "${llm_proxy_base[@]}" --set llmProxy.identity.policyID=
-refuses "zero agent generation"         "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=0
-refuses "negative agent generation"     "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=-1
-refuses "source id is not base64url"    "${llm_proxy_base[@]}" --set 'llmProxy.identity.sourceID=source/one'
-refuses "padded policy id"              "${llm_proxy_base[@]}" --set 'llmProxy.identity.policyID=cG9saWN5=='
-refuses "truncated source id"           "${llm_proxy_base[@]}" --set llmProxy.identity.sourceID=c291cmNlZ
-refuses "placeholder admission URL"     "${llm_proxy_base[@]}" --set llmProxy.admission.url=https://REPLACE_ME/
-refuses "placeholder allowed host"      "${llm_proxy_base[@]}" --set 'llmProxy.allowedHosts={REPLACE_ME.example.test}'
-# A placeholder identity is the dangerous case: the proxy comes up, passes every
+refuses "timeout outlives the lease"    "${llm_gateway_base[@]}" --set llmGateway.upstream.requestTimeout=90s
+refuses "unbounded upstream request"    "${llm_gateway_base[@]}" --set llmGateway.upstream.requestTimeout=0s
+refuses "no allowed hosts"              "${llm_gateway_base[@]}" --set llmGateway.allowedHosts=null
+refuses "blank allowed host only"       "${llm_gateway_base[@]}" --set 'llmGateway.allowedHosts={ }'
+refuses "no agent id"                   "${llm_gateway_base[@]}" --set llmGateway.identity.agentID=
+refuses "blank agent id"                "${llm_gateway_base[@]}" --set llmGateway.identity.agentID=" "
+refuses "no capability"                 "${llm_gateway_base[@]}" --set llmGateway.identity.capability=
+refuses "no action"                     "${llm_gateway_base[@]}" --set llmGateway.identity.action=
+refuses "no source id"                  "${llm_gateway_base[@]}" --set llmGateway.identity.sourceID=
+refuses "no policy id"                  "${llm_gateway_base[@]}" --set llmGateway.identity.policyID=
+refuses "zero agent generation"         "${llm_gateway_base[@]}" --set llmGateway.identity.agentGeneration=0
+refuses "negative agent generation"     "${llm_gateway_base[@]}" --set llmGateway.identity.agentGeneration=-1
+refuses "source id is not base64url"    "${llm_gateway_base[@]}" --set 'llmGateway.identity.sourceID=source/one'
+refuses "padded policy id"              "${llm_gateway_base[@]}" --set 'llmGateway.identity.policyID=cG9saWN5=='
+refuses "truncated source id"           "${llm_gateway_base[@]}" --set llmGateway.identity.sourceID=c291cmNlZ
+refuses "placeholder admission URL"     "${llm_gateway_base[@]}" --set llmGateway.admission.url=https://REPLACE_ME/
+refuses "placeholder allowed host"      "${llm_gateway_base[@]}" --set 'llmGateway.allowedHosts={REPLACE_ME.example.test}'
+# A placeholder identity is the dangerous case: the gateway comes up, passes every
 # probe, and is refused by the plane on every request while the chart reports
 # success.
-refuses "placeholder capability"        "${llm_proxy_base[@]}" --set llmProxy.identity.capability=REPLACE_ME
-refuses "placeholder upstream URL"      "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=https://REPLACE_ME/v1
-refuses "health port collides"          "${llm_proxy_base[@]}" --set llmProxy.healthPort=8100
-refuses "privileged listen port"        "${llm_proxy_base[@]}" --set llmProxy.containerPort=80
-refuses "privileged health port"        "${llm_proxy_base[@]}" --set llmProxy.healthPort=81
-refuses "port out of range"             "${llm_proxy_base[@]}" --set llmProxy.servicePort=70000
-refuses "negative replicas"             "${llm_proxy_base[@]}" --set llmProxy.replicas=-1
-refuses "fractional replicas"           "${llm_proxy_base[@]}" --set llmProxy.replicas=1.5
-refuses "null replicas"                 "${llm_proxy_base[@]}" --set llmProxy.replicas=null
+refuses "placeholder capability"        "${llm_gateway_base[@]}" --set llmGateway.identity.capability=REPLACE_ME
+refuses "placeholder upstream URL"      "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=https://REPLACE_ME/v1
+refuses "health port collides"          "${llm_gateway_base[@]}" --set llmGateway.healthPort=8100
+refuses "privileged listen port"        "${llm_gateway_base[@]}" --set llmGateway.containerPort=80
+refuses "privileged health port"        "${llm_gateway_base[@]}" --set llmGateway.healthPort=81
+refuses "port out of range"             "${llm_gateway_base[@]}" --set llmGateway.servicePort=70000
+refuses "negative replicas"             "${llm_gateway_base[@]}" --set llmGateway.replicas=-1
+refuses "fractional replicas"           "${llm_gateway_base[@]}" --set llmGateway.replicas=1.5
+refuses "null replicas"                 "${llm_gateway_base[@]}" --set llmGateway.replicas=null
 # The mirror image of the explorer's rule. A budget that refuses every eviction
 # protects a singleton; this is not one, so it only wedges drains.
-refuses "singleton disruption budget"   "${llm_proxy_base[@]}" --set llmProxy.podDisruptionBudget.maxUnavailable=0
+refuses "singleton disruption budget"   "${llm_gateway_base[@]}" --set llmGateway.podDisruptionBudget.maxUnavailable=0
 # A key written with nothing after it is nil, not "". `toString nil` is the
 # string "<nil>", which is non-blank — so a required-value check that does not
 # normalize first reads an absent value as configured and renders the pod with
 # an empty flag. These were observed rendering before `default ""` went in
 # ahead of every `trim`, which is the whole reason they are pinned here.
-refuses "null admission URL"            "${llm_proxy_base[@]}" --set llmProxy.admission.url=null
-refuses "null admission token env"      "${llm_proxy_base[@]}" --set llmProxy.admission.tokenEnv=null
-refuses "null admission credential"     "${llm_proxy_base[@]}" --set llmProxy.admission.credentialSecretName=null
-refuses "null lease"                    "${llm_proxy_base[@]}" --set llmProxy.admission.lease=null
-refuses "null upstream base URL"        "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=null
-refuses "null upstream api key env"     "${llm_proxy_base[@]}" --set llmProxy.upstream.apiKeyEnv=null
-refuses "null request timeout"          "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=null
-refuses "null agent id"                 "${llm_proxy_base[@]}" --set llmProxy.identity.agentID=null
-refuses "null capability"               "${llm_proxy_base[@]}" --set llmProxy.identity.capability=null
-refuses "null action"                   "${llm_proxy_base[@]}" --set llmProxy.identity.action=null
-refuses "null source id"                "${llm_proxy_base[@]}" --set llmProxy.identity.sourceID=null
-refuses "null agent generation"         "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=null
+refuses "null admission URL"            "${llm_gateway_base[@]}" --set llmGateway.admission.url=null
+refuses "null admission token env"      "${llm_gateway_base[@]}" --set llmGateway.admission.tokenEnv=null
+refuses "null admission credential"     "${llm_gateway_base[@]}" --set llmGateway.admission.credentialSecretName=null
+refuses "null lease"                    "${llm_gateway_base[@]}" --set llmGateway.admission.lease=null
+refuses "null upstream base URL"        "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=null
+refuses "null upstream api key env"     "${llm_gateway_base[@]}" --set llmGateway.upstream.apiKeyEnv=null
+refuses "null request timeout"          "${llm_gateway_base[@]}" --set llmGateway.upstream.requestTimeout=null
+refuses "null agent id"                 "${llm_gateway_base[@]}" --set llmGateway.identity.agentID=null
+refuses "null capability"               "${llm_gateway_base[@]}" --set llmGateway.identity.capability=null
+refuses "null action"                   "${llm_gateway_base[@]}" --set llmGateway.identity.action=null
+refuses "null source id"                "${llm_gateway_base[@]}" --set llmGateway.identity.sourceID=null
+refuses "null agent generation"         "${llm_gateway_base[@]}" --set llmGateway.identity.agentGeneration=null
 
-note "== llm proxy valid configurations still render =="
-# The proxy is stateless and must not be a singleton: the explorer refuses
-# replicas above 1 and the proxy must not, so scaling out is asserted to render
+note "== llm gateway valid configurations still render =="
+# The gateway is stateless and must not be a singleton: the explorer refuses
+# replicas above 1 and the gateway must not, so scaling out is asserted to render
 # rather than merely left unforbidden.
-renders "scaled out to ten"                 "${llm_proxy_base[@]}" --set llmProxy.replicas=10
-renders "scaled to zero"                    "${llm_proxy_base[@]}" --set llmProxy.replicas=0
-renders "loopback upstream needs no credential" "${llm_proxy_base[@]}" --set llmProxy.upstream.credentialSecretName=,llmProxy.upstream.baseURL=http://localhost:11434/v1
-renders "plaintext admission acknowledged"  "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://shoal-explorer:8098,llmProxy.admission.allowPlaintext=true
-renders "loopback admission needs no acknowledgement" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.0.0.1:8098
+renders "scaled out to ten"                 "${llm_gateway_base[@]}" --set llmGateway.replicas=10
+renders "scaled to zero"                    "${llm_gateway_base[@]}" --set llmGateway.replicas=0
+renders "loopback upstream needs no credential" "${llm_gateway_base[@]}" --set llmGateway.upstream.credentialSecretName=,llmGateway.upstream.baseURL=http://localhost:11434/v1
+renders "plaintext admission acknowledged"  "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://shoal-explorer:8098,llmGateway.admission.allowPlaintext=true
+renders "loopback admission needs no acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://127.0.0.1:8098
 # The fleet's claim ceiling is the upper bound, and the report window is the
 # lower one. A lease equal to the timeout is refused, not accepted: the binary
 # refuses that pair at startup, so rendering it would produce a pod that never
 # serves — which is the failure these guards exist to move to render time.
-# The grace period moves with the lease, because the proxy drains for the lease:
+# The grace period moves with the lease, because the gateway drains for the lease:
 # at the 5m ceiling the shipped 75s grace period is refused, and that refusal is
 # asserted below rather than worked around here.
-renders "lease at the ceiling with room to report" "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=4m,llmProxy.terminationGracePeriodSeconds=305
-refuses "lease equal to the timeout"        "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=5m
-refuses "lease inside the report window"    "${llm_proxy_base[@]}" --set llmProxy.admission.lease=35s,llmProxy.upstream.requestTimeout=31s
-renders "compound durations"                "${llm_proxy_base[@]}" --set llmProxy.admission.lease=2m30s,llmProxy.upstream.requestTimeout=1m30s,llmProxy.terminationGracePeriodSeconds=155
-refuses "timeout equal to the lease"        "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=60s
-renders "millisecond timeout"               "${llm_proxy_base[@]}" --set llmProxy.upstream.requestTimeout=500ms
-renders "disruption budget disabled"        "${llm_proxy_base[@]}" --set llmProxy.podDisruptionBudget.enabled=false,llmProxy.podDisruptionBudget.maxUnavailable=0
-renders "operator-supplied affinity"        "${llm_proxy_base[@]}" --set 'llmProxy.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/os' --set 'llmProxy.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In' --set 'llmProxy.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values={linux}'
-renders "several allowed hosts, trimmed"    "${llm_proxy_base[@]}" --set 'llmProxy.allowedHosts={ llm.example.test , llm-internal.example.test }'
+renders "lease at the ceiling with room to report" "${llm_gateway_base[@]}" --set llmGateway.admission.lease=5m,llmGateway.upstream.requestTimeout=4m,llmGateway.terminationGracePeriodSeconds=305
+refuses "lease equal to the timeout"        "${llm_gateway_base[@]}" --set llmGateway.admission.lease=5m,llmGateway.upstream.requestTimeout=5m
+refuses "lease inside the report window"    "${llm_gateway_base[@]}" --set llmGateway.admission.lease=35s,llmGateway.upstream.requestTimeout=31s
+renders "compound durations"                "${llm_gateway_base[@]}" --set llmGateway.admission.lease=2m30s,llmGateway.upstream.requestTimeout=1m30s,llmGateway.terminationGracePeriodSeconds=155
+refuses "timeout equal to the lease"        "${llm_gateway_base[@]}" --set llmGateway.upstream.requestTimeout=60s
+renders "millisecond timeout"               "${llm_gateway_base[@]}" --set llmGateway.upstream.requestTimeout=500ms
+renders "disruption budget disabled"        "${llm_gateway_base[@]}" --set llmGateway.podDisruptionBudget.enabled=false,llmGateway.podDisruptionBudget.maxUnavailable=0
+renders "operator-supplied affinity"        "${llm_gateway_base[@]}" --set 'llmGateway.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=kubernetes.io/os' --set 'llmGateway.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In' --set 'llmGateway.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values={linux}'
+renders "several allowed hosts, trimmed"    "${llm_gateway_base[@]}" --set 'llmGateway.allowedHosts={ llm.example.test , llm-internal.example.test }'
 
 note "== the grace period covers the drain =="
-# The proxy drains for the lease on SIGTERM, because the lease is the bound on
+# The gateway drains for the lease on SIGTERM, because the lease is the bound on
 # an admitted call's whole lifetime including its report. terminationGracePeriod
 # is the kubelet's budget for that window, so a grace period inside it is a
 # SIGKILL mid-drain: the calls killed are exactly the ones whose egress has
@@ -510,24 +525,24 @@ note "== the grace period covers the drain =="
 #
 # The shipped values did this — 45 against a 60s lease — which is why the
 # default moved and why both sides of the boundary are pinned here.
-refuses "grace period below the lease"      "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=30
-refuses "grace period equal to the lease"   "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=60
+refuses "grace period below the lease"      "${llm_gateway_base[@]}" --set llmGateway.terminationGracePeriodSeconds=30
+refuses "grace period equal to the lease"   "${llm_gateway_base[@]}" --set llmGateway.terminationGracePeriodSeconds=60
 # One second apart, on either side of the required 5s margin. A guard that only
 # refused a grace period *below* the lease would pass the first of these, and
 # the pod would be killed while the drain still had five seconds of work.
-refuses "grace period one second inside the margin" "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=64
-renders "grace period exactly the margin above the lease" "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=65
-refuses "the shipped grace period against a ceiling lease" "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=4m
-renders "a ceiling lease with the grace period raised" "${llm_proxy_base[@]}" --set llmProxy.admission.lease=5m,llmProxy.upstream.requestTimeout=4m,llmProxy.terminationGracePeriodSeconds=305
-refuses "zero grace period"                 "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=0
+refuses "grace period one second inside the margin" "${llm_gateway_base[@]}" --set llmGateway.terminationGracePeriodSeconds=64
+renders "grace period exactly the margin above the lease" "${llm_gateway_base[@]}" --set llmGateway.terminationGracePeriodSeconds=65
+refuses "the shipped grace period against a ceiling lease" "${llm_gateway_base[@]}" --set llmGateway.admission.lease=5m,llmGateway.upstream.requestTimeout=4m
+renders "a ceiling lease with the grace period raised" "${llm_gateway_base[@]}" --set llmGateway.admission.lease=5m,llmGateway.upstream.requestTimeout=4m,llmGateway.terminationGracePeriodSeconds=305
+refuses "zero grace period"                 "${llm_gateway_base[@]}" --set llmGateway.terminationGracePeriodSeconds=0
 # Cited, because a value that is not a number casts to 0 and is then refused by
 # the drain guard above as well.
-refuses_citing "must be a whole number of seconds" "null grace period" "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=null
-refuses_citing "must be a whole number of seconds" "negative grace period" "${llm_proxy_base[@]}" --set llmProxy.terminationGracePeriodSeconds=-1
+refuses_citing "must be a whole number of seconds" "null grace period" "${llm_gateway_base[@]}" --set llmGateway.terminationGracePeriodSeconds=null
+refuses_citing "must be a whole number of seconds" "negative grace period" "${llm_gateway_base[@]}" --set llmGateway.terminationGracePeriodSeconds=-1
 # A float that is comfortably above the lease, via --set-json for the reason the
 # token lifetime needs it: this is the only shape the whole-number guard alone
 # catches, because it casts to 75 and clears the drain guard.
-refuses_citing "must be a whole number of seconds" "fractional grace period" "${llm_proxy_base[@]}" --set-json 'llmProxy.terminationGracePeriodSeconds=75.5'
+refuses_citing "must be a whole number of seconds" "fractional grace period" "${llm_gateway_base[@]}" --set-json 'llmGateway.terminationGracePeriodSeconds=75.5'
 
 note "== the admission token file form =="
 # The file form exists because a rotating credential is a file: the kubelet
@@ -541,185 +556,185 @@ renders "a projected ServiceAccount token"  "${token_file_base[@]}"
 # than against emptiness, so the default being present is not a second choice.
 # If it were, the file form would be unreachable without also blanking the env
 # key, and this case is what proves the chart kept that property.
-renders "the file form with tokenEnv at its default" "${token_file_base[@]}" --set llmProxy.admission.tokenEnv=SHOAL_ADMISSION_TOKEN
-renders "the file form with tokenEnv blanked" "${token_file_base[@]}" --set llmProxy.admission.tokenEnv=
-refuses "both token forms chosen explicitly" "${token_file_base[@]}" --set llmProxy.admission.tokenEnv=OTHER_VAR
+renders "the file form with tokenEnv at its default" "${token_file_base[@]}" --set llmGateway.admission.tokenEnv=SHOAL_ADMISSION_TOKEN
+renders "the file form with tokenEnv blanked" "${token_file_base[@]}" --set llmGateway.admission.tokenEnv=
+refuses "both token forms chosen explicitly" "${token_file_base[@]}" --set llmGateway.admission.tokenEnv=OTHER_VAR
 # Blank and absent are the env form, not a broken file form — so these render
 # against the base's Secret rather than being refused. Without them, reading
 # `tokenFile` as configured-when-whitespace would be invisible.
-renders "a blank token file is the env form" "${llm_proxy_base[@]}" --set 'llmProxy.admission.tokenFile= '
-renders "a null token file is the env form"  "${llm_proxy_base[@]}" --set llmProxy.admission.tokenFile=null
-refuses "a relative token file"             "${token_file_base[@]}" --set llmProxy.admission.tokenFile=secrets/token
-refuses "a token file at the filesystem root" "${token_file_base[@]}" --set llmProxy.admission.tokenFile=/token
+renders "a blank token file is the env form" "${llm_gateway_base[@]}" --set 'llmGateway.admission.tokenFile= '
+renders "a null token file is the env form"  "${llm_gateway_base[@]}" --set llmGateway.admission.tokenFile=null
+refuses "a relative token file"             "${token_file_base[@]}" --set llmGateway.admission.tokenFile=secrets/token
+refuses "a token file at the filesystem root" "${token_file_base[@]}" --set llmGateway.admission.tokenFile=/token
 # Cited, not merely refused: an unrecognised source leaves the audience set with
 # no projection to bind it to, so the audience guard refuses these too and a
 # bare `refuses` would pass with the source guard deleted.
-refuses_citing "tokenFileSource must be projected" "an unknown token file source" "${token_file_base[@]}" --set llmProxy.admission.tokenFileSource=serviceaccount
-refuses_citing "tokenFileSource must be projected" "a null token file source" "${token_file_base[@]}" --set llmProxy.admission.tokenFileSource=null
-refuses_citing "tokenFileSource must be projected" "a blank token file source" "${token_file_base[@]}" --set 'llmProxy.admission.tokenFileSource= '
+refuses_citing "tokenFileSource must be projected" "an unknown token file source" "${token_file_base[@]}" --set llmGateway.admission.tokenFileSource=serviceaccount
+refuses_citing "tokenFileSource must be projected" "a null token file source" "${token_file_base[@]}" --set llmGateway.admission.tokenFileSource=null
+refuses_citing "tokenFileSource must be projected" "a blank token file source" "${token_file_base[@]}" --set 'llmGateway.admission.tokenFileSource= '
 # A Secret named where nothing reads it is the invisible credential the binary
 # refuses two token flags over: the operator believes one thing is presented and
 # another is, and the symptom names neither.
-refuses "a projected token with an admission Secret" "${token_file_base[@]}" --set llmProxy.admission.credentialSecretName=shoal-admission-token
-refuses "an operator volume with an admission Secret" "${token_file_base[@]}" --set llmProxy.admission.tokenFileSource=volume,llmProxy.admission.tokenAudience=,llmProxy.admission.credentialSecretName=shoal-admission-token --set 'llmProxy.admission.tokenVolume.csi.driver=csi.spiffe.io'
+refuses "a projected token with an admission Secret" "${token_file_base[@]}" --set llmGateway.admission.credentialSecretName=shoal-admission-token
+refuses "an operator volume with an admission Secret" "${token_file_base[@]}" --set llmGateway.admission.tokenFileSource=volume,llmGateway.admission.tokenAudience=,llmGateway.admission.credentialSecretName=shoal-admission-token --set 'llmGateway.admission.tokenVolume.csi.driver=csi.spiffe.io'
 # Without an audience the projected token is issued for the cluster's own API
 # server, which the explorer is not: a 401 on every admission request.
-refuses "a projected token with no audience" "${token_file_base[@]}" --set llmProxy.admission.tokenAudience=
-refuses "a projected token with a blank audience" "${token_file_base[@]}" --set 'llmProxy.admission.tokenAudience= '
-refuses "a projected token with a placeholder audience" "${token_file_base[@]}" --set llmProxy.admission.tokenAudience=REPLACE_ME
-refuses "a placeholder token file"          "${token_file_base[@]}" --set llmProxy.admission.tokenFile=/var/run/REPLACE_ME/token
+refuses "a projected token with no audience" "${token_file_base[@]}" --set llmGateway.admission.tokenAudience=
+refuses "a projected token with a blank audience" "${token_file_base[@]}" --set 'llmGateway.admission.tokenAudience= '
+refuses "a projected token with a placeholder audience" "${token_file_base[@]}" --set llmGateway.admission.tokenAudience=REPLACE_ME
+refuses "a placeholder token file"          "${token_file_base[@]}" --set llmGateway.admission.tokenFile=/var/run/REPLACE_ME/token
 # A projected token's subject is the pod's ServiceAccount. Left implicit it is
-# the namespace's `default`, so authorizing the proxy authorizes every pod in
+# the namespace's `default`, so authorizing the gateway authorizes every pod in
 # the namespace.
-refuses "a projected token with no ServiceAccount" "${token_file_base[@]}" --set llmProxy.serviceAccountName=
-refuses "a projected token with a blank ServiceAccount" "${token_file_base[@]}" --set 'llmProxy.serviceAccountName= '
-renders "default named explicitly as the ServiceAccount" "${token_file_base[@]}" --set llmProxy.serviceAccountName=default
+refuses "a projected token with no ServiceAccount" "${token_file_base[@]}" --set llmGateway.serviceAccountName=
+refuses "a projected token with a blank ServiceAccount" "${token_file_base[@]}" --set 'llmGateway.serviceAccountName= '
+renders "default named explicitly as the ServiceAccount" "${token_file_base[@]}" --set llmGateway.serviceAccountName=default
 # 600 is the API server's floor for a token projection. Below it the Deployment
 # is accepted and no pod is ever created from it, which is a rollout that never
 # completes and no pod log to read at all.
-refuses "a token lifetime below the API server floor" "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=599
-refuses "a zero token lifetime"             "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=0
-refuses "a negative token lifetime"         "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=-1
+refuses "a token lifetime below the API server floor" "${token_file_base[@]}" --set llmGateway.admission.tokenExpirationSeconds=599
+refuses "a zero token lifetime"             "${token_file_base[@]}" --set llmGateway.admission.tokenExpirationSeconds=0
+refuses "a negative token lifetime"         "${token_file_base[@]}" --set llmGateway.admission.tokenExpirationSeconds=-1
 # Cited for the reason above, from the other side: anything non-numeric casts to
 # 0, so the floor guard refuses all of these as well.
-refuses_citing "must be a whole number of seconds" "a null token lifetime" "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=null
-refuses_citing "must be a whole number of seconds" "an unparseable token lifetime" "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=1h
+refuses_citing "must be a whole number of seconds" "a null token lifetime" "${token_file_base[@]}" --set llmGateway.admission.tokenExpirationSeconds=null
+refuses_citing "must be a whole number of seconds" "an unparseable token lifetime" "${token_file_base[@]}" --set llmGateway.admission.tokenExpirationSeconds=1h
 # --set-json, because --set cannot express a float: it parses what it can as an
 # integer and keeps the rest as a string, and a string casts to 0 and lands on
 # the floor guard. A real fractional value is the one shape only the
 # whole-number guard can catch — it casts to a perfectly acceptable 600 — and
 # a values file can hold one, so the fixture has to be able to say it.
-refuses_citing "must be a whole number of seconds" "a fractional token lifetime" "${token_file_base[@]}" --set-json 'llmProxy.admission.tokenExpirationSeconds=600.5'
-renders "a token lifetime at the floor"     "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=600
-renders "a day-long token lifetime"         "${token_file_base[@]}" --set llmProxy.admission.tokenExpirationSeconds=86400
+refuses_citing "must be a whole number of seconds" "a fractional token lifetime" "${token_file_base[@]}" --set-json 'llmGateway.admission.tokenExpirationSeconds=600.5'
+renders "a token lifetime at the floor"     "${token_file_base[@]}" --set llmGateway.admission.tokenExpirationSeconds=600
+renders "a day-long token lifetime"         "${token_file_base[@]}" --set llmGateway.admission.tokenExpirationSeconds=86400
 # The file form with a loopback upstream is the one configuration where nothing
 # at all goes into the environment. `env:` with no entries under it is YAML
 # null, which the API server rejects as not a list, so the key has to be omitted
 # rather than emptied — and this is the only case that renders it.
 loopback_token_file=(
   "${token_file_base[@]}"
-  --set llmProxy.upstream.credentialSecretName=
-  --set llmProxy.upstream.baseURL=http://localhost:11434/v1
+  --set llmGateway.upstream.credentialSecretName=
+  --set llmGateway.upstream.baseURL=http://localhost:11434/v1
 )
 renders "a token file with nothing in the environment" "${loopback_token_file[@]}"
 
 # The Secret-as-a-file source. Worth having rather than redundant with the env
-# form: the kubelet updates a mounted Secret's contents in place and the proxy
+# form: the kubelet updates a mounted Secret's contents in place and the gateway
 # re-reads per request, so rotating the value takes effect without rolling the
 # pod — which an environment variable cannot do at all.
 secret_file=(
-  "${llm_proxy_base[@]}"
-  --set llmProxy.admission.tokenFile=/etc/shoal/admission/token
-  --set llmProxy.admission.tokenFileSource=secret
+  "${llm_gateway_base[@]}"
+  --set llmGateway.admission.tokenFile=/etc/shoal/admission/token
+  --set llmGateway.admission.tokenFileSource=secret
 )
 renders "the admission Secret mounted as a file" "${secret_file[@]}"
-refuses "a Secret file source with no Secret" "${secret_file[@]}" --set llmProxy.admission.credentialSecretName=
-refuses "a Secret file source with no key"  "${secret_file[@]}" --set llmProxy.admission.credentialSecretKey=
+refuses "a Secret file source with no Secret" "${secret_file[@]}" --set llmGateway.admission.credentialSecretName=
+refuses "a Secret file source with no key"  "${secret_file[@]}" --set llmGateway.admission.credentialSecretKey=
 # An audience names the verifier a projected token is minted for. With this
 # source nothing issues a token, so a value here records a binding that exists
 # nowhere in the deployment.
-refuses "a Secret file source with an audience" "${secret_file[@]}" --set llmProxy.admission.tokenAudience=shoal
+refuses "a Secret file source with an audience" "${secret_file[@]}" --set llmGateway.admission.tokenAudience=shoal
 # The lifetime is only consulted for a projection, so a bad one here must not
 # refuse: a guard that fired anyway would be refusing a configuration that works.
-renders "a Secret file source ignores the token lifetime" "${secret_file[@]}" --set llmProxy.admission.tokenExpirationSeconds=1
+renders "a Secret file source ignores the token lifetime" "${secret_file[@]}" --set llmGateway.admission.tokenExpirationSeconds=1
 
 # The operator-supplied volume: the seam for a CSI driver the chart does not
 # model. It can check only the two things that make the volume unusable rather
 # than merely unknown.
 operator_volume=(
-  "${llm_proxy_base[@]}"
-  --set llmProxy.admission.credentialSecretName=
-  --set llmProxy.admission.tokenFile=/var/run/spiffe/token
-  --set llmProxy.admission.tokenFileSource=volume
+  "${llm_gateway_base[@]}"
+  --set llmGateway.admission.credentialSecretName=
+  --set llmGateway.admission.tokenFile=/var/run/spiffe/token
+  --set llmGateway.admission.tokenFileSource=volume
 )
-renders "an operator-supplied CSI token volume" "${operator_volume[@]}" --set 'llmProxy.admission.tokenVolume.csi.driver=csi.spiffe.io' --set 'llmProxy.admission.tokenVolume.csi.readOnly=true'
+renders "an operator-supplied CSI token volume" "${operator_volume[@]}" --set 'llmGateway.admission.tokenVolume.csi.driver=csi.spiffe.io' --set 'llmGateway.admission.tokenVolume.csi.readOnly=true'
 # Cited: with the guard gone the chart renders a volume whose source is an empty
 # flow mapping, which Helm refuses while parsing its own output — so the case
 # would pass for a reason that has nothing to do with the guard.
 refuses_citing "tokenVolume is required" "a volume source with no volume" "${operator_volume[@]}"
-refuses "a volume source that names itself" "${operator_volume[@]}" --set 'llmProxy.admission.tokenVolume.name=my-token' --set 'llmProxy.admission.tokenVolume.csi.driver=csi.spiffe.io'
-refuses "a volume source with an audience"  "${operator_volume[@]}" --set llmProxy.admission.tokenAudience=shoal --set 'llmProxy.admission.tokenVolume.csi.driver=csi.spiffe.io'
+refuses "a volume source that names itself" "${operator_volume[@]}" --set 'llmGateway.admission.tokenVolume.name=my-token' --set 'llmGateway.admission.tokenVolume.csi.driver=csi.spiffe.io'
+refuses "a volume source with an audience"  "${operator_volume[@]}" --set llmGateway.admission.tokenAudience=shoal --set 'llmGateway.admission.tokenVolume.csi.driver=csi.spiffe.io'
 
 # The env form's own guards still own the env form, which is what makes
 # relaxing them for the file form safe. Each of these is already asserted above
-# against llm_proxy_base; the point here is that the file form does not silently
+# against llm_gateway_base; the point here is that the file form does not silently
 # relax them for everyone.
-renders "the env form still needs no volume" "${llm_proxy_base[@]}"
-refuses "the env form still needs a Secret"  "${llm_proxy_base[@]}" --set llmProxy.admission.credentialSecretName=
-refuses "the env form still needs a variable" "${llm_proxy_base[@]}" --set llmProxy.admission.tokenEnv=
+renders "the env form still needs no volume" "${llm_gateway_base[@]}"
+refuses "the env form still needs a Secret"  "${llm_gateway_base[@]}" --set llmGateway.admission.credentialSecretName=
+refuses "the env form still needs a variable" "${llm_gateway_base[@]}" --set llmGateway.admission.tokenEnv=
 
 note "== the transport acknowledgement, and the one hop that has none =="
 # The acknowledgement is a flag now, because it was a values key that reached
 # nothing: the binary refuses a remote http:// admission URL without it, so the
 # documented mesh deployment rendered cleanly and produced CrashLoopBackOff.
-renders "plaintext admission acknowledged, as a flag" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://shoal-explorer:8098,llmProxy.admission.allowPlaintext=true
+renders "plaintext admission acknowledged, as a flag" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://shoal-explorer:8098,llmGateway.admission.allowPlaintext=true
 # It is rendered verbatim into a boolean flag, so a YAML word that is not a
 # boolean is a pod that exits on a flag error.
-refuses "a non-boolean plaintext acknowledgement" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://shoal-explorer:8098 --set-string llmProxy.admission.allowPlaintext=yes
+refuses "a non-boolean plaintext acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://shoal-explorer:8098 --set-string llmGateway.admission.allowPlaintext=yes
 # And the upstream hop has no acknowledgement at all: it carries the prompt and
 # the provider credential, so a mesh authenticating the hop to the explorer says
 # nothing about it. allowPlaintext must not open this one.
-refuses "a plaintext remote upstream" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://api.example.test/v1
-refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the admission acknowledgement" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://api.example.test/v1,llmProxy.admission.allowPlaintext=true
-renders "a loopback provider over http"     "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://localhost:11434/v1,llmProxy.upstream.credentialSecretName=
+refuses "a plaintext remote upstream" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://api.example.test/v1
+refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the admission acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://api.example.test/v1,llmGateway.admission.allowPlaintext=true
+renders "a loopback provider over http"     "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://localhost:11434/v1,llmGateway.upstream.credentialSecretName=
 
 note "== the declared model list =="
 # Empty is valid: every model is then reported as "other", which is what keeps
 # caller text out of the declaration without configuration.
-renders "no models named"        "${llm_proxy_base[@]}"
-renders "one model named"        "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o}'
-renders "several models named"   "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o,claude-opus-5}'
+renders "no models named"        "${llm_gateway_base[@]}"
+renders "one model named"        "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o}'
+renders "several models named"   "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o,claude-opus-5}'
 # Blank entries are dropped rather than rendered, since the list is joined into
 # one argument and a comma pair is an empty model name to the binary.
-assert_renders "a blank model entry is dropped" "\-model=gpt-4o$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o, }'
-assert_renders "models render as one joined argument" "\-model=gpt-4o,claude-opus-5$" "${llm_proxy_base[@]}" --set 'llmProxy.models={gpt-4o,claude-opus-5}'
-assert_renders "no models renders an empty flag" "\-model=$" "${llm_proxy_base[@]}"
+assert_renders "a blank model entry is dropped" "\-model=gpt-4o$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o, }'
+assert_renders "models render as one joined argument" "\-model=gpt-4o,claude-opus-5$" "${llm_gateway_base[@]}" --set 'llmGateway.models={gpt-4o,claude-opus-5}'
+assert_renders "no models renders an empty flag" "\-model=$" "${llm_gateway_base[@]}"
 
 note "== rollout and disruption values are validated as written =="
 # These reach the API server verbatim, and their only guard cast to int first —
 # which is where the value escapes. int 1.5 is 1 and int -1 is -1, so a guard
 # asking "did it cast to zero" approves both: the chart reports success and the
 # API server rejects the object at install or upgrade time.
-refuses_citing "non-negative whole number" "a fractional rollout surge" "${llm_proxy_base[@]}" --set-json llmProxy.strategy.maxSurge=1.5
-refuses_citing "non-negative whole number" "a negative rollout surge" "${llm_proxy_base[@]}" --set llmProxy.strategy.maxSurge=-1
-refuses_citing "non-negative whole number" "a fractional rollout maxUnavailable" "${llm_proxy_base[@]}" --set-json llmProxy.strategy.maxUnavailable=1.5
-refuses_citing "non-negative whole number" "a negative rollout maxUnavailable" "${llm_proxy_base[@]}" --set llmProxy.strategy.maxUnavailable=-1
-refuses_citing "non-negative whole number" "a fractional disruption budget" "${llm_proxy_base[@]}" --set-json llmProxy.podDisruptionBudget.maxUnavailable=1.5
-refuses_citing "non-negative whole number" "a negative disruption budget" "${llm_proxy_base[@]}" --set llmProxy.podDisruptionBudget.maxUnavailable=-1
-refuses_citing "non-negative whole number" "a nonsense rollout value" "${llm_proxy_base[@]}" --set-string llmProxy.strategy.maxSurge=lots
+refuses_citing "non-negative whole number" "a fractional rollout surge" "${llm_gateway_base[@]}" --set-json llmGateway.strategy.maxSurge=1.5
+refuses_citing "non-negative whole number" "a negative rollout surge" "${llm_gateway_base[@]}" --set llmGateway.strategy.maxSurge=-1
+refuses_citing "non-negative whole number" "a fractional rollout maxUnavailable" "${llm_gateway_base[@]}" --set-json llmGateway.strategy.maxUnavailable=1.5
+refuses_citing "non-negative whole number" "a negative rollout maxUnavailable" "${llm_gateway_base[@]}" --set llmGateway.strategy.maxUnavailable=-1
+refuses_citing "non-negative whole number" "a fractional disruption budget" "${llm_gateway_base[@]}" --set-json llmGateway.podDisruptionBudget.maxUnavailable=1.5
+refuses_citing "non-negative whole number" "a negative disruption budget" "${llm_gateway_base[@]}" --set llmGateway.podDisruptionBudget.maxUnavailable=-1
+refuses_citing "non-negative whole number" "a nonsense rollout value" "${llm_gateway_base[@]}" --set-string llmGateway.strategy.maxSurge=lots
 # Both at zero is accepted by the API server and then never progresses: nothing
 # may be added and nothing taken down, so every upgrade hangs with no event
 # saying why. A values file that zeroes the surge "to be careful" produces it.
-refuses_citing "cannot both be 0" "a rollout that cannot start" "${llm_proxy_base[@]}" --set llmProxy.strategy.maxSurge=0,llmProxy.strategy.maxUnavailable=0
+refuses_citing "cannot both be 0" "a rollout that cannot start" "${llm_gateway_base[@]}" --set llmGateway.strategy.maxSurge=0,llmGateway.strategy.maxUnavailable=0
 # Percentages are an IntOrString and must still render, as must the shipped
 # pair — a guard that refuses the chart's own defaults is the first thing to
 # get wrong here, and did: Helm's "default" treats 0 as empty.
-renders "percentage rollout values"   "${llm_proxy_base[@]}" --set-string llmProxy.strategy.maxSurge=25%,llmProxy.strategy.maxUnavailable=0%
-renders "a percentage disruption budget" "${llm_proxy_base[@]}" --set-string llmProxy.podDisruptionBudget.maxUnavailable=50%
-renders "the shipped rollout pair"    "${llm_proxy_base[@]}" --set llmProxy.strategy.maxSurge=1,llmProxy.strategy.maxUnavailable=0
-renders "a larger surge"              "${llm_proxy_base[@]}" --set llmProxy.strategy.maxSurge=3,llmProxy.strategy.maxUnavailable=1
+renders "percentage rollout values"   "${llm_gateway_base[@]}" --set-string llmGateway.strategy.maxSurge=25%,llmGateway.strategy.maxUnavailable=0%
+renders "a percentage disruption budget" "${llm_gateway_base[@]}" --set-string llmGateway.podDisruptionBudget.maxUnavailable=50%
+renders "the shipped rollout pair"    "${llm_gateway_base[@]}" --set llmGateway.strategy.maxSurge=1,llmGateway.strategy.maxUnavailable=0
+renders "a larger surge"              "${llm_gateway_base[@]}" --set llmGateway.strategy.maxSurge=3,llmGateway.strategy.maxUnavailable=1
 # Zero is judged on what was written, so "0%" is zero and "50%" is not. The
 # pre-existing guard cast to int first, and int of "50%" is 0 — so a valid
 # percentage budget was refused as if it blocked every eviction, which is the
 # same cast-before-validating flaw one line further on.
-refuses_citing "must not be 0" "a disruption budget of 0%" "${llm_proxy_base[@]}" --set-string llmProxy.podDisruptionBudget.maxUnavailable=0%
-refuses_citing "cannot both be 0" "a rollout zeroed as percentages" "${llm_proxy_base[@]}" --set-string llmProxy.strategy.maxSurge=0%,llmProxy.strategy.maxUnavailable=0%
+refuses_citing "must not be 0" "a disruption budget of 0%" "${llm_gateway_base[@]}" --set-string llmGateway.podDisruptionBudget.maxUnavailable=0%
+refuses_citing "cannot both be 0" "a rollout zeroed as percentages" "${llm_gateway_base[@]}" --set-string llmGateway.strategy.maxSurge=0%,llmGateway.strategy.maxUnavailable=0%
 
 note "== a credential path names a file, not a directory =="
 # A trailing slash passes an absolute-path test and is not a file. The chart
 # derives the mount from the directory and the projected item from the base, so
 # "/var/run/secrets/shoal/" renders that exact flag while the credential lands
-# at "/var/run/secrets/shoal/shoal" — the proxy then opens a directory on every
+# at "/var/run/secrets/shoal/shoal" — the gateway then opens a directory on every
 # request, and the pod passes both probes while denying every call.
-refuses_citing "must name a file" "a token path with a trailing slash" "${token_file_base[@]}" --set 'llmProxy.admission.tokenFile=/var/run/secrets/shoal/'
+refuses_citing "must name a file" "a token path with a trailing slash" "${token_file_base[@]}" --set 'llmGateway.admission.tokenFile=/var/run/secrets/shoal/'
 # The matching upstream case lives with the upstream key fixture further down:
 # these arrays are ordinary shell arrays, so using one above its definition
-# expands to nothing and renders a chart with the proxy disabled — which is a
+# expands to nothing and renders a chart with the gateway disabled — which is a
 # check that cannot fail, in a script rather than in Go this time.
 #
 # The same path without the slash still renders, or the guard refuses the
 # feature.
-renders "a token path naming a file"  "${token_file_base[@]}" --set 'llmProxy.admission.tokenFile=/var/run/secrets/shoal/token'
+renders "a token path naming a file"  "${token_file_base[@]}" --set 'llmGateway.admission.tokenFile=/var/run/secrets/shoal/token'
 assert_renders "and the flag matches the mount" "admission-token-file=/var/run/secrets/shoal/token$" "${token_file_base[@]}"
 
 note "== no Kubernetes API credential in the prompt-processing pod =="
@@ -727,11 +742,11 @@ note "== no Kubernetes API credential in the prompt-processing pod =="
 # provider, and touches the API server nowhere. The automatic mount put a token
 # for its ServiceAccount on the filesystem anyway, so a compromise of the one
 # process in this chart that parses arbitrary caller input inherited whatever
-# RBAC the account carries — the opposite of the reason the proxy is a separate
+# RBAC the account carries — the opposite of the reason the gateway is a separate
 # process from the workspace at all.
-assert_renders "the automatic token mount is off in the env form" "automountServiceAccountToken: false" "${llm_proxy_base[@]}"
+assert_renders "the automatic token mount is off in the env form" "automountServiceAccountToken: false" "${llm_gateway_base[@]}"
 assert_renders "the automatic token mount is off in the file form" "automountServiceAccountToken: false" "${token_file_base[@]}"
-assert_renders "the automatic token mount is off with an operator volume" "automountServiceAccountToken: false" "${operator_volume[@]}" --set 'llmProxy.admission.tokenVolume.secret.secretName=shoal-admission-token' --set 'llmProxy.admission.tokenVolume.secret.defaultMode=288' --set 'llmProxy.admission.tokenVolume.secret.items[0].key=token' --set 'llmProxy.admission.tokenVolume.secret.items[0].path=token'
+assert_renders "the automatic token mount is off with an operator volume" "automountServiceAccountToken: false" "${operator_volume[@]}" --set 'llmGateway.admission.tokenVolume.secret.secretName=shoal-admission-token' --set 'llmGateway.admission.tokenVolume.secret.defaultMode=288' --set 'llmGateway.admission.tokenVolume.secret.items[0].key=token' --set 'llmGateway.admission.tokenVolume.secret.items[0].path=token'
 # The pairing that looks like it should conflict and does not: suppressing the
 # automatic mount leaves an explicitly declared serviceAccountToken projection
 # alone, and the kubelet still mints it. Asserted rather than assumed, because
@@ -747,68 +762,68 @@ note "== both URLs are parsed, not prefix-matched =="
 #
 # Scheme present, host absent. The prefix matched, the binary refused it for
 # having no host, and the pod went into CrashLoopBackOff.
-refuses_citing "with a host" "an admission URL with a scheme and no host" "${llm_proxy_base[@]}" --set llmProxy.admission.url=https://
-refuses_citing "with a host" "an upstream URL with a scheme and no host" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=https://
+refuses_citing "with a host" "an admission URL with a scheme and no host" "${llm_gateway_base[@]}" --set llmGateway.admission.url=https://
+refuses_citing "with a host" "an upstream URL with a scheme and no host" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=https://
 # A host that merely begins with "localhost". The prefix form read this as
 # loopback and exempted a remote plaintext hop from the rule entirely — the
 # direction that matters, since it waved through what the rule exists to stop.
-refuses_citing "is plaintext to a non-loopback decision plane" "an admission host that only starts with localhost" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://localhost.example:8098
-refuses_citing "is plaintext to a remote provider" "an upstream host that only starts with localhost" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://localhost.example:11434/v1,llmProxy.upstream.credentialSecretName=
+refuses_citing "is plaintext to a non-loopback decision plane" "an admission host that only starts with localhost" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://localhost.example:8098
+refuses_citing "is plaintext to a remote provider" "an upstream host that only starts with localhost" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://localhost.example:11434/v1,llmGateway.upstream.credentialSecretName=
 # A scheme-relative URL has a host and no scheme, and is not absolute.
-refuses_citing "with a host" "a scheme-relative admission URL" "${llm_proxy_base[@]}" --set llmProxy.admission.url=//shoal-explorer:8098
-refuses_citing "with a host" "a non-HTTP scheme" "${llm_proxy_base[@]}" --set llmProxy.admission.url=ftp://shoal-explorer:8098
+refuses_citing "with a host" "a scheme-relative admission URL" "${llm_gateway_base[@]}" --set llmGateway.admission.url=//shoal-explorer:8098
+refuses_citing "with a host" "a non-HTTP scheme" "${llm_gateway_base[@]}" --set llmGateway.admission.url=ftp://shoal-explorer:8098
 # And the loopback forms the binary accepts must all still render, or parsing
 # has traded one disagreement for another. isLoopback there is EqualFold on
 # "localhost" plus net.IP.IsLoopback, so the whole 127.0.0.0/8 block counts and
 # case does not.
-renders "a loopback admission URL in upper case" "${llm_proxy_base[@]}" --set llmProxy.admission.url=HTTP://LOCALHOST:8098
-renders "an admission URL elsewhere in 127.0.0.0/8" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.5.5.5:8098
-renders "an IPv6 loopback admission URL" "${llm_proxy_base[@]}" --set 'llmProxy.admission.url=http://[::1]:8098'
-renders "an IPv6 loopback upstream" "${llm_proxy_base[@]}" --set 'llmProxy.upstream.baseURL=http://[::1]:11434/v1' --set llmProxy.upstream.credentialSecretName=
-renders "an https URL with a port and a path" "${llm_proxy_base[@]}" --set llmProxy.admission.url=https://shoal.example.test:8443/base
+renders "a loopback admission URL in upper case" "${llm_gateway_base[@]}" --set llmGateway.admission.url=HTTP://LOCALHOST:8098
+renders "an admission URL elsewhere in 127.0.0.0/8" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://127.5.5.5:8098
+renders "an IPv6 loopback admission URL" "${llm_gateway_base[@]}" --set 'llmGateway.admission.url=http://[::1]:8098'
+renders "an IPv6 loopback upstream" "${llm_gateway_base[@]}" --set 'llmGateway.upstream.baseURL=http://[::1]:11434/v1' --set llmGateway.upstream.credentialSecretName=
+renders "an https URL with a port and a path" "${llm_gateway_base[@]}" --set llmGateway.admission.url=https://shoal.example.test:8443/base
 # Loopback is matched as an address, not as a "127." prefix. The prefix form
 # classified the DNS name 127.example.com as loopback and exempted it from the
 # plaintext rule, which the binary then refuses at startup — the same
 # chart-approves-what-the-binary-refuses failure the parsing was meant to end.
-refuses_citing "is plaintext to a non-loopback decision plane" "a DNS name beginning with 127." "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.example.com:8098
-refuses_citing "is plaintext to a remote provider" "an upstream DNS name beginning with 127." "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://127.example.com:11434/v1,llmProxy.upstream.credentialSecretName=
+refuses_citing "is plaintext to a non-loopback decision plane" "a DNS name beginning with 127." "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://127.example.com:8098
+refuses_citing "is plaintext to a remote provider" "an upstream DNS name beginning with 127." "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://127.example.com:11434/v1,llmGateway.upstream.credentialSecretName=
 # Each octet is bounded, because net.ParseIP refuses this and a loose \d{1,3}
 # would approve it.
-refuses_citing "is plaintext to a non-loopback decision plane" "an octet above 255" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.0.0.256:8098
+refuses_citing "is plaintext to a non-loopback decision plane" "an octet above 255" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://127.0.0.256:8098
 # Go refuses the short form too, so a full dotted quad is required.
-refuses_citing "is plaintext to a non-loopback decision plane" "a short-form loopback address" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.1:8098
+refuses_citing "is plaintext to a non-loopback decision plane" "a short-form loopback address" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://127.1:8098
 # And the whole block still counts, as net.IP.IsLoopback has it.
-renders "the lowest address in 127.0.0.0/8" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://127.0.0.0:8098
-renders "the expanded IPv6 loopback spelling" "${llm_proxy_base[@]}" --set 'llmProxy.admission.url=http://[0:0:0:0:0:0:0:1]:8098'
+renders "the lowest address in 127.0.0.0/8" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://127.0.0.0:8098
+renders "the expanded IPv6 loopback spelling" "${llm_gateway_base[@]}" --set 'llmGateway.admission.url=http://[0:0:0:0:0:0:0:1]:8098'
 
 note "== values rendered verbatim are validated as written =="
 # Each of these is written into an argument or a port declaration unchanged, so
 # a guard that converts before testing passes a value the flag parser or the API
 # server then rejects. int64 of 1.5 is a positive 1; int of 8100.5 is 8100.
-refuses "a fractional agent generation"     "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=1.5
+refuses "a fractional agent generation"     "${llm_gateway_base[@]}" --set llmGateway.identity.agentGeneration=1.5
 # --set-string, because --set normalises 010 to 10 and the fixture would then be
 # unable to express the condition it is named for. Written as a string it
 # renders as 010, which Go parses as octal 8 — a generation nothing registered.
-refuses "an agent generation with a leading zero" "${llm_proxy_base[@]}" --set-string llmProxy.identity.agentGeneration=010
-refuses "an agent generation past the int64 maximum" "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=9223372036854775808
-refuses "a twenty-digit agent generation"   "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=99999999999999999999
-renders "the largest int64 agent generation" "${llm_proxy_base[@]}" --set llmProxy.identity.agentGeneration=9223372036854775807
+refuses "an agent generation with a leading zero" "${llm_gateway_base[@]}" --set-string llmGateway.identity.agentGeneration=010
+refuses "an agent generation past the int64 maximum" "${llm_gateway_base[@]}" --set llmGateway.identity.agentGeneration=9223372036854775808
+refuses "a twenty-digit agent generation"   "${llm_gateway_base[@]}" --set llmGateway.identity.agentGeneration=99999999999999999999
+renders "the largest int64 agent generation" "${llm_gateway_base[@]}" --set llmGateway.identity.agentGeneration=9223372036854775807
 # Cited: a non-numeric port casts to 0 and the range guard refuses it too, so
 # only a float can attribute to the whole-number guard — and only --set-json can
 # express one.
-refuses_citing "llmProxy.containerPort must be a whole number" "a fractional container port" "${llm_proxy_base[@]}" --set-json 'llmProxy.containerPort=8100.5'
-refuses_citing "llmProxy.servicePort must be a whole number" "a fractional service port" "${llm_proxy_base[@]}" --set-json 'llmProxy.servicePort=8100.5'
+refuses_citing "llmGateway.containerPort must be a whole number" "a fractional container port" "${llm_gateway_base[@]}" --set-json 'llmGateway.containerPort=8100.5'
+refuses_citing "llmGateway.servicePort must be a whole number" "a fractional service port" "${llm_gateway_base[@]}" --set-json 'llmGateway.servicePort=8100.5'
 
 note "== the agent id is an encoding, not a name =="
 # The workspace decodes this field and the binary refuses an undecodable value
 # at startup. The guard reaches encoding mistakes and not the class: a readable
 # name that happens to decode is indistinguishable from a registered ID here.
-refuses "an agent id that is not base64url" "${llm_proxy_base[@]}" --set 'llmProxy.identity.agentID=governed/proxy'
-refuses "a padded agent id"                 "${llm_proxy_base[@]}" --set 'llmProxy.identity.agentID=Z292ZXJuZWQtcHJveHk='
-refuses "a truncated agent id"              "${llm_proxy_base[@]}" --set llmProxy.identity.agentID=Z292ZXJuZWQtcHJveHkBC
+refuses "an agent id that is not base64url" "${llm_gateway_base[@]}" --set 'llmGateway.identity.agentID=governed/gateway'
+refuses "a padded agent id"                 "${llm_gateway_base[@]}" --set 'llmGateway.identity.agentID=Z292ZXJuZWQtcHJveHk='
+refuses "a truncated agent id"              "${llm_gateway_base[@]}" --set llmGateway.identity.agentID=Z292ZXJuZWQtcHJveHkBC
 # The documented limit, pinned so nobody later claims the guard catches it: a
 # display name of exactly the right shape decodes to garbage and renders.
-renders "a readable agent id that happens to decode" "${llm_proxy_base[@]}" --set llmProxy.identity.agentID=gateway
+renders "a readable agent id that happens to decode" "${llm_gateway_base[@]}" --set llmGateway.identity.agentID=gateway
 
 note "== the upstream credential file form =="
 # The same reasoning as the admission token, applied to the provider key: an
@@ -816,53 +831,53 @@ note "== the upstream credential file form =="
 # container's environment is fixed after start. A Secret mounted as a volume is
 # updated in place and the per-request read picks it up.
 upstream_key_file=(
-  "${llm_proxy_base[@]}"
-  --set llmProxy.upstream.apiKeyFile=/etc/shoal/upstream/api-key
-  --set llmProxy.upstream.apiKeyFileSource=secret
+  "${llm_gateway_base[@]}"
+  --set llmGateway.upstream.apiKeyFile=/etc/shoal/upstream/api-key
+  --set llmGateway.upstream.apiKeyFileSource=secret
 )
 renders "the provider key mounted as a file" "${upstream_key_file[@]}"
-renders "the upstream file form with apiKeyEnv at its default" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyEnv=SHOAL_UPSTREAM_API_KEY
+renders "the upstream file form with apiKeyEnv at its default" "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyEnv=SHOAL_UPSTREAM_API_KEY
 # Blanking the variable is the other way to say "use the file", and it has to
 # render: the binary only refuses a *changed* variable name beside a file.
-renders "the upstream file form with apiKeyEnv blanked" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyEnv=
-refuses "both upstream key forms chosen explicitly" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyEnv=OTHER_VAR
+renders "the upstream file form with apiKeyEnv blanked" "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyEnv=
+refuses "both upstream key forms chosen explicitly" "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyEnv=OTHER_VAR
 # A trailing slash is the token path's problem too; see that section. The chart
 # derives the mount from the directory and the item from the base, so the flag
 # would name a directory while the credential landed inside it.
-refuses_citing "must name a file" "a key path with a trailing slash" "${upstream_key_file[@]}" --set 'llmProxy.upstream.apiKeyFile=/var/run/secrets/upstream/'
+refuses_citing "must name a file" "a key path with a trailing slash" "${upstream_key_file[@]}" --set 'llmGateway.upstream.apiKeyFile=/var/run/secrets/upstream/'
 assert_renders "the key flag matches its mount" "upstream-api-key-file=/etc/shoal/upstream/api-key$" "${upstream_key_file[@]}"
-refuses "a relative upstream key file"      "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyFile=upstream/api-key
-refuses "an upstream key file at the filesystem root" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyFile=/api-key
+refuses "a relative upstream key file"      "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyFile=upstream/api-key
+refuses "an upstream key file at the filesystem root" "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyFile=/api-key
 # Cited: with the source guard gone the chart renders an empty volume source,
 # which Helm refuses while parsing its own output.
-refuses_citing "apiKeyFileSource must be secret or volume" "an unknown upstream key file source" "${upstream_key_file[@]}" --set llmProxy.upstream.apiKeyFileSource=projected
+refuses_citing "apiKeyFileSource must be secret or volume" "an unknown upstream key file source" "${upstream_key_file[@]}" --set llmGateway.upstream.apiKeyFileSource=projected
 # Against a loopback provider, so the remote-credential rule above cannot be
 # what refuses it: the Secret source with no Secret is its own failure.
-refuses "a Secret source for the provider key with no Secret" "${upstream_key_file[@]}" --set llmProxy.upstream.baseURL=http://localhost:11434/v1,llmProxy.upstream.credentialSecretName=
-refuses "a Secret source for the provider key with no key" "${upstream_key_file[@]}" --set llmProxy.upstream.credentialSecretKey=
+refuses "a Secret source for the provider key with no Secret" "${upstream_key_file[@]}" --set llmGateway.upstream.baseURL=http://localhost:11434/v1,llmGateway.upstream.credentialSecretName=
+refuses "a Secret source for the provider key with no key" "${upstream_key_file[@]}" --set llmGateway.upstream.credentialSecretKey=
 upstream_key_volume=(
-  "${llm_proxy_base[@]}"
-  --set llmProxy.upstream.credentialSecretName=
-  --set llmProxy.upstream.apiKeyFile=/etc/shoal/upstream/api-key
-  --set llmProxy.upstream.apiKeyFileSource=volume
+  "${llm_gateway_base[@]}"
+  --set llmGateway.upstream.credentialSecretName=
+  --set llmGateway.upstream.apiKeyFile=/etc/shoal/upstream/api-key
+  --set llmGateway.upstream.apiKeyFileSource=volume
 )
 # The relaxation that makes the volume source worth having: a remote provider
 # with no Secret anywhere must render, or a CSI-delivered credential is
 # unexpressible and the guard is a guard against the feature.
-renders "a remote provider whose key comes from a CSI volume" "${upstream_key_volume[@]}" --set 'llmProxy.upstream.apiKeyVolume.csi.driver=secrets-store.csi.k8s.io' --set 'llmProxy.upstream.apiKeyVolume.csi.readOnly=true'
+renders "a remote provider whose key comes from a CSI volume" "${upstream_key_volume[@]}" --set 'llmGateway.upstream.apiKeyVolume.csi.driver=secrets-store.csi.k8s.io' --set 'llmGateway.upstream.apiKeyVolume.csi.readOnly=true'
 refuses_citing "apiKeyVolume is required" "an upstream volume source with no volume" "${upstream_key_volume[@]}"
-refuses "an upstream volume source that names itself" "${upstream_key_volume[@]}" --set 'llmProxy.upstream.apiKeyVolume.name=my-key' --set 'llmProxy.upstream.apiKeyVolume.csi.driver=secrets-store.csi.k8s.io'
+refuses "an upstream volume source that names itself" "${upstream_key_volume[@]}" --set 'llmGateway.upstream.apiKeyVolume.name=my-key' --set 'llmGateway.upstream.apiKeyVolume.csi.driver=secrets-store.csi.k8s.io'
 # Both credentials from files is the configuration the mount paths collide in.
 both_files=(
   "${token_file_base[@]}"
-  --set llmProxy.upstream.apiKeyFile=/etc/shoal/upstream/api-key
-  --set llmProxy.upstream.apiKeyFileSource=secret
+  --set llmGateway.upstream.apiKeyFile=/etc/shoal/upstream/api-key
+  --set llmGateway.upstream.apiKeyFileSource=secret
 )
 renders "both credentials from files in separate directories" "${both_files[@]}"
-refuses "both credentials from files in one directory" "${both_files[@]}" --set llmProxy.upstream.apiKeyFile=/var/run/secrets/shoal/api-key
+refuses "both credentials from files in one directory" "${both_files[@]}" --set llmGateway.upstream.apiKeyFile=/var/run/secrets/shoal/api-key
 # Including the case where they are the same file, which is the same refusal
 # and the one an operator reaches by copying the path.
-refuses "both credentials from the same file" "${both_files[@]}" --set llmProxy.upstream.apiKeyFile=/var/run/secrets/shoal/token
+refuses "both credentials from the same file" "${both_files[@]}" --set llmGateway.upstream.apiKeyFile=/var/run/secrets/shoal/token
 
 note "== the probe surface is wired end to end =="
 # Three separate things have to agree, and the pod never becomes ready if any
@@ -920,9 +935,9 @@ raise SystemExit(1 if problems else 0)
   fail "the explorer probe surface is not wired end to end (see above)"
 fi
 
-note "== the llm proxy is wired end to end =="
+note "== the llm gateway is wired end to end =="
 # Same end-to-end rule as the explorer's check above, plus the second listener
-# the proxy has: the one carrying traffic.
+# the gateway has: the one carrying traffic.
 #
 # The trap this is written against is real and was hit on the explorer: a check
 # that asserted only that the probes *name* the health port passed a chart whose
@@ -944,10 +959,10 @@ note "== the llm proxy is wired end to end =="
 # a 421 to every request, produced by a space in a YAML list. Trimming in the
 # guard but not in the argument would let the chart pass its own check and
 # render exactly that, so the arguments are asserted to come out trimmed.
-if ! helm template shoal "$chart" "${llm_proxy_base[@]}" \
-  --set 'llmProxy.allowedHosts={ llm.example.test ,, llm-internal.example.test }' \
-  --set 'llmProxy.admission.url= https://shoal.example.test ' \
-  --set 'llmProxy.identity.capability= chat.completions ' | python3 -c '
+if ! helm template shoal "$chart" "${llm_gateway_base[@]}" \
+  --set 'llmGateway.allowedHosts={ llm.example.test ,, llm-internal.example.test }' \
+  --set 'llmGateway.admission.url= https://shoal.example.test ' \
+  --set 'llmGateway.identity.capability= chat.completions ' | python3 -c '
 import sys, yaml
 
 problems = []
@@ -958,7 +973,7 @@ for document in yaml.safe_load_all(sys.stdin):
         continue
     component = document.get("metadata", {}).get("labels", {}).get(
         "app.kubernetes.io/component")
-    if component != "llm-proxy":
+    if component != "llm-gateway":
         continue
     if document["kind"] == "Deployment":
         deployment = document
@@ -966,10 +981,10 @@ for document in yaml.safe_load_all(sys.stdin):
         services.append(document)
 
 if deployment is None:
-    print("no llm-proxy Deployment was rendered")
+    print("no llm-gateway Deployment was rendered")
     raise SystemExit(1)
 
-# A Deployment, not a StatefulSet: the proxy is stateless, and this is the one
+# A Deployment, not a StatefulSet: the gateway is stateless, and this is the one
 # structural difference from the explorer.
 template = deployment["spec"]["template"]
 container = template["spec"]["containers"][0]
@@ -981,7 +996,7 @@ for name in ("http", "health"):
 
 if "startupProbe" in container:
     problems.append(
-        "a startupProbe only delays the first readiness check: the proxy opens "
+        "a startupProbe only delays the first readiness check: the gateway opens "
         "no corpus"
     )
 for probe in ("readinessProbe", "livenessProbe"):
@@ -1038,7 +1053,7 @@ for flag, name in (("-health-address", "health"), ("-listen", "http")):
         )
 
 if not services:
-    problems.append("no llm-proxy Service was rendered")
+    problems.append("no llm-gateway Service was rendered")
 for service in services:
     for port in service["spec"]["ports"]:
         target = port.get("targetPort")
@@ -1067,7 +1082,7 @@ for problem in problems:
     print(problem)
 raise SystemExit(1 if problems else 0)
 '; then
-  fail "the llm proxy is not wired end to end (see above)"
+  fail "the llm gateway is not wired end to end (see above)"
 fi
 
 note "== each credential reaches the process in exactly one form =="
@@ -1105,11 +1120,11 @@ for document in yaml.safe_load_all(sys.stdin):
         continue
     labels = document.get("metadata", {}).get("labels", {})
     if document.get("kind") == "Deployment" and labels.get(
-            "app.kubernetes.io/component") == "llm-proxy":
+            "app.kubernetes.io/component") == "llm-gateway":
         deployment = document
 
 if deployment is None:
-    print("no llm-proxy Deployment was rendered")
+    print("no llm-gateway Deployment was rendered")
     raise SystemExit(1)
 
 pod = deployment["spec"]["template"]["spec"]
@@ -1176,7 +1191,7 @@ for name, file_flag, env_flag, consequence, must_project in credentials:
             if must_project and from_env not in environment:
                 problems.append(
                     f"{from_env} is named by {env_flag} and projected from "
-                    f"nothing, so the proxy {consequence}"
+                    f"nothing, so the gateway {consequence}"
                 )
         if name in volumes or name in mounts:
             problems.append(
@@ -1188,7 +1203,7 @@ for name, file_flag, env_flag, consequence, must_project in credentials:
     if mount is None:
         problems.append(
             f"{file_flag}={from_file} is rendered with no volumeMount, so the "
-            f"path does not exist in the container and the proxy {consequence}"
+            f"path does not exist in the container and the gateway {consequence}"
         )
     else:
         mount_path = mount["mountPath"]
@@ -1227,7 +1242,7 @@ for name, file_flag, env_flag, consequence, must_project in credentials:
                 f"the {name} file is mode {mode:04o}, which only its owner can "
                 "read. The kubelet writes it owned by root and the container "
                 "runs as uid 65532, so the one process that needs the "
-                f"credential cannot open it: the proxy starts, passes every "
+                f"credential cannot open it: the gateway starts, passes every "
                 f"probe, and {consequence}"
             )
         elif not mode & 0o004 and fsgroup != run_as_group:
@@ -1336,15 +1351,15 @@ wired "a token file with nothing in the environment" "${loopback_token_file[@]}"
 # credential wherever the Secret's keys happen to fall, which is the operator's
 # business and not something the chart can see — so the fixture says it the way
 # the guide tells an operator to.
-wired "an operator-supplied admission volume" "${operator_volume[@]}" --set 'llmProxy.admission.tokenVolume.secret.secretName=shoal-admission-token' --set 'llmProxy.admission.tokenVolume.secret.defaultMode=288' --set 'llmProxy.admission.tokenVolume.secret.items[0].key=token' --set 'llmProxy.admission.tokenVolume.secret.items[0].path=token'
+wired "an operator-supplied admission volume" "${operator_volume[@]}" --set 'llmGateway.admission.tokenVolume.secret.secretName=shoal-admission-token' --set 'llmGateway.admission.tokenVolume.secret.defaultMode=288' --set 'llmGateway.admission.tokenVolume.secret.items[0].key=token' --set 'llmGateway.admission.tokenVolume.secret.items[0].path=token'
 wired "the provider key as a file"            "${upstream_key_file[@]}"
 wired "both credentials from files"           "${both_files[@]}"
-wired "both credentials from the environment" "${llm_proxy_base[@]}"
-wired "a loopback provider that needs no credential" "${llm_proxy_base[@]}" --set llmProxy.upstream.baseURL=http://localhost:11434/v1,llmProxy.upstream.credentialSecretName=
-wired "an acknowledged plaintext decision plane" "${llm_proxy_base[@]}" --set llmProxy.admission.url=http://shoal-explorer:8098,llmProxy.admission.allowPlaintext=true
+wired "both credentials from the environment" "${llm_gateway_base[@]}"
+wired "a loopback provider that needs no credential" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://localhost:11434/v1,llmGateway.upstream.credentialSecretName=
+wired "an acknowledged plaintext decision plane" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://shoal-explorer:8098,llmGateway.admission.allowPlaintext=true
 
 note "== the guide's worked example still installs =="
-# The example in docs/llm-proxy-deploy.md is copied by operators verbatim, and a
+# The example in docs/llm-gateway-deploy.md is copied by operators verbatim, and a
 # values file in prose is the first thing to rot when a key is renamed or a new
 # refusal lands. So it is extracted from the document and rendered, rather than
 # trusted.
@@ -1353,7 +1368,7 @@ note "== the guide's worked example still installs =="
 # keys the chart refuses to render without — an audience, a ServiceAccount, no
 # admission Secret — and the one where a stale document produces a pod that
 # passes every probe and denies every call.
-guide="$chart/../../../docs/llm-proxy-deploy.md"
+guide="$chart/../../../docs/llm-gateway-deploy.md"
 if [ -f "$guide" ]; then
   example="$(mktemp)"
   python3 - "$guide" > "$example" <<'EXTRACT'
@@ -1369,14 +1384,14 @@ if not block:
 sys.stdout.write(block.group(1))
 EXTRACT
   if [ -s "$example" ]; then
-    renders "the worked example from docs/llm-proxy-deploy.md" -f "$chart/values-llm-proxy.yaml" -f "$example"
-    wired "the worked example from docs/llm-proxy-deploy.md" -f "$chart/values-llm-proxy.yaml" -f "$example"
+    renders "the worked example from docs/llm-gateway-deploy.md" -f "$chart/values-llm-gateway.yaml" -f "$example"
+    wired "the worked example from docs/llm-gateway-deploy.md" -f "$chart/values-llm-gateway.yaml" -f "$example"
   else
-    fail "could not extract the worked example from docs/llm-proxy-deploy.md"
+    fail "could not extract the worked example from docs/llm-gateway-deploy.md"
   fi
   rm -f "$example"
 else
-  fail "docs/llm-proxy-deploy.md is missing: the worked example cannot be checked"
+  fail "docs/llm-gateway-deploy.md is missing: the worked example cannot be checked"
 fi
 
 note "== every rendered name fits the 63-character limit =="
@@ -1387,9 +1402,9 @@ note "== every rendered name fits the 63-character limit =="
 # so this is the worst case an install can actually present.
 #
 # Both planes are rendered together so every name the chart derives — including
-# the proxy's, which hangs off its own bounded stem — is measured in one pass.
+# the gateway's, which hangs off its own bounded stem — is measured in one pass.
 long_release="shoal-production-authorized-plane-euw1-cluster-prime"
-if ! helm template "$long_release" "$chart" "${explorer_base[@]}" "${valid_llm_proxy[@]}" | python3 -c '
+if ! helm template "$long_release" "$chart" "${explorer_base[@]}" "${valid_llm_gateway[@]}" | python3 -c '
 import sys, yaml
 
 problems = []

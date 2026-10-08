@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Command shoal-llm-proxy governs an OpenAI-compatible endpoint by asking Shoal
+// Command shoal-llm-gateway governs an OpenAI-compatible endpoint by asking Shoal
 // before each call and reporting what happened after it.
 //
 // It needs no cooperation from the caller: anything that speaks the API is
@@ -45,7 +45,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
-		fmt.Fprintf(os.Stderr, "shoal-llm-proxy: %v\n", err)
+		fmt.Fprintf(os.Stderr, "shoal-llm-gateway: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -66,7 +66,7 @@ var listenTCP = net.Listen
 var drain = healthsurface.Drain
 
 func run(ctx context.Context, args []string, output io.Writer) error {
-	flags := flag.NewFlagSet("shoal-llm-proxy", flag.ContinueOnError)
+	flags := flag.NewFlagSet("shoal-llm-gateway", flag.ContinueOnError)
 	flags.SetOutput(output)
 	listen := flags.String("listen", "127.0.0.1:8100",
 		"OpenAI-compatible listen address")
@@ -99,7 +99,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"is worse than no enforcement point")
 	admissionTokenEnv := flags.String("admission-token-env", "SHOAL_ADMISSION_TOKEN",
 		"Environment variable read at request time holding the bearer token "+
-			"this proxy presents to the workspace")
+			"this gateway presents to the workspace")
 	admissionTokenFile := flags.String("admission-token-file", "",
 		"File read at request time holding that bearer token, instead of an "+
 			"environment variable. This is the form a projected "+
@@ -108,7 +108,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"with only the env form a rotating token cannot be used at all. "+
 			"Mutually exclusive with -admission-token-env")
 	upstreamBaseURL := flags.String("upstream-base-url", "",
-		"The real OpenAI-compatible provider this proxy forwards to")
+		"The real OpenAI-compatible provider this gateway forwards to")
 	models := flags.String("model", "",
 		"Comma-separated model names this deployment expects. The declaration "+
 			"sent to the workspace reports the matched name, and reports any "+
@@ -129,7 +129,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"the same Secret behind a secretKeyRef is not. Mutually "+
 			"exclusive with -upstream-api-key-env")
 	agentID := flags.String("agent-id", "",
-		"Registered descriptor this proxy admits against, as unpadded "+
+		"Registered descriptor this gateway admits against, as unpadded "+
 			"base64url. This is the encoded ID, not a descriptor's display "+
 			"name: the workspace decodes the field, and a readable name "+
 			"either fails to decode or decodes to bytes nothing was "+
@@ -296,7 +296,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		WriteTimeout:      0, // streamed responses have no useful write bound
 		IdleTimeout:       60 * time.Second,
 	}
-	fmt.Fprintf(output, "Shoal LLM proxy listening at http://%s\n", listener.Addr())
+	fmt.Fprintf(output, "Shoal LLM gateway listening at http://%s\n", listener.Addr())
 	fmt.Fprintf(output, "Admitting against %s as %s/%s\n",
 		base.String(), *capability, *action)
 

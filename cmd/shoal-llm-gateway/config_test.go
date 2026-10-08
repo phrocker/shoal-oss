@@ -292,7 +292,7 @@ func proxyArgs(overrides ...string) []string {
 		"-upstream-base-url", "https://api.example.test",
 		"-agent-id", "YWdlbnQ",
 		"-agent-generation", "1",
-		"-capability", "llm.proxy",
+		"-capability", "llm.gateway",
 		"-action", "complete",
 		"-source-id", "c291cmNl",
 		"-policy-id", "cG9saWN5",
@@ -566,7 +566,7 @@ func TestADrainingProxyWaitsOutTheCallsItAdmitted(t *testing.T) {
 
 // TestAnAcknowledgedPlaintextPlaneIsAccepted closes a chart/binary mismatch.
 //
-// The chart has llmProxy.admission.allowPlaintext for a mesh that supplies the
+// The chart has llmGateway.admission.allowPlaintext for a mesh that supplies the
 // transport authentication the scheme would, and validate-chart.sh asserts that
 // configuration *renders*. Nothing carried the acknowledgement into the
 // process, so absoluteURL refused it at startup: the documented mesh deployment
@@ -749,7 +749,7 @@ func TestAnAllowListEntryWithNoHostIsRefusedAtStartup(t *testing.T) {
 		}
 		governed := &proxy{allowedHosts: got}
 		for _, sent := range []string{
-			"shoal-llm-proxy.default.svc", "shoal-llm-proxy:8100",
+			"shoal-llm-gateway.default.svc", "shoal-llm-gateway:8100",
 			"example.test", "127.0.0.1:8100", "localhost:8100",
 		} {
 			if governed.permits(sent) {
@@ -910,7 +910,7 @@ func TestFleetNamesAreValidatedAtStartup(t *testing.T) {
 	// The grammar the plane does accept must still pass, or this refuses the
 	// feature. Every character class the service allows is covered.
 	for _, probe := range []string{
-		"complete", "chat.completions", "llm_proxy", "llm-proxy",
+		"complete", "chat.completions", "llm_gateway", "llm-gateway",
 		"chat:complete", "Complete9", strings.Repeat("a", fleet.MaxNameBytes),
 	} {
 		if err := fleetName("-action", probe); err != nil {
@@ -965,7 +965,7 @@ func TestTheAgentIDSentIsTheOneValidated(t *testing.T) {
 			"-upstream-base-url", upstream.server.URL,
 			"-agent-id", " YWdlbnQ ",
 			"-agent-generation", "1",
-			"-capability", "llm.proxy",
+			"-capability", "llm.gateway",
 			"-action", "complete",
 			"-source-id", "c291cmNl",
 			"-policy-id", "cG9saWN5",
@@ -1076,7 +1076,7 @@ func TestReadinessIsNeverFlippedBackAfterShutdownBegins(t *testing.T) {
 		"-admission-url", plane.server.URL,
 		"-upstream-base-url", upstream.server.URL,
 		"-agent-id", "YWdlbnQ", "-agent-generation", "1",
-		"-capability", "llm.proxy", "-action", "complete",
+		"-capability", "llm.gateway", "-action", "complete",
 		"-source-id", "c291cmNl", "-policy-id", "cG9saWN5",
 		"-lease", "70s", "-request-timeout", "60s",
 	}, io.Discard)
