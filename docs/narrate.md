@@ -283,6 +283,15 @@ selectors by import path to deny `Now`, `Since`, `Until`, `After`, `Tick`,
     `outcome_unknown` reports, as the handle an operator takes to the target;
   - `Target` and `Reference` are target-controlled. They are bounded and
     printable-only, but are still rendered as attributed untrusted quotes.
+  - **A report's absence is not evidence.** A co-tenant in the same execute
+    scope can exhaust the per-record report budget or evict the genuine
+    holder from the claim history, after which the holder's report is refused
+    as not found (#514). So a missing `request_not_sent` report must never be
+    rendered as "the request was sent"; the default advice stays
+    "reconcile with the target".
+  - Claim holders are ordered by `ClaimFence`. Retained holder timestamps were
+    wrong before #484's final round (they recorded the successor's claim
+    time), so no holder timestamp is shown.
 - Decision-service reasons are string literals in `internal/decisionservice`;
   exporting them as constants would let this package reference them directly.
 - Only English ships. Wording should be reviewed by someone outside the
