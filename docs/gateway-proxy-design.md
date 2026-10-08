@@ -7,6 +7,15 @@ How Shoal governs what an agent is permitted to *do*, as opposed to what a model
 is permitted to be told. The second is `cmd/shoal-llm-gateway` (#390,
 `docs/llm-gateway-deploy.md`). This is the design for the first (#391).
 
+**Source citations here name a file and a symbol, never a line number.** An
+earlier revision cited lines, and they went stale twice in a single day: once
+when five pull requests moved every one of them, and again a few hours later
+when a sixth landed between the verification pass and the correction. A wrong
+line number is worse than none — it sends a reader to code that is not the code
+the sentence is about, with nothing to signal the mismatch. The prose names the
+function or the field in almost every case, which is stable; where it does not,
+the claim is phrased so that grepping the file finds it.
+
 `docs/gateways.md` places both in the wider frame — three gateways, the
 core/extension boundary, and where ATPL policy sits. Read that for why the
 surfaces are separate; read this for how the effects gateway is built.
@@ -84,17 +93,33 @@ The original finding: the action's input was never sent to a remote worker. That
 was more fundamental than the four blockers below and was found last, which is
 its own lesson about reviewing a design by reading its prose.
 
-`fleetActionWire` (`pkg/explorer/webapi/fleet_dispatch.go:356-443`) carries
-`id`, `version`, `agent_id`, `capability`, `deadline`, `claim_id`,
-`claim_lease_until`, `output`, `error_code` and the evidence snapshot fields.
-It does **not** carry `input`. `encodeFleetAction` (`:486-526`) never emits it,
-and every one of the seven responses that returns an action goes through that
-encoder. `Input` appears on the *enqueue* wire only.
+The original finding, as it stood: `fleetActionWire` carried `id`, `version`,
+`agent_id`, `capability`, `deadline`, `claim_id`, `claim_lease_until`,
+`output`, `error_code` and the evidence snapshot fields, and **not** `input`.
+`encodeFleetAction` never emitted it, every response returning an action went
+through that encoder, and `Input` appeared on the *enqueue* wire only.
 
-So a gateway can pull an action, claim it under a fence, and complete it without
-ever receiving the parameters of the operation it is supposed to perform. This is
-a missing wire field and nothing else — the data is on the record, validated
-against the action's `InputSchema` at enqueue, and the read encoder drops it.
+`fleetActionWire` now carries `input`
+(`pkg/explorer/webapi/fleet_dispatch.go`), and the way it carries it is the
+part worth reading. The obvious fix — emitting `input` from the shared encoder
+— was made and then reverted, because it put a fixed one-megabyte payload on
+every commit-bearing route governed by a narrowable output budget: a `Pull` of
+`MaxDispatchListResults` records would have carried a quarter of a gigabyte,
+and an over-budget response on a commit-bearing route is answered
+`503 indeterminate` *after* the write. So the payload rides one route only.
+`encodeClaimedFleetAction`
+(`pkg/explorer/webapi/fleet_dispatch.go`) is `encodeFleetAction` plus
+`input` and `executor_key`, and it is mounted on `/claim` alone.
+
+That also makes the old "one encoder, every response" sentence false twice
+over: there are two encoders now, and nine action-returning routes rather than
+seven — `/extend` and `/ambiguity` were added since.
+
+The consequence while it stood: a gateway could pull an action, claim it under
+a fence, and complete it without ever receiving the parameters of the operation
+it was supposed to perform. It was a missing wire field and nothing else — the
+data was on the record, validated against the action's `InputSchema` at
+enqueue, and the read encoder dropped it.
 
 Worth stating because the gap invites a wrong fix: nothing on the worker's side
 can recover it. A worker that reconstructed a plausible request from the
@@ -165,12 +190,26 @@ reasoning is the design, and because closing it moved two things.*
 **Path A as drawn could not work against the dispatch surface as it was, and
 this is still the first thing to read.**
 
-`Pull` filters every candidate through `sameActionPrincipal`
-(`pkg/explorer/fleet/dispatch_service.go:1209`), and `Claim` and `CompleteClaim`
-reach the store only through `authorizedCurrent`, which applies the same
-predicate (`:1329`). That predicate requires the caller's decision to match the
-record on **all four** of `Subject`, `Actor`, `ClientID` and the full
-`OnBehalfOf` chain, by equality (`:1361`).
+As it was: `Pull` filtered every candidate through `sameActionPrincipal`, and
+`Claim` and `CompleteClaim` reached the store only through `authorizedCurrent`,
+which applied the same predicate. That predicate requires the caller's decision
+to match the record on **all four** of `Subject`, `Actor`, `ClientID` and the
+full `OnBehalfOf` chain, by equality, and still does
+(`pkg/explorer/fleet/dispatch_service.go`) — it was never loosened,
+which is the point of what replaced it.
+
+As it is: both routes resolve through `authorizedClaimant`
+(`pkg/explorer/fleet/dispatch_service.go`), which tries
+`OperationExecute` with no principal requirement and falls back to
+`OperationInvoke` with one. `Pull` filters through `claimableBy`,
+which tries the same two routes in order. So `sameActionPrincipal` still gates
+the invoke route exactly as before and does not gate the execute route at all.
+
+What confirms a worker on the execute route is `holdsClaimOn`,
+checked at completion and before the effect in `ExecuteClaim`
+ — the record's *claimant*, not its enqueuer. That substitution is the
+whole of #437, and it is why the predicate above could stay exactly as strict
+as it was.
 
 So the topology this document draws —
 
@@ -178,10 +217,10 @@ So the topology this document draws —
 agent ──enqueue──▶ [dispatch queue] ──▶ gateway worker
 ```
 
-— is precisely the one the code forbids. An agent enqueues with its own token;
-the record stores the agent's principal. The gateway pulls with its own token;
-every record fails the predicate and is **silently skipped**. The gateway
-receives an empty page, forever, with no error and nothing in the explorer's logs
+— was precisely the one the code forbade. An agent enqueues with its own token;
+the record stores the agent's principal. The gateway pulled with its own token;
+every record failed the predicate and was **silently skipped**. The gateway
+received an empty page, forever, with no error and nothing in the explorer's logs
 to explain it. An operator sees a ready worker, a growing queue, and zero
 effects.
 
@@ -221,12 +260,12 @@ options 1 and 2 change what a gateway's identity even means.
 ## The second blocker: every heartbeat invalidates every claim
 
 `Heartbeat` sets `next.Generation = request.ExpectedGeneration + 1`
-(`pkg/explorer/fleet/service.go:275`) — **every** descriptor lease renewal moves
+(`pkg/explorer/fleet/service.go`) — **every** descriptor lease renewal moves
 the generation. A queued record pins `AgentGeneration` at enqueue
-(`pkg/explorer/fleet/dispatch_service.go:181`), and `resolveActionBinding`
-returns `ObjectNotFound` when `descriptor.Generation != generation` (`:1431`).
+(`pkg/explorer/fleet/dispatch_service.go`), and `resolveActionBinding`
+returns `ObjectNotFound` when `descriptor.Generation != generation`.
 
-The codebase states this itself, in `pkg/explorer/fleet/admission.go:457`:
+The codebase states this itself, in `pkg/explorer/fleet/admission.go`:
 "blind to any record whose generation has moved, **which Heartbeat does on every
 lease renewal**."
 
@@ -372,21 +411,21 @@ left the host, but the flag is never cleared. Reach a gateway through the queue,
 not through `/invoke`.
 
 Registration resolves the executor reference and checks the declared effects
-against that executor's ceiling (`pkg/explorer/fleet/service.go:120`, which
-calls `validateDeclaredEffects` at `:717`). `executorCeiling` returns `nil` for
+against that executor's ceiling (`pkg/explorer/fleet/service.go`, which
+calls `validateDeclaredEffects` at ). `executorCeiling` returns `nil` for
 any executor that does not implement `EffectBounded`
-(`pkg/explorer/fleet/model.go:492-497`), and `exceeds(nil)` is true for any
+(`pkg/explorer/fleet/model.go`), and `exceeds(nil)` is true for any
 non-empty declaration — so an unbound reference permits nothing at all. The only
 bound executor was `AskExecutor`, whose ceiling is `{reads-corpus}` or
 `{reads-corpus, egresses-content}` and which **deliberately** excludes external
 mutation; its comment says declaring it "would raise the ceiling enough for
 genuinely external actions to resolve here"
-(`pkg/explorer/webapi/fleet_executor.go:218-220`).
+(`pkg/explorer/webapi/fleet_executor.go`).
 
 An earlier draft added "its floor equals its ceiling, so `{external}` also fails
 the floor check". True in isolation and **operationally dead**, because
 `validateDeclaredEffects` tests the ceiling first and returns
-(`pkg/explorer/fleet/service.go:720-721`) before reaching the floor at `:727`.
+(`pkg/explorer/fleet/service.go`) before reaching the floor arm.
 The floor is never the reason `{external}` is refused there.
 
 That is worth more than a footnote, because presenting the floor as a second
@@ -402,9 +441,9 @@ A dispatch-only binding must **not** implement `ActionExecutor`.
 `resolveActionBinding` deliberately does not require one — its comment explains
 that "requiring it to supply an Execute method would force every remote
 deployment to bind a stub whose only job is to be refused"
-(`pkg/explorer/fleet/dispatch_service.go:1413-1418`) — while `resolveAction`
+(`pkg/explorer/fleet/dispatch_service.go`) — while `resolveAction`
 is "`resolveActionBinding` plus the assertion that the bound reference can
-actually run the work here" (`:1378-1380`). So claiming, cancelling, inspecting
+actually run the work here". So claiming, cancelling, inspecting
 and completing resolve through the first, and only in-process execution demands
 the second.
 
@@ -420,13 +459,21 @@ This one is the most dangerous of the four, because it produces a duplicate
 effect that is neither prevented nor detectable, in steady-state operation, with
 no partition and no outage.
 
-`Claim` has a replay branch that returns success to any caller presenting the
-same `ClaimID` and the same `Lease` against a record one version ahead
-(`pkg/explorer/fleet/dispatch_service.go:267-278`). `completeClaim` has the
-mirror, returning the committed record and a 200
-(`pkg/explorer/fleet/dispatch_service.go:611-621`). Nothing requires `ClaimID` to
+`Claim` has a replay branch that returns success against a record one version
+ahead (`pkg/explorer/fleet/dispatch_service.go`), and `completeClaim`
+has the mirror, returning the committed record and a 200.
+
+Both are now gated on the claimant. This document said the claim branch
+returned success to *any* caller presenting the same `ClaimID` and `Lease`,
+which was true and is the hole #437 opened and #443 closed: the branch keys on
+values a second execute-holder knows, so it gained `holdsClaimOn` as a fourth
+conjunct, and the completion mirror runs its own claimant check
+*before* the replay arm rather than after. The duplicate-`ClaimID`
+hazard below is unchanged by that — sibling replicas share one principal tuple
+and so satisfy `holdsClaimOn` — which is exactly why it is a worker-side
+obligation and not something the gate can enforce. Nothing requires `ClaimID` to
 be unique: `validateOpaque` enforces only non-empty and at most
-`MaxActionIDBytes` (`:240`).
+`MaxActionIDBytes` (`pkg/explorer/fleet/dispatch_model.go`).
 
 Two replicas pull the same record at version V and both claim with
 `ExpectedVersion=V`. A wins. B's request matches the replay branch — same
@@ -436,7 +483,7 @@ work already committed" and gets a 200 with A's record. One completion on the
 record, two effects, both workers told they succeeded, nothing rejected.
 
 The implementation knows the risk and says so in its own test
-(`pkg/explorer/fleet/dispatch_completion_test.go:482`): recognising a terminal
+(`pkg/explorer/fleet/dispatch_completion_test.go`): recognising a terminal
 record at the expected version as "my work already committed" is only safe if it
 really was this reporter's work. That test passes because its stranger uses a
 different `ClaimID`.
@@ -450,7 +497,7 @@ So, normatively: **`ClaimID` must be freshly generated per worker per claim
 attempt**, from a CSPRNG, and must encode pod identity so the record can answer
 which replica performed an effect — `hostname ‖ nonce`. Unpredictability does **not** close the sibling problem, which an earlier draft
 claimed it would. `encodeFleetAction` emits `claim_id` and `version` on every
-action response (`pkg/explorer/webapi/fleet_dispatch.go:587`), and `Status`
+action response (`pkg/explorer/webapi/fleet_dispatch.go`), and `Status`
 authorizes through `sameActionPrincipal` — which every replica satisfies. So a
 sibling does not need to guess: it reads the live `claim_id` off `Status` and can
 forge a completion. A CSPRNG nonce publishes its entropy to exactly the parties it
@@ -465,15 +512,29 @@ something the record does not publish, or co-replicas must not share a principal
 
 This document said "the fence is `(ClaimID, ClaimFence)`" and "report under the
 same fence". `ClaimFence` is returned to the worker
-(`pkg/explorer/webapi/fleet_dispatch.go:437`) and **there is no field to send it
-back.** The completion wire carries `context`, `expected_version`, `claim_id`,
-output, error and evidence (`pkg/explorer/webapi/fleet_dispatch.go:317-327`), and
-`completeClaim` validates `(Version, ClaimID, state)`
-(`pkg/explorer/fleet/dispatch_service.go:622-627`). `ClaimFence` is used only for
-the store's internal compare-and-swap.
+(`pkg/explorer/webapi/fleet_dispatch.go`), and there was no field to send it
+back: the completion wire carried `context`, `expected_version`, `claim_id`,
+output, error and evidence, `completeClaim` validated `(Version, ClaimID,
+state)`, and `ClaimFence` was used only for the store's internal
+compare-and-swap.
 
-What a worker echoes is **`(claim_id, expected_version)`**, where
-`expected_version` is the version of the *claimed* record — what `Claim`
+**Both halves of that changed, and the second is why the first had to.**
+`completeClaim` now binds on the claim *generation*
+(`pkg/explorer/fleet/dispatch_service.go`): when a fence is supplied
+the version is not compared at all, and `(ClaimFence, ClaimID, state)` is the
+predicate. Comparing the version exactly was never a generation check — it
+behaved like one only while nothing could advance the version while leaving the
+claim intact, and the ambiguity route and the renewal both do exactly that.
+
+So the wire gained the field. `fleetCompletionWire.ClaimFence`
+(`pkg/explorer/webapi/fleet_dispatch.go`) is optional, and a worker that
+omits it keeps the exact-version fallback — which is strandable, and is the
+contract a pre-fence client was written against. A gateway should supply it and
+ignore the version entirely.
+
+What a worker echoes is therefore **`(claim_id, claim_fence)`**, and the
+paragraph below describes the older **`(claim_id, expected_version)`** shape,
+where `expected_version` is the version of the *claimed* record — what `Claim`
 returned, not what `Pull` offered. Those differ by one, and guessing the pulled
 version makes every completion fail with `ErrClaimLost` after the effect has
 happened, which is the exact post-effect ambiguity this design exists to avoid.
@@ -600,8 +661,8 @@ agent ──enqueue──▶ [dispatch queue]
 ```
 
 The registered `Action` carries the declared effect set and an input schema. The
-effect ceiling is enforced where the action is *registered* (`pkg/explorer/fleet/service.go:720`)
-and re-checked where it is *resolved* (`pkg/explorer/fleet/dispatch_service.go:1483`) — the second
+effect ceiling is enforced where the action is *registered* (`pkg/explorer/fleet/service.go`)
+and re-checked where it is *resolved* (`pkg/explorer/fleet/dispatch_service.go`) — the second
 check exists because a host can rebind an executor reference to a narrower
 ceiling while descriptors registered under the old one are still live, and those
 must stop resolving rather than keep running. So an action whose effects exceed
@@ -631,7 +692,7 @@ agent ──▶ gateway ──▶ /api/v1/admission/request
 
 For agents that want "may I do this, now" semantics and cannot restructure
 around a queue. It reuses the admission seam (#388) exactly as the LLM gateway
-does, and the ceiling is enforced there too: `pkg/explorer/fleet/admission.go:401` refuses a
+does, and the ceiling is enforced there too: `pkg/explorer/fleet/admission.go` refuses a
 declaration that exceeds the registered action's effects, so Path B cannot
 declare its way to something broader than it was registered for.
 
@@ -663,14 +724,14 @@ something to attach it to.
 
 **Path B is hard-bounded at five minutes and cannot be extended.** The admission
 service refuses a lease above `MaxActionClaimTTL`
-(`pkg/explorer/fleet/admission.go:338`), admissions are explicitly not
+(`pkg/explorer/fleet/admission.go`), admissions are explicitly not
 reclaimable, and #430's renewal is on `DispatchService` — not here. So a Path B
 operation has at most five minutes minus the report window, forever. That bound
 decides which operations can use Path B at all and this document never stated it.
 
 **The shared principal is worse than "unresolved".** The admission identity is
 derived from the decision plus a caller-chosen `request.ID`
-(`pkg/explorer/fleet/admission.go:365`, and `admissionActionID` at `:774`). With the LLM gateway's answer — one
+(`pkg/explorer/fleet/admission.go`, and `admissionActionID` at ). With the LLM gateway's answer — one
 configured descriptor for the whole gateway — every Path B caller shares one
 admission-ID namespace keyed on a value callers pick. Caller A submitting
 caller B's in-flight `request.ID` with a different declaration gets a conflict,
@@ -779,9 +840,9 @@ reinvented it — the second time worse than the first.**
 
 `ExecutorKey` is derived at enqueue as
 `SHA-256("shoal.fleet.executor-key.v2" ‖ actionID ‖ idempotencyKey)`
-(`pkg/explorer/fleet/dispatch_service.go:1500-1507`), where `IdempotencyKey` is
+(`pkg/explorer/fleet/dispatch_service.go`), where `IdempotencyKey` is
 a **required** enqueue field. It is already handed to in-process executors *as
-their idempotency key* (`pkg/explorer/fleet/dispatch_service.go:512`). So the
+their idempotency key* (`pkg/explorer/fleet/dispatch_service.go`). So the
 thing this section spent seventy lines deriving is a solved problem with a
 shipped, domain-separated, caller-independent construction.
 
@@ -874,7 +935,7 @@ is set at all.
 Where the target does not accept one, the design must not claim what it cannot
 deliver. `EffectPossible` is set at claim time for any external-mutating or
 egressing action and is **never cleared** — it is only ever set true
-(`pkg/explorer/fleet/dispatch_service.go:376`, `:698`) — so it survives the
+(`pkg/explorer/fleet/dispatch_service.go`, ) — so it survives the
 requeue and the second claim. An operator reconciling a duplicated effect has
 that flag and the fence history; they do not have prevention. For targets where
 a duplicate is unacceptable and no idempotency key exists, the correct answer is
@@ -885,7 +946,7 @@ guarantee that holds only until the first partition.
 
 `DispatchService.Claim` sets `EffectPossible = true` for any action whose effects
 contain `EffectMutatesExternal` or `EffectEgressesContent`
-(`pkg/explorer/fleet/dispatch_service.go:374`). That flag is the honest answer to "did this run",
+(`pkg/explorer/fleet/dispatch_service.go`). That flag is the honest answer to "did this run",
 and it is set at claim time precisely because the claim is the last moment
 before an effect becomes possible.
 
@@ -929,7 +990,7 @@ and the predicate false at every instant. The worker would claim and then refuse
 to perform, forever.
 
 The error was transplanting `validateDurations` from the LLM gateway
-(`cmd/shoal-llm-gateway/main.go:516`), where the shape is sound **because that
+(`cmd/shoal-llm-gateway/main.go`), where the shape is sound **because that
 proxy has no renewal** — its lease really is the bound on the whole call. A
 renewing worker's lease is a silence interval, and an operation is expected to
 span many of them, so no lease-relative predicate can gate the start of one.
@@ -973,7 +1034,7 @@ an operator reaches for first.
 
 **An operator cannot reach `Cancel` at all**, which is stronger than the timing
 problem below and was missed because the analysis assumed they could. `Cancel`
-goes through `authorizedCurrent` (`pkg/explorer/fleet/dispatch_service.go:845`),
+goes through `authorizedCurrent` (`pkg/explorer/fleet/dispatch_service.go`),
 which applies `sameActionPrincipal` and normalises a mismatch to
 `auth.ObjectNotFound()`. An operator is not the enqueuing principal, so they are
 told the action does not exist. `TeamActions` is explicitly the surface that does
@@ -985,7 +1046,7 @@ operator and a worker.
 
 For a caller who can reach it, it is refused while a claim is live:
 `if current.State == DispatchClaimed && now.Before(current.ClaimLeaseUntil)` →
-`ErrActionConflict` (`pkg/explorer/fleet/dispatch_service.go:870-871`). The renewal
+`ErrActionConflict` (`pkg/explorer/fleet/dispatch_service.go`). The renewal
 rule above keeps `ClaimLeaseUntil` in the future for as long as the worker lives,
 so **the cancel window never opens.** An operator who discovers mid-operation
 that a payment is going to the wrong account can kill the pod — which strands the
@@ -1000,7 +1061,7 @@ gated on `!now.Before(ClaimLeaseUntil)`. So they race:
 3. At `T+1ms` the operator cancels. `Cancel` wins the compare-and-swap.
 4. Worker 1 resumes and reports. `completeClaim`'s replay arm accepts only
    `Succeeded` or `Failed`, deliberately excluding `Canceled`
-   (`pkg/explorer/fleet/dispatch_service.go:611-621`), so worker 1 gets
+   (`pkg/explorer/fleet/dispatch_service.go`), so worker 1 gets
    `ErrClaimLost`.
 
 The durable record now says **`canceled`** — which elsewhere in this codebase
@@ -1025,7 +1086,7 @@ certainly need to *do*, and cannot:
 `EffectPossible` in several places as the reconciliation signal, and it is not
 one. `applyClaim` sets it on every claim of an external action, and
 `applyExecutionResult` sets it **unconditionally for every completion of any
-effect class** (`pkg/explorer/fleet/dispatch_service.go:698` — no declaration
+effect class** (`pkg/explorer/fleet/dispatch_service.go` — no declaration
 check). So it is true for the overwhelming majority of perfectly healthy actions.
 It is an honest answer to "could this have had an effect" and useless as an
 answer to "did this run twice".
@@ -1097,7 +1158,7 @@ total duration bounded by the action's Deadline
 `reportWindow` has to be a defined number before any of that is normative, since
 it appears in two invariants and a grace-period calculation. It is a **fixed
 conservative margin of 5 seconds**, not a setting: the same value and the same
-reasoning as `minimumReportWindow` in `cmd/shoal-llm-gateway/admission.go:108`,
+reasoning as `minimumReportWindow` in `cmd/shoal-llm-gateway/admission.go`,
 because it is the same act — one authenticated POST to the explorer after the
 work is done. Making it configurable would invite an operator to tune away the
 margin that keeps a completed effect reportable, which is the one thing here
@@ -1155,12 +1216,17 @@ Two consequences for a gateway, both practical:
   action". The flag is informative only while a claim is open, where it does
   reflect the declaration.
 - **There is no way to record that a dispatch failed without reaching its
-  target.** Not through `complete`, whose error code is an unauthenticated
-  string the service does not distinguish from its own; and not through the
-  flag, which the model forbids from saying so. The only place the distinction
-  can be expressed is an ambiguity report whose outcome is `request_not_sent`.
+  target.** Not through the flag, which the model forbids from saying so. And
+  not through `complete`'s error code, which carries no such outcome in its
+  vocabulary — though it is no longer indistinguishable from the service's own:
+  #508 reserved the four codes the service assigns and added
+  `ErrorCodeOrigin`, so a reader can tell an adjudication from an executor's
+  account. What it still cannot tell is whether the request left the host.
+  The only place that distinction can be expressed is an ambiguity report whose
+  outcome is `request_not_sent`.
 
-That is tracked as #510, with the error-code provenance half as #508. Until
+That is tracked as #510; the error-code provenance half was #508 and has
+landed. Until
 both land, a gateway should assume an operator will have to reconcile every
 terminal external-effect action, and should size its own local logging
 accordingly — the record will not narrow the set for them.
@@ -1170,7 +1236,7 @@ accordingly — the record will not narrow the set for them.
 `fleetevents.Service.Publish` rejects the five **exact** lifecycle kinds —
 `action.enqueued`, `action.canceled`, `action.claimed`, `action.completed`,
 `action.failed` (`isReservedLifecycleKind`,
-`pkg/explorer/fleetevents/service.go:295-303`) — with "fleet lifecycle event
+`pkg/explorer/fleetevents/service.go`) — with "fleet lifecycle event
 kinds require trusted publication". `action.*` is **not** a
 reserved prefix, which an earlier draft of this paragraph asserted: a worker
 could publish `action.effect_ambiguous` through the public route, into the
@@ -1178,19 +1244,33 @@ namespace every consumer filtering on `action.` is reading. That is a reason to
 choose a `gateway.` kind deliberately rather than a reason it is forced. And
 `PublishLifecycle` is an in-process path requiring a reconcile capability and a
 `LifecycleReceipt` carrying a request ID, an authorization fingerprint, a UTC
-expiry and a matching correlation ID (`pkg/explorer/fleetevents/service.go:267-293`).
+expiry and a matching correlation ID (`pkg/explorer/fleetevents/service.go`).
 
 Which operation may publish which lifecycle kind is a separate question from
-whether the kind is reserved, and `lifecyclePublicationPermits` (`:330`) answers
-it per kind. Two kinds accept more than one operation, and the second of those
-is new: a claim or a completion is authorized by invoke **or** by execute, since
-#437 lets a principal holding execute on the descriptor claim and complete work
-it did not enqueue. That gate previously admitted invoke alone, which did not
-mislabel such an event but *refused* it — and a refused publication is returned
-as `ErrActionCommitted`, so the transition was durably written and the worker was
-told to reconcile an outcome that had in fact been recorded. Worth knowing before
+whether the kind is reserved, and `lifecyclePublicationPermits` answers
+it per kind. **All three kinds now accept more than one operation**, and both
+of the widenings were made for the same reason — a gate admitting one operation
+where two legitimate writers exist does not mislabel the event, it *refuses*
+it, and a refused publication is returned as `ErrActionCommitted`: the
+transition was durably written and the caller was told to reconcile an outcome
+that had in fact been recorded.
+
+A claim or a completion is authorized by invoke **or** by execute, since #437
+lets a principal holding execute on the descriptor claim and complete work it
+did not enqueue. A cancellation is authorized by dispatch **or** by invoke,
+which this document previously had as dispatch-only: `DispatchService.Cancel`
+transitions under dispatch, and `AdmissionService.deny` is a second writer of
+that kind, reached through the admission surface under invoke. Every admission
+denial therefore committed a cancelled record and then reported a publication
+failure — a 503 for a refusal that had granted nothing, which survived three
+reviews because the retry answered "denied".
+
+That second one is worth more than its own fix to an implementer, because the
+mistake was a property of one *writer* asserted as a property of the *kind*.
+The permitted set is keyed by kind; the writers are not enumerated anywhere. Worth knowing before
 adding a sixth kind: the permitted set and the identity the publisher compares
-against both have to be decided for it, and the identity for a claim or a
+against both have to be decided for it, **and every writer that can produce it
+has to be enumerated before the set is written**, and the identity for a claim or a
 completion is the record's **claimant**, not its enqueuer.
 An out-of-process worker can produce none of that, and should not be able to —
 that gate is what keeps the lifecycle record trustworthy.
@@ -1217,7 +1297,9 @@ and a bounded `Reference` — the opaque handle the target returned, which is th
 thing an operator takes to the other system and the reason the route is worth
 more than `EffectPossible` alone. Its `Subject` and `Actor` are recorded from
 the *decision*, not from the request, so the report is attributed rather than
-self-asserted; `ErrorCode` on a completion is not, which is #508.
+self-asserted. `ErrorCode` on a completion now carries the same distinction
+through `ErrorCodeOrigin` (#508) — derived from which code path wrote it, never
+from the request — but it says who decided, not whether the target was reached.
 
 Either way the gateway needs an authorization separate from its dispatch
 authorization, so losing a claim does not also cost it the ability to say so.
@@ -1286,7 +1368,7 @@ of them, which is not a policy so much as a hole.
 An earlier draft added "and the explorer needs egress to none", which is false
 for supported deployments. `shoal-explore-web` takes `-chat-base-url` and
 `-embedding-base-url` and the chart has a guard specifically for a **remote**
-chat provider needing a credential Secret (`deploy/helm/shoal/templates/validate.yaml:96`),
+chat provider needing a credential Secret (`deploy/helm/shoal/templates/validate.yaml`),
 so a workspace configured with a hosted model egresses by design. The asymmetry
 is real only in a loopback-only configuration, where the explorer's providers are
 sidecars and its egress set is genuinely empty.
@@ -1361,7 +1443,7 @@ one per `operationTimeout`, and the operator has no replay.
 **What reaches the record.** `Output` is validated against the `OutputSchema` the
 *gateway itself registered*, and the supported schema keywords are
 `{type, properties, required, items, enum, additionalProperties}`
-(`pkg/explorer/fleet/dispatch_model.go:835`) — **no `maxLength`, no `pattern`**.
+(`pkg/explorer/fleet/dispatch_model.go`) — **no `maxLength`, no `pattern`**.
 So any field declared a string accepts up to `MaxActionOutputBytes` of
 target-controlled text, which is canonicalised into the durable record, published
 on `action.completed`, and surfaced through `Status` and the team overview to
@@ -1376,7 +1458,7 @@ reason to constrain what it forwards *inward*.
 **Evidence anchors.** `CompleteClaim` accepts a list of `EvidenceRef` over HTTP
 with caller-supplied node, edge and assertion IDs and a `Visibility` label set,
 where an empty set is **public**. `EvidenceRef` is documented as coming from a
-*trusted* executor (`pkg/explorer/fleet/dispatch_model.go:60`) — and this design
+*trusted* executor (`pkg/explorer/fleet/dispatch_model.go`) — and this design
 introduces the first executor that is not one. This document lists "no corpus
 access" as an enforced absence; that is about *reads*. The write side lets the
 one pod holding production credentials attach fabricated anchors citing real IDs,
@@ -1706,7 +1788,7 @@ not design debates; they are omissions, and each one is reachable in the first
 hour of work:
 
 - **`Deadline` is the enqueuing caller's own request-context deadline**
-  (`pkg/explorer/fleet/dispatch_service.go:189`), not a separate field. An agent
+  (`pkg/explorer/fleet/dispatch_service.go`), not a separate field. An agent
   using a conventional 30-second HTTP deadline creates a 30-second action, which
   fails the claim-time margin on every claim. Every `Deadline - now` expression
   in this document depends on agents knowing that, and `equivalentEnqueue` pins
