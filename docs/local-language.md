@@ -50,8 +50,9 @@ closed.
 
 It is served as a registered typed decision (a choice question with abstention)
 through `pkg/decision`, on the local CPU predictor path the decision track has
-prototyped (`docs/local-decisions.md`; #439 is a synthetic CPU-SVM slice, #441 an
-offline replay of a frozen classifier; production serving is still open).
+prototyped (`experiments/local-ml/README.md`; #439 is a synthetic CPU-SVM
+slice, #441 an offline replay of a frozen classifier; production serving is
+still open).
 Confidence below a threshold **abstains**.
 
 **Filling the parameters** is slot extraction against the target's declared
