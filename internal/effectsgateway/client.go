@@ -83,18 +83,19 @@ const (
 	// DispatchConflict (409): the version or claim moved.
 	DispatchConflict DispatchErrorKind = "conflict"
 	// DispatchIndeterminate (503 + Shoal-Commit-Outcome: indeterminate): the
-	// mutation may have committed; resend the identical body.
+	// mutation may have committed. Claim reports it as DispatchRepull.
 	DispatchIndeterminate DispatchErrorKind = "indeterminate"
 	// DispatchUnavailable (503 without the header). Claim and Complete never
 	// return it for a 503 of their own: until #505 a bare 503 from either may
 	// hide a committed write (see DispatchRepull and Complete).
 	DispatchUnavailable DispatchErrorKind = "unavailable"
-	// DispatchRepull (Claim only, 503 without the header): the claim may or
-	// may not have been taken. The caller holds no claim — it must not
-	// execute — and re-pulls. If the claim did commit, the record reappears
-	// on the pull page when its lease lapses, and a completion against it is
-	// refused by the claim check, so acting as though nothing is held is safe.
-	// Interim until #505; see Claim.
+	// DispatchRepull (Claim only: a transport error, any 503, a 502 or a
+	// 504): the claim may or may not have been taken. The caller holds no
+	// claim — it must not execute — and re-pulls. If the claim did commit,
+	// the record reappears on the pull page when its lease lapses, and a
+	// completion against it is refused by the claim check, so acting as
+	// though nothing is held is safe. The original error is its cause. The
+	// bare-503 case is interim until #505; see Claim.
 	DispatchRepull       DispatchErrorKind = "repull"
 	DispatchInvalid      DispatchErrorKind = "invalid_argument"
 	DispatchUnauthorized DispatchErrorKind = "unauthorized"
@@ -513,20 +514,26 @@ func (c *DispatchClient) Claim(ctx context.Context, actionID []byte, request Cla
 	}
 	var response actionWire
 	if _, _, err := c.post(ctx, op, actionPath(actionID, "claim"), body, &response); err != nil {
-		// Interim until #505. A bare 503 from /claim can be
-		// ErrActionCommitted — the claim was durably written and only its
-		// publication failed — as easily as a clean refusal, and the two are
-		// indistinguishable on the wire today. Never report it as a definite
-		// failure: it is a re-pull signal, and the contract is unchanged —
-		// Claim returns no Action, so the caller holds no claim and executes
-		// nothing. After #505 a header-less 503 is a clean pre-write refusal
-		// and this narrows back to DispatchUnavailable; an indeterminate 503
-		// is unaffected either way.
-		if DispatchKind(err) == DispatchUnavailable {
+		// Every answer after which the claim may have committed — a
+		// transport error, any 503, a 502 or 504 (answerLost) — is a
+		// re-pull signal, never a definite failure, and the caller contract
+		// is unchanged: Claim returns no Action, so the caller holds no claim
+		// and executes nothing. If the claim did commit, it lapses at its
+		// lease and reappears on the pull page; a completion against a claim
+		// the worker does not hold is refused. The original error, with its
+		// kind, is kept as the cause.
+		//
+		// The bare-503 case is interim until #505: today ErrActionCommitted
+		// (the claim was durably written and only its publication failed)
+		// reaches the wire as a bare 503, indistinguishable from a clean
+		// refusal. After #505 a header-less 503 is a clean pre-write refusal
+		// and narrows back to DispatchUnavailable; the other cases stay.
+		if answerLost(err) {
 			var dispatchErr *DispatchError
 			errors.As(err, &dispatchErr)
 			return Action{}, &DispatchError{Op: op, Kind: DispatchRepull,
-				Status: dispatchErr.Status, Code: dispatchErr.Code, cause: err}
+				Status: dispatchErr.Status, Code: dispatchErr.Code,
+				Failure: dispatchErr.Failure, cause: err}
 		}
 		return Action{}, err
 	}

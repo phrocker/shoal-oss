@@ -473,10 +473,12 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 	}
 }
 
-// A bare 503 from /claim may hide a committed claim until #505
-// (ErrActionCommitted). It is a re-pull signal, never a definite failure, and
-// the caller still holds nothing: no Action, and nothing is resent.
-func TestClaimPlain503IsARepullSignal(t *testing.T) {
+// Every answer after which a claim may have committed — any 503 (a bare one
+// may hide ErrActionCommitted until #505), a proxy's 502 or 504, a transport
+// error — is a re-pull signal, never a definite failure, and the caller still
+// holds nothing: no Action, and nothing is resent. The original kind is kept
+// as the cause.
+func TestClaimPossiblyCommittedIsARepullSignal(t *testing.T) {
 	for _, row := range []struct {
 		name  string
 		reply func() (*http.Response, error)
@@ -484,10 +486,13 @@ func TestClaimPlain503IsARepullSignal(t *testing.T) {
 	}{
 		{"plain 503", reply(503, `{"code":"unavailable"}`), DispatchRepull},
 		{"503 with another outcome header", reply(503, `{}`, "Shoal-Commit-Outcome", "committed"), DispatchRepull},
-		{"indeterminate 503", reply(503, `{}`, indeterminate...), DispatchIndeterminate},
-		{"lost", lost, DispatchTransport},
+		{"indeterminate 503", reply(503, `{}`, indeterminate...), DispatchRepull},
+		{"502", reply(502, `<html>bad gateway</html>`), DispatchRepull},
+		{"504", reply(504, ``), DispatchRepull},
+		{"lost", lost, DispatchRepull},
 		{"lost the race", reply(404, `{}`), DispatchNotFound},
 		{"version moved", reply(409, `{}`), DispatchConflict},
+		{"500", reply(500, `{}`), DispatchStatus},
 	} {
 		transport := &scriptedTransport{replies: []func() (*http.Response, error){row.reply}}
 		base, _ := url.Parse("https://explorer.invalid")
@@ -511,9 +516,16 @@ func TestClaimPlain503IsARepullSignal(t *testing.T) {
 			t.Errorf("%s: %d requests, want 1", row.name, len(transport.bodies))
 		}
 		var dispatchErr *DispatchError
-		if row.kind == DispatchRepull && (!errors.As(err, &dispatchErr) ||
-			dispatchErr.Status != http.StatusServiceUnavailable || dispatchErr.Op != "claim") {
-			t.Errorf("%s: repull error lost its status: %#v", row.name, err)
+		if row.kind == DispatchRepull {
+			if !errors.As(err, &dispatchErr) || dispatchErr.Op != "claim" {
+				t.Fatalf("%s: %#v", row.name, err)
+			}
+			original := errors.Unwrap(err)
+			var cause *DispatchError
+			if !errors.As(original, &cause) || cause.Kind == DispatchRepull ||
+				!answerLost(cause) || cause.Status != dispatchErr.Status {
+				t.Errorf("%s: repull error lost its original kind: %#v", row.name, original)
+			}
 		}
 	}
 }

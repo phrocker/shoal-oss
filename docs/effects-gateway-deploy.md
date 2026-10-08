@@ -342,12 +342,16 @@ When #492 lands the two pins flip to 2xx and the 400/500 trigger is removed.
 `not-found` from `Claim` means re-pull, never "gone": the loser of a claim race
 is told not-found deliberately.
 
-`repull` from `Claim` (interim, until #505) is a 503 without the indeterminate
-header. It may hide a committed claim (`ErrActionCommitted`), so it is never
-reported as a definite failure; but `Claim` returns no action, so the caller
-holds no claim, executes nothing, and re-pulls. A claim that did commit lapses
-at its lease and reappears on the pull page; a completion against a claim the
-worker does not hold is refused. After #505 it narrows back to `unavailable`.
+`repull` from `Claim` is every answer after which the claim may have
+committed: a transport error, any 503 (with or without the indeterminate
+header), or a 502 or 504 that a proxy can answer after the explorer processed
+the claim. It is never reported as a definite failure; but `Claim` returns no
+action, so the caller holds no claim, executes nothing, and re-pulls. A claim
+that did commit lapses at its lease and reappears on the pull page; a
+completion against a claim the worker does not hold is refused. The original
+error, with its kind, is the cause. The bare-503 case is interim: today
+`ErrActionCommitted` reaches the wire as a bare 503, and after #505 a
+header-less 503 is a clean refusal and narrows back to `unavailable`.
 
 ## Logging policy
 
