@@ -60,7 +60,54 @@ func (b *builder) actionArgs(record fleet.ActionRecord) Args {
 		"reporter":   b.reporter(record),
 		"claimed":    yesNo(record.ClaimFence > 0),
 		"origin":     errorOrigin(record.ErrorCodeOrigin),
+		"effect":     effectSelector(record),
 	}
+}
+
+// effectRuledOut reports whether a record establishes that its action could
+// not have had an external effect. Only the flag can say so, and only on a
+// succeeded or failed record (#510, #538):
+//
+//   - The flag is set when a claim is taken, from the action's declared
+//     effects (EffectMutatesExternal or EffectEgressesContent), and it can
+//     only rise (#461). Since #538 completion carries it forward instead of
+//     asserting it, so false on a succeeded or failed record means the
+//     claimed action declared neither effect and its whole outcome is in the
+//     record.
+//   - No record written before #538 reads false here: completion set the
+//     flag unconditionally, and ActionRecord.Validate required it on every
+//     succeeded and failed record from the first build that stored one. So
+//     false is trustworthy whichever build wrote the record, and no era
+//     marker is needed. A pre-#538 record of a non-declaring action reads
+//     true, and true renders as "may", which is fail-safe. (A test fixture
+//     with a terminal state and a false flag described as pre-#538 would test
+//     a shape the old code could never store.)
+//   - True means "may", whatever the era, and is never strengthened: the flag
+//     is monotonic, so even a declaring action whose request demonstrably
+//     never left reads true. Only an ambiguity report whose outcome is
+//     request_not_sent could assert the negative, and an absent report is not
+//     evidence (#514). Reports are not renderer input yet.
+//   - Nothing is inferred from declarations. An admission's record carries
+//     its admitted effects, but a declaration is not the flag: a record whose
+//     declared effects include neither, with the flag set, reads "may", never
+//     "could not".
+//   - A canceled record is not read as false. It may never have been
+//     claimed, so false there says only that no claim set the flag, and
+//     claims before #396 did not set it for egress. Its next step is decided
+//     by the claim fence, as before.
+func effectRuledOut(record fleet.ActionRecord) bool {
+	return !record.EffectPossible &&
+		(record.State == fleet.DispatchSucceeded || record.State == fleet.DispatchFailed)
+}
+
+// effectSelector chooses the next-step wording on a failed record: "none"
+// drops reconciliation with the target, and any other value keeps it, so a
+// template arm that does not know a value fails safe.
+func effectSelector(record fleet.ActionRecord) Selector {
+	if effectRuledOut(record) {
+		return "none"
+	}
+	return "possible"
 }
 
 // reporter names who reports a claimed record's outcome: the admitted caller
@@ -204,14 +251,20 @@ func (r *Renderer) Action(record fleet.ActionRecord, opts Options) ([]Sentence, 
 		}), refs...)
 	}
 
+	// Whether an external effect was possible (see effectRuledOut). No
+	// sentence says an effect happened: a set flag is "may", and only a clear
+	// flag on a succeeded or failed record is "could not".
+	if effectRuledOut(record) {
+		b.add(RoleReason, "dispatch.effect.none", args)
+	}
+
 	// What the record cannot establish.
-	//
-	// EffectPossible is read only while a claim is open, where it is set from
-	// the action's declared effects when the claim is taken. On a completed
-	// record it says nothing: completion sets it unconditionally and Validate
-	// refuses a terminal record without it (#508; #510 makes it answerable).
 	if record.EffectPossible && state == fleet.DispatchClaimed {
 		b.add(RoleGap, "dispatch.gap.effect_possible", args)
+	}
+	if record.EffectPossible && (state == fleet.DispatchSucceeded ||
+		state == fleet.DispatchFailed || state == fleet.DispatchCanceled) {
+		b.add(RoleGap, "dispatch.gap.effect_may", args)
 	}
 	if state == fleet.DispatchSucceeded && len(record.Evidence) == 0 {
 		b.add(RoleGap, "dispatch.gap.no_evidence", args)

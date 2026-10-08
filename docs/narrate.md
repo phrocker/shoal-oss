@@ -174,7 +174,8 @@ An `ErrorCode` outside the gateway and fleet sets is free text: an executor may
 record any bounded string. It is quoted, attributed to whoever the record's
 `ErrorCodeOrigin` says assigned it (`executor`, `service`, or
 `executor_or_service` when the record does not say), and its next step is to
-reconcile with the target. The same holds for a predictor's own whole-request
+reconcile with the target, unless `EffectPossible` says no external effect
+was possible (see "Whether an external effect was possible"). The same holds for a predictor's own whole-request
 or per-answer reason.
 
 ### Who assigned an error code
@@ -221,9 +222,10 @@ The origin is credited with the code, and only the code:
   for an executor's code, "Shoal recorded the failure as {code} after
   {reporter} reported its outcome" for Shoal's, and otherwise says the record
   does not say whether the reporter or Shoal assigned the code.
-- **The next step** is still always to reconcile with the target before
-  requesting the work again, whatever the code and whoever assigned it, since
-  `EffectPossible` says nothing on a terminal record (#510). Three change with
+- **The next step** is to reconcile with the target before requesting the
+  work again, whatever the code and whoever assigned it, unless
+  `EffectPossible` is false (see "Whether an external effect was possible"
+  below): the code never decides it. Three change with
   the origin, because their wording presumed who assigned the code:
   `request_not_sent` and `input_invalid` said "the report says nothing was
   sent, but the record cannot establish that". For an executor's code that
@@ -239,18 +241,55 @@ assign today (a gateway code, say): if fleet ever records one as its own, the
 sentence says so, and the parity tests on error codes flag the new
 assignment.
 
+### Whether an external effect was possible
+
+`EffectPossible` is set when a claim is taken, and only for an action that
+declares `EffectMutatesExternal` or `EffectEgressesContent`. The store lets it
+rise and never fall (#461), and since #538 completion carries it forward
+instead of setting it on every completion (#510). The renderer reads the flag,
+and only the flag:
+
+| State | `EffectPossible` | Sentence | Next step |
+| --- | --- | --- | --- |
+| claimed | true | "The action declares an external or egress effect and is claimed, so an effect may already have happened." (gap) | unchanged |
+| succeeded, failed | false | "This action could not have had an external effect; its whole outcome is in this record." (reason) | a failure's next step drops reconciliation: "No reconciliation with the target is needed …", keeping the rest of its advice (correct the input, fix the executor, review the refusal at the target) |
+| succeeded, failed, canceled | true | "An external effect may have occurred; reconcile with the target." (gap) | unchanged: a failure, and a canceled record that was claimed, reconcile with the target |
+| canceled | false | none | unchanged: decided by the claim fence |
+
+- **False is trustworthy on a succeeded or failed record, from any build.**
+  `ActionRecord.Validate` required the flag on both states from the first
+  build that stored one until #538, so no earlier record can read false there,
+  and no era marker is needed. Never build a fixture with a succeeded or
+  failed state and a false flag and call it pre-#538: it tests a shape the old
+  code could never store.
+- **True means "may", whatever the era.** Before #538 every succeeded or
+  failed record read true, including actions that declare no effect, and the
+  record does not carry a dispatched action's declared effects, so the two
+  cannot be told apart. Both read "may", which is fail-safe. And since the
+  flag is monotonic, a declaring action whose request demonstrably never left
+  still reads true: the claim set it, and a worker could have acted at any
+  time after.
+- **No sentence says an effect happened.** True is "may", never "did";
+  `TestNoSentenceSaysAnEffectHappened` scans every rendered sentence for an
+  unhedged one.
+- **False is never inferred.** Not from the declaration (an admission's
+  admitted effects are on the record, but a declaration is not the flag), not
+  from the error code (`request_not_sent` with the flag set still reconciles),
+  and not from the outcome.
+- **A canceled record says nothing about a false flag.** It may never have
+  been claimed, so false there says only that no claim set it; and claims
+  before #396 did not set it for egress, so a canceled-after-lapse record of
+  that era could read false for an egressing action. A canceled record
+  advises reconciliation when it was claimed before it was canceled, which the
+  claim fence says.
+
+`dispatch_effects` in the value goldens pins every (state × flag)
+combination, and `dispatch_errors` pins every failure's next step with the
+flag clear as well as set.
+
 ### Reports are not findings
 
-`EffectPossible` is not evidence on a completed record. Completion sets it
-unconditionally and `ActionRecord.Validate` refuses a terminal record without
-it, so on a succeeded or failed record it says nothing (#508; #510 makes it
-answerable). The renderer reads it only while a claim is open, where it was set
-from the action's declared effects when the claim was taken ("The action
-declares an external or egress effect and is claimed, so an effect may already
-have happened."). A canceled record advises reconciliation when it was claimed
-before it was canceled, which the claim fence says.
-
-Likewise, the decision service writes its own whole-request reasons and passes
+The decision service writes its own whole-request reasons and passes
 a predictor's through unchanged, and the result does not say which (#509). A whole-request abstention or failure reason
 is attributed to "the predictor or the service" (`predictor_or_service` on a
 quote), its meaning is conditional ("if accurate"), and its next step starts
@@ -365,10 +404,13 @@ selectors by import path to deny `Now`, `Since`, `Until`, `After`, `Tick`,
 - The source state of each `DispatchEdges` edge is checked against fleet's
   guards by review, not by test: the guards are spread through fleet's
   services. A transition table exported by fleet would let the test check them.
-- `EffectPossible` carries no information on a terminal record (#508). The
-  fleet issue #510 makes it answerable; until then a failure always advises
-  reconciliation.
-- Ambiguity reports (#484) are not on main, so nothing here reads them. When
+- `EffectPossible` on a terminal record is resolved by #538 (fleet #510):
+  false on a succeeded or failed record means the action declared no external
+  or egress effect, and is rendered as such; true means an effect may have
+  occurred and is monotonic, so it stays true even when the request never
+  left. See "Whether an external effect was possible".
+- Ambiguity reports (#484) are not on main, so nothing here reads them. They
+  are the only way to narrow a true `EffectPossible`. When
   they land, a failure's next step can say the target was not reached only
   where a report's outcome is `request_not_sent`. Rendering them:
   - the reporter is trustworthy: its Subject and Actor come from the

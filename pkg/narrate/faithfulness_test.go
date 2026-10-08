@@ -5,6 +5,7 @@
 package narrate
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -25,30 +26,28 @@ import (
 //   - omitted, or a value this build does not know: attributed to neither, and
 //     conditional.
 //
-// EffectPossible carries no information on a completed record — completion
-// sets it unconditionally and Validate requires it on a failure (#510) — so
-// retry advice never depends on it: a failure's next step is always to
-// reconcile with the target, whoever assigned the code, and nothing a
-// terminal record says cites EffectPossible.
+// Since #538 EffectPossible carries information on a terminal record, and a
+// failure's next step depends on it and on nothing inferred from it: with the
+// flag set it starts with reconciling with the target, whoever assigned the
+// code; with it clear (the action declared no external effect) it says no
+// reconciliation is needed, and keeps the rest of its advice. The error code
+// never decides it: request_not_sent with the flag set still reconciles.
 func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 	r := New(nil)
 	codes := append(sourceErrorCodes(t), "made up by an executor")
 	for _, origin := range errorCodeOriginCases(t) {
 		for _, code := range codes {
-			what := code + " origin=" + string(origin)
-			var nexts []string
 			for _, effect := range []bool{true, false} {
+				what := fmt.Sprintf("%s origin=%s effect=%v", code, origin, effect)
 				record := failedWith(code, origin)
 				record.EffectPossible = effect
 				sentences, err := r.Action(record, Options{})
 				if err != nil {
 					t.Fatal(err)
 				}
+				nexts := 0
 				for _, s := range sentences {
 					text := strings.ToLower(s.Text)
-					if strings.Contains(text, "effect as possible") || strings.Contains(text, "may already have happened") {
-						t.Errorf("%s: a terminal record cites EffectPossible: %s", what, s.Text)
-					}
 					if !strings.HasPrefix(s.Key, "dispatch.error.") {
 						continue
 					}
@@ -56,9 +55,14 @@ func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 					case RoleReason:
 						reasonIsFaithful(t, what, code, wantOrigin[origin], s)
 					case RoleNext:
-						nexts = append(nexts, s.Text)
-						if !strings.HasPrefix(text, "reconcile with the target") {
+						nexts++
+						if effect && !strings.HasPrefix(text, "reconcile with the target") {
 							t.Errorf("%s: next step does not start with reconciliation: %s", what, s.Text)
+						}
+						if !effect && (strings.Contains(text, "reconcile with the target") ||
+							!strings.Contains(text, "no reconciliation with the target is needed")) {
+							t.Errorf("%s: an action that could not have had an external effect "+
+								"is still sent to reconcile: %s", what, s.Text)
 						}
 						for _, unsafe := range []string{"without repeating", "safe to", "can be requested again"} {
 							if strings.Contains(text, unsafe) {
@@ -68,23 +72,9 @@ func TestErrorCodesAreReportsNotFindings(t *testing.T) {
 						nextIsFaithful(t, what, wantOrigin[origin], text)
 					}
 				}
-			}
-			if len(nexts) != 2 || nexts[0] != nexts[1] {
-				t.Errorf("%s: next step depends on EffectPossible: %q", what, nexts)
-			}
-		}
-	}
-	// A succeeded record says nothing about EffectPossible either.
-	for _, effect := range []bool{true, false} {
-		record := action(fleet.DispatchSucceeded)
-		record.EffectPossible = effect
-		sentences, err := r.Action(record, Options{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, s := range sentences {
-			if strings.Contains(s.Text, "effect as possible") || strings.Contains(s.Text, "may already have happened") {
-				t.Errorf("succeeded record cites EffectPossible: %s", s.Text)
+				if nexts != 1 {
+					t.Errorf("%s: %d next steps", what, nexts)
+				}
 			}
 		}
 	}

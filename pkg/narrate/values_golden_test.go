@@ -49,6 +49,7 @@ func valueFamilies(t *testing.T) []valueFamily {
 	t.Helper()
 	return []valueFamily{
 		{"dispatch_states", dispatchStateCases(t)},
+		{"dispatch_effects", dispatchEffectCases(t)},
 		{"dispatch_errors", dispatchErrorCases(t)},
 		{"dispatch_transitions", dispatchTransitionCases(t)},
 		{"approval", approvalCases(t)},
@@ -86,6 +87,36 @@ func dispatchStateCases(t *testing.T) []valueCase {
 	return out
 }
 
+// dispatchEffectCases renders every source dispatch state, as an action and
+// as an admission, with EffectPossible set and clear (#538), so every
+// (state × flag) combination — the open claim's "may already have happened",
+// a terminal record's "may have occurred", and a succeeded or failed record's
+// "could not have had an external effect" — is pinned by name. The other
+// families render the fixtures' own flag.
+func dispatchEffectCases(t *testing.T) []valueCase {
+	var out []valueCase
+	for _, state := range sourceDispatchStates(t) {
+		for _, kind := range []string{"action", "admission"} {
+			build := action
+			if kind == "admission" {
+				if state == string(fleet.DispatchQueued) {
+					continue // an admission is never queued
+				}
+				build = admission
+			}
+			for _, flag := range []bool{true, false} {
+				record := build(fleet.DispatchState(state))
+				record.EffectPossible = flag
+				out = append(out, valueCase{
+					name: fmt.Sprintf("%s %s effect_possible=%v", kind, state, flag),
+					run:  func(r *Renderer) ([]Sentence, error) { return r.Action(record, Options{}) },
+				})
+			}
+		}
+	}
+	return out
+}
+
 // originLabel names an error code origin in a case name.
 func originLabel(origin fleet.ErrorCodeOrigin) string {
 	if origin == fleet.ErrorCodeOriginUnknown {
@@ -108,20 +139,30 @@ func dispatchErrorCases(t *testing.T) []valueCase {
 	for _, s := range sourceErrorCodeOrigins(t) {
 		origin := fleet.ErrorCodeOrigin(s)
 		for _, code := range append(sourceErrorCodes(t), "made up by an executor") {
-			record := failedWith(code, origin)
-			out = append(out, valueCase{
-				name: "failed code=" + code + " origin=" + originLabel(origin),
-				run: func(r *Renderer) ([]Sentence, error) {
-					sentences, err := r.Action(record, Options{})
-					var kept []Sentence
-					for _, s := range sentences {
-						if s.Role == RoleReason || s.Role == RoleNext {
-							kept = append(kept, s)
+			// The fixture's flag is set; a clear one (#538: the action
+			// declared no external effect) changes the next step, so both
+			// are pinned.
+			for _, flag := range []bool{true, false} {
+				record := failedWith(code, origin)
+				record.EffectPossible = flag
+				name := "failed code=" + code + " origin=" + originLabel(origin)
+				if !flag {
+					name += " effect_possible=false"
+				}
+				out = append(out, valueCase{
+					name: name,
+					run: func(r *Renderer) ([]Sentence, error) {
+						sentences, err := r.Action(record, Options{})
+						var kept []Sentence
+						for _, s := range sentences {
+							if s.Role == RoleReason || s.Role == RoleNext {
+								kept = append(kept, s)
+							}
 						}
-					}
-					return kept, err
-				},
-			})
+						return kept, err
+					},
+				})
+			}
 		}
 		record := failedWith(GatewayOutcomeUnknown, origin)
 		out = append(out, valueCase{
