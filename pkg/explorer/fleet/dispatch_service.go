@@ -1725,6 +1725,45 @@ func (s *DispatchService) ReportAmbiguity(
 		current.Version != request.ExpectedVersion {
 		return ActionRecord{}, ErrActionConflict
 	}
+	// An exact duplicate is a replay, not a new report.
+	//
+	// The append rule below is deliberate and stays: two reports from one
+	// attempt mean the worker retried, and an operator wants both rather than
+	// the later silently overwriting the earlier. But that reasoning is about
+	// a retry carrying *different* information — a changed outcome, or a
+	// reference the worker has since obtained. A report identical in every
+	// respect to one already stored carries nothing beyond it.
+	//
+	// Treating it as a replay fixes an honest case and an adversarial one with
+	// the same change. The honest case: a worker whose response was lost
+	// retries, and the retry consumed budget for a report the record already
+	// had — on a route whose whole purpose is recourse for a worker that
+	// cannot get its outcome recorded. It now gets success and the record
+	// back, which is what completeClaim's replay branch does for the same
+	// situation.
+	//
+	// The adversarial case is #514's report-budget exhaustion, reproduced by
+	// filing eight *identical* reports from a lapsed co-tenant until the
+	// worker that performed the effect was refused. That reproduction no
+	// longer works. This does not close #514: a co-tenant willing to vary its
+	// reports still exhausts the budget, and the claim-history eviction half
+	// is untouched. Eight distinct and plausible reports from one principal
+	// are a much less comfortable thing to write off as organic, which is the
+	// most this mitigation claims.
+	//
+	// ReportedAt is excluded from the comparison on purpose: it is set by the
+	// service from its own clock, so a retry always differs there and
+	// including it would make every duplicate look new.
+	for _, existing := range current.AmbiguityReports {
+		if existing.ClaimFence == request.ClaimFence &&
+			existing.Outcome == request.Outcome &&
+			existing.Target == request.Target &&
+			existing.Reference == request.Reference &&
+			existing.Subject == decision.Subject() &&
+			existing.Actor == decision.Actor() {
+			return cloneActionRecord(current), nil
+		}
+	}
 	if len(current.AmbiguityReports) >= MaxActionAmbiguityReports {
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument,

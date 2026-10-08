@@ -3965,3 +3965,87 @@ func TestInvokeRefusesADispatchOnlyBindingWithoutClaiming(t *testing.T) {
 			before.ClaimFence, after.ClaimFence)
 	}
 }
+
+// TestAnIdenticalAmbiguityReportIsAReplay fixes an honest case and an
+// adversarial one with the same change.
+//
+// The honest case: a worker whose response was lost retries, and the retry
+// consumed one of eight report slots for a report the record already had — on
+// the one route whose purpose is recourse for a worker that cannot otherwise
+// get its outcome recorded.
+//
+// The adversarial case is #514's report-budget exhaustion. The budget is per
+// record and shared across every principal the record has seen, and the
+// reproduction filed eight *identical* reports from a lapsed co-tenant until
+// the worker that performed the effect was refused. That reproduction no
+// longer works.
+//
+// It does not close #514, and the test says so: a co-tenant willing to vary
+// its reports still exhausts the budget. What the mitigation claims is that
+// eight distinct and plausible reports from one principal are a much less
+// comfortable thing to write off as organic.
+//
+// The append rule it preserves is the other half: a retry carrying *different*
+// information is still appended, because an operator wants both rather than
+// the later silently overwriting the earlier.
+func TestAnIdenticalAmbiguityReportIsAReplay(t *testing.T) {
+	fixture := newExecutorClaimFixture(t)
+	worker, fence, _ := fixture.lapsedClaimant(t, "worker")
+	report := func(outcome AmbiguityOutcome, reference string) (ActionRecord, error) {
+		return fixture.service.ReportAmbiguity(worker, AmbiguityRequest{
+			ID: fixture.queued.ID, ClaimFence: fence, Outcome: outcome,
+			Target: "payments.example.test", Reference: reference,
+			Context: dispatchContext(fixture.now, "worker-request"),
+		})
+	}
+
+	first, err := report(AmbiguityOutcomeUnknown, "ch_1")
+	if err != nil {
+		t.Fatalf("the first report was refused: %v", err)
+	}
+	if len(first.AmbiguityReports) != 1 {
+		t.Fatalf("reports after the first = %d", len(first.AmbiguityReports))
+	}
+
+	// Identical: a replay. Success, the record back, and nothing appended.
+	replayed, err := report(AmbiguityOutcomeUnknown, "ch_1")
+	if err != nil {
+		t.Fatalf("an identical retry was refused, so a worker whose response "+
+			"was lost cannot safely retry the one route that exists for it: %v",
+			err)
+	}
+	if len(replayed.AmbiguityReports) != 1 {
+		t.Fatalf("an identical retry appended a second report (%d total), so "+
+			"it still consumes the shared budget",
+			len(replayed.AmbiguityReports))
+	}
+	if replayed.Version != first.Version {
+		t.Fatalf("an identical retry advanced the version from %d to %d, so "+
+			"it still writes", first.Version, replayed.Version)
+	}
+
+	// Different in any respect: appended, because a retry that carries new
+	// information is exactly what the append rule is for.
+	for _, probe := range []struct {
+		name      string
+		outcome   AmbiguityOutcome
+		reference string
+	}{
+		{"a changed outcome", AmbiguityEffectObserved, "ch_1"},
+		{"a reference obtained since", AmbiguityOutcomeUnknown, "ch_2"},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			before := fixture.dispatchStore.records[string(fixture.queued.ID)]
+			after, err := report(probe.outcome, probe.reference)
+			if err != nil {
+				t.Fatalf("a report differing in %s was refused: %v",
+					probe.name, err)
+			}
+			if len(after.AmbiguityReports) != len(before.AmbiguityReports)+1 {
+				t.Fatalf("a report differing in %s was not appended: %d then "+
+					"%d", probe.name, len(before.AmbiguityReports),
+					len(after.AmbiguityReports))
+			}
+		})
+	}
+}
