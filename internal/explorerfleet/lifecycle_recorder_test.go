@@ -106,9 +106,17 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 		t.Fatalf("record attempts = %d", len(store.requests))
 	}
 	expectedID := interaction.DerivedID(
-		"session", "fleet.lifecycle.v2", string(lifecycle.Operation),
+		"session", "fleet.lifecycle.v3", string(lifecycle.Operation),
 		string(lifecycle.RequestID), string(lifecycle.AgentID),
 	)
+	// The pre-asserted-reason identity is still derived exactly, because
+	// retries reconcile against receipts written under it.
+	if v2LifecycleSessionID(lifecycle) != interaction.DerivedID(
+		"session", "fleet.lifecycle.v2", string(lifecycle.Operation),
+		string(lifecycle.RequestID), string(lifecycle.AgentID),
+	) {
+		t.Fatal("v2 lifecycle receipt identity drifted")
+	}
 	if lifecycleSessionID(lifecycle) != expectedID {
 		t.Fatalf(
 			"lifecycle session ID = %q, want %q",
@@ -119,8 +127,8 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 
 func TestLifecycleRecorderReconcilesLegacyReceiptBeforeWritingV2(t *testing.T) {
 	lifecycle := testLifecycle()
-	accepted := lifecycleSession(lifecycle)
-	accepted.ID = legacyLifecycleSessionID(lifecycle)
+	accepted := lifecycleSession(lifecycle, interaction.CallerAssertedReason{})
+	accepted.ID = v1LifecycleSessionID(lifecycle)
 	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
 	accepted.Actor = interaction.ActorContext{
 		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,
@@ -226,7 +234,7 @@ func TestLifecycleRecorderPreservesCommittedAmbiguity(t *testing.T) {
 func TestLifecycleRecorderRecoversDroppedCommittedResult(t *testing.T) {
 	cause := context.DeadlineExceeded
 	lifecycle := testLifecycle()
-	accepted := lifecycleSession(lifecycle)
+	accepted := lifecycleSession(lifecycle, interaction.CallerAssertedReason{})
 	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
 	accepted.Actor = interaction.ActorContext{
 		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,
@@ -257,7 +265,7 @@ func TestLifecycleRecorderRecoversDroppedCommittedResult(t *testing.T) {
 func TestLifecycleRecorderRejectsDroppedDivergentCommittedResult(t *testing.T) {
 	cause := context.DeadlineExceeded
 	lifecycle := testLifecycle()
-	accepted := lifecycleSession(lifecycle)
+	accepted := lifecycleSession(lifecycle, interaction.CallerAssertedReason{})
 	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
 	accepted.Actor = interaction.ActorContext{
 		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,

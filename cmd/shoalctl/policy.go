@@ -52,8 +52,11 @@ import (
 const (
 	// applyReasonCode is recorded on every registration apply makes. The
 	// policy digest is recorded beside it as the reason detail, so the
-	// lifecycle record names the exact policy that produced each generation.
-	applyReasonCode = "atpl-apply"
+	// lifecycle record names the exact policy that produced each generation:
+	// a hosted registry keeps it as the receipt's caller-asserted reason
+	// source, attributed to the authenticated caller, and refuses any detail
+	// that is not a policy digest.
+	applyReasonCode = fleet.ReasonCodeATPLApply
 	// maxTokenBytes bounds the bearer token file.
 	maxTokenBytes = 64 << 10
 	// maxResponseBytes bounds one registry response: a full list page of

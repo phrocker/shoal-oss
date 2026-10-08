@@ -217,9 +217,43 @@ followed.
   raise the lease; only a heartbeat or a later content change does. The
   "stopped after N of M writes" error names each child left clamped and the
   time its clamped lease ends.
-- `internal/explorerfleet`'s durable lifecycle recorder does not persist reason
-  code or detail, so in a hosted deployment the policy digest reaches
-  `fleet.Lifecycle` but not the durable interaction record.
+- `policy plan` does not yet show which policy produced each live
+  registration. The hosted registry records it (see below), but there is no
+  HTTP route that reads a registration's lifecycle receipt.
+
+## Recorded policy source
+
+A hosted registry (`internal/explorerfleet`'s durable lifecycle recorder)
+records each registration's reason code and detail in its lifecycle receipt as
+`interaction.Session.CallerAssertedReason`: what the authenticated caller
+asserted, attributed to the receipt's trusted `Actor`, not verified by Shoal and
+never used to authorize anything. It sits beside the trusted `Reason`, which
+remains the decision's audit purpose. For reason code `atpl-apply` the detail
+must be exactly `atpl:policy:v1:<64 lowercase hex>` and is kept verbatim as
+`Source`; anything else is refused before the receipt or the registration is
+written. Other reason codes keep their detail only as a SHA-256 `DetailDigest`,
+and every code must match `[A-Za-z0-9_.:-]`; this code rule applies to every
+registry route, reads (resolve, list) included.
+
+The assertion is bound into the receipt's query digest, so a retry of the same
+request with a different assertion conflicts (HTTP 409). That digest is an
+unkeyed SHA-256: it detects a divergent retry, not tampering by someone who can
+write the store. A register that replays an existing registration key is still
+recorded: under its original request ID it is checked against the original
+receipt, and under a new request ID it gets its own receipt with its own
+assertion, attributed to its caller, over the same mutation. The receipt that
+admitted the generation, the earliest one, is never changed. To find which
+policy produced a generation, read that earliest receipt; a later replay
+receipt records only what that later caller asserted.
+
+Receipts are written under the identity `fleet.lifecycle.v3`. Receipts written
+before the asserted reason was recorded have v1 or v2 identities and no
+`CallerAssertedReason`; a retry of such a request reconciles with them, whatever
+it asserts, because they never recorded an assertion to compare. A v3 receipt
+without an asserted reason, or a v1/v2 receipt with one, is a conflict.
+
+The receipt's ID is `explorerfleet.LifecycleReceiptID(operation, request ID,
+agent ID)`, and it is read with the corpus's `InteractionRecord`.
 
 ## Deferred
 
