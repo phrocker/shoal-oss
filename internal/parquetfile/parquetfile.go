@@ -22,15 +22,16 @@ type EncodeOptions struct {
 }
 
 // Cell is the Parquet representation of one Accumulo key/value entry.
-// Every key component remains binary so arbitrary Accumulo keys round-trip.
+// Key components remain binary so arbitrary Accumulo keys round-trip. Byte-array
+// columns use dictionary encoding and ZSTD compression for compact storage.
 type Cell struct {
-	Row       []byte `parquet:"row"`
-	CF        []byte `parquet:"cf"`
-	CQ        []byte `parquet:"cq"`
-	CV        []byte `parquet:"cv"`
-	Timestamp int64  `parquet:"timestamp"`
-	Deleted   bool   `parquet:"deleted"`
-	Value     []byte `parquet:"value"`
+	Row       []byte `parquet:"row,dict,zstd"`
+	CF        []byte `parquet:"cf,dict,zstd"`
+	CQ        []byte `parquet:"cq,dict,zstd"`
+	CV        []byte `parquet:"cv,dict,zstd"`
+	Timestamp int64  `parquet:"timestamp,zstd"`
+	Deleted   bool   `parquet:"deleted,zstd"`
+	Value     []byte `parquet:"value,dict,zstd"`
 }
 
 // Encode drains an already-seeked, sorted iterator into a Parquet image.
