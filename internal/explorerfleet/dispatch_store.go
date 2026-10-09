@@ -81,7 +81,7 @@ func (s *DispatchStore) ScanActions(ctx context.Context, after []byte, limit int
 	}
 	head, err := s.runtime.CurrentHead(ctx)
 	if err != nil {
-		return fleet.ActionPage{}, publicError(err)
+		return fleet.ActionPage{}, publicError("action", err)
 	}
 	var startAfter []byte
 	if len(after) > 0 {
@@ -94,7 +94,7 @@ func (s *DispatchStore) ScanActions(ctx context.Context, after []byte, limit int
 		MaxScanned: explorercoord.MaxCommittedScanCells,
 	})
 	if err != nil {
-		return fleet.ActionPage{}, publicError(err)
+		return fleet.ActionPage{}, publicError("action", err)
 	}
 	result := fleet.ActionPage{Actions: make([]fleet.ActionRecord, 0, len(page.Cells))}
 	for _, cell := range page.Cells {
@@ -129,14 +129,14 @@ func (s *DispatchStore) readAction(
 		if errors.Is(err, guard.ErrNotFound) || errors.Is(err, transaction.ErrNotFound) {
 			return fleet.ActionRecord{}, nil, fleet.ErrActionNotFound
 		}
-		return fleet.ActionRecord{}, nil, publicError(err)
+		return fleet.ActionRecord{}, nil, publicError("action", err)
 	}
 	if head == nil {
 		return fleet.ActionRecord{}, nil, fleet.ErrActionNotFound
 	}
 	value, err := s.readCommittedAction(ctx, dispatchRow(id), head.Epoch)
 	if err != nil {
-		return fleet.ActionRecord{}, nil, publicError(err)
+		return fleet.ActionRecord{}, nil, publicError("action", err)
 	}
 	record, err := decodeAction(value)
 	if err != nil {
@@ -214,7 +214,7 @@ func (s *DispatchStore) ApplyAction(ctx context.Context, mutation fleet.Dispatch
 	lpart, err := explorercoord.Partition(
 		coordination.DomainID("fleet-dispatch"), canonical.ID)
 	if err != nil {
-		return fleet.ActionRecord{}, publicError(err)
+		return fleet.ActionRecord{}, publicError("action", err)
 	}
 	actionGuard := explorercoord.GuardIntent{
 		Entity: dispatchEntity(canonical.ID), DesiredState: guard.StateLive,
@@ -312,7 +312,7 @@ func (s *DispatchStore) ApplyAction(ctx context.Context, mutation fleet.Dispatch
 		if errors.Is(publishErr, explorercoord.ErrIndeterminatePublication) {
 			return fleet.ActionRecord{}, shoal.WrapError(shoal.ErrorUnavailable, "fleet action publication is indeterminate", publishErr)
 		}
-		return fleet.ActionRecord{}, publicError(publishErr)
+		return fleet.ActionRecord{}, publicError("action", publishErr)
 	}
 	stored, err := s.GetAction(ctx, canonical.ID)
 	if err != nil {
@@ -342,7 +342,7 @@ func (s *DispatchStore) PendingActionTransitions(
 	}
 	head, err := s.runtime.CurrentHead(ctx)
 	if err != nil {
-		return fleet.ActionTransitionPage{}, publicError(err)
+		return fleet.ActionTransitionPage{}, publicError("action", err)
 	}
 	var startAfter []byte
 	if len(after) > 0 {
@@ -357,7 +357,7 @@ func (s *DispatchStore) PendingActionTransitions(
 		MaxScanned: explorercoord.MaxCommittedScanCells,
 	})
 	if err != nil {
-		return fleet.ActionTransitionPage{}, publicError(err)
+		return fleet.ActionTransitionPage{}, publicError("action", err)
 	}
 	result := fleet.ActionTransitionPage{
 		Transitions: make([]fleet.ActionTransition, 0, len(page.Cells)),
@@ -405,7 +405,7 @@ func (s *DispatchStore) CompleteActionTransition(
 	lpart, err := explorercoord.Partition(
 		coordination.DomainID("fleet-dispatch"), transition.Record.ID)
 	if err != nil {
-		return publicError(err)
+		return publicError("action", err)
 	}
 	_, err = s.runtime.Publish(ctx, explorercoord.Request{Intent: explorercoord.Intent{
 		Operation: []byte("fleet.dispatch.complete-transition.v1"),
@@ -438,7 +438,7 @@ func (s *DispatchStore) CompleteActionTransition(
 			reflect.DeepEqual(replayed.Transition, transition) {
 			return nil
 		}
-		return publicError(err)
+		return publicError("action", err)
 	}
 	return nil
 }
@@ -460,7 +460,7 @@ func (s *DispatchStore) ensureTransition(
 	lpart, err := explorercoord.Partition(
 		coordination.DomainID("fleet-dispatch"), transition.Record.ID)
 	if err != nil {
-		return publicError(err)
+		return publicError("action", err)
 	}
 	_, err = s.runtime.Publish(ctx, explorercoord.Request{Intent: explorercoord.Intent{
 		Operation: []byte("fleet.dispatch.repair-transition.v1"),
@@ -484,7 +484,7 @@ func (s *DispatchStore) ensureTransition(
 			ID:   append([]byte(nil), transition.ID...),
 		}},
 	}})
-	return publicError(err)
+	return publicError("action", err)
 }
 
 func (s *DispatchStore) readTransition(
@@ -502,7 +502,7 @@ func (s *DispatchStore) readTransition(
 			errors.Is(err, transaction.ErrNotFound) {
 			return storedTransition{}, nil, fleet.ErrActionNotFound
 		}
-		return storedTransition{}, nil, publicError(err)
+		return storedTransition{}, nil, publicError("action", err)
 	}
 	if head == nil {
 		return storedTransition{}, nil, fleet.ErrActionNotFound
@@ -513,7 +513,7 @@ func (s *DispatchStore) readTransition(
 		dispatchFamily,
 		dispatchQualifier, s.visibility, head.Epoch)
 	if err != nil {
-		return storedTransition{}, nil, publicError(err)
+		return storedTransition{}, nil, publicError("action", err)
 	}
 	if !ok {
 		return storedTransition{}, nil, fleet.ErrActionNotFound

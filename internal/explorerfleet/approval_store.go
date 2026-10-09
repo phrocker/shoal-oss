@@ -74,7 +74,7 @@ func (s *ApprovalStore) readApproval(
 			errors.Is(err, transaction.ErrNotFound) {
 			return fleet.ApprovalRecord{}, nil, fleet.ErrApprovalNotFound
 		}
-		return fleet.ApprovalRecord{}, nil, publicError(err)
+		return fleet.ApprovalRecord{}, nil, publicError("approval", err)
 	}
 	if head == nil {
 		return fleet.ApprovalRecord{}, nil, fleet.ErrApprovalNotFound
@@ -83,7 +83,7 @@ func (s *ApprovalStore) readApproval(
 		ctx, DispatchTable, approvalRow(id), dispatchFamily,
 		dispatchQualifier, s.visibility, head.Epoch)
 	if err != nil {
-		return fleet.ApprovalRecord{}, nil, publicError(err)
+		return fleet.ApprovalRecord{}, nil, publicError("approval", err)
 	}
 	if !ok {
 		return fleet.ApprovalRecord{}, nil, fleet.ErrApprovalNotFound
@@ -125,7 +125,7 @@ func (s *ApprovalStore) ApplyApproval(
 	lpart, err := explorercoord.Partition(
 		coordination.DomainID("fleet-approval"), canonical.ID)
 	if err != nil {
-		return fleet.ApprovalRecord{}, publicError(err)
+		return fleet.ApprovalRecord{}, publicError("approval", err)
 	}
 	intentGuard := explorercoord.GuardIntent{
 		Entity: approvalEntity(canonical.ID), DesiredState: guard.StateLive,
@@ -195,7 +195,7 @@ func (s *ApprovalStore) ApplyApproval(
 				shoal.ErrorUnavailable,
 				"fleet approval publication is indeterminate", publishErr)
 		}
-		return fleet.ApprovalRecord{}, publicError(publishErr)
+		return fleet.ApprovalRecord{}, publicError("approval", publishErr)
 	}
 	stored, err := s.GetApproval(ctx, canonical.ID)
 	if err != nil {
@@ -325,7 +325,7 @@ func (s *ApprovalStore) ScanApprovals(
 	}
 	head, err := s.runtime.CurrentHead(ctx)
 	if err != nil {
-		return fleet.ApprovalPage{}, publicError(err)
+		return fleet.ApprovalPage{}, publicError("approval", err)
 	}
 	var startAfter []byte
 	if len(after) > 0 {
@@ -339,7 +339,7 @@ func (s *ApprovalStore) ScanApprovals(
 		MaxScanned: explorercoord.MaxCommittedScanCells,
 	})
 	if err != nil {
-		return fleet.ApprovalPage{}, publicError(err)
+		return fleet.ApprovalPage{}, publicError("approval", err)
 	}
 	result := fleet.ApprovalPage{
 		Approvals: make([]fleet.ApprovalRecord, 0, len(page.Cells)),

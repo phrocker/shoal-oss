@@ -116,7 +116,7 @@ func (s *Store) Get(ctx context.Context, id shoal.ID) (fleet.Stored, error) {
 	}
 	head, _, err := s.runtime.ReadEntity(ctx, agentEntity(id))
 	if err != nil {
-		return fleet.Stored{}, publicError(err)
+		return fleet.Stored{}, publicError("agent", err)
 	}
 	if head == nil {
 		return fleet.Stored{}, shoal.NewError(shoal.ErrorNotFound, "agent not found")
@@ -130,7 +130,7 @@ func (s *Store) Get(ctx context.Context, id shoal.ID) (fleet.Stored, error) {
 				err,
 			)
 		}
-		return fleet.Stored{}, publicError(err)
+		return fleet.Stored{}, publicError("agent", err)
 	}
 	descriptor, registrationDigest, err := decodeDescriptor(value)
 	if err != nil {
@@ -154,7 +154,7 @@ func (s *Store) List(
 	}
 	head, err := s.runtime.CurrentHead(ctx)
 	if err != nil {
-		return fleet.StoredPage{}, publicError(err)
+		return fleet.StoredPage{}, publicError("agent", err)
 	}
 	var startAfter []byte
 	if len(cursor) > 0 {
@@ -167,7 +167,7 @@ func (s *Store) List(
 		MaxScanned: explorercoord.MaxCommittedScanCells,
 	})
 	if err != nil {
-		return fleet.StoredPage{}, publicError(err)
+		return fleet.StoredPage{}, publicError("agent", err)
 	}
 	result := fleet.StoredPage{Entries: make([]fleet.Stored, 0, len(page.Cells))}
 	for _, cell := range page.Cells {
@@ -235,7 +235,7 @@ func (s *Store) Apply(ctx context.Context, mutation fleet.Mutation) (fleet.Store
 	}
 	lpart, err := explorercoord.Partition(coordination.DomainID("fleet-registry"), []byte(mutation.Descriptor.ID))
 	if err != nil {
-		return fleet.Stored{}, publicError(err)
+		return fleet.Stored{}, publicError("agent", err)
 	}
 	agentGuard := explorercoord.GuardIntent{
 		Entity: agentEntity(mutation.Descriptor.ID), DesiredState: guard.StateLive,
@@ -307,7 +307,7 @@ func (s *Store) Apply(ctx context.Context, mutation fleet.Mutation) (fleet.Store
 			}
 			time.Sleep(time.Millisecond)
 		}
-		return fleet.Stored{}, publicError(err)
+		return fleet.Stored{}, publicError("agent", err)
 	}
 	stored, err := s.Get(ctx, mutation.Descriptor.ID)
 	if err != nil {
@@ -363,7 +363,17 @@ func descriptorWinner(value []byte) []byte {
 	return digest[:]
 }
 
-func publicError(err error) error {
+// publicError maps a coordination error to the public surface. The subject is
+// the kind of object the caller was reading — "agent", "action", "approval" —
+// and is required rather than defaulted.
+//
+// It was a single hardcoded "agent not found" shared by all three stores, so a
+// dispatch action read reported a missing *agent* (#633). Two investigations
+// went to the agent head cell and proved it sound before anyone noticed the
+// message belonged to a different store. A defaulted subject would have let
+// the next store added here inherit the same mislabel silently, so the
+// parameter has no default and the compiler names every call site.
+func publicError(subject string, err error) error {
 	switch {
 	case err == nil:
 		return nil
@@ -374,7 +384,7 @@ func publicError(err error) error {
 	case errors.Is(err, transaction.ErrConflict), errors.Is(err, guard.ErrConflict):
 		return shoal.NewError(shoal.ErrorConflict, "fleet registry conflict")
 	case errors.Is(err, transaction.ErrNotFound), errors.Is(err, guard.ErrNotFound):
-		return shoal.NewError(shoal.ErrorNotFound, "agent not found")
+		return shoal.NewError(shoal.ErrorNotFound, subject+" not found")
 	case errors.Is(err, transaction.ErrInvalid):
 		return shoal.NewError(shoal.ErrorInvalidArgument, "fleet registry request is invalid")
 	case errors.Is(err, explorercoord.ErrIndeterminatePublication), errors.Is(err, guard.ErrUnknown):
