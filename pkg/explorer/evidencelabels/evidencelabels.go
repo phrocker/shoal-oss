@@ -6,14 +6,31 @@
 // evidence carrying these visibility labels" for evidence that is *stored*
 // rather than scanned.
 //
-// Label enforcement in this plane normally happens at the scan: a document a
-// reader may not see does not come back from storage, so no service-layer
-// filter is needed. An evidence reference recorded on another record — a
-// dispatch action (#369), or the lifecycle event published for it (#562) — was
-// recorded by that record's principal and is stored as a field of it, so it
-// is returned to whoever may read the record rather than to whoever holds its
-// labels. Every such path filters through Filter here, so the rule cannot
-// drift between them.
+// These labels are enforced nowhere else, and the reason first given for this
+// package said otherwise. It said label enforcement in this plane happens at
+// the scan — that a document a reader may not see does not come back from
+// storage, so no service-layer filter was needed, and an evidence reference
+// merely escaped that.
+//
+// That does not hold for the free-form labels an evidence reference carries.
+// interaction.PropertyVisibility ("shoal.visibility") is written into a
+// node's *properties* by explorer.setVisibility, reached from parse.go, and
+// never into a cell visibility — so the scan has nothing to filter on and
+// internal/visfilter never sees it. Authorized reads gate on the access
+// rule's domain, source and policy, so a reader granted a source receives
+// every labelled document, span and node in it, label included (#570).
+//
+// So Filter is not restoring a check that existed at a lower layer. It is the
+// only check, which makes the nil case load-bearing rather than defensive: a
+// deployment with no Visibility withholds labelled evidence precisely because
+// nothing else would.
+//
+// An evidence reference recorded on another record — a dispatch action
+// (#369), or the lifecycle event published for it (#562) — was recorded by
+// that record's principal and is stored as a field of it, so it is returned
+// to whoever may read the record rather than to whoever holds its labels.
+// Every such path filters through Filter here, so the rule cannot drift
+// between them.
 //
 // A leaf package on purpose: the dispatch plane and the event plane both
 // import it, and neither imports the other for it.
