@@ -255,20 +255,20 @@ var (
 )
 
 // DecisionServiceReasons are the whole-request reasons the decision service
-// writes, by status.
+// writes, by status, taken from pkg/decision rather than mirrored: the mirror
+// was the drift risk, since a reason added to the service and not to the list
+// would have been narrated as a predictor's.
 //
-// Taken from pkg/decision rather than mirrored. The mirror carried the note
-// that "a result does not say whether the service or the predictor set its
-// reason (#509), so these are narrated conditionally and attributed to both"
-// — which is no longer true: these reasons are reserved, so a predictor
-// cannot return one and seeing one means the service established it. The
-// conditional attribution can go, and a renderer may state the service fact
-// outright.
-//
-// Not mirrored, because the mirror was the drift risk: a reason added to the
-// service and not to this list would have been quoted as the predictor's own
-// words. A predictor's whole-request reason is still quoted, which is correct
-// — it is now guaranteed to be the predictor's.
+// They are still narrated conditionally and attributed to both the predictor
+// and the service. Since #556 they are reserved (decision.ReservedServiceReason),
+// so a build with #556 never stores one a predictor returned. But a result
+// written before #556 could carry one the predictor set — nothing refused it
+// then (#509) — and a result records nothing that shows which build wrote it:
+// no build version, and the release it names is the predictor's, not the
+// service's. Stating the service fact outright would therefore assert, for
+// every such historical record, a finding the record cannot support. The hedge
+// can go once a result carries a marker that the service wrote its reason, or
+// that it was written by a build that refuses these reasons from a predictor.
 var DecisionServiceReasons = decision.ServiceReasons()
 
 // AnswerAbstentionReasons are per-answer abstention reasons with a meaning

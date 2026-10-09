@@ -331,11 +331,20 @@ clear (the shape #541's review reproduced).
 
 ### Reports are not findings
 
-The decision service writes its own whole-request reasons and passes
-a predictor's through unchanged, and the result does not say which (#509). A whole-request abstention or failure reason
-is attributed to "the predictor or the service" (`predictor_or_service` on a
-quote), its meaning is conditional ("if accurate"), and its next step starts
-"If …". A per-answer abstention is the predictor's own and is attributed to it.
+The decision service writes its own whole-request reasons and passes a
+predictor's through, and the result does not say which. Since #556 the
+service's reasons (`decision.ServiceReasons()`) are reserved: a predictor that
+returns one is adjudicated as `invalid_predictor_response`, so a build with
+#556 never stores a service reason a predictor set. A result written before
+#556 could carry one — nothing refused it then (#509) — and a result records
+nothing that shows which build wrote it: no build version, and its
+`ReleaseID` is the predictor's release, not the service's. So a whole-request
+abstention or failure reason, a service reason included, is still attributed
+to "the predictor or the service" (`predictor_or_service` on a quote), its
+meaning is conditional ("if accurate"), and its next step starts "If …".
+Stating the service fact outright would assert, for every historical record,
+a finding the record cannot support. A per-answer abstention is the
+predictor's own and is attributed to it.
 
 A success, or a failure whose code the executor gave, is "reported as
 succeeded (failed) by" whoever reported it: the claimant, or, for an admission,
@@ -438,11 +447,15 @@ selectors by import path to deny `Now`, `Since`, `Until`, `After`, `Tick`,
   `ActionRecord` on main; aggregation uses the claim fence. When attempt
   history lands (#438/#430), add an `ActionRecord` history sentence per
   attempt.
-- A decision result does not record who assigned its whole-request reason
-  (#509: the service or the predictor). Once it does, reasons the service
-  assigned can be narrated as Shoal's determinations, as error codes now are.
-  The `ErrorCode` half of this note (#508) is resolved by #529's
-  `ErrorCodeOrigin`; see "Who assigned an error code".
+- Since #556 a predictor cannot set a service reason, but a decision result
+  still carries nothing that tells a pre-#556 result from a later one (see
+  "Reports are not findings"). Once a result carries such a marker — that the
+  service wrote its reason, or that it was written by a build that reserves
+  the service's reasons — reasons on marked results can be narrated as Shoal's
+  determinations, as error codes with an origin are, and unmarked results keep
+  the hedge, as error codes without one do. The `ErrorCode` half of this note
+  (#508) is resolved by #529's `ErrorCodeOrigin`; see "Who assigned an error
+  code".
 - The source state of each `DispatchEdges` edge is checked against fleet's
   guards by review, not by test: the guards are spread through fleet's
   services. A transition table exported by fleet would let the test check them.

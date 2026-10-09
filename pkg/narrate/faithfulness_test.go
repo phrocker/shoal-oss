@@ -372,45 +372,89 @@ func TestAdmissionReporterIsTheRequester(t *testing.T) {
 	}
 }
 
-// A whole-request decision reason may be the service's or a predictor's own;
-// the record does not say which, so it is attributed to both and its meaning
-// is conditional.
+// A whole-request decision reason may be the service's or a predictor's own.
+// Since #556 a predictor cannot return one of the service's reasons
+// (decision.ReservedServiceReason), but a result written before #556 could,
+// and a result records nothing that shows which build wrote it. So every
+// whole-request reason, a service reason included, is attributed to both and
+// its meaning is conditional; none is ever stated as the service's finding.
 func TestDecisionReasonsAreReportsNotFindings(t *testing.T) {
 	r := New(nil)
 	req := request(t, taskConfig(), []shoal.ID{"subject1"}, nil)
-	for status, reasons := range DecisionServiceReasons {
-		for _, reason := range append(append([]string{}, reasons...), "predictor words") {
+	const predictorWords = "predictor words"
+	if decision.ReservedServiceReason(predictorWords) {
+		t.Fatal("the predictor fixture is a reserved service reason")
+	}
+	// Every reserved reason on every status, so one reserved for the other
+	// status (evidence_ineligible on a failure) is covered too, and a reason
+	// that is not reserved, which only a predictor can have set.
+	var reasons []string
+	for _, rs := range decision.ServiceReasons() {
+		reasons = append(reasons, rs...)
+	}
+	reasons = append(reasons, predictorWords)
+	for _, status := range []decision.ResultStatus{decision.Abstained, decision.Failed} {
+		for _, reason := range reasons {
 			sentences, err := r.Prediction(prediction(t, req, status, reason, nil), Options{})
 			if err != nil {
 				t.Fatal(err)
 			}
+			found := false
 			for _, s := range sentences {
 				text := strings.ToLower(s.Text)
 				switch {
 				case strings.HasPrefix(s.Key, "decision.reason."):
-					if !strings.Contains(text, "reported, by the predictor or the service") {
-						t.Errorf("%s/%s: reason not attributed to both: %s", status, reason, s.Text)
-					}
-					if knownDecisionReason(status, reason) && !strings.Contains(text, "if accurate") {
-						t.Errorf("%s/%s: meaning stated as fact: %s", status, reason, s.Text)
-					}
-					for _, causal := range []string{"no predictor was run", "so no"} {
-						if strings.Contains(text, causal) {
-							t.Errorf("%s/%s: causal claim: %s", status, reason, s.Text)
-						}
-					}
-					for _, q := range s.Quotes {
-						if q.Attribution != AttributedToPredictorOrService {
-							t.Errorf("%s/%s: quote attributed to %s", status, reason, q.Attribution)
-						}
-					}
+					found = true
+					decisionReasonIsFaithful(t, status, reason, s)
 				case strings.HasPrefix(s.Key, "decision.next.") && knownDecisionReason(status, reason):
 					if !strings.HasPrefix(text, "if ") {
 						t.Errorf("%s/%s: next step is not conditional: %s", status, reason, s.Text)
 					}
 				}
 			}
+			if !found {
+				t.Errorf("%s/%s: no reason sentence", status, reason)
+			}
 		}
+	}
+}
+
+// decisionReasonIsFaithful checks a whole-request reason sentence attributes
+// the reason to the predictor or the service, never to the service alone, and
+// states a reason's meaning only conditionally.
+func decisionReasonIsFaithful(t *testing.T, status decision.ResultStatus, reason string, s Sentence) {
+	t.Helper()
+	text := strings.ToLower(s.Text)
+	if !strings.Contains(text, "reported, by the predictor or the service") {
+		t.Errorf("%s/%s: reason not attributed to both: %s", status, reason, s.Text)
+	}
+	// The service's finding stated as such, as an error code with a service
+	// origin is. No decision result supports it: a reserved reason may be a
+	// pre-#556 predictor's, and any other reason is a predictor's or a newer
+	// build's.
+	for _, finding := range []string{
+		"shoal recorded", "shoal determined", "shoal found", "shoal assigned",
+		"the service recorded", "the service found", "the service determined",
+		"the service assigned", "the service established", "service’s own",
+		"service's own", "no predictor was run", "so no",
+	} {
+		if strings.Contains(text, finding) {
+			t.Errorf("%s/%s: stated as the service's finding (%q): %s",
+				status, reason, finding, s.Text)
+		}
+	}
+	if knownDecisionReason(status, reason) && !strings.Contains(text, "if accurate") {
+		t.Errorf("%s/%s: meaning stated as fact: %s", status, reason, s.Text)
+	}
+	quoted := false
+	for _, q := range s.Quotes {
+		quoted = true
+		if q.Attribution != AttributedToPredictorOrService {
+			t.Errorf("%s/%s: quote attributed to %s", status, reason, q.Attribution)
+		}
+	}
+	if !quoted && !strings.Contains(text, reason) {
+		t.Errorf("%s/%s: the reason is neither quoted nor named: %s", status, reason, s.Text)
 	}
 }
 
