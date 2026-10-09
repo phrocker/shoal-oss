@@ -48,9 +48,13 @@ const (
 // LatentLinkCell is the storage-neutral shape of a link cell emitted by the
 // latent-edge iterator into the graph index.
 type LatentLinkCell struct {
-	Row              []byte
-	ColumnFamily     []byte
-	ColumnQualifier  []byte
+	Row             []byte
+	ColumnFamily    []byte
+	ColumnQualifier []byte
+	// ColumnVisibility is the compound cell visibility the latent-edge
+	// iterator derived from the two embeddings. ProjectLatentLinkAssertions
+	// refuses to project a cell that carries one, because nothing downstream
+	// of the projection can enforce it (#569).
 	ColumnVisibility []byte
 	Timestamp        int64
 	Deleted          bool
@@ -76,8 +80,8 @@ type LatentLinkAssertionProjection struct {
 }
 
 // ProjectLatentLinkAssertions turns latent-edge link cells into derived
-// ontology assertions. Non-link and deleted cells are ignored so callers can
-// pass a mixed graph-index scan without pre-filtering.
+// ontology assertions. Non-link, deleted and labelled cells are ignored so
+// callers can pass a mixed graph-index scan without pre-filtering.
 func ProjectLatentLinkAssertions(
 	cells []LatentLinkCell,
 	projection LatentLinkAssertionProjection,
@@ -103,6 +107,42 @@ func ProjectLatentLinkAssertions(
 		if cell.Deleted {
 			// Load-bearing: TestProjectLatentLinkAssertionsSkipsDeletedLinkCells
 			// pins that tombstoned link cells do not become positive assertions.
+			continue
+		}
+		if len(cell.ColumnVisibility) != 0 {
+			// A labelled relationship must not become an unlabelled assertion
+			// (#569). LatentEdgeDiscoveryIterator writes the compound
+			// visibility of the two embeddings onto the link cell, and nothing
+			// past this point carries it: the derivation, the evidence ref and
+			// the assertion have no visibility, and computeCurrentGraph adds
+			// the result as a graph edge gated only by its endpoints'
+			// AccessRules. So a reader authorized on both endpoints would
+			// otherwise see the labelled relationship and its similarity
+			// score, derived from embeddings whose labels it does not hold.
+			//
+			// Dropped rather than enforced, and the difference is not a
+			// preference. Enforcing means scanning under the reader's
+			// authorizations, and the derived graph is cached process-wide in
+			// Explorer.graphNodes/graphEdges with no authorization in the key,
+			// so the first reader's label set would decide what every later
+			// reader sees. Keying that cache per label set is #569's other
+			// option and a real design change.
+			//
+			// Note for whoever revisits this: a cell visibility expression is
+			// not the same representation as the structured label policies
+			// #570 introduced, which live in node properties and are evaluated
+			// through AccessRules. The #623 label evaluator does not apply
+			// here, which is why this is a refusal and not a filter.
+			//
+			// Two costs, both accepted. A reader that does hold the labels
+			// also loses the edge, and an operator who attaches the latent
+			// iterator over labelled embeddings gets no latent edges and no
+			// explanation. Both are over-withholding, which is the safe
+			// direction, and PutLatentLinkCells has no production caller today
+			// (counted, not sampled), so nothing shipped changes behaviour.
+			//
+			// Load-bearing: TestProjectLatentLinkAssertionsSkipsLabelledCells
+			// and TestLatentLinkGraphReadDropsLabelledCells.
 			continue
 		}
 		tessellationCell, source, target, err := latentLinkEndpoints(cell)

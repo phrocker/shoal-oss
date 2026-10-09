@@ -207,6 +207,73 @@ func TestLatentLinkGraphReadSkipsTombstonedCells(t *testing.T) {
 	}
 }
 
+// TestLatentLinkGraphReadDropsLabelledCells is #569 end to end, through the
+// read path the leak actually travelled.
+//
+// The latent-edge iterator writes the compound visibility of the two
+// embeddings onto the link cell. scanLatentLinkCellsLocked scans in system
+// context (nil Authorizations), so the cell is visible to the scan, and
+// nothing past the projection carries the label — the graph edge is gated
+// only by its endpoints' AccessRules. A reader authorized on both endpoints
+// therefore saw a labelled relationship and its similarity score.
+//
+// Both links are written in one corpus on purpose. Asserting only that the
+// labelled edge is absent would pass if the latent read path were broken for
+// any other reason — a changed edge type, a projection error, the assertion
+// cap — so the unlabelled link is here to prove the path still reaches the
+// graph, and the labelled one to prove the refusal turns on the label.
+func TestLatentLinkGraphReadDropsLabelledCells(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	source := ingestLatentReadPathDocument(t, corpus, "labelled-source")
+	plain := ingestLatentReadPathDocument(t, corpus, "labelled-plain-target")
+	secret := ingestLatentReadPathDocument(t, corpus, "labelled-secret-target")
+
+	labelled := latentReadPathCell(source.Document.ID, secret.Document.ID, 20, false)
+	labelled.ColumnVisibility = []byte("A&B")
+	if err := corpus.PutLatentLinkCells(ctx, []LatentLinkCell{
+		latentReadPathCell(source.Document.ID, plain.Document.ID, 10, false),
+		labelled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := corpus.BoundedNeighborhood(ctx, BoundedNeighborhoodRequest{
+		NodeIDs: []shoal.ID{source.Document.ID}, Depth: 1, Fanout: 8, MaxNodes: 8,
+		EdgeTypes: []string{latentReadPathEdgeType(t)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Neighborhood.Assertions) != 1 {
+		t.Fatalf("derived assertions = %d, want 1: the unlabelled link must "+
+			"still reach the graph and the labelled one must not",
+			len(got.Neighborhood.Assertions))
+	}
+	derivation, ok := got.Neighborhood.Assertions[0].Evidence()[0].Derivation()
+	if !ok {
+		t.Fatal("derived assertion evidence lost its derivation")
+	}
+	// Named, not counted. A count of one also holds if the labelled link
+	// survived and the unlabelled one was dropped instead.
+	if derivation.TargetEndpoint() != plain.Document.ID {
+		t.Fatalf("the surviving derivation points at %q, want the unlabelled "+
+			"target %q: a labelled relationship reached a reader authorized "+
+			"only on its endpoints",
+			derivation.TargetEndpoint(), plain.Document.ID)
+	}
+	for _, edge := range got.Neighborhood.Edges {
+		if edge.To == secret.Document.ID || edge.From == secret.Document.ID {
+			t.Fatalf("a graph edge still reaches the labelled endpoint %q",
+				secret.Document.ID)
+		}
+	}
+}
+
 func TestLatentLinkGraphReadErrorsAtExplicitCap(t *testing.T) {
 	ctx := context.Background()
 	corpus, err := OpenWithOptions(t.TempDir(), Options{
