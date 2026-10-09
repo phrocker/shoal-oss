@@ -1364,6 +1364,22 @@ refuses "the env form still needs a Secret"  "${llm_gateway_base[@]}" --set llmG
 refuses "the env form still needs a variable" "${llm_gateway_base[@]}" --set llmGateway.admission.tokenEnv=
 
 note "== the transport acknowledgement, and the one hop that has none =="
+# The listener acknowledgement is separate from the admission hop and must be
+# a boolean: a quoted "false" is truthy in a Helm condition.
+assert_renders "the default internal gateway Service" 'type: "ClusterIP"' "${llm_gateway_base[@]}"
+for service_type in LoadBalancer NodePort ExternalName; do
+  refuses_citing "exposes a plaintext prompt endpoint" "an unacknowledged $service_type gateway" "${llm_gateway_base[@]}" --set llmGateway.service.type="$service_type"
+done
+for service_type in LoadBalancer NodePort; do
+  assert_renders "an acknowledged $service_type gateway" "type: \"$service_type\"" "${llm_gateway_base[@]}" --set llmGateway.service.type="$service_type",llmGateway.service.allowPlaintext=true
+done
+refuses_citing "exposes a plaintext prompt endpoint" "an explicitly unacknowledged public gateway" "${llm_gateway_base[@]}" --set llmGateway.service.type=LoadBalancer,llmGateway.service.allowPlaintext=false
+refuses_citing "exposes a plaintext prompt endpoint" "admission acknowledgement does not cover the listener" "${llm_gateway_base[@]}" --set llmGateway.service.type=LoadBalancer,llmGateway.admission.allowPlaintext=true
+for acknowledgement in true false yes; do
+  refuses_citing "llmGateway.service.allowPlaintext must be a boolean" "a string listener acknowledgement ($acknowledgement)" "${llm_gateway_base[@]}" --set llmGateway.service.type=LoadBalancer --set-string llmGateway.service.allowPlaintext="$acknowledgement"
+done
+refuses_citing "llmGateway.service.allowPlaintext must be a boolean" "a null listener acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.service.allowPlaintext=null
+renders "a disabled gateway does not guard listener exposure" -f "$chart/values.yaml" --set llmGateway.enabled=false,llmGateway.service.type=LoadBalancer
 # The acknowledgement is a flag now, because it was a values key that reached
 # nothing: the binary refuses a remote http:// admission URL without it, so the
 # documented mesh deployment rendered cleanly and produced CrashLoopBackOff.
@@ -1376,6 +1392,7 @@ refuses "a non-boolean plaintext acknowledgement" "${llm_gateway_base[@]}" --set
 # nothing about it. allowPlaintext must not open this one.
 refuses "a plaintext remote upstream" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://api.example.test/v1
 refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the admission acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://api.example.test/v1,llmGateway.admission.allowPlaintext=true
+refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the listener acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://api.example.test/v1,llmGateway.service.allowPlaintext=true
 renders "a loopback provider over http"     "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://localhost:11434/v1,llmGateway.upstream.credentialSecretName=
 
 note "== the declared model list =="

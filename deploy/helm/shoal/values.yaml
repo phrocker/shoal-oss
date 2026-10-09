@@ -638,6 +638,9 @@ llmGateway:
     policyID: ""
   service:
     type: ClusterIP
+    # The listener is plaintext: require a TLS-terminating ingress or mesh.
+    # Non-ClusterIP exposure requires explicit acknowledgement of that hop.
+    allowPlaintext: false
     annotations: {}
   # Must exceed admission.lease, and validate.yaml refuses the pair when it
   # does not.

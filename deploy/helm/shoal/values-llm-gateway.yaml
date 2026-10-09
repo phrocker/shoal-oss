@@ -35,6 +35,11 @@ llmGateway:
   # the caller's work outright, so an unavailable gateway is an outage for
   # everything configured to go through it.
   replicas: 2
+  service:
+    type: ClusterIP
+    # The gateway does not terminate TLS. Supply a terminating ingress or mesh;
+    # acknowledge that requirement explicitly before exposing a non-ClusterIP.
+    allowPlaintext: false
   # The authority clients send as their OpenAI base URL — usually the port-less
   # Service or ingress name. With none, every request is refused with 421
   # Misdirected Request before admission is even asked.

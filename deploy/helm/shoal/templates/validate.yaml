@@ -446,6 +446,15 @@
 {{- $upstream := $gateway.upstream -}}
 {{- $identity := $gateway.identity -}}
 
+{{- /* The listener stays plaintext behind a terminating ingress or mesh.
+       A public Service must not silently expose the caller's prompt. */ -}}
+{{- if not (kindIs "bool" $gateway.service.allowPlaintext) -}}
+{{- fail "llmGateway.service.allowPlaintext must be a boolean, true or false: only an explicit boolean acknowledgement permits non-ClusterIP exposure of the plaintext listener" -}}
+{{- end -}}
+{{- if and (ne $gateway.service.type "ClusterIP") (not $gateway.service.allowPlaintext) -}}
+{{- fail (printf "llmGateway.service.type %q exposes a plaintext prompt endpoint outside a ClusterIP: the gateway does not terminate TLS. Use ClusterIP behind a TLS-terminating ingress or mesh, or set llmGateway.service.allowPlaintext=true to explicitly acknowledge exposure with a terminating hop configured separately. This value does not enable TLS, and llmGateway.admission.allowPlaintext does not cover the listener" $gateway.service.type) -}}
+{{- end -}}
+
 {{- /* Every string the gateway pod is rendered from reaches it as one quoted
        YAML scalar: a container argument, an environment variable name, a
        Secret reference, a mount path, the image. Before they were quoted, a

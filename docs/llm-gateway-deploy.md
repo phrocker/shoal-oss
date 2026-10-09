@@ -19,6 +19,7 @@ Read anything below about obligations with that in mind.
 - [Why it is a separate process](#why-it-is-a-separate-process)
 - [The flag contract](#the-flag-contract)
 - [Withhold obligations and attribution](#withhold-obligations-and-attribution)
+- [Listener transport: require a terminating hop](#listener-transport-require-a-terminating-hop)
 - [Kubernetes: the Helm chart](#kubernetes-the-helm-chart)
 - [The render-time refusals](#the-render-time-refusals)
 - [Orchestrator probes: the health surface](#orchestrator-probes-the-health-surface)
@@ -336,6 +337,35 @@ authenticating the hop to the Explorer says nothing about the hop to a third
 party. A remote `http://` upstream is refused by the chart at render and by the
 binary at startup, with no way to accept it.
 
+## Listener transport: require a terminating hop
+
+The gateway **does not terminate TLS**. Its `-listen` endpoint accepts plaintext
+HTTP, including prompts; outside loopback development, deploy it behind a
+TLS-terminating ingress, sidecar or mTLS mesh. Certificate provisioning and
+rotation belong to that terminating hop, not to this process.
+
+The chart defaults to `llmGateway.service.type: ClusterIP`. It refuses any other
+Service type, including `LoadBalancer` and `NodePort`, unless the values file
+explicitly acknowledges the plaintext listener:
+
+```yaml
+llmGateway:
+  service:
+    type: LoadBalancer
+    allowPlaintext: true
+```
+
+This is an acknowledgement, **not TLS configuration**. Configure the terminating
+hop separately before exposing the Service. It must protect callers' prompts
+in transit; if TLS ends at an ingress or load balancer, secure its backend hop
+with a mesh or keep that plaintext hop confined to a trusted network. The chart
+neither installs nor verifies that protection. ClusterIP limits exposure but
+does not encrypt pod-network traffic, so it still needs that deployment decision.
+
+`service.allowPlaintext` must be a boolean and defaults to `false`. It is separate
+from `admission.allowPlaintext`: neither acknowledgement covers the other's hop,
+and neither permits a remote plaintext upstream provider.
+
 ## Kubernetes: the Helm chart
 
 `deploy/helm/shoal` renders the gateway as a **Deployment** with a Service and a
@@ -381,6 +411,8 @@ is confirmed to fail.
 
 | Setting | Why the chart will not render without it |
 | --- | --- |
+| a non-ClusterIP `llmGateway.service.type` without `service.allowPlaintext: true` | The listener is plaintext and carries prompts. Configure a terminating hop separately and explicitly acknowledge the exposure; the chart does not enable TLS. |
+| a non-boolean `llmGateway.service.allowPlaintext` | Only a boolean acknowledgement is accepted; a quoted `"false"` must not bypass the exposure guard. |
 | `llmGateway.admission.url` | A gateway that cannot ask must deny. With no decision plane every request behind it is refused while the pod stays healthy. It must also be an absolute `http://` or `https://` URL: a bare host is a transport error on every admission. |
 | a plaintext `admission.url` to a non-loopback host | Over `http://` the bearer token crosses the network in the clear, and so does the verdict — anything on the path can rewrite a deny into an allow, which removes the enforcement plane while everything still looks healthy. `admission.allowPlaintext: true` accepts it where a mesh already authenticates the hop. |
 | `llmGateway.admission.tokenEnv`, `credentialSecretName`, `credentialSecretKey` | The Explorer's API is authenticated in every deployment this chart can render, so an admission request with no bearer token is a 401 — every time. The gateway then denies every call. Required **in the environment-variable form**; the file form requires other things instead, below. |
@@ -826,11 +858,10 @@ Gaps in the flag contract, recorded rather than worked around.
   supplies a writer (`healthsurface.Config.Metrics`), so the outcome metrics
   #425 asks for can be exposed there. The gateway does not supply one yet, and
   until it does `/metrics` there is a `404`.
-- **No TLS flags for the gateway's own listener.** `writeTier`, `readFleet`,
-  `tserver` and `compactor` all take `tls.enabled`/`secretName`. The gateway
-  cannot, so it is plaintext behind an ingress or a mesh. The Explorer has the
-  same gap, which is also why reaching it over `http://` needs the explicit
-  acknowledgement above.
+- **TLS termination is external by contract.** The gateway listener remains
+  plaintext behind a terminating hop; non-ClusterIP Service exposure requires
+  `llmGateway.service.allowPlaintext: true`. See
+  [Listener transport](#listener-transport-require-a-terminating-hop).
 - **No quiesce delay.** `readFleet` has `-quiesce-delay`; the gateway does not.
   Readiness drops and the listener stops accepting in the same breath, so
   requests arriving in the few seconds before the endpoints controller removes
