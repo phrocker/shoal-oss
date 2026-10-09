@@ -22,9 +22,8 @@
 
 Status: **accepted architecture direction**, 2026-08-19. Implementation is
 tracked by [#128](https://github.com/phrocker/shoal-oss/issues/128).
-This document is the release-gated target contract; it does not claim that the
-current binaries already implement the coordinator adapters, durable fencing,
-or cutover state machine.
+This document is the release-gated target contract. The implementation status
+and remaining release gates are recorded in [section 7](#7-implementation-order).
 
 ## 1. Decision
 
@@ -169,7 +168,11 @@ Shoal must not make a coordination service carry data-plane load.
 The process acquires exclusive OS/PVC ownership before opening a writable
 engine. Every durable manifest replacement increments a generation with atomic
 replacement or backend compare-and-swap. A second process cannot open the same
-writer domain merely because it can read the files.
+writer domain merely because it can read the files. The held OS lock is the
+live lease; the manifest is durable fencing state validated while acquiring or
+advancing authority, not a second lease polled on every mutation. The lock and
+manifest paths are coordinator-owned, and out-of-band removal or replacement is
+storage corruption rather than a handoff mechanism.
 
 ### 5.2 Shoal-only Kubernetes
 
@@ -313,6 +316,41 @@ The dependency order is maintained in issue #128:
 Each phase must ship as independently tested slices. A coordinator abstraction
 alone does not satisfy a phase; the loss, restart, partition, and stale-token
 tests are part of the deliverable.
+
+### Current implementation status
+
+- [x] **Phase 0 — architecture contract.** This document is linked from the
+  architecture, hosting, promotion, and deployment contracts.
+- [x] **Phase 1 — common vocabulary and embedded fencing.**
+  `internal/coordination` defines authority, membership, lease, watch, and
+  validation interfaces; the embedded engine holds an OS/PVC lock and persists
+  a monotonic manifest generation. The shared conformance suite covers
+  acquisition, renewal, stale tokens, duplicate release, restart, and epoch
+  advancement; embedded fault tests additionally cover authority loss.
+- [x] **Phase 2 — Accumulo authority.** The tserver ServiceLock lifecycle,
+  compatible descriptors, generation-bound assignment attempts, session-loss
+  shutdown, and stale-generation rejection are implemented and tested under
+  `internal/tserver`. Durable work remains in Accumulo metadata, FATE, WALs, and
+  RFiles rather than ZooKeeper.
+- [ ] **Phase 3 — Shoal-only Kubernetes coordination.** The Lease adapter,
+  backend manifest CAS, RBAC, readiness fencing, and restart/partition/skew
+  tests remain to be implemented. The chart therefore continues to reject
+  multiple writable write-tier replicas.
+- [ ] **Phase 4 — fenced authority handoff.** `internal/promotion` persists the
+  source/destination authority tokens, immutable checkpoint, FATE identity, and
+  terminal cutover state and reconciles retries. Concrete embedded and Accumulo
+  authority controllers plus dual-authority and write-loss crash tests remain
+  release blockers.
+- [ ] **Phase 5 — operations and release gates.** Accumulo ServiceLock health,
+  readiness, and safe-drain operations are documented in
+  `write-tier-operations.md`. Kubernetes Lease diagnostics and the complete
+  partition, session-loss, rolling-upgrade, and handoff crash matrix remain
+  release blockers.
+
+Issues #69 and #72 are implemented, but Shoal-only multi-writer deployment
+remains blocked on Phase 3 and promotion remains blocked on Phases 3–5. An
+unchecked phase above is not an assertion that no code exists; it means at
+least one required release gate remains open.
 
 ## 8. Rejected alternatives
 

@@ -1049,6 +1049,8 @@ func (t *table) migrate(format tablet.FileFormat, stack []iterrt.IterSpec) error
 }
 
 func (t *table) close() error {
+	t.formatMu.Lock()
+	defer t.formatMu.Unlock()
 	var firstErr error
 	for i, tab := range t.tablets {
 		if err := tab.Close(); err != nil && firstErr == nil {
