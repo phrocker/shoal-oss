@@ -260,6 +260,7 @@ func TestWorkerNeverResendsAWrittenUnprotectedRequest(t *testing.T) {
 func (h *workerHarness) startGated() {
 	h.t.Helper()
 	h.target.gate = make(chan struct{})
+	h.t.Cleanup(h.release)
 	h.start()
 	select {
 	case <-h.target.entered:
@@ -269,11 +270,16 @@ func (h *workerHarness) startGated() {
 	settle()
 }
 
+// release opens the target's gate, once; a failing test's cleanup opens it
+// too, so the target's Close is never left waiting on a held request.
 func (h *workerHarness) release() {
 	h.target.mu.Lock()
 	gate := h.target.gate
+	h.target.gate = nil
 	h.target.mu.Unlock()
-	close(gate)
+	if gate != nil {
+		close(gate)
+	}
 }
 
 // TestWorkerExtendsToTheExplorersClampedEnd: the extension at L/2 is granted
@@ -749,6 +755,7 @@ func TestWorkerPullsOnlyWithAFreeSlot(t *testing.T) {
 		h.explorer.enqueue(id, "charge", chargeInput, workerEpoch.Add(time.Hour))
 	}
 	h.target.gate = make(chan struct{})
+	t.Cleanup(h.release)
 	h.start()
 	for i := 0; i < 2; i++ {
 		select {

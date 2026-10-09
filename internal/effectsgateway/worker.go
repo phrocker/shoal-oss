@@ -914,10 +914,10 @@ func (w *Worker) extend(run *claimRun) (Action, error) {
 		return Action{}, &DispatchError{Op: "extend", Kind: DispatchProtocol,
 			reason: "extend response cannot be anchored"}
 	}
+	// Adopted as granted, even if it ends earlier than the end already held:
+	// the explorer's answer is the lease.
 	run.mu.Lock()
-	if anchored.LeaseLocal.After(run.anchored.LeaseLocal) {
-		run.anchored = anchored
-	}
+	run.anchored = anchored
 	run.anchorAt = sent
 	if extended.Version > run.action.Version {
 		run.action.Version = extended.Version

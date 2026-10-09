@@ -159,6 +159,9 @@ func newPaymentTarget(t *testing.T) *paymentTarget {
 		_, _ = io.WriteString(w, cached)
 	}))
 	t.Cleanup(target.server.Close)
+	// Cleanups run last-in first-out: a held request is released before the
+	// server's Close waits for it.
+	t.Cleanup(target.release)
 	return target
 }
 
@@ -179,7 +182,9 @@ func (p *paymentTarget) release() {
 	gate := p.gate
 	p.gate = nil
 	p.mu.Unlock()
-	close(gate)
+	if gate != nil {
+		close(gate)
+	}
 }
 
 // advanceUntil moves the clock a step at a time until cond holds, giving the

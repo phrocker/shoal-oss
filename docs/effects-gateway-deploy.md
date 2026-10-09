@@ -1,9 +1,9 @@
 # Effects gateway: deployment
 
-> **Not yet runnable.** There is no `cmd/shoal-gateway`, no worker loop and no
-> chart entry. What exists is the core the worker will be built on, in
-> `internal/effectsgateway`, merged ahead of the four prerequisites below so it
-> can be reviewed on its own. Nothing in it performs an effect by itself.
+> **Not yet runnable.** There is no `cmd/shoal-gateway` and no chart entry.
+> What exists is the library in `internal/effectsgateway`: the core, the
+> dispatch client and the worker loop with its unrecorded-report log. The
+> command (PR6) composes them; nothing in the package starts on its own.
 
 This is the HTTP Path A worker from #391: it pulls an action off the fleet
 dispatch queue, claims it under a fence, performs one HTTP request against a
@@ -38,6 +38,8 @@ heartbeats and carries no registrar credential (#391).
 | `dialer.go` | the egress-restricted target transport and the separate explorer client |
 | `client.go`, `client_ops.go` | the internal dispatch client: pull, claim, extend, complete (bound on the claim fence), ambiguity, resolve (its own ref only), attestation presentation; every claim-scoped request carries the record's `Shoal-Correlation-ID` |
 | `logging.go` | the one logging function, and the policy it enforces |
+| `worker.go` | the worker loop: pull, filter, precheck, attest, claim, bind, send, classify, complete; renewal and FENCE_LOST; slots, backoff and drain |
+| `unrecorded.go` | the unrecorded-report log (#514) and the directory lock that keeps the gateway to one replica |
 
 The dispatch client is tested against the real explorer composition — the
 embedded store, the real recorder and publisher, the authenticated webapi
@@ -460,11 +462,100 @@ instant; no local wall-clock reading is compared with a server timestamp.
   the local instant the claim ID was *first* sent. Both err early.
 - **Send gate**, before every attempt: not draining,
   `deadlineLocal − now ≥ T + 5s`, and `leaseLocal − now ≥ T + 5s` (or
-  `≥ L/2` once renewal exists).
+  `≥ L/2` with `-renew`).
 
 An agent enqueuing with a conventional 30-second request deadline creates a
 30-second action, which PRECHECK skips: `Deadline` is the enqueuing request's
 own context deadline.
+
+## The worker loop
+
+`Worker.Run` is the loop, in `worker.go`; `WorkerConfig` is what the command
+builds from `Config`.
+
+```
+PULL → FILTER → PRECHECK → [ATTEST] → CLAIM → BIND → SEND → CLASSIFY → COMPLETE
+                                         └──────── FENCE_LOST ────────┘
+```
+
+- **PULL** only with a free slot (`-max-in-flight`, default 4) and room
+  reserved in the unrecorded log. An empty page or an error backs off,
+  jittered over `[d/2, d]`, doubling from the pull interval to 30s.
+- **FILTER**: the record's agent, capability, and an action with a route. The
+  pull page has no server-side filter, and a claim sets `EffectPossible`.
+- **PRECHECK** as above. A skipped record is logged once per version.
+- **ATTEST** when the action requires attestation (`AttestationRequirements`
+  reads it from the resolved descriptor) and the attestation in hand expires
+  before the explorer's now `+ L + 5s`. A presentation that is still too short
+  is not claimed under.
+- **CLAIM** with a fresh claim ID per attempt. `repull`, 404 and 409 send the
+  worker back to PULL; a 409 on an attested action also forgets the
+  attestation in hand.
+- **BIND** failure sends nothing: `request_not_sent` is reported, then the
+  action completes `failed/input_invalid`.
+- **SEND** behind the send gate, re-checked before every attempt and once
+  more after the credential is read. Retries reuse the bound request (same
+  key, same bytes), at most five attempts, waiting the target's
+  `Retry-After` capped at 30s or a jittered backoff.
+- **COMPLETE** on the claim fence, with `effected` on a failure that may have
+  left on an egress route: the request body of every attempt that may have
+  been written (#427).
+
+**Renewal.** Every `L/2` from the anchor of the last claim or extension, the
+worker extends — bound on the fence (#629), re-attesting first when needed —
+and re-anchors on the explorer's returned end, which the explorer clamps to
+the deadline; never on the lease it asked for. A lease clamped to the deadline
+is not extended again. An extension whose answer is lost keeps the end already
+held and is retried after the plane timeout.
+
+**FENCE_LOST** is a refused extension or the local lease end arriving:
+
+| when | the worker |
+|---|---|
+| nothing sent | sends nothing more, reports `request_not_sent`, lets the claim lapse |
+| a request in flight | lets it finish, then reports `effect_observed` (a success) or `outcome_unknown` |
+
+The same report follows a completion the explorer refused (404, 409, …). A
+completion whose answer may have committed (`indeterminate`, #506) stops
+renewing, waits out the lease, and then reports through the ambiguity route,
+which appends at `expected_version` 0. Each fence gets at most one report.
+
+**Shutdown** (context cancelled): stop pulling and go not-ready (`draining`).
+A claim with nothing sent reports `request_not_sent` and lapses. A request in
+flight finishes and completes, falling back to the report and then to the
+unrecorded log. The drain is bounded by `GracePeriod(T)`. `Kill` abandons
+everything, as SIGKILL would; the next instance re-claims after the lapse and
+resends under the same `ExecutorKey`.
+
+## The unrecorded log
+
+A report the explorer refused, did not find, or could not confirm after two
+attempts is never "nothing to report" (#514). It is appended to
+`unrecorded.jsonl` in the unrecorded directory:
+
+- **Entry**: action ID, fence, claim nonce, route action, method, path
+  template, outcome, target, the bounded reference, the record's correlation
+  (a retry must send it), the explorer's status and the client's error kind,
+  first and last times, attempts. No input, filled path, body, header or
+  error text.
+- **Durability**: every change rewrites the log through a temporary file that
+  is fsync'd and renamed, then fsyncs the directory. A torn trailing line is
+  tolerated on read; any other unreadable line refuses the start.
+- **Bound**: 1024 entries and 1 MiB, kept by reserving room for one report
+  before each claim. When no room is left the worker stops claiming and is
+  not ready (`unrecorded_log_full`).
+- **Retry**: every entry is presented again at start. One the explorer now
+  records — an identical replay is accepted (#542) — leaves the log; the rest
+  stay.
+- **Clearing**: otherwise only `UnrecordedLog.Ack` / `Worker.AckUnrecorded`,
+  which the command exposes as `shoal-gateway unrecorded ack`. The ack opens
+  the log, so it runs against a stopped gateway's directory.
+- **Signals**: the `unrecorded` and `unrecorded_cleared` log events carry the
+  entry count (the gauge, also `Worker.UnrecordedEntries`), and `readiness`
+  events carry the not-ready reason.
+
+The directory also holds `effects-gateway.lock`, flock'd for the life of the
+log: a second gateway on the same directory refuses to start.
 
 ## Egress
 
