@@ -950,6 +950,8 @@ func DeriveEffectiveDecision(
 		ServiceCeilingIdentity: base.ServiceCeilingIdentity(),
 		// Narrowing removes authority; it never changes who granted it.
 		GrantProvenance: base.GrantProvenance(),
+		// Nor which executor it is bound to (#391).
+		ExecutorBinding: base.ExecutorBinding(),
 	}
 	if selectedSet {
 		config.SelectedOntology = selected

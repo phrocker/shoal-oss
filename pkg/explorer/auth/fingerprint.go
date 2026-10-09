@@ -56,7 +56,8 @@ func (f Fingerprint) String() string {
 
 // AuthorizationFingerprint deterministically hashes the exact canonical
 // domain, identity, delegation, operation, source, policy, generation, and
-// service-ceiling grants, and the grant provenance when one is set. Expiry and request/audit identifiers are excluded
+// service-ceiling grants, the grant provenance when one is set, and the
+// executor binding when one is set. Expiry and request/audit identifiers are excluded
 // because they do not change the authorized projection.
 func AuthorizationFingerprint(decision Decision) (Fingerprint, error) {
 	cloned, err := decision.cloneValidated()
@@ -94,6 +95,21 @@ func AuthorizationFingerprint(decision Decision) (Fingerprint, error) {
 	}
 	if cloned.grantProvenance.Set() {
 		encoder.grantProvenance(cloned.grantProvenance)
+	}
+	// The optional sections follow the fixed fields above, which are all
+	// length-prefixed or counted and so end at a position a reader can find.
+	// Each optional section is present only when set, appears in this fixed
+	// order, opens with its own marker (ontology 1, provenance 2, executor
+	// binding 3), and is itself length-prefixed throughout. After the fixed
+	// fields a reader therefore sees either the end of input or a marker that
+	// names exactly one section, parses that section to its known end, and
+	// repeats; no section can be read as another, an absent section cannot be
+	// read as a present one, and two decisions differing only in which
+	// optional sections they carry, or in their contents, hash different
+	// inputs. A decision with none of them hashes the bytes it did before any
+	// existed, which keeps persisted fingerprints stable.
+	if cloned.executorBinding != "" {
+		encoder.executorBinding(cloned.executorBinding)
 	}
 	return Fingerprint(encoder.sum()), nil
 }
