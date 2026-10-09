@@ -138,6 +138,15 @@ func NewDecision(config DecisionConfig) (Decision, error) {
 	if err != nil {
 		return Decision{}, err
 	}
+	for _, policy := range policies {
+		if IsReservedLabelPolicyID(policy) {
+			return Decision{}, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"permitted policy identity is in the reserved label namespace "+
+					"and can never be granted",
+			)
+		}
+	}
 	if config.PolicyGeneration <= 0 {
 		return Decision{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "policy generation must be positive")
