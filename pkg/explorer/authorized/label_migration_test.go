@@ -49,6 +49,7 @@ type legacyStore struct {
 	authorized.PolicyStore
 	mu            sync.Mutex
 	strip         bool
+	keepRevisions bool
 	hideMarker    bool
 	failTightenAt int
 	tightenCalls  int
@@ -76,7 +77,12 @@ func (s *legacyStore) legacy(rule authorized.AccessRule) authorized.AccessRule {
 }
 
 func (s *legacyStore) PutRevision(ctx context.Context, registration authorized.RevisionRegistration) error {
-	registration.Rule = s.legacy(registration.Rule)
+	s.mu.Lock()
+	keep := s.keepRevisions
+	s.mu.Unlock()
+	if !keep {
+		registration.Rule = s.legacy(registration.Rule)
+	}
 	return s.PolicyStore.PutRevision(ctx, registration)
 }
 
@@ -604,4 +610,64 @@ func TestLabelMigrationRequiresTheCapability(t *testing.T) {
 			t.Errorf("%s capability: err = %v, want unauthorized", name, err)
 		}
 	}
+}
+
+// TestLabelMigrationRepairsATornTighten builds the state a crash can leave
+// when the durable batch of a TightenRule is torn: the revision registration
+// already carries the labels, but the extracted registrations and the source
+// claim do not. The rerun finds the document "already labelled" and must
+// still sweep the rest.
+func TestLabelMigrationRepairsATornTighten(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		f := newFixture(t)
+		legacy := &legacyStore{PolicyStore: store, keepRevisions: true}
+		legacy.setStrip(true)
+		selector := f.staticSelector(t, f.sourceA, f.policyA)
+		client := f.labelClient(t, f.base, legacy, selector, selector)
+		owner := f.labelIngester(t, "owner", "secret")
+		const uri = "file:///label/torn/SKILL.md"
+		document, err := client.Ingest(owner, explorer.Source{
+			URI: uri, MediaType: explorer.MediaTypeMarkdown,
+			Content:  authorizedSkillMarkdown,
+			Metadata: shoal.Metadata{interaction.PropertyVisibility: "secret"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		extracted, err := client.ExtractDocument(owner, explorer.ExtractionRequest{
+			DocumentID: document.Document.ID, RevisionID: document.Revision.ID,
+			Version: authorizedSkillsOntologyVersion(t),
+		})
+		if err != nil || len(extracted.EntityNodeIDs) == 0 {
+			t.Fatalf("extraction: %v, %+v", err, extracted)
+		}
+		legacy.setStrip(false)
+		entity := extracted.EntityNodeIDs[0]
+		neighborhood := func(ctx context.Context) error {
+			_, err := client.Neighborhood(ctx, explorer.NeighborhoodRequest{
+				NodeIDs: []shoal.ID{entity}, Depth: 1,
+			})
+			return err
+		}
+		if err := neighborhood(f.labelIngester(t, "before")); err != nil {
+			t.Fatalf("the torn state does not leak the entity; the test would be vacuous: %v", err)
+		}
+		record, _ := migrate(t, client)
+		// The revision already carried its labels; the sweep still
+		// rewrote the extracted registrations and the claim.
+		if record.Tightened != 1 || record.AlreadyTightened != 0 {
+			t.Fatalf("report = %+v, want the sweep to have rewritten the rest", record)
+		}
+		if err := neighborhood(f.labelIngester(t, "reader")); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			t.Errorf("source-only entity read after the repair = %v, want not found", err)
+		}
+		current, _, err := store.CurrentRevision(context.Background(), document.Document.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim, ok, err := store.SourceClaim(context.Background(), uri)
+		if err != nil || !ok || !authorized.RuleIncludes(claim.Rule, current.Rule) {
+			t.Fatalf("source claim after the repair = %+v, %v, %v", claim, ok, err)
+		}
+	})
 }

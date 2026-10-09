@@ -42,6 +42,7 @@ type tightenWorld struct {
 	secret      AccessRule // bare + (source, secret)
 	secretX     AccessRule // bare + (source, secret) + (source, x)
 	onlyX       AccessRule // bare + (source, x)
+	xyz         AccessRule // bare + (source, x), (source, y), (source, z)
 	otherBare   AccessRule // another source's bare rule
 	otherSecret AccessRule // otherBare + (source-b, secret)
 }
@@ -75,6 +76,7 @@ func newTightenWorld(t *testing.T) tightenWorld {
 		secret:      mustRule(LabelRule(source, []string{"secret"})),
 		secretX:     mustRule(LabelRule(source, []string{"secret", "x"})),
 		onlyX:       mustRule(LabelRule(source, []string{"x"})),
+		xyz:         mustRule(LabelRule(source, []string{"x", "y", "z"})),
 		otherBare:   mustRule(NewAccessRule(other)),
 		otherSecret: mustRule(LabelRule(other, []string{"secret"})),
 	}
@@ -354,11 +356,13 @@ func TestTightenRuleRefusesWidening(t *testing.T) {
 			from, to AccessRule
 			code     shoal.ErrorCode
 		}{
-			"drops a label":         {w.secretX, w.secret, shoal.ErrorInvalidArgument},
-			"drops every label":     {w.secretX, w.bare, shoal.ErrorInvalidArgument},
-			"no change":             {w.secretX, w.secretX, shoal.ErrorInvalidArgument},
-			"swaps the source":      {w.secretX, w.otherBare, shoal.ErrorInvalidArgument},
-			"stale from, no subset": {w.otherBare, w.bare, shoal.ErrorInvalidArgument},
+			"drops a label":     {w.secretX, w.secret, shoal.ErrorInvalidArgument},
+			"drops every label": {w.secretX, w.bare, shoal.ErrorInvalidArgument},
+			// Larger, but without secret: a superset by count only.
+			"drops a label, adds two": {w.secretX, w.xyz, shoal.ErrorInvalidArgument},
+			"no change":               {w.secretX, w.secretX, shoal.ErrorInvalidArgument},
+			"swaps the source":        {w.secretX, w.otherBare, shoal.ErrorInvalidArgument},
+			"stale from, no subset":   {w.otherBare, w.bare, shoal.ErrorInvalidArgument},
 			// A strict superset of a rule the document does not have.
 			"stale from": {w.otherBare, w.otherSecret, shoal.ErrorConflict},
 		} {
