@@ -1713,8 +1713,10 @@ func (s *DispatchService) ExtendClaim(
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if request.ExpectedVersion == 0 || request.Lease <= 0 ||
-		request.Lease > MaxActionClaimTTL {
+	// One of the two bindings is required. A fence-bound renewal needs no
+	// version, and a caller that sends neither has pinned nothing.
+	if (request.ExpectedVersion == 0 && request.ClaimFence == 0) ||
+		request.Lease <= 0 || request.Lease > MaxActionClaimTTL {
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "claim version or lease is invalid")
 	}
@@ -1740,7 +1742,21 @@ func (s *DispatchService) ExtendClaim(
 		!bytes.Equal(current.ClaimID, request.ClaimID) {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
-	if current.Version != request.ExpectedVersion {
+	// Fence-bound or version-bound, as CompleteClaim does it (the branch at
+	// the fence comparison there). Unlike that one this arm compares only the
+	// fence: ClaimID is already compared above and the state below, so
+	// repeating either here would add a clause no test could fail on.
+	//
+	// ErrClaimLost, not ErrActionConflict: a fence mismatch means another
+	// attempt holds the claim, which is the thing the holder needs to know.
+	// The version arm keeps ErrActionConflict, because changing what an
+	// existing caller is told is a separate decision from offering a new
+	// binding.
+	if request.ClaimFence != 0 {
+		if current.ClaimFence != request.ClaimFence {
+			return ActionRecord{}, ErrClaimLost
+		}
+	} else if current.Version != request.ExpectedVersion {
 		return ActionRecord{}, ErrActionConflict
 	}
 	// Claimed and live, in that order. A terminal record has no claim to
