@@ -493,7 +493,7 @@ follows the first measured shadow baseline; it does not block that first slice.
 The offline learning boundary now includes sealed quality, influence,
 calibration, challenger-comparison, and challenger-manifest verifiers. PRs
 #612, #613, #616, #617, #618, and #620 add repeated adversarial checks and
-green repository CI while preserving shadow-only promotion. The remaining
+green CI on each merged hardening PR while preserving shadow-only promotion. The remaining
 issues stay open where production authority, a prospective family-held-out
 cohort, independently verified frontier outcomes, or operational deployment
 evidence is still required; synthetic fixtures and retrospective replays do
