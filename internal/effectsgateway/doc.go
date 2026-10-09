@@ -33,7 +33,7 @@
 // assert a descriptor's liveness, so the gateway never heartbeats (#391).
 //
 // The worker loop (worker.go) and the unrecorded-report log
-// (unrecorded.go) are here as a library; the command that composes them is
-// not yet (see docs/effects-gateway-deploy.md). Nothing in this package
-// performs an effect until a caller runs a Worker.
+// (unrecorded.go) are here as a library; gatewaycmd composes them into
+// cmd/shoal-gateway (see docs/effects-gateway-deploy.md). Nothing in this
+// package performs an effect until a caller runs a Worker.
 package effectsgateway

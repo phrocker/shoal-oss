@@ -47,6 +47,9 @@ func baseArgs() map[string]string {
 		"routes":                configRoutes,
 		"idempotency-header":    "Idempotency-Key",
 		"idempotency-retention": "24h",
+		"executor-ref":          "stripe",
+		"unrecorded-dir":        "/var/lib/shoal-gateway",
+		"pod-name":              "gw-0",
 	}
 }
 
@@ -106,6 +109,57 @@ func TestParseFlagsAcceptsTheBaseConfiguration(t *testing.T) {
 	}
 }
 
+// TestParseFlagsAcceptsRenewal: -renew is accepted and carried to the
+// configuration and its send gate, and it is what admits an operation the
+// lease alone could not hold — the design's example, T = 10m under L = 60s.
+func TestParseFlagsAcceptsRenewal(t *testing.T) {
+	args := map[string]string{
+		"renew": "true", "claim-lease": "1m", "operation-timeout": "10m",
+		"plane-timeout": "15s",
+	}
+	if _, err := ParseFlags(with(map[string]string{
+		"claim-lease": "1m", "operation-timeout": "10m", "plane-timeout": "15s",
+	}), io.Discard); err == nil || !strings.Contains(err.Error(), "without renewal") {
+		t.Fatalf("without -renew the design example must be refused: %v", err)
+	}
+	config, err := ParseFlags(with(args), io.Discard)
+	if err != nil {
+		t.Fatalf("-renew refused: %v", err)
+	}
+	if !config.Renew || !config.SendGate().Renew ||
+		config.SendGate().RenewAfter != 30*time.Second {
+		t.Fatalf("renewal not carried: renew=%v gate=%#v", config.Renew, config.SendGate())
+	}
+	if config.GracePeriodSeconds() != 660 {
+		t.Fatalf("grace = %ds, want 660s for T = 10m and a 15s plane timeout",
+			config.GracePeriodSeconds())
+	}
+}
+
+func TestParseFlagsCarriesTheCommandFlags(t *testing.T) {
+	config, err := ParseFlags(with(map[string]string{
+		"max-in-flight":              "8",
+		"attestation-statement-file": "/run/attest/statement",
+		"attestation-key-file":       "/run/attest/key",
+	}), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ExecutorRef != "stripe" || config.UnrecordedDir != "/var/lib/shoal-gateway" ||
+		config.Pod != "gw-0" || config.MaxInFlight != 8 ||
+		config.AttestationStatementFile != "/run/attest/statement" ||
+		config.AttestationKeyFile != "/run/attest/key" {
+		t.Fatalf("config = %#v", config)
+	}
+	config, err = ParseFlags(with(map[string]string{"pod-name": "<unset>"}), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host, _ := os.Hostname(); config.Pod != host || config.MaxInFlight != DefaultMaxInFlight {
+		t.Fatalf("pod %q (host %q), max in flight %d", config.Pod, host, config.MaxInFlight)
+	}
+}
+
 func TestDefaultsSatisfyTheirOwnInvariants(t *testing.T) {
 	if err := ValidateDurations(DefaultClaimLease, DefaultOperationTimeout,
 		DefaultPlaneTimeout, false); err != nil {
@@ -160,7 +214,15 @@ func TestParseFlagsRefusals(t *testing.T) {
 		{"plane zero", map[string]string{"plane-timeout": "0s"}, "-plane-timeout must be positive"},
 		{"plane over L/4", map[string]string{"plane-timeout": "1m1s"}, "quarter"},
 		{"lease cannot cover the call", map[string]string{"operation-timeout": "3m50s"}, "without renewal"},
-		{"renewal requested", map[string]string{"renew": "true", "operation-timeout": "10m", "idempotency-retention": "24h"}, "#430"},
+		{"renewal does not lift the plane bound", map[string]string{"renew": "true", "claim-lease": "1m", "plane-timeout": "16s"}, "quarter"},
+		{"executor ref missing", map[string]string{"executor-ref": "<unset>"}, "-executor-ref"},
+		{"executor ref outside the charset", map[string]string{"executor-ref": "stripe ref"}, "-executor-ref"},
+		{"unrecorded dir missing", map[string]string{"unrecorded-dir": "<unset>"}, "-unrecorded-dir is required"},
+		{"max in flight zero", map[string]string{"max-in-flight": "0"}, "-max-in-flight"},
+		{"max in flight over its bound", map[string]string{"max-in-flight": "65"}, "-max-in-flight"},
+		{"pod name with a separator", map[string]string{"pod-name": "gw|0"}, "-pod-name"},
+		{"attestation statement without a key", map[string]string{"attestation-statement-file": "/s"}, "required together"},
+		{"attestation key without a statement", map[string]string{"attestation-key-file": "/k"}, "required together"},
 		{"response bound zero", map[string]string{"max-response-bytes": "0"}, "-max-response-bytes"},
 		{"response bound over the output bound", map[string]string{"max-response-bytes": "1048577"}, "-max-response-bytes"},
 		{"pull limit zero", map[string]string{"pull-limit": "0"}, "-pull-limit"},

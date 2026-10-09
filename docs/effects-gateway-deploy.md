@@ -1,9 +1,9 @@
 # Effects gateway: deployment
 
-> **Not yet runnable.** There is no `cmd/shoal-gateway` and no chart entry.
-> What exists is the library in `internal/effectsgateway`: the core, the
-> dispatch client and the worker loop with its unrecorded-report log. The
-> command (PR6) composes them; nothing in the package starts on its own.
+> **No chart entry yet.** `cmd/shoal-gateway` runs the gateway (see
+> [Running the gateway](#running-the-gateway)); the chart's
+> `effectsGateways:` entry is PR7 of #391. Until then the binary is deployed
+> by hand, with the requirements that section lists.
 
 This is the HTTP Path A worker from #391: it pulls an action off the fleet
 dispatch queue, claims it under a fence, performs one HTTP request against a
@@ -17,7 +17,7 @@ it among the three gateways.
 | | what | why the gateway needs it |
 |---|---|---|
 | **#480** | the lifecycle auditor, action recorder and reconciler refuse `OperationExecute`, so the grant cannot be turned on | a worker claims work it did not enqueue; until a principal can hold `OperationExecute` on one descriptor's scope, the only claimant is the enqueuer |
-| **#430** | claim renewal (`POST actions/{id}/extend`) | without it the fenced window is the claim lease, at most five minutes; `-renew` is parsed and refused |
+| **#430** | claim renewal (`POST actions/{id}/extend`) | without it the fenced window is the claim lease, at most five minutes. Landed: `-renew` turns it on |
 | **#484** | the lost-fence ambiguity route (`POST actions/{id}/ambiguity`) | a worker whose claim lapsed mid-effect has nowhere to record what it attempted |
 | **#486** | a heartbeat moves the descriptor generation, so `/complete` and `/ambiguity` answer 404 after one heartbeat | until fixed, the gateway must never register or heartbeat while holding claims |
 
@@ -40,6 +40,7 @@ heartbeats and carries no registrar credential (#391).
 | `logging.go` | the one logging function, and the policy it enforces |
 | `worker.go` | the worker loop: pull, filter, precheck, attest, claim, bind, send, classify, complete; renewal and FENCE_LOST; slots, backoff and drain |
 | `unrecorded.go` | the unrecorded-report log (#514) and the directory lock that keeps the gateway to one replica |
+| `gatewaycmd/` | the command: `run`, `unrecorded list`/`ack`, `grace-period`; `cmd/shoal-gateway` is its `main` |
 
 The dispatch client is tested against the real explorer composition — the
 embedded store, the real recorder and publisher, the authenticated webapi
@@ -73,8 +74,13 @@ complete on the real routes.
 | `-max-response-bytes` | 64 KiB | 1 to 1 MiB |
 | `-pull-limit` | 32 | 1 to 256 |
 | `-pull-interval` | 2s | at least 100ms |
-| `-health-address` | | optional `host:port` |
-| `-renew` | false | refused until #430 |
+| `-health-address` | | optional `host:port` for `/healthz`, `/readyz` and `/metrics` |
+| `-renew` | false | extend the claim every `L/2` (#430); see below |
+| `-executor-ref` | | required; the ref the dispatch credential is minted for, and the descriptor names |
+| `-unrecorded-dir` | | required; the unrecorded log and the single-replica lock. A persistent volume |
+| `-max-in-flight` | 4 | 1 to 64 claims held at once |
+| `-pod-name` | host name | names the replica in claim IDs; printable ASCII, no spaces or `\|` |
+| `-attestation-statement-file` / `-attestation-key-file` | | both or neither; required when an action requires attestation, refused when none does |
 
 Two credential rules carried over from the LLM gateway: passing the env flag
 beside the file flag is refused even when the env flag is typed as its default,
@@ -126,7 +132,18 @@ with key routes:   retention > T + 5s
 ```
 
 Without renewal the lease bounds the claim, the operation and the report
-together, which limits an operation to about 4.5 minutes. The retention rule
+together, which limits an operation to about 4.5 minutes.
+
+**`-renew`** lifts that limit. The worker extends the claim every `L/2`
+(re-attesting first when the action requires it), so the lease becomes a
+silence interval, and the `L > T + 5s + planeTimeout` rule no longer applies;
+`planeTimeout ≤ L/4` still does, so one failed extension can be retried before
+`L/2` is overdue. The send gate then asks `leaseLocal − now ≥ L/2` instead of
+`≥ T + 5s`, and each action's deadline (`deadlineLocal − now ≥ T + 5s`) is the
+bound on the operation. The design's example — `L = 60s`, `T = 10m`, plane
+timeout 15s — is refused without `-renew` and accepted with it. A refused
+extension, or the local lease end arriving, is FENCE_LOST (below). The grace
+period does not depend on `-renew`. The retention rule
 exists because the two claim-time rules `T + 5s < deadline − now` and
 `deadline − created_at ≤ retention` cannot both hold when the retention is
 shorter: nothing would ever be claimable, and the gateway would look idle.
@@ -140,6 +157,13 @@ and five seconds to exit. `GracePeriod(T, planeTimeout)` computes it from the
 same constants the worker spends, and `GracePeriodSeconds` rounds up. For the
 defaults (`T = 3m`, plane timeout 10s) that is 225s; for `T = 10m` and a 15s
 plane timeout, 660s.
+
+The command computes it three ways, all from the same function:
+`shoal-gateway grace-period -operation-timeout T -plane-timeout P` prints the
+seconds; `run` logs it at start ("terminationGracePeriodSeconds must be at
+least N"); and `/metrics` exports it as
+`shoal_effects_gateway_grace_period_seconds`. Set the pod's
+`terminationGracePeriodSeconds` to at least that figure.
 
 ## Issuing executor credentials
 
@@ -578,13 +602,97 @@ attempts is never "nothing to report" (#514). It is appended to
   stay.
 - **Clearing**: otherwise only `UnrecordedLog.Ack` / `Worker.AckUnrecorded`,
   which the command exposes as `shoal-gateway unrecorded ack`. The ack opens
-  the log, so it runs against a stopped gateway's directory.
+  the log, so it runs against a stopped gateway's directory (see
+  [Operating the unrecorded log](#operating-the-unrecorded-log)).
 - **Signals**: the `unrecorded` and `unrecorded_cleared` log events carry the
   entry count (the gauge, also `Worker.UnrecordedEntries`), and `readiness`
   events carry the not-ready reason.
 
 The directory also holds `effects-gateway.lock`, flock'd for the life of the
 log: a second gateway on the same directory refuses to start.
+
+## Running the gateway
+
+```
+shoal-gateway run [flags]
+shoal-gateway unrecorded list -unrecorded-dir DIR
+shoal-gateway unrecorded ack -unrecorded-dir DIR (ACTION_ID[:FENCE]... | -all)
+shoal-gateway grace-period [-operation-timeout T] [-plane-timeout P]
+```
+
+`internal/effectsgateway/gatewaycmd` is the command; `cmd/shoal-gateway` is a
+`main` that passes it the process's signals.
+
+**Startup**, in this order, any failure a refused start:
+
+1. Every flag is parsed and validated (exit 2). Nothing has touched the disk
+   or the network.
+2. The unrecorded log is opened, which takes `effects-gateway.lock` in
+   `-unrecorded-dir`. A second gateway on the directory stops here, before
+   any network I/O: two replicas never both talk to the explorer.
+3. The dispatch client is built with the executor credential, bound to
+   `-executor-ref`, and the gateway resolves its own descriptor
+   (`-agent-id`). A refused, unavailable or foreign descriptor (one naming
+   another executor ref) refuses the start.
+4. The descriptor is checked against the route table (`VerifyDescriptor`,
+   above): the capability must be declared and its actions must equal the
+   routes. If any action requires attestation, the attestation flags are
+   required and the attestation is presented now; if none does, the flags
+   are refused.
+5. The worker runs: it retries the unrecorded log, then pulls.
+
+**Signals.** The first SIGTERM or SIGINT drains (above, *Shutdown*), within
+`DrainBound`. A second is a hard stop: everything in flight is abandoned as
+SIGKILL would abandon it, nothing more is reported, and the next instance
+re-claims after the lapse under the same `ExecutorKey`.
+
+**Exit codes.**
+
+| code | meaning |
+|---|---|
+| 0 | drained cleanly |
+| 1 | startup refused, or the worker failed |
+| 2 | the command line is wrong |
+| 3 | the drain bound ran out with work unfinished (`ErrDrainAbandoned`); every abandoned run whose request may have reached the target is in the unrecorded log |
+| 4 | a second signal stopped the gateway without draining |
+
+**Health** (`-health-address`):
+
+- `/healthz` is liveness: 200 while the process answers, draining or not.
+- `/readyz` is readiness: 200 only while the worker is pulling. Otherwise it
+  is 503, and the `worker` dependency's `detail` names why: `starting`,
+  `draining`, `unrecorded_log_full` or `stopped`.
+- `/metrics`: `shoal_effects_gateway_unrecorded_entries` (the gauge an alert
+  should watch: any value above zero is a report awaiting reconciliation),
+  `shoal_effects_gateway_in_flight` (claims held),
+  `shoal_effects_gateway_grace_period_seconds`, and the house
+  `shoal_dependency_ready{name="worker"}`.
+
+The probes need a listener, so "no inbound listener" does not hold for a
+gateway with `-health-address`; it serves nothing else.
+
+### Operating the unrecorded log
+
+`unrecorded list` prints one JSON object per held report, with the closed
+fields only: `id` (`ACTION_ID:FENCE`, what `ack` takes), the action ID, the
+fence, the claim nonce, the route action, method and path template, the
+outcome, `has_reference`, the explorer's status and the client's error kind,
+first and last times, and attempts. It never prints the reference (text the
+target returned, however tightly the route's pattern bounds it), the target
+name or the correlation ID; the operator who needs the reference to reconcile
+reads `unrecorded.jsonl` itself.
+
+`unrecorded ack` clears the reports named, once the operator has reconciled
+each by other means, and logs an `unrecorded_cleared` event per entry. A bare
+action ID is accepted when exactly one report holds it; otherwise name the
+fence. Every name must match before anything is removed. `-all` clears
+everything.
+
+Both take the directory's lock, so both refuse while a gateway runs on the
+directory: the running gateway owns the log, holds it in memory, and would
+write back an entry acknowledged under it. Stop the gateway (or scale it to
+zero) first. A running gateway's backlog is visible meanwhile on `/metrics`
+and in its `unrecorded` log events.
 
 ## Egress
 
@@ -718,8 +826,6 @@ another fails if a field is added to the log record outside the policy.
   design does not cover it; success and `target_rejected` would each be a guess.
 - **3xx is `outcome_unknown`.** Redirects are never followed, and a 303 after a
   POST commonly means "created".
-- **`-renew` is refused** rather than accepted and ignored, until #430 exists.
-  The renewal arithmetic is implemented and tested.
 - **The send gate without renewal** requires `leaseLocal − now ≥ T + 5s`; the
   design states only the renewing form (`≥ renewAfter`).
 - **Conflict rules need a body value.** The design allows "status + optional

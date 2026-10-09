@@ -297,6 +297,14 @@ func (w *Worker) Ready() (bool, NotReadyReason) {
 // UnrecordedEntries is the gauge: reports awaiting reconciliation.
 func (w *Worker) UnrecordedEntries() int { return w.cfg.Unrecorded.Len() }
 
+// InFlight is how many claims the worker holds: claimed and not yet
+// completed, reported or abandoned.
+func (w *Worker) InFlight() int {
+	w.runsMu.Lock()
+	defer w.runsMu.Unlock()
+	return len(w.runs)
+}
+
 func (w *Worker) setReady(reason NotReadyReason) {
 	w.readyMu.Lock()
 	changed := w.notReady != reason
