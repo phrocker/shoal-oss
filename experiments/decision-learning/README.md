@@ -46,7 +46,11 @@ test cohort. It keeps unknown/disputed rows out of resolved metrics while
 recording their denominators, reports confusion metrics, Brier score, ECE,
 Wilson recall intervals, family count, and bounded training/inference/labeling
 costs. Targeted samples cannot make a population claim, and every report has
-`promotion_eligible: false`.
+`promotion_eligible: false`. Reports also bind canonical label, score, and
+group-map digests so the measured inputs can be independently retrieved.
+The verifier also checks denominator, confusion, calibration, uncertainty,
+sampling, cost, and population-claim consistency before accepting a sealed
+report.
 
 `calibration.py` fits a deterministic temperature artifact on validation scores
 only and applies it only to disjoint test/inference IDs. The artifact binds the
