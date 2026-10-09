@@ -193,6 +193,7 @@ func mountFleetDispatch(mux *http.ServeMux, provider FleetDispatchProvider) {
 			Failed:     wire.Failed, Context: contextValue,
 			Result: fleet.ExecutionResult{
 				Output: wire.Output, ErrorCode: wire.ErrorCode,
+				Effected:             decodeEffected(wire.Effected),
 				EvidenceSnapshotID:   snapshotID,
 				EvidenceSnapshotAsOf: wire.EvidenceSnapshotAsOf,
 				Evidence:             evidence,
@@ -534,13 +535,35 @@ type fleetCompletionWire struct {
 	//
 	// Optional on the wire so a worker written against the previous shape
 	// still completes, with the behaviour it was written against.
-	ClaimFence           uint64              `json:"claim_fence,omitempty"`
-	Output               json.RawMessage     `json:"output,omitempty"`
-	ErrorCode            string              `json:"error_code,omitempty"`
-	Failed               bool                `json:"failed,omitempty"`
+	ClaimFence uint64          `json:"claim_fence,omitempty"`
+	Output     json.RawMessage `json:"output,omitempty"`
+	ErrorCode  string          `json:"error_code,omitempty"`
+	Failed     bool            `json:"failed,omitempty"`
+	// Effected is how much of an irreversible egress happened before the
+	// failure (#427).
+	//
+	// On this route and not only on /report, because this is the route the
+	// effects gateway completes through — it is the component that performs
+	// real external effects, so it is the one most likely to fail after a
+	// partial one. A field validated in applyExecutionResult with no surface
+	// able to set it is the shape of #435: the service-side mechanism ships
+	// and the only client that can use it gets a 400, because decodeRequest
+	// refuses unknown fields.
+	//
+	// Optional, so a worker written against the previous shape completes
+	// exactly as before.
+	Effected             *fleetEffectedWire  `json:"effected,omitempty"`
 	EvidenceSnapshotID   string              `json:"evidence_snapshot_id,omitempty"`
 	EvidenceSnapshotAsOf time.Time           `json:"evidence_snapshot_as_of,omitempty"`
 	Evidence             []fleetEvidenceWire `json:"evidence,omitempty"`
+}
+
+// fleetEffectedWire is the volume of a partial egress. Fixed integers, for
+// the reason fleet.EffectedVolume gives: a unit label would be
+// caller-controlled text on a durable record.
+type fleetEffectedWire struct {
+	Bytes  int64 `json:"bytes"`
+	Chunks int64 `json:"chunks,omitempty"`
 }
 
 type fleetAmbiguityReportWire struct {
@@ -635,12 +658,18 @@ type fleetActionWire struct {
 	// ErrorCode, which the code alone cannot tell a reader (#508). Omitted on
 	// a record written before the field existed, which a reader must treat as
 	// "either" rather than as "executor".
-	ErrorCodeOrigin string    `json:"error_code_origin,omitempty"`
-	RequestID       string    `json:"request_id"`
-	CorrelationID   string    `json:"correlation_id,omitempty"`
-	Deadline        time.Time `json:"deadline"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ErrorCodeOrigin string `json:"error_code_origin,omitempty"`
+	// Effected accompanies a failure that followed a partial irreversible
+	// egress (#427). Returned as well as accepted, so a worker that lost its
+	// response reads back what was recorded rather than re-deriving it —
+	// which it cannot, since the record is write-once and its own retry would
+	// be compared against it.
+	Effected      *fleetEffectedWire `json:"effected,omitempty"`
+	RequestID     string             `json:"request_id"`
+	CorrelationID string             `json:"correlation_id,omitempty"`
+	Deadline      time.Time          `json:"deadline"`
+	CreatedAt     time.Time          `json:"created_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
 	// ExecutorKey is the idempotency key an in-process executor already
 	// receives (dispatch_service.go hands it over as IdempotencyKey), derived
 	// at enqueue as a length-prefixed digest over a domain tag, the action ID
@@ -826,6 +855,7 @@ func encodeFleetAction(record fleet.ActionRecord) fleetActionWire {
 		Output:          append(json.RawMessage(nil), record.Output...),
 		ErrorCode:       record.ErrorCode,
 		ErrorCodeOrigin: string(record.ErrorCodeOrigin),
+		Effected:        encodeEffected(record.Effected),
 		RequestID:       encodeFleetID(record.RequestID),
 		CorrelationID:   encodeFleetID(record.CorrelationID), Deadline: record.Deadline,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
@@ -874,6 +904,22 @@ func encodeFleetAmbiguityReports(
 		}
 	}
 	return result
+}
+
+// decodeEffected reads an optional volume. Absent means nothing left, which
+// is what a worker written before this field existed says by omitting it.
+func decodeEffected(wire *fleetEffectedWire) fleet.EffectedVolume {
+	if wire == nil {
+		return fleet.EffectedVolume{}
+	}
+	return fleet.EffectedVolume{Bytes: wire.Bytes, Chunks: wire.Chunks}
+}
+
+func encodeEffected(value fleet.EffectedVolume) *fleetEffectedWire {
+	if value.Zero() {
+		return nil
+	}
+	return &fleetEffectedWire{Bytes: value.Bytes, Chunks: value.Chunks}
 }
 
 func encodeFleetIDs(values []shoal.ID) []string {
