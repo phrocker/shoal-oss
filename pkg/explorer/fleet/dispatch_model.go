@@ -882,8 +882,37 @@ type CompletionRequest struct {
 
 // ExtendRequest renews a live claim's lease without changing the claim.
 type ExtendRequest struct {
-	ID              []byte
+	ID []byte
+	// ExpectedVersion pins the record version. It is required only when
+	// ClaimFence is zero, and is ignored when a fence is presented.
+	//
+	// Version was never the invariant on this route, for the same reason
+	// AmbiguityRequest.ExpectedVersion records: what must not change under a
+	// renewal is the *claim*, and the claim is identified by its fence. A
+	// version comparison also fails on a write that leaves the claim intact —
+	// a lapsed former holder legitimately reporting an ambiguity moves the
+	// version without touching the fence, and the current holder cannot learn
+	// the new version by any route it is authorized for. Its next extend then
+	// conflicted and the claim ran out at its current lease end while the
+	// holder still held the fence and could still complete, stranding a
+	// long-running effect mid-flight (#391).
 	ExpectedVersion uint64
+	// ClaimFence optionally binds the renewal to one claim attempt, the way
+	// CompleteClaim binds on it. When non-zero it must equal the fence of the
+	// claim the record carries now, and the version is not compared.
+	//
+	// The fence pins what the version was standing in for, and more tightly:
+	// it is server-assigned and monotonic where ClaimID is supplied by the
+	// caller. Nothing else is lost by skipping the version, because every
+	// other precondition this route has is checked explicitly against the
+	// freshly read record — terminal state, lease liveness, the action
+	// deadline, the approval and attestation gates — and the store's own
+	// compare-and-set still pins the version it read.
+	//
+	// A mismatch is ErrClaimLost rather than ErrActionConflict: with a fence
+	// presented, a mismatch means this claim is genuinely gone, so the
+	// caller's reading of it is true rather than a guess.
+	ClaimFence uint64
 	// ClaimID must equal the claim currently held. It is necessary and not
 	// sufficient: the caller must also be the claim's holder, because ClaimID
 	// is published to co-principals on Status and to every execute-holder on

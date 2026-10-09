@@ -157,6 +157,7 @@ func TestNewFleetHandlerRequiresBothProviders(t *testing.T) {
 type stubDispatchProvider struct {
 	ambiguity  fleet.AmbiguityRequest
 	completion fleet.CompletionRequest
+	extend     fleet.ExtendRequest
 	resolver   auth.Resolver
 	enqueued   bool
 	actionID   []byte
@@ -199,9 +200,10 @@ func (*stubDispatchProvider) Invoke(context.Context, fleet.InvokeRequest) (fleet
 	return fleet.ActionRecord{}, nil
 }
 
-func (*stubDispatchProvider) ExtendClaim(
-	context.Context, fleet.ExtendRequest,
+func (p *stubDispatchProvider) ExtendClaim(
+	_ context.Context, request fleet.ExtendRequest,
 ) (fleet.ActionRecord, error) {
+	p.extend = request
 	return fleet.ActionRecord{}, nil
 }
 
@@ -643,6 +645,82 @@ func TestTheCompletionRouteCarriesTheClaimFence(t *testing.T) {
 	}
 	if got := provider.completion.ClaimFence; got != 5 {
 		t.Fatalf("claim_fence decoded to %d, want 5", got)
+	}
+}
+
+// TestTheExtendRouteCarriesTheClaimFence is the renewal half of what
+// TestTheCompletionRouteCarriesTheClaimFence pins on completion.
+//
+// ExtendRequest.ClaimFence is what lets a live holder renew after a write that
+// moved the version and left its claim alone — a displaced holder's ambiguity
+// report being the case it exists for. A service that accepts the fence with
+// no surface able to send it leaves every remote worker on the exact-version
+// branch, which is the stranding this fixes, and decodeRequest's
+// DisallowUnknownFields turns the only correct client's body into a 400.
+//
+// Driven as raw JSON rather than through the wire struct, so the field must be
+// accepted *by name*: marshalling fleetExtendWire would pass whatever the tag
+// says, including a wrong one.
+func TestTheExtendRouteCarriesTheClaimFence(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor", AuthorizationDomain: []byte("domain"),
+		AllowedOperations:  []auth.Operation{auth.OperationInvoke},
+		PermittedSourceIDs: [][]byte{[]byte("source")},
+		PermittedPolicyIDs: [][]byte{[]byte("policy")}, PolicyGeneration: 1,
+		AuthenticationExpires: now.Add(time.Hour), RequestID: "request",
+		CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewAuthenticatedHandler(&stubWorkspaceService{},
+		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		authority.Binder(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &stubDispatchProvider{resolver: authority.Resolver()}
+	if err := handler.MountFleetDispatch(provider); err != nil {
+		t.Fatal(err)
+	}
+
+	actionID := []byte{'a', 0, 255}
+	route := "http://example.test/api/v1/fleet/actions/" +
+		base64.RawURLEncoding.EncodeToString(actionID) + "/extend"
+	contextWire := fleetRequestContextWire{
+		RequestID: encodeFleetID("request"), ReasonCode: "operator_request",
+		CorrelationID: encodeFleetID("correlation"),
+		Deadline:      now.Add(time.Minute),
+	}
+
+	raw := `{"context":` + mustJSON(t, contextWire) + `,` +
+		`"claim_fence":4,"claim_id":"` +
+		base64.RawURLEncoding.EncodeToString([]byte("claim")) + `",` +
+		`"lease":60000000000}`
+	request := httptest.NewRequest(
+		http.MethodPost, route, bytes.NewReader([]byte(raw)))
+	request.Host = "example.test"
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("a body naming claim_fence was refused (status=%d): %s",
+			response.Code, response.Body.String())
+	}
+	if got := provider.extend.ClaimFence; got != 4 {
+		t.Fatalf("claim_fence decoded to %d, want 4: without it every remote "+
+			"worker stays on the exact-version branch, and a renewal after "+
+			"an unrelated write ends a claim that never changed", got)
+	}
+	// A fence alone is a complete renewal request, so the route must not
+	// require a version alongside it.
+	if got := provider.extend.ExpectedVersion; got != 0 {
+		t.Fatalf("expected_version decoded to %d from a body that omitted "+
+			"it", got)
 	}
 }
 

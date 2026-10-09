@@ -231,7 +231,8 @@ func mountFleetDispatch(mux *http.ServeMux, provider FleetDispatchProvider) {
 		}
 		result, err := provider.ExtendClaim(r.Context(), fleet.ExtendRequest{
 			ID: actionID, ExpectedVersion: wire.ExpectedVersion,
-			ClaimID: claimID, Lease: wire.Lease, Context: contextValue,
+			ClaimFence: wire.ClaimFence,
+			ClaimID:    claimID, Lease: wire.Lease, Context: contextValue,
 		})
 		if err != nil {
 			writeError(w, fleetDispatchError(err))
@@ -500,8 +501,13 @@ type fleetCancelWire struct {
 type fleetExtendWire struct {
 	Context         fleetRequestContextWire `json:"context"`
 	ExpectedVersion uint64                  `json:"expected_version"`
-	ClaimID         string                  `json:"claim_id"`
-	Lease           time.Duration           `json:"lease"`
+	// ClaimFence binds the renewal to one claim attempt instead of to a
+	// version, so a write that left the claim intact does not end it. See
+	// fleet.ExtendRequest.ClaimFence. Optional, and omitted by callers that
+	// still pin the version.
+	ClaimFence uint64        `json:"claim_fence,omitempty"`
+	ClaimID    string        `json:"claim_id"`
+	Lease      time.Duration `json:"lease"`
 }
 
 // fleetAmbiguityWire is a lost-fence report.
