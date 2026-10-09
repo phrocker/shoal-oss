@@ -818,7 +818,7 @@ var (
 		"PutEdge": {}, "PutNode": {},
 		// The startup label migration (#570) is the only caller of these;
 		// no request read path reaches them.
-		"TightenRule": {}, "DocumentRevisions": {},
+		"TightenRule": {}, "TighteningIndex": {},
 		"LabelMigration": {}, "PutLabelMigration": {},
 	}
 )

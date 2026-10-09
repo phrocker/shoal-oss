@@ -21,8 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
-	"os"
 
 	"github.com/phrocker/shoal-oss/internal/labelmigration"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
@@ -33,21 +31,22 @@ import (
 type labelMigrator interface {
 	MigrateLabelledDocuments(
 		context.Context, *labelmigration.Capability,
-	) (authorized.LabelMigrationRecord, bool, error)
+	) (authorized.LabelMigrationRecord, error)
 }
 
 // labelMigrationOutcome is what the startup migration did, for the startup
 // log.
 type labelMigrationOutcome struct {
 	record authorized.LabelMigrationRecord
-	ran    bool
 }
 
 // runLabelMigration narrows the catalog rules of documents labelled before
 // labels were enforced. It runs while the workspace is being opened, under
 // the store's mutation lease and before the listener serves anything, and it
 // fails closed: any error refuses to serve, because a document it did not
-// finish would stay readable by every holder of its source.
+// finish would stay readable by every holder of its source. It runs on every
+// start, because a rollback to a binary from before #585 can register
+// labelled documents under the bare source rule again; it is idempotent.
 func runLabelMigration(
 	ctx context.Context,
 	client labelMigrator,
@@ -56,10 +55,10 @@ func runLabelMigration(
 		return labelMigrationOutcome{}, errors.New(
 			"refusing to serve: the label migration has no authorized client")
 	}
-	// The capability is minted here and in cmd/shoal-mcp's openWorkspace,
+	// The capability is minted here and in cmd/shoal-mcp's migrateLabels,
 	// the startup paths that serve the authorized store; see
 	// TestLabelMigrationCapabilityMintSites.
-	record, ran, err := client.MigrateLabelledDocuments(
+	record, err := client.MigrateLabelledDocuments(
 		ctx, labelmigration.NewCapability())
 	if err != nil {
 		return labelMigrationOutcome{}, fmt.Errorf(
@@ -67,21 +66,13 @@ func runLabelMigration(
 				"documents labelled before labels were enforced could still be "+
 				"readable by every holder of their source: %w", err)
 	}
-	return labelMigrationOutcome{record: record, ran: ran}, nil
+	return labelMigrationOutcome{record: record}, nil
 }
 
 // printLabelMigration writes the migration's counts and its untranslatable
 // list to the startup log.
 func printLabelMigration(output io.Writer, outcome labelMigrationOutcome) {
 	record := outcome.record
-	if !outcome.ran {
-		fmt.Fprintf(output,
-			"Label migration v%d already applied to this policy catalog; "+
-				"%d document(s) carry untranslatable labels "+
-				"(-list-untranslatable-labels lists them)\n",
-			record.Version, len(record.Untranslatable))
-		return
-	}
 	fmt.Fprintf(output,
 		"Label migration v%d: examined %d document(s): %d tightened, %d "+
 			"already labelled, %d unlabelled, %d unregistered; %d historical "+
@@ -108,25 +99,16 @@ func writeUntranslatable(output io.Writer, record authorized.LabelMigrationRecor
 }
 
 // listUntranslatableLabels prints the label migration report stored in the
-// policy catalog at policyDir and serves nothing. The catalog must exist; it
-// is never created here. Run it with the workspace stopped: the catalog's
-// storage engine takes no cross-process lock.
+// policy catalog at policyDir and serves nothing. A directory that holds no
+// policy catalog is refused and left as it was
+// (authorized.OpenExistingDurablePolicyStore). Run it with the workspace
+// stopped: the catalog's storage engine takes no cross-process lock.
 func listUntranslatableLabels(
 	ctx context.Context,
 	output io.Writer,
 	policyDir string,
 ) error {
-	info, err := os.Stat(policyDir)
-	if errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("no policy catalog at %s", policyDir)
-	}
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("policy catalog %s is not a directory", policyDir)
-	}
-	store, err := authorized.OpenDurablePolicyStore(policyDir)
+	store, err := authorized.OpenExistingDurablePolicyStore(policyDir)
 	if err != nil {
 		return err
 	}

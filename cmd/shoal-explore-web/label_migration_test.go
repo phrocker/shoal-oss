@@ -24,6 +24,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -49,48 +50,33 @@ func labelMigrationConfig(root string) serviceConfig {
 	}
 }
 
-func TestStartupRunsTheLabelMigrationOnce(t *testing.T) {
+func TestStartupRunsTheLabelMigrationOnEveryStart(t *testing.T) {
 	root := t.TempDir()
 	config := labelMigrationConfig(root)
-	opened, err := openService(context.Background(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := opened.labelMigration
-	opened.close()
-	if !first.ran || first.record.Version != authorized.LabelMigrationVersion {
-		t.Fatalf("first start did not run the migration: %+v", first)
-	}
-	var log bytes.Buffer
-	printLabelMigration(&log, first)
-	if !strings.Contains(log.String(), "Label migration v1: examined") {
-		t.Fatalf("startup log = %q", log.String())
-	}
-
-	// The marker is in the catalog, so the listing reads it.
-	var listing bytes.Buffer
-	if err := listUntranslatableLabels(
-		context.Background(), &listing, config.policyDir); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(listing.String(), "0 untranslatable") {
-		t.Fatalf("listing = %q", listing.String())
-	}
-
-	// A restart finds the marker and does not run it again.
-	opened, err = openService(context.Background(), config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second := opened.labelMigration
-	opened.close()
-	if second.ran || second.record.Version != authorized.LabelMigrationVersion {
-		t.Fatalf("restart re-ran the migration: %+v", second)
-	}
-	log.Reset()
-	printLabelMigration(&log, second)
-	if !strings.Contains(log.String(), "already applied") {
-		t.Fatalf("restart log = %q", log.String())
+	for start := 0; start < 2; start++ {
+		opened, err := openService(context.Background(), config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		outcome := opened.labelMigration
+		opened.close()
+		if outcome.record.Version != authorized.LabelMigrationVersion {
+			t.Fatalf("start %d did not run the migration: %+v", start, outcome)
+		}
+		var log bytes.Buffer
+		printLabelMigration(&log, outcome)
+		if !strings.Contains(log.String(), "Label migration v1: examined") {
+			t.Fatalf("start %d log = %q", start, log.String())
+		}
+		// The report is in the catalog, so the listing reads it.
+		var listing bytes.Buffer
+		if err := listUntranslatableLabels(
+			context.Background(), &listing, config.policyDir); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(listing.String(), "0 untranslatable") {
+			t.Fatalf("listing = %q", listing.String())
+		}
 	}
 }
 
@@ -98,8 +84,8 @@ type failingMigrator struct{}
 
 func (failingMigrator) MigrateLabelledDocuments(
 	context.Context, *labelmigration.Capability,
-) (authorized.LabelMigrationRecord, bool, error) {
-	return authorized.LabelMigrationRecord{}, false, errors.New("injected store failure")
+) (authorized.LabelMigrationRecord, error) {
+	return authorized.LabelMigrationRecord{}, errors.New("injected store failure")
 }
 
 func TestLabelMigrationFailureRefusesToServe(t *testing.T) {
@@ -113,6 +99,23 @@ func TestLabelMigrationFailureRefusesToServe(t *testing.T) {
 	}
 }
 
+// directoryEntries lists every path under dir, for proving a read leaves it
+// untouched.
+func directoryEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	var entries []string
+	if err := filepath.WalkDir(dir, func(path string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		entries = append(entries, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return entries
+}
+
 func TestListUntranslatableLabelsFlag(t *testing.T) {
 	root := t.TempDir()
 	var output bytes.Buffer
@@ -124,6 +127,20 @@ func TestListUntranslatableLabelsFlag(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(root, "policy")); !os.IsNotExist(statErr) {
 		t.Fatalf("the listing created a policy catalog: %v", statErr)
+	}
+	// An existing but empty directory: refused, and left empty. The storage
+	// engine would create the catalog table in it.
+	if err := os.Mkdir(filepath.Join(root, "policy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before := directoryEntries(t, filepath.Join(root, "policy"))
+	err = run(context.Background(),
+		[]string{"-list-untranslatable-labels", "-state-dir", root}, &output)
+	if err == nil || !strings.Contains(err.Error(), "no policy catalog") {
+		t.Fatalf("listing an empty directory = %v", err)
+	}
+	if after := directoryEntries(t, filepath.Join(root, "policy")); !reflect.DeepEqual(before, after) {
+		t.Fatalf("the listing wrote into an empty directory: %v -> %v", before, after)
 	}
 
 	// A catalog the migration has not completed on.

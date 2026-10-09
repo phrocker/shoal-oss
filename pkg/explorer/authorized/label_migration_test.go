@@ -50,10 +50,12 @@ type legacyStore struct {
 	mu            sync.Mutex
 	strip         bool
 	keepRevisions bool
-	hideMarker    bool
-	failTightenAt int
-	tightenCalls  int
-	tightenChange int
+	// legacyEdgeKinds registers extracted relations the way a store written
+	// before RegistrationKind decodes them.
+	legacyEdgeKinds bool
+	failTightenAt   int
+	tightenCalls    int
+	tightenChange   int
 }
 
 func (s *legacyStore) setStrip(strip bool) {
@@ -103,6 +105,15 @@ func (s *legacyStore) RollbackEdgeReservation(ctx context.Context, registration 
 
 func (s *legacyStore) PutEdge(ctx context.Context, registration authorized.EdgeRegistration) error {
 	registration.Rule = s.legacy(registration.Rule)
+	s.mu.Lock()
+	legacyKinds := s.legacyEdgeKinds
+	s.mu.Unlock()
+	if legacyKinds && registration.Kind == authorized.RegistrationExtracted {
+		// What a record persisted before RegistrationKind decodes to: an
+		// application edge naming no document (legacyEdgeKind).
+		registration.Kind = authorized.RegistrationApplication
+		registration.DocumentID, registration.RevisionID = "", ""
+	}
 	return s.PolicyStore.PutEdge(ctx, registration)
 }
 
@@ -113,7 +124,7 @@ func (s *legacyStore) CompareAndSwapSourceClaim(
 }
 
 func (s *legacyStore) TightenRule(
-	ctx context.Context, documentID, revisionID shoal.ID, uri string, from, to authorized.AccessRule,
+	ctx context.Context, index *authorized.TighteningIndex, tightening authorized.RuleTightening,
 ) (bool, error) {
 	s.mu.Lock()
 	s.tightenCalls++
@@ -122,7 +133,7 @@ func (s *legacyStore) TightenRule(
 	if fail {
 		return false, shoal.NewError(shoal.ErrorUnavailable, "injected catalog failure")
 	}
-	changed, err := s.PolicyStore.TightenRule(ctx, documentID, revisionID, uri, from, to)
+	changed, err := s.PolicyStore.TightenRule(ctx, index, tightening)
 	if changed {
 		s.mu.Lock()
 		s.tightenChange++
@@ -131,24 +142,14 @@ func (s *legacyStore) TightenRule(
 	return changed, err
 }
 
-func (s *legacyStore) LabelMigration(ctx context.Context) (authorized.LabelMigrationRecord, bool, error) {
-	s.mu.Lock()
-	hide := s.hideMarker
-	s.mu.Unlock()
-	if hide {
-		return authorized.LabelMigrationRecord{}, false, nil
-	}
-	return s.PolicyStore.LabelMigration(ctx)
-}
-
-func migrate(t *testing.T, client *authorized.Client) (authorized.LabelMigrationRecord, bool) {
+func migrate(t *testing.T, client *authorized.Client) authorized.LabelMigrationRecord {
 	t.Helper()
-	record, ran, err := client.MigrateLabelledDocuments(
+	record, err := client.MigrateLabelledDocuments(
 		context.Background(), labelmigration.NewCapability())
 	if err != nil {
 		t.Fatalf("migration: %v", err)
 	}
-	return record, ran
+	return record
 }
 
 // newLegacyLabelWorld builds the conformance world of label_conformance_test
@@ -198,8 +199,8 @@ func TestLabelMigrationClosesLegacyDocumentsOnEveryReadPath(t *testing.T) {
 		if !sourceOnlySees(t, w, secret) {
 			t.Fatal("the legacy world does not reproduce the leak; the probe would be vacuous")
 		}
-		record, ran := migrate(t, w.clientA)
-		if !ran || record.Version != authorized.LabelMigrationVersion {
+		record := migrate(t, w.clientA)
+		if record.Version != authorized.LabelMigrationVersion {
 			t.Fatalf("migration did not run: %+v", record)
 		}
 		// secret, both and secretB are labelled; control and the hub are not.
@@ -217,20 +218,16 @@ func TestLabelMigrationClosesLegacyDocumentsOnEveryReadPath(t *testing.T) {
 func TestLabelMigrationIsIdempotent(t *testing.T) {
 	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
 		w, legacy := newLegacyLabelWorld(t, store)
-		first, ran := migrate(t, w.clientA)
-		if !ran {
-			t.Fatal("first migration did not run")
-		}
-		second, ran := migrate(t, w.clientA)
-		if ran || !reflect.DeepEqual(first, second) {
-			t.Fatalf("second migration ran=%v report=%+v, want the stored marker %+v", ran, second, first)
+		first := migrate(t, w.clientA)
+		if first.Tightened != 3 {
+			t.Fatalf("first migration = %+v", first)
 		}
 		legacy.mu.Lock()
-		legacy.hideMarker = true
 		legacy.tightenChange = 0
 		legacy.mu.Unlock()
-		third, ran := migrate(t, w.clientA)
-		if !ran || third.Tightened != 0 || third.AlreadyTightened != first.Tightened ||
+		// Every start runs it again; the second run finds everything tight.
+		third := migrate(t, w.clientA)
+		if third.Tightened != 0 || third.AlreadyTightened != first.Tightened ||
 			third.HistoricalTightened != 0 {
 			t.Fatalf("rerun without the marker = %+v", third)
 		}
@@ -250,7 +247,7 @@ func TestLabelMigrationResumesAfterInterruption(t *testing.T) {
 		legacy.mu.Lock()
 		legacy.failTightenAt = 2
 		legacy.mu.Unlock()
-		_, _, err := w.clientA.MigrateLabelledDocuments(
+		_, err := w.clientA.MigrateLabelledDocuments(
 			context.Background(), labelmigration.NewCapability())
 		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 			t.Fatalf("interrupted migration err = %v, want the injected failure", err)
@@ -273,9 +270,9 @@ func TestLabelMigrationResumesAfterInterruption(t *testing.T) {
 		legacy.mu.Lock()
 		legacy.failTightenAt = 0
 		legacy.mu.Unlock()
-		record, ran := migrate(t, w.clientA)
-		if !ran || record.Tightened+record.AlreadyTightened != 3 {
-			t.Fatalf("resumed migration = %+v, ran %v", record, ran)
+		record := migrate(t, w.clientA)
+		if record.Tightened+record.AlreadyTightened != 3 {
+			t.Fatalf("resumed migration = %+v", record)
 		}
 		if _, ok, err := store.LabelMigration(context.Background()); err != nil || !ok {
 			t.Fatalf("marker after the resumed run = %v, %v", ok, err)
@@ -362,8 +359,8 @@ func TestLabelMigrationUntranslatableLabelsCloseTheDocument(t *testing.T) {
 				}
 				selector := w.f.staticSelector(t, w.f.sourceA, w.f.policyA)
 				migrator := w.f.labelClient(t, tainted, w.store, selector, selector)
-				record, ran := migrate(t, migrator)
-				if !ran || len(record.Untranslatable) == 0 {
+				record := migrate(t, migrator)
+				if len(record.Untranslatable) == 0 {
 					t.Fatalf("report = %+v", record)
 				}
 				entry := record.Untranslatable[0]
@@ -450,7 +447,7 @@ func TestLabelMigrationTightensHistoricalRevisions(t *testing.T) {
 		if err := read(f.labelIngester(t, "before"), older.Revision.ID); err != nil {
 			t.Fatalf("the legacy historical revision is not open before the migration: %v", err)
 		}
-		record, _ := migrate(t, client)
+		record := migrate(t, client)
 		if record.Tightened != 1 || record.HistoricalTightened != 1 {
 			t.Fatalf("report = %+v", record)
 		}
@@ -575,9 +572,9 @@ func TestLabelMigrationSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	w, _ := newLegacyLabelWorld(t, store)
-	first, ran := migrate(t, w.clientA)
-	if !ran {
-		t.Fatal("migration did not run")
+	first := migrate(t, w.clientA)
+	if first.Tightened != 3 {
+		t.Fatalf("migration = %+v", first)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -592,9 +589,10 @@ func TestLabelMigrationSurvivesRestart(t *testing.T) {
 	w.store = reopened
 	w.clientA = w.f.labelClient(t, w.f.base, reopened, selectorA, selectorA)
 	w.clientB = w.f.labelClient(t, w.f.base, reopened, selectorB, selectorB)
-	again, ran := migrate(t, w.clientA)
-	if ran || !reflect.DeepEqual(first, again) {
-		t.Fatalf("migration after restart ran=%v report=%+v", ran, again)
+	// The restart runs it again, and finds nothing left to narrow.
+	again := migrate(t, w.clientA)
+	if again.Tightened != 0 || again.AlreadyTightened != first.Tightened {
+		t.Fatalf("migration after restart = %+v", again)
 	}
 	runLabelConformanceTable(t, w)
 }
@@ -605,7 +603,7 @@ func TestLabelMigrationRequiresTheCapability(t *testing.T) {
 	for name, capability := range map[string]*labelmigration.Capability{
 		"nil": nil, "zero": {},
 	} {
-		_, _, err := f.clientA.MigrateLabelledDocuments(context.Background(), capability)
+		_, err := f.clientA.MigrateLabelledDocuments(context.Background(), capability)
 		if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 			t.Errorf("%s capability: err = %v, want unauthorized", name, err)
 		}
@@ -652,7 +650,7 @@ func TestLabelMigrationRepairsATornTighten(t *testing.T) {
 		if err := neighborhood(f.labelIngester(t, "before")); err != nil {
 			t.Fatalf("the torn state does not leak the entity; the test would be vacuous: %v", err)
 		}
-		record, _ := migrate(t, client)
+		record := migrate(t, client)
 		// The revision already carried its labels; the sweep still
 		// rewrote the extracted registrations and the claim.
 		if record.Tightened != 1 || record.AlreadyTightened != 0 {

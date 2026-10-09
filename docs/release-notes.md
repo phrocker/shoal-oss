@@ -22,8 +22,9 @@ together:
   labelled under an earlier release, including its historical revisions,
   extracted entities and relations, and source claim. A document whose labels
   cannot be translated becomes readable by nobody and is listed by
-  `shoal-explore-web -list-untranslatable-labels`. A marker in the policy
-  catalog makes later starts skip it; any error refuses to start.
+  `shoal-explore-web -list-untranslatable-labels`. It runs on every start, so
+  documents labelled by an older binary after a rollback are closed on the
+  next start; any error refuses to start.
 
 **Upgrade action required.** Write the label grant file before starting the
 new release, then review the untranslatable list and rebuild lexicon bundles.

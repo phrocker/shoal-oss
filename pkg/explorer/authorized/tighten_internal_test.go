@@ -109,6 +109,16 @@ func withTightenStores(t *testing.T, run func(t *testing.T, store PolicyStore, r
 	})
 }
 
+// tightenFor calls TightenRule without a prebuilt index.
+func tightenFor(
+	store PolicyStore, documentID, revisionID shoal.ID, uri string, from, to AccessRule,
+) (bool, error) {
+	return store.TightenRule(context.Background(), nil, RuleTightening{
+		DocumentID: documentID, RevisionID: revisionID, SourceURI: uri,
+		From: from, To: to,
+	})
+}
+
 func tightenDigest(name string) auth.Digest {
 	return auth.DigestBytes("tighten-test", []byte(name))
 }
@@ -248,7 +258,7 @@ func TestTightenRuleRewritesEveryRegistrationOfTheDocument(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		changed, err := store.TightenRule(ctx, "doc-1", "rev-2", tightenURI, w.bare, w.secret)
+		changed, err := tightenFor(store, "doc-1", "rev-2", tightenURI, w.bare, w.secret)
 		if err != nil || !changed {
 			t.Fatalf("TightenRule = %v, %v", changed, err)
 		}
@@ -296,12 +306,12 @@ func TestTightenRuleRewritesEveryRegistrationOfTheDocument(t *testing.T) {
 		}
 
 		// Idempotent: the same call again changes nothing.
-		changed, err = store.TightenRule(ctx, "doc-1", "rev-2", tightenURI, w.bare, w.secret)
+		changed, err = tightenFor(store, "doc-1", "rev-2", tightenURI, w.bare, w.secret)
 		if err != nil || changed {
 			t.Fatalf("repeated TightenRule = %v, %v, want a no-op", changed, err)
 		}
 		// So is a sweep from the bare rule of an already tightened document.
-		changed, err = store.TightenRule(ctx, "doc-1", "rev-2", tightenURI, w.bare, w.secret)
+		changed, err = tightenFor(store, "doc-1", "rev-2", tightenURI, w.bare, w.secret)
 		if err != nil || changed {
 			t.Fatalf("sweep = %v, %v, want a no-op", changed, err)
 		}
@@ -321,8 +331,7 @@ func TestTightenRuleHistoricalRevisionScope(t *testing.T) {
 	withTightenStores(t, func(t *testing.T, store PolicyStore, reopen func() PolicyStore) {
 		w := newTightenWorld(t)
 		seedLegacyCatalog(t, store, w)
-		ctx := context.Background()
-		changed, err := store.TightenRule(ctx, "doc-1", "rev-1", "", w.bare, w.onlyX)
+		changed, err := tightenFor(store, "doc-1", "rev-1", "", w.bare, w.onlyX)
 		if err != nil || !changed {
 			t.Fatalf("TightenRule = %v, %v", changed, err)
 		}
@@ -348,8 +357,7 @@ func TestTightenRuleRefusesWidening(t *testing.T) {
 	withTightenStores(t, func(t *testing.T, store PolicyStore, _ func() PolicyStore) {
 		w := newTightenWorld(t)
 		seedLegacyCatalog(t, store, w)
-		ctx := context.Background()
-		if _, err := store.TightenRule(ctx, "doc-1", "rev-2", tightenURI, w.bare, w.secretX); err != nil {
+		if _, err := tightenFor(store, "doc-1", "rev-2", tightenURI, w.bare, w.secretX); err != nil {
 			t.Fatal(err)
 		}
 		for name, c := range map[string]struct {
@@ -366,15 +374,15 @@ func TestTightenRuleRefusesWidening(t *testing.T) {
 			// A strict superset of a rule the document does not have.
 			"stale from": {w.otherBare, w.otherSecret, shoal.ErrorConflict},
 		} {
-			_, err := store.TightenRule(ctx, "doc-1", "rev-2", tightenURI, c.from, c.to)
+			_, err := tightenFor(store, "doc-1", "rev-2", tightenURI, c.from, c.to)
 			if !shoal.IsErrorCode(err, c.code) {
 				t.Errorf("%s: err = %v, want %v", name, err, c.code)
 			}
 		}
-		if _, err := store.TightenRule(ctx, "doc-1", "rev-404", tightenURI, w.bare, w.secret); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		if _, err := tightenFor(store, "doc-1", "rev-404", tightenURI, w.bare, w.secret); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 			t.Errorf("unknown revision: err = %v, want not found", err)
 		}
-		if _, err := store.TightenRule(ctx, "doc-2", "rev-9", "", w.bare, w.secret); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		if _, err := tightenFor(store, "doc-2", "rev-9", "", w.bare, w.secret); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 			t.Errorf("current revision without a source URI: err = %v, want invalid argument", err)
 		}
 		checkTightened(t, store, tightenExpectation{
@@ -402,13 +410,13 @@ func TestTightenRulePendingClaim(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Held by an in-flight mutation: refuse.
-		if _, err := store.TightenRule(ctx, "doc-1", "rev-2", tightenURI, w.bare, w.secret); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		if _, err := tightenFor(store, "doc-1", "rev-2", tightenURI, w.bare, w.secret); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
 			t.Fatalf("held claim: err = %v, want conflict", err)
 		}
 		if err := store.PendSourceClaim(ctx, token); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.TightenRule(ctx, "doc-1", "rev-2", tightenURI, w.bare, w.secret); err != nil {
+		if _, err := tightenFor(store, "doc-1", "rev-2", tightenURI, w.bare, w.secret); err != nil {
 			t.Fatal(err)
 		}
 		for _, s := range []PolicyStore{store, reopen()} {

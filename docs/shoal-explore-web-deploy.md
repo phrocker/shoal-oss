@@ -306,9 +306,10 @@ under the catalog's mutation lease:
   (`PolicyStore.TightenRule`) only ever adds conjuncts and refuses anything
   else. It covers every revision of the document (not only the current one),
   the current node and edge projections, the entities and relations extracted
-  from it, application edges touching those entities, and the source claim, so
-  a source holder without the labels can neither read the document nor
-  re-ingest it unlabelled.
+  from it, the relations the corpus's extraction records say it asserted
+  (see the residuals for why that matters), application edges touching its
+  entities, and the source claim, so a source holder without the labels can
+  neither read the document nor re-ingest it unlabelled.
 - A historical revision is also narrowed by its own labels, which may differ
   from the current revision's.
 - A document whose labels cannot be translated (they do not parse, fall
@@ -321,10 +322,17 @@ under the catalog's mutation lease:
 - The run logs its counts (`Label migration v1: examined N document(s): …`)
   and the untranslatable list. Any catalog or corpus error refuses to start:
   the workspace never serves a corpus it did not finish narrowing.
-- A version marker is written to the policy catalog **after** the last
-  document, so a run that is interrupted (a crash, a failed write) simply runs
-  again on the next start; every step is idempotent. Once the marker is
-  present the migration is skipped and startup logs `already applied`.
+- It runs on **every** start, not once. A rollback to a release before this
+  one, followed by a re-upgrade, can leave labelled documents ingested by the
+  older binary under the bare source rule; the next start closes them. Every
+  step is idempotent, so a run that is interrupted (a crash, a failed write)
+  is simply completed by the next start, and a start with nothing to narrow
+  only confirms it. The run builds one index of the catalog and then visits
+  each document's own registrations: on a catalog of 1M entities and 1M
+  relations, about 0.7 s for the index plus 3.6 ms per labelled document the
+  first time and 0.1 ms per document afterwards.
+- Its report is written to the policy catalog after the last document, for
+  `-list-untranslatable-labels`. It is a report, not a gate.
 
 Operator steps:
 
@@ -340,7 +348,8 @@ Operator steps:
    `shoal-explore-web -list-untranslatable-labels` (with the same
    `-state-dir`, `-data` or `-policy-dir`) prints the stored report and exits
    without serving. Run it with the workspace stopped: the catalog takes no
-   cross-process lock. It never creates a catalog.
+   cross-process lock. It refuses a directory that holds no policy catalog
+   and never creates one.
 5. **Relabel** each listed document by ingesting its content again under a
    **new source URI**, with labels inside the charset, as a principal holding
    them. The original cannot be relabelled in place: the untranslatable
@@ -355,14 +364,20 @@ Operator steps:
 
 Residuals, stated rather than implied:
 
-- An application edge written before `RegistrationKind` existed cannot be told
-  apart from a `Connect` edge. Every such edge with an endpoint among the
-  document's extracted entities takes the labels. That changes no read (the
-  endpoint is re-checked and already carries them), but retrying the very same
-  `Connect` afterwards conflicts. A legacy relation whose two endpoints are
-  entities first extracted by **other** documents names nothing that ties it
-  to this one and keeps its rule; it is still filtered when either endpoint is
-  hidden, and re-extracting the document binds it.
+- A relation written before `RegistrationKind` existed is stored as an
+  application edge naming no document, so the policy catalog alone cannot tell
+  it from a `Connect` edge. A relation that only a labelled document states,
+  between entities first extracted by **other**, public documents, would then
+  stay readable: both endpoints are visible. Re-extracting would not fix it
+  either, because the labelled rule changes the entity namespace, so
+  re-extraction mints new IDs and leaves the old relation where it is. The
+  migration therefore reads the corpus's own extraction records, which name
+  the document and revision behind every relation, and narrows each legacy
+  relation the document asserted. Two consequences: if a public document
+  asserts the same relation, it still closes (fail closed); and every
+  application edge touching the document's entities, or named by its
+  extraction records, takes the labels, so retrying the very same `Connect`
+  afterwards conflicts.
 - Shared entities and relations belong to the first document that extracted
   them. If that document is labelled, they close for readers without its
   labels even when a public document also mentions them (fail closed), and a

@@ -22,6 +22,8 @@ package authorized
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -52,6 +54,25 @@ type persistedUntranslatable struct {
 	Reason       string
 }
 
+// OpenExistingDurablePolicyStore opens a durable policy catalog that already
+// exists, for read-only tooling such as -list-untranslatable-labels. Unlike
+// OpenDurablePolicyStore it never creates anything: a missing directory, or
+// one without the catalog's table, is refused before the storage engine is
+// opened (the engine would create both).
+func OpenExistingDurablePolicyStore(dir string) (*DurablePolicyStore, error) {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return nil, shoal.NewError(shoal.ErrorNotFound,
+			"no policy catalog at "+dir)
+	}
+	table, err := os.Stat(filepath.Join(dir, policyTable))
+	if err != nil || !table.IsDir() {
+		return nil, shoal.NewError(shoal.ErrorNotFound,
+			"no policy catalog at "+dir+": it holds no "+policyTable+" table")
+	}
+	return OpenDurablePolicyStore(dir)
+}
+
 // policyRow is one record of a batched durable write.
 type policyRow struct {
 	row   []byte
@@ -64,23 +85,20 @@ type policyRow struct {
 // appends the whole batch to its WAL in one write before applying any of it.
 // A crash can still tear that write and persist only a prefix of the batch.
 // That is narrowing-only (every persisted record is tighter, none wider), and
-// the label migration does not rely on more: until its marker is written it
-// re-sweeps every labelled document on each start, and TightenRule completes
-// whatever a torn write left behind.
+// the label migration does not rely on more: it re-sweeps every labelled
+// document on every start, and TightenRule completes whatever a torn write
+// left behind.
 func (s *DurablePolicyStore) TightenRule(
 	ctx context.Context,
-	documentID, revisionID shoal.ID,
-	sourceURI string,
-	from, to AccessRule,
+	index *TighteningIndex,
+	tightening RuleTightening,
 ) (bool, error) {
 	if s == nil {
-		return (*MemoryPolicyStore)(nil).TightenRule(
-			ctx, documentID, revisionID, sourceURI, from, to)
+		return (*MemoryPolicyStore)(nil).TightenRule(ctx, index, tightening)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	changes, err := s.memory.tightenRule(
-		ctx, documentID, revisionID, sourceURI, from, to)
+	changes, err := s.memory.tightenRule(ctx, index, tightening)
 	if err != nil {
 		return false, err
 	}
@@ -127,12 +145,11 @@ func (s *DurablePolicyStore) TightenRule(
 	return true, nil
 }
 
-// DocumentRevisions is a pure read delegated to the memory store.
-func (s *DurablePolicyStore) DocumentRevisions(
+// TighteningIndex is a pure read delegated to the memory store.
+func (s *DurablePolicyStore) TighteningIndex(
 	ctx context.Context,
-	documentID shoal.ID,
-) ([]RevisionRegistration, error) {
-	return s.memoryStore().DocumentRevisions(ctx, documentID)
+) (*TighteningIndex, error) {
+	return s.memoryStore().TighteningIndex(ctx)
 }
 
 // LabelMigration is a pure read delegated to the memory store, whose marker

@@ -230,7 +230,7 @@ func migrateLabels(
 	}
 	// One of the two mint sites; see TestLabelMigrationCapabilityMintSites
 	// in cmd/shoal-explore-web.
-	record, ran, err := client.MigrateLabelledDocuments(
+	record, err := client.MigrateLabelledDocuments(
 		ctx, labelmigration.NewCapability())
 	if err != nil {
 		return fmt.Errorf(
@@ -240,15 +240,6 @@ func migrateLabels(
 	}
 	// stderr stays silent unless the migration changed something or left
 	// documents unreadable: a stdio launcher may treat any output as noise.
-	if !ran {
-		if len(record.Untranslatable) > 0 {
-			fmt.Fprintf(diagnostics,
-				"shoal-mcp: label migration v%d already applied; %d "+
-					"document(s) are unreadable until relabelled\n",
-				record.Version, len(record.Untranslatable))
-		}
-		return nil
-	}
 	if record.Tightened == 0 && record.HistoricalTightened == 0 &&
 		len(record.Untranslatable) == 0 {
 		return nil

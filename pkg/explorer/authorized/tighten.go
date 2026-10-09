@@ -44,37 +44,152 @@ func (c tightenChanges) changed() bool {
 		c.sourceClaim != ""
 }
 
+// RuleTightening is one TightenRule request.
+type RuleTightening struct {
+	DocumentID shoal.ID
+	RevisionID shoal.ID
+	// SourceURI names the document's source claim. It is required when
+	// RevisionID is the current revision, because the catalog keeps no
+	// document-to-URI index.
+	SourceURI string
+	From, To  AccessRule
+	// AssertedEdgeIDs are relation edges the base's own extraction records
+	// attribute to this document (to RevisionID when it is historical). They
+	// name legacy relations the catalog cannot tie to the document: an edge
+	// persisted before RegistrationKind existed decodes as
+	// RegistrationApplication with no document. Each one registered as
+	// RegistrationApplication takes the delta; one registered as
+	// RegistrationExtracted keeps the binding of whichever document asserted
+	// it first, as extractedEdgeMerge does.
+	AssertedEdgeIDs []shoal.ID
+}
+
+// TighteningIndex maps each document to its registrations, so TightenRule
+// visits only one document's records instead of scanning the catalog. It is
+// built once, by PolicyStore.TighteningIndex, for a run that holds the
+// mutation lease throughout: TightenRule only rewrites rules, never which
+// registrations exist, so the index stays exact for the whole run. Every
+// entry is re-checked against the stored registration (kind, document,
+// revision, endpoints) before it is touched, so a stale entry can never widen
+// scope.
+type TighteningIndex struct {
+	revisions      map[shoal.ID][]shoal.ID
+	extractedNodes map[shoal.ID][]shoal.ID
+	extractedEdges map[shoal.ID][]shoal.ID
+	// applicationEdges groups each application edge under the document that
+	// owns an extracted endpoint of it (both, when they differ).
+	applicationEdges map[shoal.ID][]shoal.ID
+}
+
+// Revisions returns the revision IDs the catalog registers for a document,
+// ordered by ID.
+func (i *TighteningIndex) Revisions(documentID shoal.ID) []shoal.ID {
+	if i == nil {
+		return nil
+	}
+	return append([]shoal.ID(nil), i.revisions[documentID]...)
+}
+
+// TighteningIndex builds the per-run index in one pass over the catalog.
+func (s *MemoryPolicyStore) TighteningIndex(ctx context.Context) (*TighteningIndex, error) {
+	if err := contextFailure(ctx); err != nil {
+		return nil, err
+	}
+	if s == nil {
+		return nil, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.buildTighteningIndexLocked(""), nil
+}
+
+// buildTighteningIndexLocked indexes every document, or only the document
+// named by only when it is not empty (a TightenRule call without an index).
+func (s *MemoryPolicyStore) buildTighteningIndexLocked(only shoal.ID) *TighteningIndex {
+	index := &TighteningIndex{
+		revisions:        make(map[shoal.ID][]shoal.ID),
+		extractedNodes:   make(map[shoal.ID][]shoal.ID),
+		extractedEdges:   make(map[shoal.ID][]shoal.ID),
+		applicationEdges: make(map[shoal.ID][]shoal.ID),
+	}
+	wanted := func(documentID shoal.ID) bool {
+		return only == "" || documentID == only
+	}
+	for key := range s.revisions {
+		if wanted(key.documentID) {
+			index.revisions[key.documentID] = append(
+				index.revisions[key.documentID], key.revisionID)
+		}
+	}
+	for _, revisions := range index.revisions {
+		sortIDs(revisions)
+	}
+	for nodeID, registration := range s.nodes {
+		if registration.Kind == RegistrationExtracted && wanted(registration.DocumentID) {
+			index.extractedNodes[registration.DocumentID] = append(
+				index.extractedNodes[registration.DocumentID], nodeID)
+		}
+	}
+	extractedOwner := func(nodeID shoal.ID) (shoal.ID, bool) {
+		registration, ok := s.nodes[nodeID]
+		if !ok || registration.Kind != RegistrationExtracted ||
+			!wanted(registration.DocumentID) {
+			return "", false
+		}
+		return registration.DocumentID, true
+	}
+	for edgeID, registration := range s.edges {
+		switch registration.Kind {
+		case RegistrationExtracted:
+			if wanted(registration.DocumentID) {
+				index.extractedEdges[registration.DocumentID] = append(
+					index.extractedEdges[registration.DocumentID], edgeID)
+			}
+		case RegistrationApplication:
+			fromOwner, fromOK := extractedOwner(registration.Edge.From)
+			toOwner, toOK := extractedOwner(registration.Edge.To)
+			if fromOK {
+				index.applicationEdges[fromOwner] = append(
+					index.applicationEdges[fromOwner], edgeID)
+			}
+			if toOK && (!fromOK || toOwner != fromOwner) {
+				index.applicationEdges[toOwner] = append(
+					index.applicationEdges[toOwner], edgeID)
+			}
+		}
+	}
+	return index
+}
+
 // TightenRule narrows the catalog rule of one document (#570). It is how the
 // startup label migration closes documents that were labelled before labels
-// were enforced: their registrations carry the bare source rule, and `to`
-// adds the label policies.
+// were enforced: their registrations carry the bare source rule, and To adds
+// the label policies.
 //
-// It refuses (InvalidArgument) unless `to`'s components are a strict superset
-// of `from`'s, so it can never widen. The added components (the delta, `to`
-// minus `from`) are conjoined onto every registration in scope through
+// It refuses (InvalidArgument) unless To's components are a strict superset
+// of From's, so it can never widen. The added components (the delta, To
+// minus From) are conjoined onto every registration in scope through
 // NewAccessRule, which only ever adds conjuncts; a registration that already
 // carries the delta is left alone, which makes a repeated call a no-op.
 //
-// The revision registration (documentID, revisionID) must exist (NotFound)
-// and its rule must be `from` or already include `to` (Conflict otherwise),
-// so a caller acting on a stale read cannot rewrite a document that changed
+// The revision registration (DocumentID, RevisionID) must exist (NotFound)
+// and its rule must be From or already include To (Conflict otherwise), so a
+// caller acting on a stale read cannot rewrite a document that changed
 // underneath it. What is in scope depends on which revision that is:
 //
-//   - revisionID is the document's current revision: every revision
+//   - RevisionID is the document's current revision: every revision
 //     registration of the document, historical ones included; the current
 //     node and intrinsic-edge projections (rebuilt from the tightened current
 //     revision); every RegistrationExtracted node and edge bound to the
-//     document, whatever revision asserted it; every RegistrationApplication
-//     edge with an endpoint among those extracted nodes (see below); and the
-//     committed or pending source claim for sourceURI, whose Rule and
-//     PreviousRule both take the delta and whose version advances. sourceURI
-//     is required here because the catalog keeps no document-to-URI index; a
-//     URI with no claim is not an error. A claim held by an in-flight
+//     document, whatever revision asserted it; the application edges described
+//     below; and the committed or pending source claim for SourceURI, whose
+//     Rule and PreviousRule both take the delta and whose version advances. A
+//     URI with no claim is not an error; a claim held by an in-flight
 //     mutation conflicts.
-//   - revisionID is a historical revision: that revision registration, and
-//     the extracted nodes and edges bound to exactly that revision, plus
-//     application edges touching those nodes. sourceURI is ignored. This lets
-//     a caller translate a historical revision's own labels, which may differ
+//   - RevisionID is a historical revision: that revision registration, and
+//     the extracted nodes and edges bound to exactly that revision, plus the
+//     application edges described below. SourceURI is ignored. This lets a
+//     caller translate a historical revision's own labels, which may differ
 //     from the current revision's.
 //
 // Registrations are selected by their stored RegistrationKind, never by an ID
@@ -82,28 +197,36 @@ func (c tightenChanges) changed() bool {
 // are never touched, nor are pending edge reservations (a reservation still
 // holding the old rule can only conflict when it is committed).
 //
-// Application edges: an edge persisted before RegistrationKind existed
-// decodes as RegistrationApplication even when ExtractDocument wrote it, so a
-// legacy extracted relation cannot be told apart from a Connect edge. Every
-// application edge with an endpoint among this document's extracted nodes
-// takes the delta. That only narrows: reading such an edge already requires
-// reading that endpoint, which carries the delta, so no reader loses an edge
-// it could otherwise see. The cost is that retrying the identical Connect
-// afterwards conflicts, because the stored rule no longer equals the one the
-// selector picks. A legacy relation whose endpoints both belong to OTHER
-// documents (shared entities first extracted elsewhere) names nothing that
-// ties it to this document and keeps its rule; it regains a document binding
-// the next time this document is extracted (extractedEdgeMerge).
+// Application edges. An edge persisted before RegistrationKind existed
+// decodes as RegistrationApplication even when ExtractDocument wrote it, and
+// carries no document, so the catalog alone cannot tell a legacy extracted
+// relation from a Connect edge. Two sets of them take the delta:
 //
-// The call is atomic: every rewritten registration is derived before any is
-// stored, under one lock, so a failure changes nothing.
+//   - every application edge with an endpoint among the in-scope extracted
+//     nodes. Reading such an edge already requires reading that endpoint, so
+//     this changes no read; it keeps the stored rule self-describing.
+//   - every application edge named in AssertedEdgeIDs: the relations the
+//     base's extraction records say this document asserted. This is what
+//     closes a relation that only this document states between two entities
+//     first extracted by OTHER documents: its endpoints stay visible, so
+//     nothing else would hide it. If another, unlabelled document asserts the
+//     same relation, the relation closes anyway (fail closed, like
+//     extractedEdgeMerge's first-asserter rule).
+//
+// Either can only narrow. The cost is that retrying an identical Connect
+// afterwards conflicts, because the stored rule no longer equals the one the
+// selector picks.
+//
+// A nil index makes the call build one itself, a full pass over the catalog;
+// a migration run passes the index it built once. The call is atomic: every
+// rewritten registration is derived before any is stored, under one lock, so
+// a failure changes nothing.
 func (s *MemoryPolicyStore) TightenRule(
 	ctx context.Context,
-	documentID, revisionID shoal.ID,
-	sourceURI string,
-	from, to AccessRule,
+	index *TighteningIndex,
+	tightening RuleTightening,
 ) (bool, error) {
-	changes, err := s.tightenRule(ctx, documentID, revisionID, sourceURI, from, to)
+	changes, err := s.tightenRule(ctx, index, tightening)
 	if err != nil {
 		return false, err
 	}
@@ -112,10 +235,11 @@ func (s *MemoryPolicyStore) TightenRule(
 
 func (s *MemoryPolicyStore) tightenRule(
 	ctx context.Context,
-	documentID, revisionID shoal.ID,
-	sourceURI string,
-	from, to AccessRule,
+	index *TighteningIndex,
+	tightening RuleTightening,
 ) (tightenChanges, error) {
+	documentID, revisionID := tightening.DocumentID, tightening.RevisionID
+	sourceURI := tightening.SourceURI
 	if err := contextFailure(ctx); err != nil {
 		return tightenChanges{}, err
 	}
@@ -125,11 +249,16 @@ func (s *MemoryPolicyStore) tightenRule(
 	if err := shoal.ValidateRequiredID("revision ID", revisionID); err != nil {
 		return tightenChanges{}, err
 	}
-	fromRule, err := from.clone()
+	for _, edgeID := range tightening.AssertedEdgeIDs {
+		if err := shoal.ValidateRequiredID("asserted edge ID", edgeID); err != nil {
+			return tightenChanges{}, err
+		}
+	}
+	fromRule, err := tightening.From.clone()
 	if err != nil {
 		return tightenChanges{}, err
 	}
-	toRule, err := to.clone()
+	toRule, err := tightening.To.clone()
 	if err != nil {
 		return tightenChanges{}, err
 	}
@@ -160,6 +289,9 @@ func (s *MemoryPolicyStore) tightenRule(
 			return tightenChanges{}, err
 		}
 	}
+	if index == nil {
+		index = s.buildTighteningIndexLocked(documentID)
+	}
 	inScope := func(document, revision shoal.ID) bool {
 		return document == documentID && (whole || revision == revisionID)
 	}
@@ -167,8 +299,10 @@ func (s *MemoryPolicyStore) tightenRule(
 	// Derive everything first; nothing is stored until all of it is built.
 	var changes tightenChanges
 	revisions := make(map[revisionKey]RevisionRegistration)
-	for candidate, registration := range s.revisions {
-		if !inScope(candidate.documentID, candidate.revisionID) {
+	for _, candidateRevision := range index.revisions[documentID] {
+		candidate := revisionKey{documentID: documentID, revisionID: candidateRevision}
+		registration, ok := s.revisions[candidate]
+		if !ok || !inScope(candidate.documentID, candidate.revisionID) {
 			continue
 		}
 		rule, changed, err := conjoinDelta(registration.Rule, delta)
@@ -183,14 +317,15 @@ func (s *MemoryPolicyStore) tightenRule(
 		revisions[candidate] = tightened
 		changes.revisions = append(changes.revisions, candidate)
 	}
-	extractedNodes := make(map[shoal.ID]struct{})
 	nodes := make(map[shoal.ID]NodeRegistration)
-	for nodeID, registration := range s.nodes {
-		if registration.Kind != RegistrationExtracted ||
+	scoped := make(map[shoal.ID]struct{})
+	for _, nodeID := range index.extractedNodes[documentID] {
+		registration, ok := s.nodes[nodeID]
+		if !ok || registration.Kind != RegistrationExtracted ||
 			!inScope(registration.DocumentID, registration.RevisionID) {
 			continue
 		}
-		extractedNodes[nodeID] = struct{}{}
+		scoped[nodeID] = struct{}{}
 		rule, changed, err := conjoinDelta(registration.Rule, delta)
 		if err != nil {
 			return tightenChanges{}, err
@@ -206,17 +341,43 @@ func (s *MemoryPolicyStore) tightenRule(
 		nodes[nodeID] = tightened
 		changes.nodes = append(changes.nodes, nodeID)
 	}
+	// Candidate edges: extracted edges bound to the document, application
+	// edges touching an in-scope extracted node, and the asserted edges.
+	type edgeCandidate struct {
+		id       shoal.ID
+		asserted bool
+	}
+	var candidates []edgeCandidate
+	for _, edgeID := range index.extractedEdges[documentID] {
+		candidates = append(candidates, edgeCandidate{id: edgeID})
+	}
+	// The application edges' endpoints are re-checked against the scoped
+	// nodes below, so an edge indexed under this document but touching only
+	// another revision's nodes is left alone.
+	for _, edgeID := range index.applicationEdges[documentID] {
+		candidates = append(candidates, edgeCandidate{id: edgeID})
+	}
+	for _, edgeID := range tightening.AssertedEdgeIDs {
+		candidates = append(candidates, edgeCandidate{id: edgeID, asserted: true})
+	}
 	edges := make(map[shoal.ID]EdgeRegistration)
-	for edgeID, registration := range s.edges {
+	for _, candidate := range candidates {
+		if _, done := edges[candidate.id]; done {
+			continue
+		}
+		registration, ok := s.edges[candidate.id]
+		if !ok {
+			continue
+		}
 		switch registration.Kind {
 		case RegistrationExtracted:
 			if !inScope(registration.DocumentID, registration.RevisionID) {
 				continue
 			}
 		case RegistrationApplication:
-			_, fromExtracted := extractedNodes[registration.Edge.From]
-			_, toExtracted := extractedNodes[registration.Edge.To]
-			if !fromExtracted && !toExtracted {
+			_, fromScoped := scoped[registration.Edge.From]
+			_, toScoped := scoped[registration.Edge.To]
+			if !candidate.asserted && !fromScoped && !toScoped {
 				continue
 			}
 		default:
@@ -234,8 +395,8 @@ func (s *MemoryPolicyStore) tightenRule(
 			return tightenChanges{}, catalogUnavailable()
 		}
 		tightened.Rule = rule
-		edges[edgeID] = tightened
-		changes.edges = append(changes.edges, edgeID)
+		edges[candidate.id] = tightened
+		changes.edges = append(changes.edges, candidate.id)
 	}
 	var claim *sourceClaimState
 	if whole {
@@ -300,40 +461,6 @@ func (s *MemoryPolicyStore) tightenRule(
 	sortIDs(changes.nodes)
 	sortIDs(changes.edges)
 	return changes, nil
-}
-
-// DocumentRevisions returns every revision registration of one document,
-// ordered by revision ID, with Current set on the current one.
-func (s *MemoryPolicyStore) DocumentRevisions(
-	ctx context.Context,
-	documentID shoal.ID,
-) ([]RevisionRegistration, error) {
-	if err := contextFailure(ctx); err != nil {
-		return nil, err
-	}
-	if err := shoal.ValidateRequiredID("document ID", documentID); err != nil {
-		return nil, err
-	}
-	if s == nil {
-		return nil, catalogUnavailable()
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	currentKey, hasCurrent := s.current[documentID]
-	registrations := make([]RevisionRegistration, 0)
-	for key, registration := range s.revisions {
-		if key.documentID != documentID {
-			continue
-		}
-		cloned := cloneRevisionRegistration(registration)
-		cloned.Current = hasCurrent && currentKey == key
-		registrations = append(registrations, cloned)
-	}
-	sort.Slice(registrations, func(left, right int) bool {
-		return shoal.CompareID(registrations[left].RevisionID,
-			registrations[right].RevisionID) < 0
-	})
-	return registrations, nil
 }
 
 // LabelMigration returns the recorded label-migration marker.
@@ -426,6 +553,18 @@ func ruleHasKey(rule AccessRule, key []byte) bool {
 // conjoinDelta adds the delta's components to rule through NewAccessRule and
 // reports whether that changed it. It can only add conjuncts.
 func conjoinDelta(rule AccessRule, delta []auth.Policy) (AccessRule, bool, error) {
+	// Already carrying every delta component (the common case on every start
+	// after the first): compare logical keys and skip rebuilding the rule.
+	carried := len(rule.keys) > 0
+	for _, policy := range delta {
+		if !ruleHasKey(rule, logicalPolicyKey(policy)) {
+			carried = false
+			break
+		}
+	}
+	if carried {
+		return rule, false, nil
+	}
 	components := rule.components()
 	if len(components) == 0 {
 		return AccessRule{}, false, catalogUnavailable()

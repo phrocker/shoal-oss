@@ -32,17 +32,16 @@ import (
 )
 
 // LabelMigrationVersion is the version of the startup label migration
-// (#570). A catalog whose marker records this version or later is not
-// migrated again.
+// (#570), recorded in its report.
 const LabelMigrationVersion uint32 = 1
 
 // maxReportedLabelBytes bounds the raw label kept in the report before it is
 // escaped, so one pathological property cannot flood the operator's log.
 const maxReportedLabelBytes = 512
 
-// LabelMigrationRecord is the label-migration marker and its report. It is
-// stored in the policy catalog only after every document has been migrated,
-// so its presence means the run completed.
+// LabelMigrationRecord is the report of the latest completed label
+// migration run. It is stored in the policy catalog after the last document
+// of every run, for -list-untranslatable-labels; it never gates a run.
 type LabelMigrationRecord struct {
 	Version uint32
 	// Documents is every base document examined.
@@ -82,6 +81,13 @@ func (r LabelMigrationRecord) clone() LabelMigrationRecord {
 	return r
 }
 
+// ExtractionRecordReader lists the base's stored extraction records. The
+// embedded explorer implements it; the migration needs it to attribute
+// legacy relations to the document that asserted them.
+type ExtractionRecordReader interface {
+	ExtractionRecords(context.Context) ([]explorer.ExtractionRecord, error)
+}
+
 // MigrateLabelledDocuments narrows the catalog rule of every document that
 // was labelled before labels were enforced (#570). Such a document carries
 // the bare source rule plus the free-form shoal.visibility property, so any
@@ -89,13 +95,14 @@ func (r LabelMigrationRecord) clone() LabelMigrationRecord {
 // would leave it open until someone happens to write it, so this runs at
 // startup instead, before anything is served.
 //
-// For each base document it reads shoal.visibility from the stored document
-// node (and checks it against the revision's own metadata), parses it with
-// interaction.ParseVisibility, builds LabelRule(sourcePolicy, labels), and
-// calls PolicyStore.TightenRule, which rewrites every revision, the current
-// projections, the extracted nodes and edges, and the source claim. Each
-// historical revision is then narrowed by its own labels too, which may
-// differ from the current revision's.
+// For each base document it reads shoal.visibility from the revision
+// metadata and, when that is not empty, from the stored document node (the
+// two must agree), parses it with interaction.ParseVisibility, builds
+// LabelRule(sourcePolicy, labels), and calls PolicyStore.TightenRule, which
+// rewrites every revision, the current projections, the extracted nodes and
+// edges, the relations the base's extraction records say the document
+// asserted, and the source claim. Each historical revision is then narrowed
+// by its own labels too, which may differ from the current revision's.
 //
 // A label set that cannot be translated (it does not parse, falls outside the
 // charset, or exceeds a length, term or byte bound) is not an error: the
@@ -104,68 +111,123 @@ func (r LabelMigrationRecord) clone() LabelMigrationRecord {
 // report. Any store or base error aborts the run, and the caller must refuse
 // to serve.
 //
+// It runs on EVERY start, not once: a binary from before #585 (a rollback)
+// can register labelled documents under the bare rule again, and the next
+// start must close them. Every step is idempotent, and one index built per run
+// keeps each document's work proportional to that document's registrations.
 // The run holds the client's mutation lock and the store's mutation lease
-// throughout. The marker (PutLabelMigration) is written last, so an
-// interrupted run is simply repeated on the next start; every step is
-// idempotent. Once the marker records LabelMigrationVersion, later calls
-// return it with ran false and do nothing.
+// throughout. Its report is stored (PutLabelMigration) after the last
+// document, for -list-untranslatable-labels; it never gates a later run.
 func (c *Client) MigrateLabelledDocuments(
 	ctx context.Context,
 	capability *labelmigration.Capability,
-) (record LabelMigrationRecord, ran bool, err error) {
+) (LabelMigrationRecord, error) {
 	if !capability.Granted() {
-		return LabelMigrationRecord{}, false, shoal.NewError(
+		return LabelMigrationRecord{}, shoal.NewError(
 			shoal.ErrorUnauthorized,
 			"the label migration requires the internal migration capability")
 	}
 	if err := contextFailure(ctx); err != nil {
-		return LabelMigrationRecord{}, false, err
+		return LabelMigrationRecord{}, err
 	}
 	c.mutationMu.Lock()
 	defer c.mutationMu.Unlock()
 	lease, err := c.policyStore.AcquireMutation(ctx)
 	if err != nil {
-		return LabelMigrationRecord{}, false, err
+		return LabelMigrationRecord{}, err
 	}
 	defer lease.Release()
 
-	existing, done, err := c.policyStore.LabelMigration(ctx)
-	if err != nil {
-		return LabelMigrationRecord{}, false, err
-	}
-	if done && existing.Version >= LabelMigrationVersion {
-		return existing, false, nil
-	}
 	summaries, err := c.base.Documents(ctx)
 	if err != nil {
-		return LabelMigrationRecord{}, false, err
+		return LabelMigrationRecord{}, err
 	}
 	sort.Slice(summaries, func(left, right int) bool {
 		return shoal.CompareID(
 			summaries[left].Document.ID, summaries[right].Document.ID) < 0
 	})
-	record = LabelMigrationRecord{Version: LabelMigrationVersion}
+	asserted, err := c.assertedEdges(ctx)
+	if err != nil {
+		return LabelMigrationRecord{}, err
+	}
+	index, err := c.policyStore.TighteningIndex(ctx)
+	if err != nil {
+		return LabelMigrationRecord{}, err
+	}
+	run := migrationRun{client: c, index: index, asserted: asserted}
+	record := LabelMigrationRecord{Version: LabelMigrationVersion}
 	for _, summary := range summaries {
 		if err := validateSummary(summary); err != nil {
-			return LabelMigrationRecord{}, false, inconsistentBase()
+			return LabelMigrationRecord{}, inconsistentBase()
 		}
 		record.Documents++
-		if err := c.migrateDocument(ctx, summary, &record); err != nil {
-			return LabelMigrationRecord{}, false, err
+		if err := run.document(ctx, summary, &record); err != nil {
+			return LabelMigrationRecord{}, err
 		}
 	}
 	if err := c.policyStore.PutLabelMigration(ctx, record); err != nil {
-		return LabelMigrationRecord{}, false, err
+		return LabelMigrationRecord{}, err
 	}
 	c.invalidateAuthorizedVectorAvailability()
-	return record, true, nil
+	return record, nil
 }
 
-func (c *Client) migrateDocument(
+// assertedEdges groups the base's extraction records' edge IDs by document
+// and revision. A base that can extract but cannot list its extraction
+// records is refused: the migration could not attribute legacy relations.
+func (c *Client) assertedEdges(
+	ctx context.Context,
+) (map[shoal.ID]map[shoal.ID][]shoal.ID, error) {
+	asserted := make(map[shoal.ID]map[shoal.ID][]shoal.ID)
+	reader, ok := c.base.(ExtractionRecordReader)
+	if !ok {
+		if _, extracts := c.base.(extractionBackend); extracts {
+			return nil, shoal.NewError(shoal.ErrorUnavailable,
+				"the label migration cannot read the base's extraction records")
+		}
+		return asserted, nil
+	}
+	records, err := reader.ExtractionRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		revisions := asserted[record.DocumentID]
+		if revisions == nil {
+			revisions = make(map[shoal.ID][]shoal.ID)
+			asserted[record.DocumentID] = revisions
+		}
+		revisions[record.RevisionID] = append(
+			revisions[record.RevisionID], record.EdgeIDs...)
+	}
+	return asserted, nil
+}
+
+type migrationRun struct {
+	client   *Client
+	index    *TighteningIndex
+	asserted map[shoal.ID]map[shoal.ID][]shoal.ID
+}
+
+// assertedFor returns the relation edges the document asserted: from every
+// revision when whole is true, else from that revision only.
+func (r migrationRun) assertedFor(documentID, revisionID shoal.ID, whole bool) []shoal.ID {
+	var edges []shoal.ID
+	for revision, ids := range r.asserted[documentID] {
+		if whole || revision == revisionID {
+			edges = append(edges, ids...)
+		}
+	}
+	sortIDs(edges)
+	return edges
+}
+
+func (r migrationRun) document(
 	ctx context.Context,
 	summary explorer.DocumentSummary,
 	record *LabelMigrationRecord,
 ) error {
+	c := r.client
 	documentID := summary.Document.ID
 	current, registered, err := c.policyStore.CurrentRevision(ctx, documentID)
 	if err != nil {
@@ -180,8 +242,8 @@ func (c *Client) migrateDocument(
 	if err != nil {
 		return err
 	}
-	outcome, err := tightenRevision(
-		ctx, c.policyStore, current, summary.SourceURI, labels, reason)
+	outcome, err := r.tightenRevision(ctx, current, summary.SourceURI,
+		r.assertedFor(documentID, current.RevisionID, true), labels, reason)
 	if err != nil {
 		return err
 	}
@@ -205,15 +267,18 @@ func (c *Client) migrateDocument(
 
 	// Historical revisions, read after the sweep above so their rules
 	// include the current revision's labels, are narrowed by their own.
-	revisions, err := c.policyStore.DocumentRevisions(ctx, documentID)
-	if err != nil {
-		return err
-	}
-	for _, revision := range revisions {
-		if revision.RevisionID == current.RevisionID {
+	for _, revisionID := range r.index.Revisions(documentID) {
+		if revisionID == current.RevisionID {
 			continue
 		}
-		view, err := c.base.Document(ctx, documentID, revision.RevisionID)
+		revision, ok, err := c.policyStore.Revision(ctx, documentID, revisionID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		view, err := c.base.Document(ctx, documentID, revisionID)
 		if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
 			// The base no longer serves this revision, so nothing of it can
 			// be read; it already carries the current labels.
@@ -228,7 +293,8 @@ func (c *Client) migrateDocument(
 		if parseErr != nil {
 			reason = "revision visibility does not parse: " + parseErr.Error()
 		}
-		outcome, err := tightenRevision(ctx, c.policyStore, revision, "", labels, reason)
+		outcome, err := r.tightenRevision(ctx, revision, "",
+			r.assertedFor(documentID, revisionID, false), labels, reason)
 		if err != nil {
 			return err
 		}
@@ -238,7 +304,7 @@ func (c *Client) migrateDocument(
 		if outcome.untranslatable != "" {
 			record.Untranslatable = append(record.Untranslatable, UntranslatableLabel{
 				DocumentID:   documentID,
-				RevisionID:   revision.RevisionID,
+				RevisionID:   revisionID,
 				SourceURI:    summary.SourceURI,
 				EscapedLabel: escapeLabel(raw),
 				Reason:       outcome.untranslatable,
@@ -261,12 +327,13 @@ type tightenOutcome struct {
 // TightenRule is called whenever the revision carries any label policy, even
 // when its own rule already has them all: the call then sweeps the derived
 // registrations again from the bare source rule, which completes a durable
-// write a crash tore and is otherwise a no-op.
-func tightenRevision(
+// write a crash tore, closes registrations a rolled-back binary wrote, and is
+// otherwise a no-op.
+func (r migrationRun) tightenRevision(
 	ctx context.Context,
-	store PolicyStore,
 	revision RevisionRegistration,
 	sourceURI string,
+	assertedEdges []shoal.ID,
 	labels []string,
 	reason string,
 ) (tightenOutcome, error) {
@@ -310,8 +377,14 @@ func tightenRevision(
 		// Already labelled: sweep from the bare rule.
 		from = bare
 	}
-	outcome.changed, err = store.TightenRule(
-		ctx, revision.DocumentID, revision.RevisionID, sourceURI, from, target)
+	outcome.changed, err = r.client.policyStore.TightenRule(ctx, r.index, RuleTightening{
+		DocumentID:      revision.DocumentID,
+		RevisionID:      revision.RevisionID,
+		SourceURI:       sourceURI,
+		From:            from,
+		To:              target,
+		AssertedEdgeIDs: assertedEdges,
+	})
 	if err != nil {
 		return tightenOutcome{}, err
 	}
@@ -359,6 +432,11 @@ func (c *Client) currentRevisionLabels(
 		return nil, "", "", err
 	}
 	declared := view.Document.Metadata[interaction.PropertyVisibility]
+	if declared == "" {
+		// parse.go derives the nodes' labels from this metadata alone, so an
+		// unlabelled revision has unlabelled nodes: skip the graph read.
+		return nil, "", "", nil
+	}
 	neighborhood, err := c.base.Neighborhood(ctx, explorer.NeighborhoodRequest{
 		NodeIDs:   []shoal.ID{documentID},
 		Depth:     1,
