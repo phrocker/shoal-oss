@@ -740,12 +740,15 @@ func TestAWorkerResolvesOnlyItsOwnDescriptor(t *testing.T) {
 
 // TestABoundWorkersPullStillRedactsEvidence: the execute route's Pull reads
 // the store through the one page path, scanDispatchActions, so a bound
-// worker — the reader least likely to hold an action's labels, since it did
-// not enqueue it — gets labelled evidence redacted exactly as the enqueuer
-// does (#369). #391 adds no second read path.
+// worker gets evidence decided exactly as the enqueuer does (#369). #391 adds
+// no second read path. A worker is a trusted service whose role requires its
+// own svc:<role> term, which no document rule carries, so it sees no
+// reference that names a node (#564).
 func TestABoundWorkersPullStillRedactsEvidence(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
 	fixture.service.evidenceVisibility = &stubEvidenceVisibility{}
+	fixture.service.evidenceNodes = fixtureCatalog(
+		t, fixture.authority.Resolver(), fixture.now)
 	stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
 	stored.Evidence = []EvidenceRef{
 		{
@@ -763,6 +766,5 @@ func TestABoundWorkersPullStillRedactsEvidence(t *testing.T) {
 	if len(pulled) != 1 {
 		t.Fatalf("pulled %d actions, want 1", len(pulled))
 	}
-	assertAnchors(t, "Pull (execute route)", pulled[0].Evidence,
-		[]shoal.ID{"anchor-open"})
+	assertAnchors(t, "Pull (execute route)", pulled[0].Evidence, []shoal.ID{})
 }

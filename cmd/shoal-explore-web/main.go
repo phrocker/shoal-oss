@@ -1339,6 +1339,10 @@ func openService(
 					}
 					return client
 				}, corpus, snapshots, fleetRegistry, cursorKey, config.clock,
+				// The reader label evaluator (#564): the same one the
+				// dispatch reads below and the client's own interaction
+				// and fold reads use, so no plane answers differently.
+				client.LabelVisibility(), client.NodeGate(),
 			)
 		if err != nil {
 			store.Close()
@@ -1355,6 +1359,11 @@ func openService(
 		fleetDispatch, err := explorerfleet.ComposeDispatchWithAttestations(
 			embedded.Runtime, fleetRegistry, config.resolver, actionRecorder,
 			actionEvents, nil, config.clock, attestationReader,
+			explorerfleet.DispatchLabels{
+				Visibility: client.LabelVisibility(),
+				Translator: client.LabelTranslator(),
+				Nodes:      client.NodeGate(),
+			},
 		)
 		if err != nil {
 			store.Close()
@@ -1695,6 +1704,13 @@ func authorizedClient(
 	if err != nil {
 		return nil, err
 	}
+	// No authenticator here mints a trusted-service decision, so no service
+	// account has a ceiling: a trusted service, were one ever to reach this
+	// process, would be refused every labelled stored record (#564).
+	ceilings, err := authorized.NewStaticCeilingResolver()
+	if err != nil {
+		return nil, err
+	}
 	scorer, _ := any(corpus).(authorized.VectorScorer)
 	return authorized.NewClient(authorized.Config{
 		Base:                   corpus,
@@ -1711,5 +1727,6 @@ func authorizedClient(
 		GenerationReader:       generationReader,
 		Clock:                  clock,
 		Mosaic:                 mosaic,
+		CeilingResolver:        ceilings,
 	})
 }

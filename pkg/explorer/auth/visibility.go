@@ -253,3 +253,33 @@ func (d Decision) grantsTerm(term visibilityTerm) bool {
 func (c *ServiceCeiling) containsTerm(label string) bool {
 	return c.authorizations.Contains([]byte(label))
 }
+
+// IsStructuredVisibilityTerm reports whether term is a canonical structured
+// grant label (d:, s:, g:<policy>:e:<epoch> or svc:<role>), the only kind a
+// decision can hold. Anything else, a free-form ingest label such as "secret"
+// included, is not, and the evaluators above refuse it.
+func IsStructuredVisibilityTerm(term string) bool {
+	_, ok := parseVisibilityTerm(term)
+	return ok
+}
+
+// VisibilityTerms returns the structured grant labels this policy stamps on
+// what it governs, as the term slice VisibilityPermittedForUser and
+// VisibilityPermittedForService accept: d:<domain>, s:<source>,
+// g:<policy>:e:<epoch> and, for a service policy, svc:<role>. They are the
+// same labels ConjoinPolicies flattens and DeriveScannerAuthorizations
+// derives for the policy.
+func (p Policy) VisibilityTerms() ([]string, error) {
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+	labels, err := p.labels()
+	if err != nil {
+		return nil, err
+	}
+	terms := make([]string, len(labels))
+	for index, label := range labels {
+		terms[index] = string(label)
+	}
+	return terms, nil
+}

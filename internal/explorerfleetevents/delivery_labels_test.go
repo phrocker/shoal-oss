@@ -21,6 +21,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
@@ -29,39 +30,138 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// subjectLabels is a test evaluator implementing the one visibility seam.
-// It answers from the real auth.Decision bound to ctx, so it can only answer
-// for whoever is asking at the moment it is asked — which is what makes
-// publish-time evaluation (the publisher asking) distinguishable from
-// delivery-time evaluation (each subscriber asking).
-type subjectLabels struct {
-	resolver auth.Resolver
-	holds    map[shoal.ID][]string
+// realLabels is the production reader label evaluator (#564). It answers
+// from the real auth.Decision bound to ctx, so it can only answer for whoever
+// is asking at the moment it is asked — which is what makes publish-time
+// evaluation (the publisher asking) distinguishable from delivery-time
+// evaluation (each subscriber asking).
+func realLabels(now time.Time) func(auth.Resolver) evidencelabels.Visibility {
+	return func(resolver auth.Resolver) evidencelabels.Visibility {
+		evaluator, err := authorized.NewLabelVisibility(authorized.LabelVisibilityConfig{
+			Resolver: resolver, Clock: func() time.Time { return now },
+		})
+		if err != nil {
+			panic(err)
+		}
+		return evaluator
+	}
 }
 
-var _ evidencelabels.Visibility = subjectLabels{}
+var deliveryNow = time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
 
-func (s subjectLabels) VisibleToReader(
-	ctx context.Context, visibility []string,
+// catalogGate is an evidencelabels.NodeGate over a fixed catalog of the
+// current node rules: each node's rule is the conjunction of its listed
+// structured terms, and the subscriber is decided by the real evaluator.
+// The references below name nodes that exist in no corpus, so their rules
+// are listed here; label_evaluator_e2e_test.go drives the authorized
+// client's own gate over a real catalog.
+type catalogGate struct {
+	evaluator evidencelabels.Visibility
+	rules     map[shoal.ID][]string
+}
+
+func (catalogGate) GraphEvidenceValid(
+	context.Context, shoal.ID, time.Time, []interaction.EvidenceReference,
 ) (bool, error) {
-	decision, err := s.resolver.Resolve(ctx)
-	if err != nil {
-		return false, err
-	}
-	held := s.holds[decision.Subject()]
-	for _, label := range visibility {
-		found := false
-		for _, candidate := range held {
-			if candidate == label {
-				found = true
-				break
-			}
+	return true, nil
+}
+
+func (g catalogGate) GraphsVisibleToReader(
+	ctx context.Context, graphs []evidencelabels.Graph,
+) ([]bool, error) {
+	verdicts := make([]bool, len(graphs))
+	for index, graph := range graphs {
+		visible, err := g.graphVisible(ctx, graph.NodeIDs, graph.EdgeIDs)
+		if err != nil {
+			return nil, err
 		}
-		if !found {
+		verdicts[index] = visible
+	}
+	return verdicts, nil
+}
+
+func (g catalogGate) graphVisible(
+	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
+) (bool, error) {
+	var terms []string
+	for _, id := range append(append([]shoal.ID(nil), nodeIDs...), edgeIDs...) {
+		rule, ok := g.rules[id]
+		if !ok {
 			return false, nil
 		}
+		terms = append(terms, rule...)
 	}
-	return true, nil
+	return g.evaluator.VisibleToReader(ctx, terms)
+}
+
+func termsOf(source, grant []byte) []string {
+	policy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: []byte("domain"), SourceID: source,
+		GrantPolicyID: grant, Epoch: 1,
+	})
+	if err != nil {
+		panic(err)
+	}
+	terms, err := policy.VisibilityTerms()
+	if err != nil {
+		panic(err)
+	}
+	return terms
+}
+
+// deliveryCatalog is the current rules of the two references' nodes: A's
+// open document is governed by A's source policy; B's labelled document by
+// B's source policy and its secret and project-x label policies.
+func deliveryCatalog(evaluator evidencelabels.Visibility) catalogGate {
+	open := termsOf([]byte("source"), []byte("policy"))
+	closed := append(append(termsOf(sourceB, []byte("policy-b")),
+		termsOf(sourceB, sourceBLabelPolicy("secret"))...),
+		termsOf(sourceB, sourceBLabelPolicy("project-x"))...)
+	rules := map[shoal.ID][]string{}
+	for _, id := range openEvidence.NodeIDs {
+		rules[id] = open
+	}
+	for _, id := range secretEvidence.NodeIDs {
+		rules[id] = closed
+	}
+	return catalogGate{evaluator: evaluator, rules: rules}
+}
+
+// sourceB is the source of the labelled document, and its two free-form
+// labels are enforced as (source, label) policies (#570).
+var sourceB = []byte("source-b")
+
+func sourceBLabelPolicy(label string) []byte {
+	id, err := authorized.LabelPolicyID(sourceB, label)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
+// secretVisibility is what the reference to B is recorded with: the grant
+// labels of B's secret and project-x label policies.
+func secretVisibility() []string {
+	var terms []string
+	for _, label := range []string{"secret", "project-x"} {
+		policy, err := auth.NewPolicy(auth.PolicyConfig{
+			AuthorizationDomain: []byte("domain"), SourceID: sourceB,
+			GrantPolicyID: sourceBLabelPolicy(label), Epoch: 1,
+		})
+		if err != nil {
+			panic(err)
+		}
+		policyTerms, err := policy.VisibilityTerms()
+		if err != nil {
+			panic(err)
+		}
+		terms = append(terms, policyTerms...)
+	}
+	labels, err := interaction.Conjoin(terms)
+	if err != nil {
+		panic(err)
+	}
+	return labels
 }
 
 // The two references the executor records. The open one is from the action's
@@ -92,7 +192,7 @@ var (
 		},
 		NodeIDs: []shoal.ID{
 			"doc-b-hidden", "section-b-hidden", "span-b-hidden"},
-		Visibility: []string{"project-x", "secret"},
+		Visibility: secretVisibility(),
 	}
 )
 
@@ -105,7 +205,7 @@ func secretMarkers() []string {
 		"section-b-hidden", "span-b-hidden",
 		"project-x", "secret", "4711", "4799",
 	}
-	markers := append([]string(nil), raw...)
+	markers := append(append([]string(nil), raw...), secretVisibility()...)
 	for _, value := range raw[:5] {
 		markers = append(markers,
 			base64.RawURLEncoding.EncodeToString([]byte(value)),
@@ -134,7 +234,7 @@ func newLabelledDelivery(
 	if len(evidence) == 0 {
 		evidence = []fleet.EvidenceRef{openEvidence, secretEvidence}
 	}
-	now := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
+	now := deliveryNow
 	config := runtimeConfig(t.TempDir())
 	config = explorerfleet.ConfigureRuntime(config)
 	ConfigureRuntime(&config)
@@ -161,8 +261,10 @@ func newLabelledDelivery(
 		t.Fatal(err)
 	}
 	var evaluator evidencelabels.Visibility
+	var nodes evidencelabels.NodeGate
 	if visibility != nil {
 		evaluator = visibility(authority.Resolver())
+		nodes = deliveryCatalog(evaluator)
 	}
 	capability := explorerfleetcap.New()
 	events, err := fleetevents.NewWithLifecycleCapability(fleetevents.Config{
@@ -171,6 +273,7 @@ func newLabelledDelivery(
 		Auditor: integrationAuditor{}, CursorKey: bytes.Repeat([]byte{7}, 32),
 		Clock:              func() time.Time { return now },
 		EvidenceVisibility: evaluator,
+		EvidenceNodes:      nodes,
 	}, capability)
 	if err != nil {
 		t.Fatal(err)
@@ -218,16 +321,23 @@ func bindSubject(
 	subject shoal.ID, operations ...auth.Operation,
 ) context.Context {
 	t.Helper()
+	// Authorized on the action's own source. The (domain, source, policy,
+	// object) check does not ask about labels — which is the whole of #562.
+	// Only "holder" is also granted B and its two label policies.
+	sources := [][]byte{[]byte("source")}
+	policies := [][]byte{[]byte("policy")}
+	if subject == "holder" {
+		sources = append(sources, sourceB)
+		policies = append(policies, []byte("policy-b"),
+			sourceBLabelPolicy("secret"), sourceBLabelPolicy("project-x"))
+	}
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: subject, Actor: "actor", ClientID: "client",
 		AuthorizationDomain: []byte("domain"),
 		AllowedOperations:   operations,
-		// Authorized on the action's own source only. Nothing here grants
-		// source B, and the (domain, source, policy, object) check does not
-		// ask about labels — which is the whole of #562.
-		PermittedSourceIDs: [][]byte{[]byte("source")},
-		PermittedPolicyIDs: [][]byte{[]byte("policy")},
-		PolicyGeneration:   1, AuthenticationExpires: now.Add(2 * time.Hour),
+		PermittedSourceIDs:  sources,
+		PermittedPolicyIDs:  policies,
+		PolicyGeneration:    1, AuthenticationExpires: now.Add(2 * time.Hour),
 		RequestID: "request", CorrelationID: "correlation",
 	})
 	if err != nil {
@@ -423,14 +533,10 @@ func assertNoSecretBytes(t *testing.T, path string, delivered []byte) {
 // identifiers, offsets, node IDs and anchors for a document in source B
 // labelled secret&project-x.
 func TestASubscriberReceivesOnlyEvidenceItsLabelsCover(t *testing.T) {
-	delivery := newLabelledDelivery(t, func(resolver auth.Resolver) evidencelabels.Visibility {
-		return subjectLabels{resolver: resolver, holds: map[shoal.ID][]string{
-			// The owner publishes every lifecycle event and holds neither
-			// label, so a filter applied at publish — under the publisher's
-			// identity — would withhold the reference from "holder" too.
-			"holder": {"project-x", "secret"},
-		}}
-	})
+	// The owner publishes every lifecycle event and holds neither label, so
+	// a filter applied at publish — under the publisher's identity — would
+	// withhold the reference from "holder" too.
+	delivery := newLabelledDelivery(t, realLabels(deliveryNow))
 
 	stored := storedCompletion(t, delivery)
 
@@ -503,7 +609,7 @@ func TestASubscriberReceivesOnlyEvidenceItsLabelsCover(t *testing.T) {
 			t.Fatalf("the durable event carries %v, want both references", got)
 		}
 		if !reflect.DeepEqual(after.ConsumedEvidenceVisibility,
-			[][]string{nil, {"project-x", "secret"}}) {
+			[][]string{nil, secretVisibility()}) {
 			t.Fatalf("the durable event's visibility = %#v",
 				after.ConsumedEvidenceVisibility)
 		}
@@ -511,25 +617,23 @@ func TestASubscriberReceivesOnlyEvidenceItsLabelsCover(t *testing.T) {
 }
 
 // TestWithNoEvaluatorLabelledEvidenceIsWithheldFromEverySubscriber is the
-// fail-closed direction, the same as the dispatch read paths: nothing can
-// evaluate the label, so nothing may be shown it. Unlabelled evidence is
-// delivered unchanged.
+// fail-closed direction, the same as the dispatch read paths: with no node
+// gate nothing can evaluate a referenced node's current rule, so no
+// reference naming a node is delivered, to a holder or anyone else (#564).
+// The event itself is still delivered.
 func TestWithNoEvaluatorLabelledEvidenceIsWithheldFromEverySubscriber(t *testing.T) {
 	delivery := newLabelledDelivery(t, nil)
 	for _, path := range deliveryPaths {
 		t.Run(path.name, func(t *testing.T) {
-			// "holder" holds the labels under the other test's evaluator;
-			// with none wired, holding them cannot be established.
 			ctx, subscription := delivery.subscribe(t, "holder")
 			completed, delivered := path.read(t, delivery, ctx, subscription)
 			if !completed.found {
 				t.Fatal("the completion was not delivered at all")
 			}
 			assertNoSecretBytes(t, path.name, delivered)
-			if got := anchors(completed.event.ConsumedEvidence); !reflect.DeepEqual(
-				got, []shoal.ID{"anchor-a-open"}) {
-				t.Fatalf("%s delivered anchors %v with no evaluator, want "+
-					"the unlabelled one only", path.name, got)
+			if got := anchors(completed.event.ConsumedEvidence); len(got) != 0 {
+				t.Fatalf("%s delivered anchors %v with no node gate, want none",
+					path.name, got)
 			}
 		})
 	}
@@ -606,11 +710,7 @@ func withoutSecret(t *testing.T, stored fleetevents.Event) fleetevents.Event {
 // marker of a withheld reference — a count, a placeholder, or the shape of
 // a visibility group that once held a label — not only one this test names.
 func TestAnOutsiderCannotTellEvidenceWasWithheld(t *testing.T) {
-	evaluator := func(resolver auth.Resolver) evidencelabels.Visibility {
-		return subjectLabels{resolver: resolver, holds: map[shoal.ID][]string{
-			"holder": {"project-x", "secret"},
-		}}
-	}
+	evaluator := realLabels(deliveryNow)
 	withheld := newLabelledDelivery(t, evaluator)
 	neverLabelled := newLabelledDelivery(t, evaluator, openEvidence)
 	for _, path := range deliveryPaths {

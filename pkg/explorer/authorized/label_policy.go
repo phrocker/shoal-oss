@@ -35,7 +35,6 @@ import (
 	"strconv"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
-	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -78,69 +77,14 @@ const (
 // policies. The source must be non-empty and the whole ID must fit in
 // auth.MaxPolicyComponentBytes.
 func LabelPolicyID(sourceID []byte, label string) ([]byte, error) {
-	if len(sourceID) == 0 {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument, "label policy source identity is required")
-	}
-	if err := interaction.ValidateLabel(label); err != nil {
-		return nil, err
-	}
-	length := strconv.Itoa(len(sourceID))
-	size := len(auth.LabelPolicyIDPrefix) + len(length) + 1 + len(sourceID) + 1 + len(label)
-	if size > auth.MaxPolicyComponentBytes {
-		return nil, shoal.NewError(
-			shoal.ErrorInvalidArgument,
-			"label policy identity exceeds the policy component byte bound",
-		)
-	}
-	id := make([]byte, 0, size)
-	id = append(id, auth.LabelPolicyIDPrefix...)
-	id = append(id, length...)
-	id = append(id, '/')
-	id = append(id, sourceID...)
-	id = append(id, '/')
-	id = append(id, label...)
-	return id, nil
+	return auth.LabelPolicyID(sourceID, label)
 }
 
 // ParseLabelPolicyID is the inverse of LabelPolicyID. It accepts only an ID
 // LabelPolicyID would emit, byte for byte, and so refuses the reserved
 // namespace.
 func ParseLabelPolicyID(id []byte) (sourceID []byte, label string, err error) {
-	invalid := func() ([]byte, string, error) {
-		return nil, "", shoal.NewError(
-			shoal.ErrorInvalidArgument, "label policy identity is not canonical")
-	}
-	if len(id) > auth.MaxPolicyComponentBytes ||
-		!bytes.HasPrefix(id, []byte(auth.LabelPolicyIDPrefix)) {
-		return invalid()
-	}
-	rest := id[len(auth.LabelPolicyIDPrefix):]
-	end := bytes.IndexByte(rest, '/')
-	if end <= 0 {
-		return invalid()
-	}
-	digits := rest[:end]
-	for _, character := range digits {
-		if character < '0' || character > '9' {
-			return invalid()
-		}
-	}
-	if digits[0] == '0' {
-		return invalid()
-	}
-	length, convErr := strconv.Atoi(string(digits))
-	rest = rest[end+1:]
-	if convErr != nil || length <= 0 || length >= len(rest) || rest[length] != '/' {
-		return invalid()
-	}
-	sourceID = append([]byte(nil), rest[:length]...)
-	label = string(rest[length+1:])
-	canonical, encodeErr := LabelPolicyID(sourceID, label)
-	if encodeErr != nil || !bytes.Equal(canonical, id) {
-		return invalid()
-	}
-	return sourceID, label, nil
+	return auth.ParseLabelPolicyID(id)
 }
 
 // IsReservedLabelPolicyID reports whether id lies in the reserved part of the

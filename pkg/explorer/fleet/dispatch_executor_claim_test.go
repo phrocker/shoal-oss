@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
-	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -4339,6 +4339,42 @@ func TestAnUnconfinedExecutorMayNotRunWiderThanItsScope(t *testing.T) {
 			},
 		},
 		{
+			// A label policy on the action's own source only narrows what
+			// the principal retrieves (#570), so a holder of one is no wider
+			// than the scope (#564).
+			name:     "a label holder no wider than the scope",
+			executor: confiningExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, onlyA, [][]byte{
+					[]byte("policy-a"), labelPolicyOn(t, "source-a", "secret"),
+				}, auth.OperationRetrieve)
+			},
+		},
+		{
+			// Only a canonical label policy is left out. An ID that merely
+			// shares the namespace prefix is compared like any policy.
+			name:     "a malformed label-namespace grant",
+			executor: confiningExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, onlyA, [][]byte{
+					[]byte("policy-a"), []byte(auth.LabelPolicyIDPrefix + "9/source-a/x"),
+				}, auth.OperationRetrieve)
+			},
+			refused: true,
+		},
+		{
+			// A label policy on another source comes with that source, and
+			// the source is what widens.
+			name:     "a label holder on another source",
+			executor: confiningExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, aAndB, [][]byte{
+					[]byte("policy-a"), labelPolicyOn(t, "source-b", "secret"),
+				}, auth.OperationRetrieve)
+			},
+			refused: true,
+		},
+		{
 			// A wider *policy* is the same defect by the other component, and
 			// a check that read only sources would miss it.
 			name:     "a wider policy and an unconfined executor",
@@ -4499,52 +4535,43 @@ func (s *stubEvidenceVisibility) VisibleToReader(
 // (#570), so the scan filters nothing. An EvidenceRef is
 // different — it was recorded by the action's principal and is stored as a
 // field of the record — so it needed a check of its own.
+//
+// Holding and lacking the label are decided by the real evaluator over
+// structured labels in TestADispatchHolderSeesTheStoredEvidence
+// (dispatch_label_evaluator_test.go); this test keeps the two directions no
+// decision can answer: no evaluator, and the question failing.
 func TestADispatchReaderSeesOnlyEvidenceItsLabelsCover(t *testing.T) {
-	labelled := EvidenceRef{
-		AnchorID: "anchor-secret", Kind: interaction.EvidenceDocument,
-		NodeIDs: []shoal.ID{"node-secret"}, Visibility: []string{"secret"},
-	}
-	open := EvidenceRef{
-		AnchorID: "anchor-open", Kind: interaction.EvidenceDocument,
-		NodeIDs: []shoal.ID{"node-open"},
-	}
+	labelled, open := structuredEvidence(t)
 
 	for _, probe := range []struct {
-		name       string
-		visibility EvidenceVisibility
-		want       []shoal.ID
-		wantErr    bool
+		name    string
+		nodes   func(*executorClaimFixture) evidencelabels.NodeGate
+		want    []shoal.ID
+		wantErr bool
 	}{
 		{
-			// No host filter at all. Nothing can evaluate the label, so
-			// nothing may be shown it — the direction Attestations takes
-			// when nil.
-			name: "no evaluator is wired", want: []shoal.ID{"anchor-open"},
-		},
-		{
-			name:       "the reader holds the labels",
-			visibility: &stubEvidenceVisibility{visible: true},
-			want:       []shoal.ID{"anchor-secret", "anchor-open"},
-		},
-		{
-			name:       "the reader does not hold the labels",
-			visibility: &stubEvidenceVisibility{},
-			want:       []shoal.ID{"anchor-open"},
+			// No host gate at all. Nothing can evaluate the nodes' rules, so
+			// nothing naming a node may be shown — the direction
+			// Attestations takes when nil.
+			name: "no node gate is wired", want: []shoal.ID{},
+			nodes: func(*executorClaimFixture) evidencelabels.NodeGate { return nil },
 		},
 		{
 			// A failing question is not a false answer. Returning the error
 			// keeps a transient fault from reading as a redaction, which
 			// would be indistinguishable from a permanent one.
 			name: "the question fails",
-			visibility: &stubEvidenceVisibility{
-				err: shoal.NewError(shoal.ErrorUnavailable, "label store down"),
+			nodes: func(f *executorClaimFixture) evidencelabels.NodeGate {
+				gate := fixtureCatalog(t, f.authority.Resolver(), f.now)
+				gate.err = shoal.NewError(shoal.ErrorUnavailable, "label store down")
+				return gate
 			},
 			wantErr: true,
 		},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
 			fixture := newExecutorClaimFixture(t)
-			fixture.service.evidenceVisibility = probe.visibility
+			fixture.service.evidenceNodes = probe.nodes(fixture)
 			stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
 			stored.Evidence = []EvidenceRef{labelled, open}
 			fixture.dispatchStore.records[string(fixture.queued.ID)] = stored

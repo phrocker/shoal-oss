@@ -304,7 +304,12 @@ func newLabelWorld(t *testing.T, store authorized.PolicyStore) *labelWorld {
 			t.Fatalf("record %s: %v", name, err)
 		}
 		target.sessionID = session.ID
-		folded, err := client.FoldInteractions(ctx, explorer.FoldRequest{
+		// Folded through the trusted store, as any build would have left it.
+		// The authorized fold refuses a caller who could not read the result
+		// (#568), and in the legacy world a label the rule does not yet
+		// enforce is untranslatable, so no one could; the "fold
+		// interactions" row probes the authorized path itself.
+		folded, err := w.f.base.FoldInteractions(ctx, explorer.FoldRequest{
 			SessionIDs: []shoal.ID{session.ID},
 		})
 		if err != nil {
@@ -900,6 +905,9 @@ var labelExcludedMethods = map[string]string{
 	"BoundedAvailable":                        "static capability bit; no context, no data",
 	"VectorAvailable":                         "capability bit over the caller's authorized projection; returns no document data",
 	"ValidateAuthorization":                   "compares the caller's own fingerprint with a pin; returns no data",
+	"LabelVisibility":                         "returns the reader label evaluator, a host wiring seam; reads no data (label_visibility_test.go)",
+	"LabelTranslator":                         "returns the record-time label translator, a host wiring seam; reads no data (label_visibility_test.go)",
+	"NodeGate":                                "returns the current-rule node gate, a host wiring seam; reads no data (dispatch and delivery relabel tests)",
 }
 
 func TestLabelConformanceCoversEveryClientMethod(t *testing.T) {

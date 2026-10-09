@@ -32,6 +32,8 @@ type DispatchService struct {
 	// attestations is consulted only for actions that require attestation.
 	attestations       ExecutorAttestations
 	evidenceVisibility EvidenceVisibility
+	evidenceLabels     evidencelabels.Translator
+	evidenceNodes      evidencelabels.NodeGate
 }
 
 func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
@@ -50,6 +52,8 @@ func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
 		recorder: config.Recorder, events: config.Events, clock: config.Clock,
 		outbox: outbox, attestations: config.Attestations,
 		evidenceVisibility: config.EvidenceVisibility,
+		evidenceLabels:     config.EvidenceLabels,
+		evidenceNodes:      config.EvidenceNodes,
 	}
 	return service, nil
 }
@@ -1371,8 +1375,24 @@ func (s *DispatchService) applyExecutionResult(
 			result.ErrorCode = "invalid_executor_evidence"
 			next.ErrorCodeOrigin = ErrorCodeOriginService
 		}
+	} else if joined, err := s.evidencePathsJoin(ctx, result); err != nil {
+		return ActionRecord{}, false, err
+	} else if !joined {
+		next.Evidence = nil
+		next.EvidenceSnapshotID = ""
+		next.EvidenceSnapshotAsOf = time.Time{}
+		if executionErr == nil {
+			executionErr = shoal.NewError(shoal.ErrorInvalidArgument,
+				"graph evidence edges do not join its nodes")
+			result.ErrorCode = "invalid_executor_evidence"
+			next.ErrorCodeOrigin = ErrorCodeOriginService
+		}
 	} else {
-		next.Evidence = result.Evidence
+		evidence, err := s.structuredEvidence(ctx, result.Evidence)
+		if err != nil {
+			return ActionRecord{}, false, err
+		}
+		next.Evidence = evidence
 		next.EvidenceSnapshotID = result.EvidenceSnapshotID
 		next.EvidenceSnapshotAsOf = result.EvidenceSnapshotAsOf.UTC()
 	}
@@ -2118,6 +2138,18 @@ func (s *DispatchService) TeamActions(
 	ctx context.Context,
 	request TeamActionListRequest,
 ) (ActionPage, error) {
+	page, err := s.teamActionRecords(ctx, request)
+	if err != nil {
+		return ActionPage{}, err
+	}
+	return s.readablePage(ctx, page)
+}
+
+// teamActionRecords is TeamActions before evidence redaction.
+func (s *DispatchService) teamActionRecords(
+	ctx context.Context,
+	request TeamActionListRequest,
+) (ActionPage, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
 	now := s.clock().UTC()
@@ -2344,21 +2376,14 @@ func (s *DispatchService) scanDispatchActions(
 		}
 		result.Actions = append(result.Actions, record)
 	}
-	// The single filtering point for both page paths (#369).
-	//
-	// TeamActions and Pull both read the store through here, so redacting
-	// here covers both and there is one place for the rule to live. A first
-	// version also called readablePage at each path's own return; mutating
-	// those left every test green, because the records had already been
-	// filtered upstream — redundant, and three places for one rule to drift
-	// between.
-	//
-	// TeamActions is the widest audience: it is explicitly cross-principal,
-	// which is the point of an overview and also what extended the reach of
-	// evidence metadata past the labels that produced it. Pull is the path
-	// where a reader is least likely to hold them, since a worker receives
-	// records it did not enqueue.
-	return s.readablePage(ctx, result)
+	// Not redacted here. TeamActions scans one record at a time, so redacting
+	// per scan asked the label gate once per record, and for records the
+	// caller would not even be shown (#564). Each page path redacts the page
+	// it returns, once, through readablePage (#369): TeamActions, the widest
+	// audience, and Pull, the path whose reader is least likely to hold the
+	// labels. Both are pinned by tests that read labelled evidence through
+	// them, so dropping either call fails.
+	return result, nil
 }
 
 func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) (ActionPage, error) {
@@ -2416,7 +2441,7 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 		}
 		result.Actions = append(result.Actions, cloneActionRecord(record))
 	}
-	return result, nil
+	return s.readablePage(ctx, result)
 }
 
 // ReconcileActionTransitions publishes and acknowledges every durable pending
@@ -3640,7 +3665,7 @@ func refuseUnconfinedRetrieval(
 		return err
 	}
 	if withinScope(sources, record.SourceID) &&
-		withinScope(policies, record.PolicyID) {
+		withinScope(withoutOwnLabelPolicies(policies, record.SourceID), record.PolicyID) {
 		return nil
 	}
 	// Names no source it does not already hold: the refusal says the
@@ -3651,6 +3676,37 @@ func refuseUnconfinedRetrieval(
 		"the bound executor does not confine retrieval to this action's "+
 			"scope, and the invoking principal may retrieve beyond it; the "+
 			"descriptor's scope would not describe what the record carries")
+}
+
+// withoutOwnLabelPolicies drops the canonical label policies (#570) of the
+// action's own source from the policy comparison above.
+//
+// A label narrows and can never widen. Every label rule is
+// NewAccessRule(sourcePolicy, labelPolicy...) (authorized.LabelRule): the
+// source policy is always in the conjunction, and AccessRule.Authorize
+// requires every term. So the documents a label policy on source A governs
+// are a strict subset of A's documents, already within the action's scope,
+// and #561 refuses only widening. Counting such a grant as a wider policy
+// refused every principal cleared for a label an unconfined executor (#564).
+//
+// Only an ID auth.ParseLabelPolicyID accepts, and whose encoded source is
+// the action's own, is dropped. Anything else in the label namespace is
+// compared like any other policy, so it still refuses. A canonical label
+// policy on another source B is compared too, and is refused when the
+// principal may retrieve from B (the sources check). Without B's source, a
+// held label on B reaches nothing: every term of a B rule, the source policy
+// and the label policy alike, names source B, and AccessRule.Authorize checks
+// each term's source against the decision.
+func withoutOwnLabelPolicies(ids [][]byte, source []byte) [][]byte {
+	kept := make([][]byte, 0, len(ids))
+	for _, id := range ids {
+		labelSource, _, err := auth.ParseLabelPolicyID(id)
+		if err == nil && bytes.Equal(labelSource, source) {
+			continue
+		}
+		kept = append(kept, id)
+	}
+	return kept
 }
 
 // withinScope reports whether permitted contains nothing beyond one identity.
@@ -3672,6 +3728,63 @@ func withinScope(permitted [][]byte, scope []byte) bool {
 		}
 	}
 	return true
+}
+
+// evidencePathsJoin refuses, at record time, a graph reference whose edges
+// are not the path its nodes describe, or whose assertions are not the ones
+// the corpus records on those edges at the executor's pinned snapshot, as
+// the interaction recorder refuses them (#564). Validation already requires
+// one edge fewer than nodes and every assertion on a listed edge
+// (interaction.EvidenceReference.Validate); only the
+// catalog and corpus know each edge's endpoints and assertions, so the rest
+// is asked of the node gate. Without a gate nothing can confirm it, and the reference
+// is recorded: every read then withholds it, since a nil gate withholds every
+// reference naming a graph member.
+func (s *DispatchService) evidencePathsJoin(
+	ctx context.Context, result ExecutionResult,
+) (bool, error) {
+	if s.evidenceNodes == nil {
+		return true, nil
+	}
+	references := make([]interaction.EvidenceReference, 0, len(result.Evidence))
+	for _, reference := range result.Evidence {
+		references = append(references, reference.interactionReference())
+	}
+	return s.evidenceNodes.GraphEvidenceValid(
+		ctx, result.EvidenceSnapshotID, result.EvidenceSnapshotAsOf, references)
+}
+
+// structuredEvidence is the record-time half of the label rule: each
+// reference's visibility is stored as the structured label-policy terms a
+// reader can be shown to hold, translated from the free-form labels the
+// executor reported (#564). A translation failure is a catalog read failing,
+// so the completion is not recorded and the claim stands; recording the
+// untranslated labels instead would withhold the evidence from every reader
+// for good.
+func (s *DispatchService) structuredEvidence(
+	ctx context.Context, evidence []EvidenceRef,
+) ([]EvidenceRef, error) {
+	if s.evidenceLabels == nil || len(evidence) == 0 {
+		return evidence, nil
+	}
+	translated := make([]EvidenceRef, len(evidence))
+	for index, reference := range evidence {
+		translated[index] = reference
+		if len(reference.Visibility) == 0 {
+			continue
+		}
+		visibility, err := s.evidenceLabels.StructuredVisibility(
+			ctx, reference.NodeIDs, reference.EdgeIDs, reference.Visibility)
+		if err != nil {
+			return nil, err
+		}
+		canonical, err := interaction.Conjoin(visibility)
+		if err != nil {
+			return nil, err
+		}
+		translated[index].Visibility = canonical
+	}
+	return translated, nil
 }
 
 // readableRecord returns the record as this reader may see it, with evidence
@@ -3697,37 +3810,97 @@ func withinScope(permitted [][]byte, scope []byte) bool {
 func (s *DispatchService) readableRecord(
 	ctx context.Context, record ActionRecord,
 ) (ActionRecord, error) {
-	// The rule itself lives in evidencelabels.Filter, shared with fleet
-	// event delivery (#562), so the dispatch reads and the event stream
-	// cannot answer the same question differently.
-	readable, withheld, err := evidencelabels.Filter(
-		ctx, s.evidenceVisibility, record.Evidence,
-		func(reference EvidenceRef) []string { return reference.Visibility })
+	readable, err := s.readableRecords(ctx, []ActionRecord{record})
 	if err != nil {
 		return ActionRecord{}, err
 	}
-	if !withheld {
-		return record, nil
-	}
-	redacted := cloneActionRecord(record)
-	if len(readable) == 0 {
-		redacted.Evidence = nil
-	} else {
-		redacted.Evidence = readable
-	}
-	return redacted, nil
+	return readable[0], nil
 }
 
-// readablePage applies readableRecord to every record in a page.
+// readableRecords is the one funnel: every dispatch read that returns a
+// record passes here, Status, the Pull and TeamActions pages, and the
+// enqueue, invoke and approval replays. The rule itself lives in
+// evidencelabels.Verdicts, shared with fleet event delivery (#562), so the
+// dispatch reads and the event stream cannot answer the same question
+// differently. A reference naming nodes, edges or a cited revision is decided
+// by their current rules; one naming none, by its stored labels (#564).
+//
+// Every reference of every record is decided in one batch, so a page costs a
+// bounded number of catalog reads however many references it carries.
+func (s *DispatchService) readableRecords(
+	ctx context.Context, records []ActionRecord,
+) ([]ActionRecord, error) {
+	var references []EvidenceRef
+	for _, record := range records {
+		references = append(references, record.Evidence...)
+	}
+	verdicts, err := evidencelabels.Verdicts(
+		ctx, s.evidenceVisibility, s.evidenceNodes, references,
+		func(reference EvidenceRef) []string { return reference.Visibility },
+		evidenceGraph)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]ActionRecord, len(records))
+	offset := 0
+	for index, record := range records {
+		count := len(record.Evidence)
+		readable, withheld, err := evidencelabels.Apply(
+			record.Evidence, verdicts[offset:offset+count])
+		offset += count
+		if err != nil {
+			return nil, err
+		}
+		if !withheld {
+			result[index] = record
+			continue
+		}
+		redacted := cloneActionRecord(record)
+		if len(readable) == 0 {
+			// Exactly a record that never had evidence: Validate refuses a
+			// snapshot pin without evidence, and the wire emits the pin, so a
+			// pin left behind would itself say evidence was withheld (#398).
+			// cloneActionEvidence's empty value is how a read returns a
+			// record stored without evidence.
+			redacted.Evidence = cloneActionEvidence(nil)
+			redacted.EvidenceSnapshotID = ""
+			redacted.EvidenceSnapshotAsOf = time.Time{}
+		} else {
+			redacted.Evidence = readable
+		}
+		result[index] = redacted
+	}
+	return result, nil
+}
+
+// evidenceGraph is what a reference names in the corpus. Every assertion is on
+// one of its EdgeIDs (interaction.EvidenceReference.Validate), so the edges
+// cover them; a document reference also names the revision it cites. One
+// rule over both kinds: a reference is no more visible than the object it
+// cites is readable now. A document reference cites a revision, so the
+// revision's own rule decides it with its nodes'; a graph reference cites
+// nodes and edges.
+//
+// The AnchorID stays on the protected side with the rest of the reference.
+// It is content-derived (it hashes the document ID, titles and quoted text),
+// so a reader who can guess the content could use it to confirm the guess.
+func evidenceGraph(reference EvidenceRef) evidencelabels.Graph {
+	graph := evidencelabels.Graph{NodeIDs: reference.NodeIDs, EdgeIDs: reference.EdgeIDs}
+	if reference.Kind == interaction.EvidenceDocument {
+		graph.DocumentID = reference.Citation.DocumentID
+		graph.RevisionID = reference.Citation.RevisionID
+	}
+	return graph
+}
+
+// readablePage decides every record in a page in one batch.
 func (s *DispatchService) readablePage(
 	ctx context.Context, page ActionPage,
 ) (ActionPage, error) {
-	for index := range page.Actions {
-		readable, err := s.readableRecord(ctx, page.Actions[index])
-		if err != nil {
-			return ActionPage{}, err
-		}
-		page.Actions[index] = readable
+	readable, err := s.readableRecords(ctx, page.Actions)
+	if err != nil {
+		return ActionPage{}, err
 	}
+	copy(page.Actions, readable)
 	return page, nil
 }

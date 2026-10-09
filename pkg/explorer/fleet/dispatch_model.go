@@ -1142,6 +1142,19 @@ type DispatchConfig struct {
 	// a label must not hand out identifiers the label exists to protect
 	// (#369).
 	EvidenceVisibility EvidenceVisibility
+	// EvidenceLabels translates, when an executor's evidence is recorded,
+	// the free-form ingest labels on each reference into the structured
+	// label-policy terms EvidenceVisibility can decide (#564, #570).
+	//
+	// Optional. Nil records the executor's visibility as reported, and a
+	// reference stored with a free-form label is then withheld from every
+	// reader, holders included: fail closed, never open.
+	EvidenceLabels evidencelabels.Translator
+	// EvidenceNodes decides an evidence reference that names nodes by those
+	// nodes' current access rules, so a relabel after recording governs
+	// the evidence as it governs the document (#564). Optional, and nil
+	// withholds every reference that names a node from every reader.
+	EvidenceNodes evidencelabels.NodeGate
 }
 
 // EvidenceVisibility answers whether the current reader holds the labels an
@@ -1150,9 +1163,8 @@ type DispatchConfig struct {
 // An alias, not a definition: the one definition lives in the leaf package
 // evidencelabels, which the event plane also uses for lifecycle delivery
 // (#562), so there is exactly one notion of "may this reader see this label"
-// for stored evidence. Implemented by the host, because the reader's
-// authorizations are established where the request is authenticated and are
-// not carried on an auth.Decision.
+// for stored evidence. Implemented by the host (authorized.LabelVisibility,
+// #564), which decides it from the reader's own decision.
 type EvidenceVisibility = evidencelabels.Visibility
 
 func (r ActionRecord) Validate() error {

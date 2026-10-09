@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -70,13 +72,14 @@ func completedByAnotherPrincipal(
 // TestAReplayToTheEnqueuerRedactsForeignEvidence is the #369 leftover found by
 // the #562 audit.
 //
-// With no evaluator wired, labelled evidence must be withheld — the same
-// fail-closed direction every other dispatch read takes, because a plane that
-// cannot evaluate a label must not hand out the identifiers the label exists
-// to protect.
+// Each reference is decided by its nodes' current rules (#564): the
+// enqueuer holds the source policy governing node-open and not the label
+// policy also governing node-secret.
 func TestAReplayToTheEnqueuerRedactsForeignEvidence(t *testing.T) {
 	t.Run("enqueue replay", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
+		fixture.service.evidenceNodes = fixtureCatalog(
+			t, fixture.authority.Resolver(), fixture.now)
 		completedByAnotherPrincipal(t, fixture)
 		// The identical enqueue, which equivalentEnqueue answers as a replay.
 		replayed, err := fixture.service.Enqueue(
@@ -90,6 +93,8 @@ func TestAReplayToTheEnqueuerRedactsForeignEvidence(t *testing.T) {
 
 	t.Run("invoke terminal replay", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
+		fixture.service.evidenceNodes = fixtureCatalog(
+			t, fixture.authority.Resolver(), fixture.now)
 		completedByAnotherPrincipal(t, fixture)
 		replayed, err := fixture.service.Invoke(
 			fixture.enqueuer, InvokeRequest{
@@ -126,12 +131,17 @@ func TestAnApprovalReRequestRedactsForeignEvidence(t *testing.T) {
 	approval := decided(
 		validApprovalRecord(t), ApprovalApproved, ApprovalVerdictApprove)
 	now := approval.DecidedAt.Add(2 * time.Second)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
 	dispatchStore := newMemoryDispatchStore()
 	service := &ApprovalService{
 		dispatch: &DispatchService{
 			store: dispatchStore, outbox: dispatchStore,
 			recorder: &dispatchRecorder{}, events: dispatchEvents{},
-			clock: func() time.Time { return now },
+			clock:         func() time.Time { return now },
+			evidenceNodes: fixtureCatalog(t, authority.Resolver(), now),
 		},
 		store: &memoryApprovalStore{records: map[string]ApprovalRecord{
 			string(approval.ID): CloneApprovalRecord(approval),
@@ -176,8 +186,9 @@ func TestAnApprovalReRequestRedactsForeignEvidence(t *testing.T) {
 			"distinguish a foreign completion from the requester's own work")
 	}
 
-	replayed, err := service.replayMaterialized(
-		context.Background(), action, approval)
+	requester := bindDecision(t, authority, ownerUntil(
+		t, now.Add(time.Hour), false, auth.OperationInvoke))
+	replayed, err := service.replayMaterialized(requester, action, approval)
 	if err != nil {
 		t.Fatalf("the materialized replay was refused, so this test did not "+
 			"reach the return under test: %v", err)

@@ -44,8 +44,15 @@ type ResultSink interface {
 
 // ValidateRecordedSession checks a successful trusted sink receipt. The sink
 // may supply trusted admission time, actor, reason and correlation metadata,
-// and a default authorization operation, but cannot replace the recorded work
-// or its pins.
+// a default authorization operation, and the structured form of the output
+// restriction, but cannot replace the recorded work or its pins.
+//
+// The output restriction may differ only by translation (#564): the
+// authorized sink replaces a free-form ingest label ("secret"), which no
+// reader holds, with the structured grant labels of the policy enforcing it.
+// So the persisted restriction must keep every structured term requested,
+// add no free-form term, and replace a free-form term only by adding a
+// structured one; anything else is a sink weakening or rewriting it.
 // Callers must mark a validation failure as committed, since writing succeeded.
 func ValidateRecordedSession(requested, persisted Session) error {
 	expected, err := requested.Canonical()
@@ -63,6 +70,9 @@ func ValidateRecordedSession(requested, persisted Session) error {
 	if expected.AuthorizationOperation == "" {
 		expected.AuthorizationOperation = actual.AuthorizationOperation
 	}
+	if translatedRestriction(expected.RequiredVisibility, actual.RequiredVisibility) {
+		expected.RequiredVisibility = actual.RequiredVisibility
+	}
 	if !reflect.DeepEqual(actual, expected) {
 		return shoal.NewError(
 			shoal.ErrorInternal,
@@ -70,6 +80,51 @@ func ValidateRecordedSession(requested, persisted Session) error {
 		)
 	}
 	return nil
+}
+
+// translatedRestriction reports whether persisted is requested with free-form
+// terms replaced by structured ones and nothing structured dropped.
+func translatedRestriction(requested, persisted []string) bool {
+	present := make(map[string]struct{}, len(persisted))
+	for _, label := range persisted {
+		present[label] = struct{}{}
+	}
+	asked := make(map[string]struct{}, len(requested))
+	replaced := false
+	for _, label := range requested {
+		asked[label] = struct{}{}
+		if _, kept := present[label]; kept {
+			continue
+		}
+		if structuredGrantLabel(label) {
+			return false
+		}
+		replaced = true
+	}
+	added := false
+	for _, label := range persisted {
+		if _, wasAsked := asked[label]; wasAsked {
+			continue
+		}
+		if !structuredGrantLabel(label) {
+			return false
+		}
+		added = true
+	}
+	return !replaced || added
+}
+
+// structuredGrantLabel recognizes the structured grant label prefixes (d:,
+// s:, g:, svc:). It is a classification, not validation: a free-form label
+// that happens to share a prefix is treated as structured, which only makes
+// the check above stricter.
+func structuredGrantLabel(label string) bool {
+	for _, prefix := range []string{"d:", "s:", "g:", "svc:"} {
+		if len(label) > len(prefix) && label[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
 }
 
 // Recorder is the product-level fail-closed recorder for retrieval, chat, MCP,

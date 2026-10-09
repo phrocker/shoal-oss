@@ -29,6 +29,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/explorerfleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
+	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
@@ -60,6 +61,13 @@ type HostConfig struct {
 	CursorKeys        CursorKeyStore
 	Visibility        []byte
 	Clock             func() time.Time
+	// EvidenceVisibility is the reader label evaluator applied at delivery
+	// (authorized.LabelVisibility). Nil withholds labelled evidence from
+	// every subscriber.
+	EvidenceVisibility evidencelabels.Visibility
+	// EvidenceNodes is the current-rule node gate (authorized.NodeGate). Nil
+	// withholds every reference that names a node.
+	EvidenceNodes evidencelabels.NodeGate
 }
 
 // HostedServices is the compact production construction and mounting seam.
@@ -117,7 +125,8 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 	events, actionEvents, err := ComposeWithPublisherAndReader(
 		config.Runtime, config.Domain, config.Resolver, config.Generations,
 		config.EventInteraction, config.InteractionReader, config.Snapshots,
-		registry, cursorKey, config.Clock)
+		registry, cursorKey, config.Clock, config.EvidenceVisibility,
+		config.EvidenceNodes)
 	if err != nil {
 		return nil, err
 	}

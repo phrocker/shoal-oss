@@ -550,12 +550,14 @@ The same workspace header applies to provenance list/inspection and unfold
 under `read`, and to provenance fold under `connect`. These are provenance
 folds, not context compression.
 
-Until per-reader label evaluation lands (#564), a session's or fold's
-`output_visibility` label expression is returned only to the principal that
-recorded it (for a fold, only to a principal that recorded every member). Any
-other reader receives it empty, exactly as for an unlabelled record, over HTTP,
-MCP, and team overview alike; session and fold IDs and digests remain visible.
-See "Output-label exposure" in `docs/explorer-public-contract.md`.
+A labelled session or fold is returned only to a reader holding its labels
+(#564, #567, #568): to any other reader it is absent from lists and not found
+on point reads, exactly as if it had never been written, over HTTP, MCP and
+team overview alike. A free-form ingest label is evaluated as its structured
+(source, label) policy, granted through the label-grant file (#570). The
+`output_visibility` expression is shown only to a reader permitted every term
+it names. See "Output labels on interaction and fold reads" in
+`docs/explorer-public-contract.md`.
 
 The following local acceptance matrix exercises REST ask, SSE chat, and HTTP
 MCP ask with 24 cited documents, a nonpublic workspace output policy, and
@@ -629,11 +631,42 @@ Lifecycle publication reauthorizes the original exact `dispatch` or `invoke`
 operation and retains complete representable evidence. Subscription delivery
 uses the dedicated `subscription_deliver` operation and rechecks the shared
 policy-generation authority during long polls. Delivery also drops, per
-subscriber, every evidence reference whose visibility labels that subscriber
-does not hold, whole and with no count (#562, under #398's rule); the stored
-event keeps them. The host supplies the label evaluator through
-`fleetevents.Config.EvidenceVisibility`; until it does, labelled evidence is
-withheld from every subscriber, exactly as on the dispatch read paths (#369).
+subscriber, every evidence reference that subscriber may not see, whole and
+with no count (#562, under #398's rule); the stored event keeps them.
+
+The same per-reference rule (`evidencelabels.FilterReferences`, #564) decides
+every dispatch read that returns a record (Status, the Pull and TeamActions
+pages, and the enqueue, invoke and approval replays) and every delivery:
+
+- A reference that names nodes or edges is decided by their **current**
+  access rules (`authorized.NodeGate`): every node, every edge's effective
+  rule (an extracted relation is bound to the document that asserted it), and
+  both endpoints of every edge, the same rules interaction reads re-check. A
+  document reference also needs its cited revision's own rule (and the
+  current revision's, as historical document reads do): section and span
+  identities do not change with the revision, so an unlabelled current
+  revision must not open a labelled historical one. A loosened document
+  therefore does not release evidence citing a revision that was labelled.
+  A node, edge or revision the catalog does not know withholds the
+  reference. Every reference on a page or delivery is decided in one batch.
+  At record time a graph reference is refused as `invalid_executor_evidence`
+  unless its edges run between its nodes in sequence and its assertions are
+  exactly the corpus's at the executor's pinned snapshot, as the interaction
+  recorder requires. A
+  document relabelled after the action ran therefore governs its evidence:
+  tightened, a holder of only the old labels loses it; loosened, a reader of
+  the new rule gains it. The labels stored with the reference are provenance
+  only.
+- A reference that names no node or edge has nothing current to consult and is
+  decided by its stored labels (`authorized.LabelVisibility`).
+
+`shoal-explore-web` wires the authorized client's gate and evaluator into
+`fleetevents.Config` and, through `explorerfleet.ComposeDispatchWithAttestations`,
+into dispatch. A host that wires no gate withholds every reference naming a
+node from every reader. When an executor's evidence is recorded, the free-form
+label it reports is replaced by the structured terms of the label policy
+enforcing it (`authorized.LabelTranslator`), so the stored provenance names
+what was enforced at the time.
 
 Fleet event cursors are AES-GCM-protected, restart-stable, and scoped to the
 subscription and authorization identity. Event and subscription storage use
