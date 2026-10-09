@@ -2578,6 +2578,22 @@ func (s *DispatchService) authorizedClaimant(
 // #437 — invoke and dispatch — and false only for OperationExecute, where the
 // grant on the descriptor is the authorization and requiring the enqueuer's
 // identity is what made an out-of-process executor impossible.
+// authorizedCurrent resolves and authorizes an existing action for a route
+// that is *not* a claimant route.
+//
+// It hardcodes executorPhaseNone, and that is the whole hazard: every
+// toleration a claimant route needs is keyed on the phase. A route that
+// reports on a claim already taken — a completion, an ambiguity report, an
+// admission report — must call authorizedCurrentBinding with its own phase,
+// or it silently receives the strict behaviour: a descriptor lease that
+// lapsed or a reference rebound after the claim refuses the report, and the
+// record of an effect that already happened is lost (#577).
+//
+// Silently is the operative word. There is no error and nothing to notice at
+// review; the only symptom is a stranded effect in production. The admission
+// report path reached for this wrapper for exactly that reason and was broken
+// by it, which is why TestOnlyNonClaimantRoutesUseAuthorizedCurrent pins the
+// callers rather than leaving this as advice.
 func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.Decision, id []byte, operation auth.Operation, requirePrincipal bool, now time.Time) (ActionRecord, Action, error) {
 	record, action, _, err := s.authorizedCurrentBinding(
 		ctx, decision, id, operation, requirePrincipal, now,
