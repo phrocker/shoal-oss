@@ -296,6 +296,12 @@ func workspaceOperationForRequest(
 				len(strings.TrimPrefix(path, "/api/v1/provenance/")) > 0 &&
 				!strings.Contains(strings.TrimPrefix(path, "/api/v1/provenance/"), "/"))):
 		return auth.OperationRead, true
+	case method == http.MethodGet &&
+		strings.HasPrefix(path, RegistrationsRoute+"/") &&
+		!strings.Contains(strings.TrimPrefix(path, RegistrationsRoute+"/"), "/"):
+		return auth.OperationRead, true
+	case method == http.MethodPost && path == RegistrationsRoute:
+		return auth.OperationIngest, true
 	case method == http.MethodPost && path == "/api/v1/provenance/fold":
 		return auth.OperationConnect, true
 	case method == http.MethodPost && path == "/api/v1/provenance/unfold":
@@ -680,6 +686,7 @@ func requestMayCommit(method, path string) bool {
 		"/api/v1/decisions",
 		"/api/v1/outcomes",
 		"/api/v1/adjudications",
+		RegistrationsRoute,
 		// Collector writes commit before the response is encoded. Their
 		// receipts are small and fixed-shape so a narrow budget still fits;
 		// the GET read route commits nothing and is deliberately absent.
