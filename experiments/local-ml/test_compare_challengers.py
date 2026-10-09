@@ -67,5 +67,28 @@ class ComparisonContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_comparison.verify(tampered)
 
+    def test_resealed_impossible_comparison_rejected(self):
+        report = contract.seal(
+            'challenger_comparison', manifest_id='a' * 64,
+            train_ids=['0', '1'], test_ids=['2', '3'],
+            candidates={'catboost': 'b' * 64, 'unixcoder': 'c' * 64},
+            metrics={name: {'examples': 2, 'positive_examples': 2, 'accuracy': 1.0,
+                            'positive_recall': 1.0, 'false_positive_rate': None,
+                            'threshold': 0.5, 'threshold_predeclared': True,
+                            'predicted_positive': 2} for name in ('catboost', 'unixcoder')},
+            disposition='measurement_only', optimization_enabled=False,
+            limitation='Measurement only; no promotion or quality generalization.')
+        bad_identity = dict(report)
+        bad_identity['candidates'] = dict(report['candidates'], unixcoder='b' * 64)
+        bad_identity['id'] = contract._digest({key: value for key, value in bad_identity.items() if key != 'id'})
+        with self.assertRaises(ValueError):
+            verify_comparison.verify(bad_identity)
+        bad_rate = dict(report)
+        bad_rate['metrics'] = {name: dict(values, positive_recall=None)
+                               for name, values in report['metrics'].items()}
+        bad_rate['id'] = contract._digest({key: value for key, value in bad_rate.items() if key != 'id'})
+        with self.assertRaises(ValueError):
+            verify_comparison.verify(bad_rate)
+
 
 if __name__ == '__main__': unittest.main()
