@@ -44,6 +44,8 @@ def verify(report):
         raise ValueError('comparison candidate set mismatch')
     for name in candidates:
         _digest(candidates[name], name + ' artifact')
+    if candidates['catboost'] == candidates['unixcoder']:
+        raise ValueError('comparison candidates must be distinct artifacts')
     metrics = report.get('metrics')
     if not isinstance(metrics, dict) or set(metrics) != {'catboost', 'unixcoder'}:
         raise ValueError('comparison metric set mismatch')
@@ -59,6 +61,14 @@ def verify(report):
             value = values[field]
             if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1):
                 raise ValueError(name + ' rate is out of bounds')
+        if values['positive_examples'] == 0 and values['positive_recall'] is not None:
+            raise ValueError(name + ' recall requires positive examples')
+        if values['positive_examples'] == len(test) and values['false_positive_rate'] is not None:
+            raise ValueError(name + ' false-positive rate requires negatives')
+        if values['positive_examples'] > 0 and values['positive_recall'] is None:
+            raise ValueError(name + ' recall is missing')
+        if values['positive_examples'] < len(test) and values['false_positive_rate'] is None:
+            raise ValueError(name + ' false-positive rate is missing')
         if values['threshold'] != 0.5 or values['threshold_predeclared'] is not True:
             raise ValueError(name + ' threshold is not pinned')
     limitation = report.get('limitation')
