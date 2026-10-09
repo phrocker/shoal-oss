@@ -392,8 +392,20 @@ type recordView struct {
 
 func (g *gatewayOps) view(id string) recordView {
 	g.t.Helper()
-	got, _ := g.send(call{token: g.fleetToken("alice", nil)},
-		"/api/v1/fleet/actions/"+b64([]byte(id))+"/status", g.contextWire(g.h.now().Add(time.Minute)))
+	read := func() answer {
+		got, _ := g.send(call{token: g.fleetToken("alice", nil)},
+			"/api/v1/fleet/actions/"+b64([]byte(id))+"/status", g.contextWire(g.h.now().Add(time.Minute)))
+		return got
+	}
+	got := read()
+	// #633: a concurrent claim or extend write can briefly make the live
+	// agent read as not found, so this test-side status read retries a 404 a
+	// few times. It is the explorer's gap, not the gateway's, and nothing in
+	// the gateway masks it.
+	for attempt := 0; got.status == http.StatusNotFound && attempt < 20; attempt++ {
+		time.Sleep(10 * time.Millisecond)
+		got = read()
+	}
 	if got.status != http.StatusOK {
 		g.t.Fatalf("status %s = %d %s", id, got.status, got.raw)
 	}

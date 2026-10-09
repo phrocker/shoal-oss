@@ -259,22 +259,45 @@ func TestSkewedWorkersAgreeOnTheGate(t *testing.T) {
 }
 
 func TestGracePeriod(t *testing.T) {
-	// The design's example: T=10m gives 615s, of which the final 5s is the
-	// only slack beyond the request, its completion and the fallback report.
 	for _, row := range []struct {
-		operation time.Duration
-		seconds   int64
+		operation, plane time.Duration
+		seconds          int64
 	}{
-		{10 * time.Minute, 615},
-		{3 * time.Minute, 195},
-		{90 * time.Second, 105},
-		{1500 * time.Millisecond, 17},
+		// The completion budget is the report window until three plane
+		// timeouts exceed it.
+		{10 * time.Minute, time.Second, 620},
+		{10 * time.Minute, 15 * time.Second, 660},
+		{3 * time.Minute, 10 * time.Second, 225},
+		{90 * time.Second, time.Second, 110},
+		{1500 * time.Millisecond, time.Second, 22},
 	} {
-		if got := GracePeriodSeconds(row.operation); got != row.seconds {
-			t.Errorf("T=%s: grace %ds, want %ds", row.operation, got, row.seconds)
+		if got := GracePeriodSeconds(row.operation, row.plane); got != row.seconds {
+			t.Errorf("T=%s P=%s: grace %ds, want %ds", row.operation, row.plane, got, row.seconds)
 		}
-		if GracePeriod(row.operation) != row.operation+2*ReportWindow+5*time.Second {
-			t.Errorf("T=%s: grace is not T + 2×5s + 5s", row.operation)
+	}
+}
+
+// TestGracePeriodCoversTheWorstShutdownPath: the worst path a drain can take
+// — the request in flight for T, the completion for its whole budget, then
+// every fallback report for its whole window — computed from the constants
+// the worker spends, plus the exit margin, fits the grace period. The old
+// formula (T + 2×ReportWindow + 5s) did not once 3×planeTimeout exceeded the
+// report window.
+func TestGracePeriodCoversTheWorstShutdownPath(t *testing.T) {
+	for _, operation := range []time.Duration{time.Second, 3 * time.Minute, 10 * time.Minute} {
+		for _, plane := range []time.Duration{time.Second, 5 * time.Second, 10 * time.Second, 75 * time.Second} {
+			worst := operation + CompletionBudget(plane) +
+				time.Duration(FallbackReportAttempts)*ReportWindow
+			if GracePeriod(operation, plane) < worst+exitMargin {
+				t.Errorf("T=%s P=%s: grace %s does not cover the worst path %s plus exit",
+					operation, plane, GracePeriod(operation, plane), worst)
+			}
+			if plane*3 > ReportWindow && worst+exitMargin <= operation+2*ReportWindow+5*time.Second {
+				t.Errorf("T=%s P=%s: the case the old formula missed is not exercised", operation, plane)
+			}
 		}
+	}
+	if CompletionBudget(time.Second) != ReportWindow || CompletionBudget(10*time.Second) != 30*time.Second {
+		t.Fatal("completion budget is not max(ReportWindow, 3×planeTimeout)")
 	}
 }

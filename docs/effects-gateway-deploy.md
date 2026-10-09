@@ -133,10 +133,13 @@ shorter: nothing would ever be claimable, and the gateway would look idle.
 
 ### Grace period
 
-`terminationGracePeriodSeconds ≥ T + 2×5s + 5s`: the in-flight request, its
-completion, the fallback ambiguity report, and five seconds to exit.
-`GracePeriodSeconds` rounds up. For `T = 10m` that is 615s; for the default
-`T = 3m`, 195s.
+`terminationGracePeriodSeconds ≥ T + max(5s, 3×planeTimeout) + 2×5s + 5s`:
+the in-flight request, its completion (whose client may send the body three
+times, each bounded by the plane timeout), the two fallback ambiguity reports,
+and five seconds to exit. `GracePeriod(T, planeTimeout)` computes it from the
+same constants the worker spends, and `GracePeriodSeconds` rounds up. For the
+defaults (`T = 3m`, plane timeout 10s) that is 225s; for `T = 10m` and a 15s
+plane timeout, 660s.
 
 ## Issuing executor credentials
 
@@ -523,7 +526,12 @@ which appends at `expected_version` 0. Each fence gets at most one report.
 **Shutdown** (context cancelled): stop pulling and go not-ready (`draining`).
 A claim with nothing sent reports `request_not_sent` and lapses. A request in
 flight finishes and completes, falling back to the report and then to the
-unrecorded log. The drain is bounded by `GracePeriod(T)`. `Kill` abandons
+unrecorded log. The start-up retry of held reports also stops on SIGTERM;
+what it did not reach stays on disk. The drain is bounded by
+`GracePeriod(T, planeTimeout)`. If that runs out, every unfinished run whose
+request may have reached the target is written to the unrecorded log as
+`outcome_unknown` before it is abandoned, an `abandoned` event carries the
+count, and `Run` returns `ErrDrainAbandoned`. `Kill` abandons
 everything, as SIGKILL would; the next instance re-claims after the lapse and
 resends under the same `ExecutorKey`.
 

@@ -129,6 +129,7 @@ func TestLogRecordAdmitsOnlyThePolicyFields(t *testing.T) {
 		"Ambiguity":     reflect.TypeOf(fleet.AmbiguityOutcome("")),
 		"Unrecorded":    reflect.TypeOf(0),
 		"NotReady":      reflect.TypeOf(NotReadyReason("")),
+		"Abandoned":     reflect.TypeOf(0),
 		"RequestBytes":  reflect.TypeOf(int64(0)),
 		"ResponseBytes": reflect.TypeOf(int64(0)),
 		"Duration":      reflect.TypeOf(time.Duration(0)),

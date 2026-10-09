@@ -82,6 +82,9 @@ const (
 	EventUnrecordedCleared Event = "unrecorded_cleared"
 	// EventReadiness: readiness changed; NotReady says why, empty when ready.
 	EventReadiness Event = "readiness"
+	// EventAbandoned: the drain's grace period ended with runs unfinished;
+	// Abandoned counts them.
+	EventAbandoned Event = "abandoned"
 )
 
 var validEvents = map[Event]bool{
@@ -89,7 +92,7 @@ var validEvents = map[Event]bool{
 	EventCompleted: true, EventRefused: true, EventFenceLost: true,
 	EventDispatch: true, EventStartup: true, EventExtended: true,
 	EventAttested: true, EventAmbiguity: true, EventUnrecorded: true,
-	EventUnrecordedCleared: true, EventReadiness: true,
+	EventUnrecordedCleared: true, EventReadiness: true, EventAbandoned: true,
 }
 
 // FailureKind is a transport failure reduced to its category. Closed.
@@ -180,7 +183,9 @@ type LogRecord struct {
 	// on EventUnrecorded and EventUnrecordedCleared.
 	Unrecorded int
 	// NotReady is why the worker is not ready, on EventReadiness.
-	NotReady      NotReadyReason
+	NotReady NotReadyReason
+	// Abandoned is how many runs a drain gave up on, on EventAbandoned.
+	Abandoned     int
 	RequestBytes  int64
 	ResponseBytes int64
 	Duration      time.Duration
@@ -218,6 +223,7 @@ type logLine struct {
 	Ambiguity      string `json:"ambiguity,omitempty"`
 	Unrecorded     *int   `json:"unrecorded_entries,omitempty"`
 	NotReady       string `json:"not_ready,omitempty"`
+	Abandoned      int    `json:"abandoned_runs,omitempty"`
 	RequestBytes   int64  `json:"request_bytes,omitempty"`
 	ResponseBytes  int64  `json:"response_bytes,omitempty"`
 	DurationMillis int64  `json:"duration_ms,omitempty"`
@@ -271,7 +277,9 @@ func (l *Logger) Log(record LogRecord) {
 	if record.Ambiguity != "" {
 		line.Ambiguity = closed(string(record.Ambiguity), validAmbiguity[record.Ambiguity])
 	}
-	if record.Event == EventUnrecorded || record.Event == EventUnrecordedCleared {
+	line.Abandoned = record.Abandoned
+	if record.Event == EventUnrecorded || record.Event == EventUnrecordedCleared ||
+		record.Event == EventAbandoned {
 		count := record.Unrecorded
 		line.Unrecorded = &count
 	}

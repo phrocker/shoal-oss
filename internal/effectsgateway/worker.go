@@ -112,7 +112,7 @@ const (
 	targetBackoffBase = 500 * time.Millisecond
 	// reportAttempts is how many times the worker calls ReportAmbiguity for
 	// one report; the client resends once inside each call.
-	reportAttempts = 2
+	reportAttempts = FallbackReportAttempts
 )
 
 // WorkerConfig is everything the loop needs. The command (PR6) builds it from
@@ -216,6 +216,10 @@ type Worker struct {
 	skipMu  sync.Mutex
 	skipped map[string]uint64
 
+	// runs are the claims in hand, for abandonment at the end of a drain.
+	runsMu sync.Mutex
+	runs   map[*claimRun]struct{}
+
 	work sync.WaitGroup
 }
 
@@ -275,6 +279,7 @@ func NewWorker(cfg WorkerConfig) (*Worker, error) {
 		},
 		slots: make(chan struct{}, cfg.MaxInFlight), notReady: NotReadyStarting,
 		drainCh: make(chan struct{}), skipped: map[string]uint64{},
+		runs: map[*claimRun]struct{}{},
 	}
 	w.hard, w.kill = context.WithCancel(context.Background())
 	return w, nil
@@ -318,24 +323,37 @@ func (w *Worker) Kill() {
 // done, then drains: it stops pulling and goes not-ready; claims with nothing
 // sent are reported request_not_sent and lapse; requests in flight finish and
 // complete, falling back to an ambiguity report and then to the unrecorded
-// log. The drain is bounded by GracePeriod(T). Run returns when the drain
-// ends or Kill is called.
+// log. The drain is bounded by GracePeriod(T, planeTimeout); a run still
+// unfinished when it ends is abandoned (ErrDrainAbandoned), and one whose
+// request may have reached the target is written to the unrecorded log first.
+// Run returns when the drain ends or Kill is called.
 func (w *Worker) Run(ctx context.Context) error {
 	defer w.kill()
-	w.RetryUnrecorded(w.hardContext())
+	// The start-up retry stops on SIGTERM as well as on Kill; whatever it
+	// did not reach stays on disk for the next start.
+	retryCtx, stopRetry := context.WithCancel(ctx)
+	unhook := context.AfterFunc(w.hard, stopRetry)
+	w.RetryUnrecorded(retryCtx)
+	unhook()
+	stopRetry()
 	if w.killed.Load() {
 		return errors.New("worker killed")
 	}
 	w.refreshReadiness()
 	w.pullLoop(ctx)
-	w.drain()
+	abandoned := w.drain()
 	if w.killed.Load() {
 		return errors.New("worker killed")
+	}
+	if abandoned > 0 {
+		return ErrDrainAbandoned
 	}
 	return nil
 }
 
-func (w *Worker) hardContext() context.Context { return w.hard }
+// ErrDrainAbandoned says the grace period ended with runs unfinished. Each
+// one whose request may have reached the target is in the unrecorded log.
+var ErrDrainAbandoned = errors.New("the drain ended with work unfinished")
 
 func (w *Worker) refreshReadiness() {
 	if w.draining.Load() {
@@ -348,7 +366,9 @@ func (w *Worker) refreshReadiness() {
 	w.setReady("")
 }
 
-func (w *Worker) drain() {
+// drain stops pulling and waits for the runs in hand, for at most the grace
+// period. It returns how many it abandoned.
+func (w *Worker) drain() int {
 	w.draining.Store(true)
 	w.drainMu.Do(func() { close(w.drainCh) })
 	w.setReady(NotReadyDraining)
@@ -357,14 +377,51 @@ func (w *Worker) drain() {
 		w.work.Wait()
 		close(done)
 	}()
+	abandoned := 0
 	select {
 	case <-done:
-	case <-w.clock.After(GracePeriod(w.cfg.OperationTimeout)):
-		// The kubelet's SIGKILL follows; anything still running has had
-		// its window.
+	case <-w.clock.After(GracePeriod(w.cfg.OperationTimeout, w.cfg.PlaneTimeout)):
+		// The kubelet's SIGKILL follows. Nothing that may have happened is
+		// left only in memory.
+		abandoned = w.abandon()
 	case <-w.hard.Done():
 	}
 	w.setReady(NotReadyStopped)
+	return abandoned
+}
+
+// abandon gives up on every unfinished run: each one whose request may have
+// reached the target, and whose outcome is not yet on the record or in the
+// log, is written to the unrecorded log as outcome_unknown. Then everything
+// still running is cancelled. It returns how many runs were unfinished.
+func (w *Worker) abandon() int {
+	w.runsMu.Lock()
+	runs := make([]*claimRun, 0, len(w.runs))
+	for run := range w.runs {
+		runs = append(runs, run)
+	}
+	w.runsMu.Unlock()
+	for _, run := range runs {
+		run.mu.Lock()
+		write := run.attempted && !run.settled
+		run.abandoned, run.reported = true, true
+		run.mu.Unlock()
+		if !write {
+			continue
+		}
+		record := w.record(run, EventUnrecorded)
+		record.Ambiguity = fleet.AmbiguityOutcomeUnknown
+		if err := w.cfg.Unrecorded.Append(run.unrecorded(w.cfg.SurfaceName,
+			fleet.AmbiguityOutcomeUnknown, "", nil)); err != nil {
+			record.Event = EventDispatch
+		}
+		record.Unrecorded = w.cfg.Unrecorded.Len()
+		w.log.Log(record)
+	}
+	w.log.Log(LogRecord{Event: EventAbandoned, Abandoned: len(runs),
+		Unrecorded: w.cfg.Unrecorded.Len()})
+	w.kill()
+	return len(runs)
 }
 
 // RetryUnrecorded presents every held report again. One the explorer now
@@ -600,6 +657,9 @@ func (w *Worker) pullOnce(ctx context.Context, held *ticket, cursor string) (boo
 		}
 		claimedAny = true
 		run.ticket, held = held, nil
+		w.runsMu.Lock()
+		w.runs[run] = struct{}{}
+		w.runsMu.Unlock()
 		w.work.Add(1)
 		go w.handle(run)
 	}
@@ -727,13 +787,19 @@ type claimRun struct {
 	nonce   ClaimNonce
 	ticket  *ticket
 
-	mu        sync.Mutex
-	anchored  Anchored
-	anchorAt  time.Time
-	lost      bool
-	lostCh    chan struct{}
-	inFlight  bool
-	reported  bool
+	mu       sync.Mutex
+	anchored Anchored
+	anchorAt time.Time
+	lost     bool
+	lostCh   chan struct{}
+	inFlight bool
+	reported bool
+	// attempted: a request was handed to the target client, so the effect
+	// may have happened. settled: the outcome is on the record or in the
+	// unrecorded log. abandoned: the drain gave up on this run.
+	attempted bool
+	settled   bool
+	abandoned bool
 	stopRenew chan struct{}
 	renewDone chan struct{}
 }
@@ -744,6 +810,24 @@ func (r *claimRun) markLost() {
 	if !r.lost {
 		r.lost = true
 		close(r.lostCh)
+	}
+}
+
+func (r *claimRun) settle() {
+	r.mu.Lock()
+	r.settled = true
+	r.mu.Unlock()
+}
+
+// unrecorded is this run's entry in the unrecorded log; err is the report's
+// last failure, nil when no report was attempted.
+func (r *claimRun) unrecorded(target string, outcome fleet.AmbiguityOutcome, ref string, err error) UnrecordedEntry {
+	return UnrecordedEntry{
+		ActionID: r.action.ID, Fence: r.action.ClaimFence, ClaimNonce: r.nonce,
+		RouteAction: r.route.Action(), Method: r.route.Method(),
+		PathTemplate: r.route.PathTemplate(), Outcome: outcome,
+		Target: target, Reference: ref, CorrelationID: r.action.CorrelationID,
+		Status: dispatchStatus(err), DispatchError: DispatchKind(err),
 	}
 }
 
@@ -945,6 +1029,11 @@ type sendResult struct {
 func (w *Worker) handle(run *claimRun) {
 	defer w.work.Done()
 	defer w.release(run.ticket)
+	defer func() {
+		w.runsMu.Lock()
+		delete(w.runs, run)
+		w.runsMu.Unlock()
+	}()
 	go w.renew(run)
 	stopRenewal := func() {
 		select {
@@ -1107,7 +1196,7 @@ func (w *Worker) attempt(run *claimRun, bound BoundRequest, header, credential s
 		return Observation{Err: err}, 0, 0, 0
 	}
 	run.mu.Lock()
-	run.inFlight = true
+	run.inFlight, run.attempted = true, true
 	run.mu.Unlock()
 	defer func() {
 		run.mu.Lock()
@@ -1134,6 +1223,13 @@ func (w *Worker) attempt(run *claimRun, bound BoundRequest, header, credential s
 // longer renewed) and then reports through the ambiguity route, which
 // appends with expected_version 0.
 func (w *Worker) complete(run *claimRun, class Classification, result sendResult, stopRenewal func()) {
+	run.mu.Lock()
+	abandoned := run.abandoned
+	run.mu.Unlock()
+	if abandoned {
+		// The drain gave up on this run and wrote what it knew.
+		return
+	}
 	request, err := w.requestContext("gateway_complete")
 	if err != nil {
 		w.report(run, lostOutcome(result), reference(class))
@@ -1152,23 +1248,20 @@ func (w *Worker) complete(run *claimRun, class Classification, result sendResult
 		completion.Failed, completion.ErrorCode = true, class.ErrorCode
 		completion.Effected = w.effected(run.route, result)
 	}
-	// ReportWindow is the completion's budget; the client's resends fit in
-	// it because each call is bounded by the plane timeout.
-	budget := ReportWindow
-	if w.cfg.PlaneTimeout*3 > budget {
-		budget = w.cfg.PlaneTimeout * 3
-	}
-	callCtx, cancel := context.WithTimeout(w.hard, budget)
+	// CompletionBudget is the same figure GracePeriod reserves for it.
+	callCtx, cancel := context.WithTimeout(w.hard, CompletionBudget(w.cfg.PlaneTimeout))
 	_, err = w.cfg.Dispatch.Complete(callCtx, run.action.ID, completion)
 	cancel()
 	record := w.record(run, EventCompleted)
 	record.Classification, record.Status = class.Kind, class.Status
 	switch {
 	case err == nil:
+		run.settle()
 		w.log.Log(record)
 		return
 	case DispatchKind(err) == DispatchRecordedOtherwise:
 		// Final: the record says something else under this claim.
+		run.settle()
 		record.DispatchError = DispatchRecordedOtherwise
 		w.log.Log(record)
 		return
@@ -1258,22 +1351,17 @@ func (w *Worker) report(run *claimRun, outcome fleet.AmbiguityOutcome, ref strin
 	record := w.record(run, EventAmbiguity)
 	record.Ambiguity = outcome
 	if err == nil {
+		run.settle()
 		w.log.Log(record)
 		return
 	}
-	entry := UnrecordedEntry{
-		ActionID: run.action.ID, Fence: run.action.ClaimFence, ClaimNonce: run.nonce,
-		RouteAction: run.route.Action(), Method: run.route.Method(),
-		PathTemplate: run.route.PathTemplate(), Outcome: outcome,
-		Target: w.cfg.SurfaceName, Reference: ref,
-		CorrelationID: run.action.CorrelationID,
-		Status:        dispatchStatus(err), DispatchError: DispatchKind(err),
-	}
+	entry := run.unrecorded(w.cfg.SurfaceName, outcome, ref, err)
 	if appendErr := w.cfg.Unrecorded.Append(entry); appendErr != nil {
 		record.Event, record.DispatchError = EventDispatch, DispatchKind(err)
 		w.log.Log(record)
 		return
 	}
+	run.settle()
 	record.Event, record.DispatchError = EventUnrecorded, DispatchKind(err)
 	record.Unrecorded = w.cfg.Unrecorded.Len()
 	w.log.Log(record)

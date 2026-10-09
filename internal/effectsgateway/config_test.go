@@ -96,7 +96,8 @@ func TestParseFlagsAcceptsTheBaseConfiguration(t *testing.T) {
 	if _, ok := config.Routes.Lookup("charge"); !ok {
 		t.Fatal("route missing")
 	}
-	if config.GracePeriod() != DefaultOperationTimeout+15*time.Second {
+	// The default plane timeout (10s) makes the completion budget 30s.
+	if config.GracePeriod() != DefaultOperationTimeout+30*time.Second+2*ReportWindow+5*time.Second {
 		t.Fatalf("grace = %s", config.GracePeriod())
 	}
 	gate := config.SendGate()

@@ -221,25 +221,45 @@ func (g SendGate) Check(anchored Anchored, now time.Time, draining bool) GateRef
 	return GateOpen
 }
 
+// CompletionBudget is how long the worker gives one completion, resends
+// included: the report window, or three plane timeouts when that is longer,
+// since the client may send the body three times (Complete).
+func CompletionBudget(planeTimeout time.Duration) time.Duration {
+	if 3*planeTimeout > ReportWindow {
+		return 3 * planeTimeout
+	}
+	return ReportWindow
+}
+
+// FallbackReportAttempts is how many ambiguity reports, each bounded by the
+// report window, the worker makes before it writes the unrecorded log.
+const FallbackReportAttempts = 2
+
+// exitMargin is the process's own exit after the drain.
+const exitMargin = 5 * time.Second
+
 // GracePeriod is the minimum terminationGracePeriodSeconds for a pod running
 // the gateway:
 //
-//	T + 2×ReportWindow + 5s
+//	T + max(ReportWindow, 3×planeTimeout) + 2×ReportWindow + 5s
 //
-// A request in flight when SIGTERM arrives runs for up to T, then its
-// completion (one report window), then the fallback ambiguity report if the
-// completion is refused (another), and five seconds of process exit. A shorter
-// grace period has the kubelet SIGKILL a worker that has performed an effect
-// and not yet reported it, which is the stranding this gateway exists to avoid.
-func GracePeriod(operationTimeout time.Duration) time.Duration {
-	return operationTimeout + 2*ReportWindow + 5*time.Second
+// It is the worst shutdown path, from the same constants the worker spends:
+// a request in flight when SIGTERM arrives runs for up to T, then its
+// completion (CompletionBudget), then the fallback ambiguity reports if the
+// completion is refused (FallbackReportAttempts report windows), and five
+// seconds of process exit. A shorter grace period has the kubelet SIGKILL a
+// worker that has performed an effect and not yet reported it, which is the
+// stranding this gateway exists to avoid.
+func GracePeriod(operationTimeout, planeTimeout time.Duration) time.Duration {
+	return operationTimeout + CompletionBudget(planeTimeout) +
+		FallbackReportAttempts*ReportWindow + exitMargin
 }
 
 // GracePeriodSeconds rounds GracePeriod up to whole seconds, which is the unit
 // Kubernetes takes. Rounding down would shave the margin the formula exists
 // to provide.
-func GracePeriodSeconds(operationTimeout time.Duration) int64 {
-	grace := GracePeriod(operationTimeout)
+func GracePeriodSeconds(operationTimeout, planeTimeout time.Duration) int64 {
+	grace := GracePeriod(operationTimeout, planeTimeout)
 	seconds := int64(grace / time.Second)
 	if grace%time.Second != 0 {
 		seconds++
