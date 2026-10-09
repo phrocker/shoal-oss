@@ -192,6 +192,43 @@ func TestProjectLatentLinkAssertionsSkipsDeletedLinkCells(t *testing.T) {
 	}
 }
 
+// TestProjectLatentLinkAssertionsSkipsLabelledCells pins #569: a link cell
+// carrying a compound cell visibility is not projected, because nothing past
+// the projection carries that label — the derivation, evidence and assertion
+// have no visibility, and the resulting graph edge is gated only by its
+// endpoints' AccessRules.
+//
+// An unlabelled cell in the same call is projected, so the refusal turns on
+// the visibility and not on the projection having been broken.
+func TestProjectLatentLinkAssertionsSkipsLabelledCells(t *testing.T) {
+	projection := latentProjectionFixture(t)
+	labelled := latentCell("cell-a:entity:labelled", "entity:target", "0.95")
+	labelled.ColumnVisibility = []byte("A&B")
+
+	assertions, err := ProjectLatentLinkAssertions(
+		[]LatentLinkCell{
+			labelled,
+			latentCell("cell-a:entity:plain", "entity:target", "0.91"),
+		},
+		projection,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Named rather than counted: a count alone passes on a projection that
+	// dropped the wrong cell, and this is the pair that distinguishes
+	// "labelled cells are refused" from "the projection is broken".
+	if len(assertions) != 1 || assertions[0].Subject() != "entity:plain" {
+		subjects := make([]shoal.ID, len(assertions))
+		for i, assertion := range assertions {
+			subjects[i] = assertion.Subject()
+		}
+		t.Fatalf("projected subjects = %v, want only [entity:plain]: a "+
+			"labelled relationship projected here reaches a reader "+
+			"authorized on both endpoints, which is the #569 leak", subjects)
+	}
+}
+
 func TestProjectLatentLinkAssertionsPreservesCustomLinkColumnFamily(t *testing.T) {
 	projection := latentProjectionFixture(t)
 	projection.LinkColumnFamily = "edge.custom:"
