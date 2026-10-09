@@ -28,6 +28,13 @@ points at a prior complete release and requires a bound approval. Neither
 function authenticates the caller or enables live traffic by itself; a service
 must enforce those boundaries around the records.
 
+`poisoning.py` runs a versioned deterministic attack corpus covering duplicate
+flooding, prediction-as-label injection, held-out overlap, failed evaluation,
+artifact substitution, and unauthorized promotion. It reports rejection and
+quarantine denominators with a clean control. The report is structural attack
+evidence only; it does not estimate model quality, ground truth, influence, or
+machine unlearning.
+
 Every output is content-addressed, schema-versioned JSON and created with
 exclusive file creation. A new batch produces a new ledger snapshot, never an
 in-place label correction. Conflicts stay excluded until a later explicitly
