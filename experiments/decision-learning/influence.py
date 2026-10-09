@@ -40,6 +40,15 @@ def _scores(scores, ids, name):
             raise ValueError('invalid ' + name + ' score')
 
 
+def _score_digest(scores):
+    return _digest(scores)
+
+
+def _digest_id(value, name):
+    if not isinstance(value, str) or len(value) != 64 or any(char not in '0123456789abcdef' for char in value):
+        raise ValueError('invalid ' + name)
+
+
 def verify(report):
     if not isinstance(report, dict) or report.get('schema') != SCHEMA or report.get('kind') != 'influence_report':
         raise ValueError('invalid influence report')
@@ -50,6 +59,8 @@ def verify(report):
     for name in ('baseline_model_id', 'perturbed_model_id', 'baseline_manifest_id',
                  'perturbed_manifest_id', 'removed_training_id', 'limitation'):
         _text(report.get(name), name)
+    for name in ('baseline_scores_digest', 'perturbed_scores_digest'):
+        _digest_id(report.get(name), name)
     if report['baseline_model_id'] == report['perturbed_model_id']:
         raise ValueError('influence report reuses model identity')
     if report['baseline_manifest_id'] == report['perturbed_manifest_id']:
@@ -101,6 +112,8 @@ def measure(baseline, perturbed, *, baseline_model_id, perturbed_model_id,
     return seal('influence_report', test_ids=test_ids,
                 baseline_model_id=baseline_model_id, perturbed_model_id=perturbed_model_id,
                 baseline_manifest_id=baseline_manifest_id, perturbed_manifest_id=perturbed_manifest_id,
+                baseline_scores_digest=_score_digest(baseline),
+                perturbed_scores_digest=_score_digest(perturbed),
                 removed_training_id=removed_training_id, threshold=threshold,
                 metrics={'mean_absolute_delta': sum(absolute) / len(absolute),
                          'max_absolute_delta': max(absolute), 'decision_flips': len(flips),

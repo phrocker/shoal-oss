@@ -46,6 +46,22 @@ class InfluenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             influence.verify(report)
 
+    def test_score_digests_are_required_and_bound(self):
+        baseline = {'a': .4}
+        perturbed = {'a': .6}
+        report = influence.measure(baseline, perturbed, baseline_model_id='m0', perturbed_model_id='m1',
+                                   baseline_manifest_id='d0', perturbed_manifest_id='d1', removed_training_id='row')
+        self.assertEqual(report['baseline_scores_digest'], influence._score_digest(baseline))
+        self.assertEqual(report['perturbed_scores_digest'], influence._score_digest(perturbed))
+        missing = copy.deepcopy(report)
+        del missing['baseline_scores_digest']
+        with self.assertRaises(ValueError):
+            influence.verify(missing)
+        malformed = copy.deepcopy(report)
+        malformed['perturbed_scores_digest'] = '0' * 63 + 'z'
+        with self.assertRaises(ValueError):
+            influence.verify(malformed)
+
 
 if __name__ == '__main__':
     unittest.main()
