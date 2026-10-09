@@ -4201,7 +4201,6 @@ func containsOperationForTest(
 	return false
 }
 
-<<<<<<< Updated upstream
 // confiningExecutor declares that it confines retrieval to the invocation's
 // scope, which is the promise #370 requires before an in-process execution
 // may run wider than the action's scope.
@@ -4339,112 +4338,10 @@ func TestAnUnconfinedExecutorMayNotRunWiderThanItsScope(t *testing.T) {
 				if strings.Contains(err.Error(), "source-b") ||
 					strings.Contains(err.Error(), "policy-b") {
 					t.Fatalf("the refusal names another scope: %v", err)
-=======
-// stubEvidenceVisibility answers a fixed verdict, or fails.
-type stubEvidenceVisibility struct {
-	visible bool
-	err     error
-	asked   [][]string
-}
-
-func (s *stubEvidenceVisibility) VisibleToReader(
-	_ context.Context, visibility []string,
-) (bool, error) {
-	s.asked = append(s.asked, append([]string(nil), visibility...))
-	if s.err != nil {
-		return false, s.err
-	}
-	return s.visible, nil
-}
-
-// TestADispatchReaderSeesOnlyEvidenceItsLabelsCover is #369.
-//
-// Status, Pull and TeamActions authorize a reader on
-// (domain, source, policy, object) and applied no visibility-label check
-// before returning an ActionRecord, and webapi serializes Evidence in full:
-// anchor ID, citation document, revision, section and span identifiers,
-// character offsets, node and edge IDs, and the label expression itself.
-//
-// Every EvidenceRef records its own Visibility, so the record states which
-// labels apply, and nothing on the read path consulted it. An action enqueued
-// on source A, answered from a document in source B labelled secret&project-x,
-// handed its identifiers and that label expression to any principal with
-// dispatch or team-overview authority on A — holding neither of B's labels.
-// Content was not exposed; identity, structure and the label expression were.
-//
-// Label enforcement in this plane normally happens at the scan: a document a
-// reader may not see does not come back from storage. An EvidenceRef is
-// different — it was recorded by the action's principal and is stored as a
-// field of the record — so it needed a check of its own.
-func TestADispatchReaderSeesOnlyEvidenceItsLabelsCover(t *testing.T) {
-	labelled := EvidenceRef{
-		AnchorID: "anchor-secret", Kind: interaction.EvidenceDocument,
-		NodeIDs: []shoal.ID{"node-secret"}, Visibility: []string{"secret"},
-	}
-	open := EvidenceRef{
-		AnchorID: "anchor-open", Kind: interaction.EvidenceDocument,
-		NodeIDs: []shoal.ID{"node-open"},
-	}
-
-	for _, probe := range []struct {
-		name       string
-		visibility EvidenceVisibility
-		// want is the anchors a reader must receive, in order.
-		want    []shoal.ID
-		wantErr bool
-	}{
-		{
-			// No host filter at all. Nothing can evaluate the label, so
-			// nothing may be shown it — the same direction Attestations
-			// takes when nil.
-			name: "no evaluator is wired", want: []shoal.ID{"anchor-open"},
-		},
-		{
-			name:       "the reader holds the labels",
-			visibility: &stubEvidenceVisibility{visible: true},
-			want:       []shoal.ID{"anchor-secret", "anchor-open"},
-		},
-		{
-			name:       "the reader does not hold the labels",
-			visibility: &stubEvidenceVisibility{},
-			want:       []shoal.ID{"anchor-open"},
-		},
-		{
-			// A failing question is not a false answer. Returning the error
-			// keeps a transient fault from reading as a redaction, which
-			// would be indistinguishable from a permanent one.
-			name: "the question fails",
-			visibility: &stubEvidenceVisibility{
-				err: shoal.NewError(shoal.ErrorUnavailable, "label store down"),
-			},
-			wantErr: true,
-		},
-	} {
-		t.Run(probe.name, func(t *testing.T) {
-			fixture := newExecutorClaimFixture(t)
-			fixture.service.evidenceVisibility = probe.visibility
-			// Evidence lands on the stored record, as a completion would
-			// leave it.
-			stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
-			stored.Evidence = []EvidenceRef{labelled, open}
-			fixture.dispatchStore.records[string(fixture.queued.ID)] = stored
-
-			record, err := fixture.service.Status(
-				fixture.enqueuer, StatusRequest{
-					ID:      fixture.queued.ID,
-					Context: dispatchContext(fixture.now, "request"),
-				})
-			if probe.wantErr {
-				if err == nil {
-					t.Fatal("a failing visibility question was answered as " +
-						"a redaction, so a transient fault is " +
-						"indistinguishable from a permanent refusal")
->>>>>>> Stashed changes
 				}
 				return
 			}
 			if err != nil {
-<<<<<<< Updated upstream
 				t.Fatalf("a confined or already-narrow execution was "+
 					"refused: %v", err)
 			}
@@ -4534,21 +4431,110 @@ func TestExecuteClaimAppliesTheRetrievalConfinementCheck(t *testing.T) {
 		}
 	})
 }
-=======
+
+// stubEvidenceVisibility answers a fixed verdict, or fails.
+type stubEvidenceVisibility struct {
+	visible bool
+	err     error
+}
+
+func (s *stubEvidenceVisibility) VisibleToReader(
+	_ context.Context, _ []string,
+) (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
+	return s.visible, nil
+}
+
+// TestADispatchReaderSeesOnlyEvidenceItsLabelsCover is #369.
+//
+// Status, Pull and TeamActions authorize a reader on
+// (domain, source, policy, object) and applied no visibility-label check
+// before returning an ActionRecord, and webapi serializes Evidence in full:
+// anchor ID, citation document, revision, section and span identifiers,
+// character offsets, node and edge IDs, and the label expression itself.
+//
+// Every EvidenceRef records its own Visibility, so the record states which
+// labels apply, and nothing on the read path consulted it. An action enqueued
+// on source A, answered from a document in source B labelled
+// secret&project-x, handed its identifiers and that label expression to any
+// principal with dispatch or team-overview authority on A — holding neither
+// of B's labels. Content was not exposed; identity, structure and the label
+// expression were.
+//
+// Label enforcement in this plane normally happens at the scan: a document a
+// reader may not see does not come back from storage. An EvidenceRef is
+// different — it was recorded by the action's principal and is stored as a
+// field of the record — so it needed a check of its own.
+func TestADispatchReaderSeesOnlyEvidenceItsLabelsCover(t *testing.T) {
+	labelled := EvidenceRef{
+		AnchorID: "anchor-secret", Kind: interaction.EvidenceDocument,
+		NodeIDs: []shoal.ID{"node-secret"}, Visibility: []string{"secret"},
+	}
+	open := EvidenceRef{
+		AnchorID: "anchor-open", Kind: interaction.EvidenceDocument,
+		NodeIDs: []shoal.ID{"node-open"},
+	}
+
+	for _, probe := range []struct {
+		name       string
+		visibility EvidenceVisibility
+		want       []shoal.ID
+		wantErr    bool
+	}{
+		{
+			// No host filter at all. Nothing can evaluate the label, so
+			// nothing may be shown it — the direction Attestations takes
+			// when nil.
+			name: "no evaluator is wired", want: []shoal.ID{"anchor-open"},
+		},
+		{
+			name:       "the reader holds the labels",
+			visibility: &stubEvidenceVisibility{visible: true},
+			want:       []shoal.ID{"anchor-secret", "anchor-open"},
+		},
+		{
+			name:       "the reader does not hold the labels",
+			visibility: &stubEvidenceVisibility{},
+			want:       []shoal.ID{"anchor-open"},
+		},
+		{
+			// A failing question is not a false answer. Returning the error
+			// keeps a transient fault from reading as a redaction, which
+			// would be indistinguishable from a permanent one.
+			name: "the question fails",
+			visibility: &stubEvidenceVisibility{
+				err: shoal.NewError(shoal.ErrorUnavailable, "label store down"),
+			},
+			wantErr: true,
+		},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			fixture := newExecutorClaimFixture(t)
+			fixture.service.evidenceVisibility = probe.visibility
+			stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
+			stored.Evidence = []EvidenceRef{labelled, open}
+			fixture.dispatchStore.records[string(fixture.queued.ID)] = stored
+
+			record, err := fixture.service.Status(
+				fixture.enqueuer, StatusRequest{
+					ID:      fixture.queued.ID,
+					Context: dispatchContext(fixture.now, "request"),
+				})
+			if probe.wantErr {
+				if err == nil {
+					t.Fatal("a failing visibility question was answered as " +
+						"a redaction, so a transient fault is " +
+						"indistinguishable from a permanent refusal")
+				}
+				return
+			}
+			if err != nil {
 				t.Fatalf("Status = %v", err)
 			}
 			assertAnchors(t, "Status", record.Evidence, probe.want)
 
-			// No count of what was withheld, anywhere. A returned count that
-			// disagrees with the returned list is an existence oracle for the
-			// rest, which is what #398's rule forbids.
-			if len(record.Evidence) != len(probe.want) {
-				t.Fatalf("Status returned %d references for %d readable",
-					len(record.Evidence), len(probe.want))
-			}
-
-			// Every read path, because covering two of three is the mistake
-			// available here and each has its own return.
 			// TeamActions has its own operation, so the enqueuer's token
 			// cannot read it — the overview is a different authority, which
 			// is also why it is the widest audience for this evidence.
@@ -4610,6 +4596,9 @@ func TestExecuteClaimAppliesTheRetrievalConfinementCheck(t *testing.T) {
 	})
 }
 
+// assertAnchors compares the evidence a path returned, by anchor and in
+// order, and reports the whole list on a mismatch so a redaction that drops
+// the wrong reference is legible.
 func assertAnchors(
 	t *testing.T, path string, got []EvidenceRef, want []shoal.ID,
 ) {
@@ -4625,4 +4614,3 @@ func assertAnchors(
 		}
 	}
 }
->>>>>>> Stashed changes

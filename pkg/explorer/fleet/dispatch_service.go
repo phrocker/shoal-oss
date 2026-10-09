@@ -2256,11 +2256,11 @@ func (s *DispatchService) scanDispatchActions(
 	// The single filtering point for both page paths (#369).
 	//
 	// TeamActions and Pull both read the store through here, so redacting
-	// here covers both and there is one place for the rule to live. Earlier
-	// versions of this change also called readablePage at each path's own
-	// return; mutating those left every test green, because the records had
-	// already been filtered upstream — redundant, and three places for one
-	// rule to drift between.
+	// here covers both and there is one place for the rule to live. A first
+	// version also called readablePage at each path's own return; mutating
+	// those left every test green, because the records had already been
+	// filtered upstream — redundant, and three places for one rule to drift
+	// between.
 	//
 	// TeamActions is the widest audience: it is explicitly cross-principal,
 	// which is the point of an overview and also what extended the reach of
@@ -3232,7 +3232,6 @@ func actionEventKind(record ActionRecord) string {
 	}
 }
 
-<<<<<<< Updated upstream
 // refuseUnconfinedRetrieval refuses an in-process execution whose executor
 // cannot confine retrieval to the action's scope, when the invoking decision
 // permits more than that scope.
@@ -3327,24 +3326,23 @@ func withinScope(permitted [][]byte, scope []byte) bool {
 		}
 	}
 	return true
-=======
+}
+
 // readableRecord returns the record as this reader may see it, with evidence
 // references whose labels the reader does not hold removed.
 //
-// Dropped whole, and with no count of what was dropped. The alternative the
-// issue weighed — anchor identity with citation detail elided — leaves the
-// anchor ID, which is itself an identifier of material in a source the reader
-// may not see, and a returned count that disagrees with the returned list is
-// an existence oracle for the rest. #398's rule applies: a standing refusal
-// must not be distinguishable from absence, so a reader sees a record whose
-// evidence is what it may read and learns nothing about the remainder.
+// Dropped whole, and with no count of what was dropped. The alternative #369
+// weighed — anchor identity with citation detail elided — leaves the anchor
+// ID, which is itself an identifier of material in a source the reader may
+// not see, and a returned count that disagrees with the returned list is an
+// existence oracle for the rest. #398's rule applies: a standing refusal must
+// not be distinguishable from absence.
 //
 // What this gives up, stated rather than hidden: a reader cannot tell "this
 // action recorded no evidence" from "recorded evidence you may not see". That
-// is the correct trade here — the alternative discloses the thing the label
-// exists to protect — but it means a partial evidence list is not a
-// completeness claim, and a reader reconciling grounding must not read it as
-// one.
+// is the correct trade — the alternative discloses the thing the label exists
+// to protect — but it means a partial evidence list is not a completeness
+// claim, and a reader reconciling grounding must not read it as one.
 //
 // Unlabelled references are returned unchanged. An EvidenceRef with no
 // visibility expression carries no label to lack, so withholding it would
@@ -3402,5 +3400,4 @@ func (s *DispatchService) readablePage(
 		page.Actions[index] = readable
 	}
 	return page, nil
->>>>>>> Stashed changes
 }

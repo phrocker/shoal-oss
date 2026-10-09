@@ -1105,8 +1105,8 @@ type DispatchConfig struct {
 // EvidenceVisibility answers whether the current reader holds the labels an
 // evidence reference carries.
 //
-// It exists because label enforcement in this plane happens at the *scan*:
-// a document a reader may not see does not come back from storage, so no
+// It exists because label enforcement in this plane happens at the *scan*: a
+// document a reader may not see does not come back from storage, so no
 // service-layer filter was ever needed. An EvidenceRef on a dispatch record
 // is different — it was recorded by the action's principal and is stored as a
 // field of that record, so it is returned to whoever may read the record
