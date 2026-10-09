@@ -48,6 +48,9 @@ type approvalHarness struct {
 	// scheme is the OIDC identity scheme the service is opened under
 	// (#526); nil means none, as for a non-OIDC authenticator.
 	scheme *identitySchemeConfig
+	// recorded is the scheme of the last successful open: what the
+	// coordination store's row holds.
+	recorded *identitySchemeConfig
 }
 
 func newApprovalHarness(t *testing.T) *approvalHarness {
@@ -106,6 +109,7 @@ func (h *approvalHarness) tryOpen() error {
 		h.t.Fatal("embedded service did not compose approvals")
 	}
 	h.opened, h.isOpen = opened, true
+	h.recorded = h.scheme
 	return nil
 }
 

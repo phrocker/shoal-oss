@@ -336,7 +336,7 @@ type oidcAuthenticator struct {
 	approver           *approverMapping
 	workspaceAudiences map[string]struct{}
 	// identityClaim is the stable identity claim path (#526), or nil. When
-	// set, every principal on both branches is oidcid:<iss>#<value>, derived
+	// set, every principal on both branches is oidcid:<iss>#<tag>#<value>, derived
 	// by stableIdentity and by nothing else.
 	identityClaim []string
 }

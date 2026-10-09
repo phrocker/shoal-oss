@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/rand/v2"
+	"sort"
 	"strings"
 	"time"
 
@@ -523,8 +524,8 @@ type ApprovalConfig struct {
 	// DefaultApprovalWindow. It is clamped to each request's deadline.
 	Window time.Duration
 	// IdentityScheme is how the host names its principals (#526). The zero
-	// value is the legacy scheme, which is what every host that does not
-	// configure a stable identity claim runs under.
+	// value configures no namespace rule and stamps nothing: a host whose
+	// principals are not OIDC-minted.
 	IdentityScheme IdentityScheme
 }
 
@@ -532,63 +533,79 @@ type ApprovalConfig struct {
 //
 // Separation of duty compares identities, so it is only meaningful while the
 // requester and the approver are named in one identity space. A host that
-// changes how it names principals — from a per-client sub to a stable claim,
-// say — changes every identity, and an identity under the old scheme cannot
-// be compared with one under the new: the same human can hold one of each.
+// changes how it names principals changes every identity, and an identity
+// under one scheme cannot be compared with one under another: the same human
+// can hold one of each. So the rule is not a list of schemes that used to be
+// in force — that list cannot be complete across every switch history and
+// every mixed rollout — but the converse: within the host's identity family,
+// only the namespace in force is acceptable.
 type IdentityScheme struct {
-	// Digest identifies the scheme in force. Zero is the legacy scheme.
+	// Digest stamps requests (ApprovalRecord.IdentityScheme). Zero is the
+	// default, sub-derived scheme, which is also what every record written
+	// before the stamp existed decodes as.
 	Digest auth.Digest
-	// Prefix begins every identity the scheme in force mints. Required when
-	// Digest is set; a decision whose subject does not begin with it is not
-	// under the scheme in force.
+	// Prefix is the namespace in force: it begins every identity the scheme
+	// in force mints. It must itself begin with one of Family.
 	Prefix string
-	// Legacy are the namespaces (identity prefixes) of schemes no longer in
-	// force. While a scheme is in force, an approval that involves any
-	// identity in one of them is refused: the human behind it may be the
-	// approver under the new name. Adoption (#526 PR2) moves a registration
-	// from a legacy namespace to the new one; until then approvals for it
-	// fail closed. Empty when Digest is zero.
-	Legacy []string
+	// Family are the namespaces (identity prefixes) this host's
+	// authenticator can mint under any of its schemes, for this issuer. An
+	// identity in the family but outside Prefix was minted under another
+	// scheme, and is refused wherever it is involved in an approval.
+	// Identities outside the family — other issuers, service and development
+	// principals, MCP — are not this rule's business. Empty, with an empty
+	// Prefix and a zero Digest, configures no rule.
+	Family []string
 }
 
 func (s IdentityScheme) validate() error {
-	if s.Digest == (auth.Digest{}) {
-		if s.Prefix != "" || len(s.Legacy) > 0 {
+	if s.Prefix == "" {
+		if s.Digest != (auth.Digest{}) || len(s.Family) > 0 {
 			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"the legacy identity scheme has no prefix or legacy namespaces")
+				shoal.ErrorInvalidArgument, "identity scheme prefix is required")
 		}
 		return nil
 	}
-	if s.Prefix == "" {
-		return shoal.NewError(
-			shoal.ErrorInvalidArgument, "identity scheme prefix is required")
-	}
-	for _, namespace := range s.Legacy {
-		if namespace == "" || strings.HasPrefix(s.Prefix, namespace) ||
-			strings.HasPrefix(namespace, s.Prefix) {
+	inFamily := false
+	for _, namespace := range s.Family {
+		if namespace == "" {
 			return shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"a legacy identity namespace must be disjoint from the scheme in force")
+				shoal.ErrorInvalidArgument, "an identity namespace is empty")
 		}
+		if strings.HasPrefix(s.Prefix, namespace) {
+			inFamily = true
+		}
+	}
+	if !inFamily {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"the identity scheme prefix must be in its identity family")
 	}
 	return nil
 }
 
-// of is the scheme an identity was minted under: Digest when it is in the
-// scheme in force, and the legacy scheme otherwise.
+// of is the stamp for an identity: Digest when it is in the namespace in
+// force, and zero otherwise.
 func (s IdentityScheme) of(identity shoal.ID) auth.Digest {
-	if s.Digest != (auth.Digest{}) && strings.HasPrefix(string(identity), s.Prefix) {
+	if s.Prefix != "" && strings.HasPrefix(string(identity), s.Prefix) {
 		return s.Digest
 	}
 	return auth.Digest{}
 }
 
-// legacyNamespace returns the first legacy namespace, in configured order,
-// that any of the identities is in, or "".
-func (s IdentityScheme) legacyNamespace(identities map[shoal.ID]struct{}) string {
-	for _, namespace := range s.Legacy {
-		for identity := range identities {
+// foreignNamespace returns the family namespace of the first identity (in
+// sorted order, so the answer is stable) that is in the family but not in
+// the namespace in force, or "".
+func (s IdentityScheme) foreignNamespace(identities []shoal.ID) string {
+	if s.Prefix == "" {
+		return ""
+	}
+	sorted := append([]shoal.ID(nil), identities...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	for _, identity := range sorted {
+		if strings.HasPrefix(string(identity), s.Prefix) {
+			continue
+		}
+		for _, namespace := range s.Family {
 			if strings.HasPrefix(string(identity), namespace) {
 				return namespace
 			}
@@ -598,7 +615,7 @@ func (s IdentityScheme) legacyNamespace(identities map[shoal.ID]struct{}) string
 }
 
 func cloneIdentityScheme(s IdentityScheme) IdentityScheme {
-	s.Legacy = append([]string(nil), s.Legacy...)
+	s.Family = append([]string(nil), s.Family...)
 	return s
 }
 
@@ -1469,18 +1486,29 @@ func (s *ApprovalService) eligibility(
 		involved[ancestor.Subject] = struct{}{}
 		involved[ancestor.Actor] = struct{}{}
 	}
-	// Under a stable identity scheme (#526), an identity still in a legacy
-	// namespace is one this approver cannot be compared with: the human
-	// who registered an agent as oidc:<iss>#<sub> may be this approver under
-	// oidcid:. Refuse, naming the namespace and never the identity. Adoption
-	// (#526 PR2) moves a registration to the new namespace, which is how
-	// approvals for it resume.
-	if namespace := s.scheme.legacyNamespace(involved); namespace != "" {
+	// Within this host's identity family, only the namespace in force is
+	// comparable (#526). An identity minted under any other scheme — the
+	// sub-derived one, another stable claim path, legacy Entra — may be this
+	// approver under another name: the human who registered an agent as
+	// oidc:<iss>#<sub> may approve as oidcid:, and one who registered under
+	// one stable claim may approve under another. That holds under every
+	// scheme, the default one included, and across a mixed rollout, without
+	// listing which schemes came before. The approver's own identity is
+	// checked too. Refuse, naming the namespace and never the identity.
+	// Adoption (#526 PR2) moves a registration into the namespace in force,
+	// which is how approvals for it resume.
+	checked := make([]shoal.ID, 0, len(involved)+2)
+	for identity := range involved {
+		checked = append(checked, identity)
+	}
+	checked = append(checked, decision.Subject(), decision.Actor())
+	if namespace := s.scheme.foreignNamespace(checked); namespace != "" {
 		return Descriptor{}, shoal.NewError(
 			shoal.ErrorUnauthorized,
-			"an identity involved in the request is in the legacy namespace "+
-				namespace+"; it must be adopted into the identity scheme in "+
-				"force before the request can be approved")
+			"an identity involved in the request is in namespace "+namespace+
+				", not the namespace in force "+s.scheme.Prefix+"; it must be "+
+				"adopted into the identity scheme in force before the request "+
+				"can be approved")
 	}
 	// Read this loop as one comparison for an OIDC approver, not two. A
 	// mapped approver's decision is minted with actor = subject

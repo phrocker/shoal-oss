@@ -225,15 +225,18 @@ explorer:
       approverMapping: {}
       # A stable identity claim (#526) as a list of path segments, for example
       # [oid] for Entra on a tenant issuer. Requesters and approvers are then
-      # named oidcid:<issuer>#<value> on both branches. approverMapping must
-      # restate it as identity_claim. Switching an existing deployment to it
-      # is a scheme change, which the workspace refuses to start on without
-      # identitySchemeMigrate; see docs/approval.md.
+      # named oidcid:<issuer>#<path tag>#<value> on both branches.
+      # approverMapping must restate it as identity_claim. Switching an
+      # existing deployment to it is a scheme change, which the workspace
+      # refuses to start on without identitySchemeMigrateFrom; see
+      # docs/approval.md.
       identityClaim: []
-      # -oidc-identity-scheme-migrate: accept and record a changed identity
-      # scheme. Set it for the one rollout that switches, then unset it, so a
-      # misconfigured later rollout is refused rather than recorded.
-      identitySchemeMigrate: false
+      # -oidc-identity-scheme-migrate: the 64-hex-digit digest of the recorded
+      # scheme this rollout replaces, as the startup refusal prints it. A
+      # replica starts only if the recorded scheme is that one or already its
+      # own, so the value cannot move the record twice; unset it once the
+      # rollout is done.
+      identitySchemeMigrateFrom: ""
   # Disclosure posture. Both settings are deployment choices, not defaults to
   # inherit silently: see docs/shoal-explore-web-deploy.md and #372.
   disclosure:

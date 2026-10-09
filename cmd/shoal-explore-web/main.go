@@ -342,14 +342,16 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"oidc-identity-claim", "",
 		"Stable identity claim (#526) as a JSON array of path segments, such "+
 			"as '[\"oid\"]'. Requesters and approvers are then named "+
-			"oidcid:<iss>#<value> on both branches; the approver mapping must "+
+			"oidcid:<iss>#<tag>#<value> on both branches; the approver mapping must "+
 			"restate it as identity_claim. Environment fallback "+
 			"SHOAL_OIDC_IDENTITY_CLAIM")
-	oidcIdentitySchemeMigrate := flags.Bool(
-		"oidc-identity-scheme-migrate", false,
-		"Accept a change of the identity scheme recorded for -oidc-issuer and "+
-			"record the new one. Without it a replica whose scheme differs "+
-			"from the recorded one refuses to start")
+	oidcIdentitySchemeMigrate := flags.String(
+		"oidc-identity-scheme-migrate", "",
+		"One-shot identity scheme switch: the digest (64 hex digits, as the "+
+			"startup refusal prints it) of the scheme recorded for -oidc-issuer "+
+			"that this rollout replaces. Startup proceeds only if the recorded "+
+			"scheme is that one, or already this replica's. Without it a "+
+			"replica whose scheme differs from the recorded one refuses to start")
 	oidcTokenEndpoint := flags.String(
 		"oidc-token-endpoint", "",
 		"Token endpoint override for browser login; otherwise read from "+
@@ -565,10 +567,18 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 				listener.Addr(), err)
 		}
 		approverMapping = oidcAuthenticator.approverMappingDigest()
+		migrateFrom, err := parseIdentitySchemeMigrate(
+			strings.TrimSpace(*oidcIdentitySchemeMigrate))
+		if err != nil {
+			listener.Close()
+			return err
+		}
 		scheme := oidcAuthenticator.identityScheme()
 		identityScheme = &identitySchemeConfig{
-			scheme: scheme, migrate: *oidcIdentitySchemeMigrate,
+			scheme: scheme, migrateFrom: migrateFrom,
 		}
+		fmt.Fprintf(output, "OIDC identity scheme for %s: %s\n",
+			scheme.issuer, coordination.Digest(scheme.digest))
 		browserAuth, err = oidcAuthenticator.browserAuthConfig(ctx)
 		if err != nil {
 			listener.Close()

@@ -18,7 +18,9 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -51,7 +53,7 @@ func newStableWorld(
 }
 
 func (w *oidcApprovalWorld) stable(value string) shoal.ID {
-	return shoal.ID(oidcStableIdentityPrefix + w.issuer.server.URL + "#" + value)
+	return shoal.ID(w.authn.Load().stableIdentityNamespace() + value)
 }
 
 // approverTokenWith is a human's approver-audience token with extra claims;
@@ -308,7 +310,7 @@ func TestStableIdentityClaimPathIsNotADottedString(t *testing.T) {
 	}
 }
 
-// TestStableIdentityFormatCannotCollide: oidcid:<iss>#<value> is injective in
+// TestStableIdentityFormatCannotCollide: oidcid:<iss>#<tag>#<value> is injective in
 // the value and disjoint from every sub-derived identity. A sub that is
 // literally a stable identity does not make its holder that identity, an
 // oid containing '#' names its own identity, and a sub-derived identity of
@@ -359,15 +361,36 @@ func TestStableIdentityFormatCannotCollide(t *testing.T) {
 		t.Fatalf("a sub-derived identity entered the stable namespace: %q", subject)
 	}
 	approvals := w.authn.Load().identityScheme().approvals
-	legacyNamespace := false
-	for _, namespace := range approvals.Legacy {
+	inFamily := false
+	for _, namespace := range approvals.Family {
 		if strings.HasPrefix(subject, namespace) {
-			legacyNamespace = true
+			inFamily = true
 		}
 	}
-	if !legacyNamespace || strings.HasPrefix(subject, approvals.Prefix) {
-		t.Fatalf("the sub-derived identity %q is not in a legacy namespace of %+v",
+	if !inFamily || strings.HasPrefix(subject, approvals.Prefix) {
+		t.Fatalf("the sub-derived identity %q is not a foreign family member of %+v",
 			subject, approvals)
+	}
+
+	// Two stable claim paths never share a namespace, so a value under one
+	// can never be read as the same value under the other.
+	paths := map[string][]string{
+		"oid": {"oid"}, "uid": {"uid"}, "nested": {"ext", "oid"}, "dotted": {"ext.oid"},
+	}
+	seen := map[string]string{}
+	for name, path := range paths {
+		tag := claimPathTag(path)
+		if len(tag) != 16 {
+			t.Fatalf("claim path tag %q is not 16 hex digits", tag)
+		}
+		if previous, ok := seen[tag]; ok {
+			t.Fatalf("%s and %s share a namespace", name, previous)
+		}
+		seen[tag] = name
+	}
+	if !strings.HasPrefix(string(w.stable("x")),
+		oidcStableIdentityPrefix+w.issuer.server.URL+"#"+claimPathTag([]string{"oid"})+"#") {
+		t.Fatalf("the stable identity does not carry its claim path tag: %s", w.stable("x"))
 	}
 }
 
@@ -379,16 +402,59 @@ func assertSchemeMoved(t *testing.T, name string, got answer) {
 	}
 }
 
-// switchToStable is the operator switching the issuer to the stable claim.
-// It returns the open error without migrate when migrate is false.
-func (w *oidcApprovalWorld) switchToStable(migrate bool) error {
+// schemeConfig is the authenticator configuration of one identity scheme:
+// claim nil is the default, sub-derived scheme.
+func (w *oidcApprovalWorld) schemeConfig(claim []string) (func(*oidcConfig), map[string]any) {
+	if claim == nil {
+		return nil, approverMappingDocument(w.issuer.server.URL)
+	}
+	return stableEdit(w.t, claim), stableMappingDocument(claim)(w.issuer.server.URL)
+}
+
+// authenticatorFor is a real authenticator on another scheme over the same
+// issuer: what a replica configured for that scheme runs.
+func (w *oidcApprovalWorld) authenticatorFor(claim []string) webapi.Authenticator {
 	w.t.Helper()
-	claim := []string{"oid"}
-	w.edit = stableEdit(w.t, claim)
-	w.migrate = migrate
-	w.configure(stableMappingDocument(claim)(w.issuer.server.URL))
+	edit, document := w.schemeConfig(claim)
+	config := approverTestConfig(w.t, w.issuer, w.h.now, document)
+	if edit != nil {
+		edit(&config)
+	}
+	return webapi.AuthenticatorFunc(newTestOIDCAuthenticator(w.t, config).Authenticate)
+}
+
+// switchScheme is the operator switching the issuer's identity scheme and
+// restarting. With migrate the restart names the recorded scheme being
+// replaced, as -oidc-identity-scheme-migrate does; it returns the open error.
+func (w *oidcApprovalWorld) switchScheme(claim []string, migrate bool) error {
+	w.t.Helper()
+	previous := coordination.Digest(w.h.recorded.scheme.digest)
+	w.edit, _ = w.schemeConfig(claim)
+	w.migrateFrom = coordination.Digest{}
+	if migrate {
+		w.migrateFrom = previous
+	}
+	_, document := w.schemeConfig(claim)
+	w.configure(document)
 	w.h.close()
 	return w.h.tryOpen()
+}
+
+func (w *oidcApprovalWorld) switchToStable(migrate bool) error {
+	return w.switchScheme([]string{"oid"}, migrate)
+}
+
+// assertForeignNamespace is the namespace rule's refusal, naming the
+// namespace and never the identity.
+func assertForeignNamespace(t *testing.T, name string, got answer, namespace, hidden string) {
+	t.Helper()
+	if got.status != http.StatusUnauthorized ||
+		!strings.Contains(got.Message, "in namespace "+namespace+",") {
+		t.Fatalf("%s = %d %s, want the refusal naming %s", name, got.status, got.raw, namespace)
+	}
+	if hidden != "" && strings.Contains(string(got.raw), hidden) {
+		t.Fatalf("%s: the refusal discloses the identity %q: %s", name, hidden, got.raw)
+	}
 }
 
 // TestStableIdentitySwitchStrandsPreSwitchRequests: a request made under the
@@ -420,8 +486,10 @@ func TestStableIdentitySwitchStrandsPreSwitchRequests(t *testing.T) {
 	if err := w.switchToStable(true); err != nil {
 		t.Fatalf("migrating the scheme: %v", err)
 	}
-	// Once recorded, a restart under the same scheme needs no flag.
-	w.migrate = false
+	// Once recorded, a restart under the same scheme needs no flag — and one
+	// left set, naming the scheme it replaced, is harmless on this scheme.
+	h.reopen()
+	w.migrateFrom = coordination.Digest{}
 	w.configure(stableMappingDocument([]string{"oid"})(w.issuer.server.URL))
 	h.reopen()
 
@@ -466,7 +534,8 @@ func TestStableIdentitySwitchStrandsPreSwitchRequests(t *testing.T) {
 // identity no stable approver can be compared with — the registrant may be
 // the approver under oidcid:. Approval is refused, naming the namespace and
 // not the identity, until adoption (#526 PR2). An agent registered under the
-// stable scheme is approvable, so the refusal is the namespace's.
+// stable scheme is approvable, and so is one registered by a principal
+// outside the OIDC family, so the refusal is the namespace's.
 func TestStableIdentityLegacyRegistrationBlocksApproval(t *testing.T) {
 	w := newOIDCApprovalWorld(t, nil, oid("oid-owner"))
 	h := w.h
@@ -476,18 +545,123 @@ func TestStableIdentityLegacyRegistrationBlocksApproval(t *testing.T) {
 	alice := call{token: w.fleetToken("alice", oid("oid-alice"))}
 	receipt := w.mustHold(alice, h.held("legacy-agent"), "gateway")
 	bob := call{token: w.approverTokenWith("bob", oid("oid-bob"))}
-	got := w.decide(bob, receipt)
-	namespace := oidcIdentityPrefix + w.issuer.server.URL + "#"
-	if got.status != http.StatusUnauthorized ||
-		!strings.Contains(got.Message, "legacy namespace "+namespace) {
-		t.Fatalf("approving work on a legacy registration = %d %s", got.status, got.raw)
-	}
-	if strings.Contains(got.Message, namespace+"owner") ||
-		strings.Contains(string(got.raw), "owner") {
-		t.Fatalf("the refusal discloses the legacy identity: %s", got.raw)
-	}
+	assertForeignNamespace(t, "approving work on a legacy registration",
+		w.decide(bob, receipt), oidcIdentityPrefix+w.issuer.server.URL+"#", "owner")
 
 	// Control: an agent registered under the stable scheme.
 	w.register(w.fleetToken("carol", oid("oid-carol")), "stable-agent", "")
 	w.mustDecide(bob, w.mustHold(alice, h.held("stable-agent-request"), "stable-agent"))
+
+	// Outside the family: a service principal's registration ("owner" /
+	// "operator", not an OIDC identity) is not this rule's business.
+	if _, err := h.register("service-agent", "service-registration", 0, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	w.mustDecide(bob, w.mustHold(alice, h.held("service-agent-request"), "service-agent"))
+}
+
+// TestStableIdentityStableToStableSwitchIsRefused is review finding (a):
+// stable ["oid"] then stable ["uid"]. Bob registered his agent under oid;
+// after the switch he approves as his uid. Each stable claim path has a
+// namespace of its own, and only the one in force is comparable, so this is
+// refused — naming oidcid:<iss>#, never Bob.
+func TestStableIdentityStableToStableSwitchIsRefused(t *testing.T) {
+	both := func(subject string) jwt.MapClaims {
+		return jwt.MapClaims{"oid": "oid-" + subject, "uid": "uid-" + subject}
+	}
+	w := newStableWorld(t, []string{"oid"}, both("owner"))
+	h := w.h
+	w.register(w.fleetToken("bob-ws", both("bob")), "bobs-agent", "")
+	if err := w.switchScheme([]string{"uid"}, true); err != nil {
+		t.Fatal(err)
+	}
+	alice := call{token: w.fleetToken("alice-ws", both("alice"))}
+	bob := call{token: w.approverTokenWith("bob-console", both("bob"))}
+	receipt := w.mustHold(alice, h.held("oid-to-uid"), "bobs-agent")
+	assertForeignNamespace(t, "self-approval across stable claim paths",
+		w.decide(bob, receipt), oidcStableIdentityPrefix+w.issuer.server.URL+"#", "bob")
+
+	// Control: the same approver on an agent registered under uid.
+	w.register(w.fleetToken("carol-ws", both("carol")), "carols-agent", "")
+	w.mustDecide(bob, w.mustHold(alice, h.held("uid-control"), "carols-agent"))
+}
+
+// TestStableIdentityStableToDefaultSwitchIsRefused is review finding (b):
+// stable ["oid"] back to the default sub-derived scheme. The default scheme
+// is held to the same rule: an oidcid: registrant is foreign to it.
+func TestStableIdentityStableToDefaultSwitchIsRefused(t *testing.T) {
+	w := newStableWorld(t, []string{"oid"}, oid("oid-owner"))
+	h := w.h
+	w.register(w.fleetToken("bob", oid("oid-bob")), "bobs-agent", "")
+	// The default scheme needs public subjects again.
+	w.issuer.mu.Lock()
+	w.issuer.subjectTypes = []string{"public"}
+	w.issuer.mu.Unlock()
+	if err := w.switchScheme(nil, true); err != nil {
+		t.Fatal(err)
+	}
+	alice := call{token: w.fleetToken("alice", nil)}
+	bob := call{token: w.approverToken("bob")}
+	receipt := w.mustHold(alice, h.held("stable-to-sub"), "bobs-agent")
+	assertForeignNamespace(t, "self-approval after switching back to sub",
+		w.decide(bob, receipt), oidcStableIdentityPrefix+w.issuer.server.URL+"#", "oid-bob")
+
+	w.register(w.fleetToken("carol", nil), "carols-agent", "")
+	// The approver is held to the namespace too: Bob through an authenticator
+	// still on the stable scheme, on work otherwise wholly in the default
+	// namespace, is refused. (The stamp cannot catch this: the default scheme
+	// does not stamp.)
+	controlReceipt := w.mustHold(alice, h.held("sub-control"), "carols-agent")
+	assertForeignNamespace(t, "an approver minted under another scheme",
+		w.decide(call{token: w.approverTokenWith("bob", oid("oid-bob")),
+			authn: w.authenticatorFor([]string{"oid"})}, controlReceipt),
+		oidcStableIdentityPrefix+w.issuer.server.URL+"#", "oid-bob")
+	w.mustDecide(bob, controlReceipt)
+}
+
+// TestStableIdentityMixedRolloutFailsClosed is review finding (c): the row is
+// checked only at startup, so during a rollout a replica on the old scheme
+// and one on the new serve the same store. Two real authenticators on
+// different schemes act against one store — one as registrant, the other as
+// approver — with the service first on the old scheme (the old replica's
+// view) and then on the new (the new replica's). Both views refuse.
+func TestStableIdentityMixedRolloutFailsClosed(t *testing.T) {
+	both := func(subject string) jwt.MapClaims {
+		return jwt.MapClaims{"oid": "oid-" + subject, "uid": "uid-" + subject}
+	}
+	w := newStableWorld(t, []string{"oid"}, both("owner"))
+	h := w.h
+	oldReplica := w.authenticatorFor([]string{"oid"})
+	newReplica := w.authenticatorFor([]string{"uid"})
+	family := oidcStableIdentityPrefix + w.issuer.server.URL + "#"
+
+	// The old replica's view: Bob registered through the new replica, and
+	// approves through the old one under his oid.
+	w.registerWith(call{token: w.fleetToken("bob-ws", both("bob")), authn: newReplica},
+		"bobs-new-agent", "")
+	receipt := w.mustHold(call{token: w.fleetToken("alice-ws", both("alice")),
+		authn: oldReplica}, h.held("mixed-old"), "bobs-new-agent")
+	assertForeignNamespace(t, "the old replica, a registrant from the new",
+		w.decide(call{token: w.approverTokenWith("bob-console", both("bob")),
+			authn: oldReplica}, receipt), family, "bob")
+
+	// The new replica's view: Bob registered through the old replica, and
+	// approves through the new one under his uid.
+	w.registerWith(call{token: w.fleetToken("bob-ws", both("bob")), authn: oldReplica},
+		"bobs-old-agent", "")
+	if err := w.switchScheme([]string{"uid"}, true); err != nil {
+		t.Fatal(err)
+	}
+	receipt = w.mustHold(call{token: w.fleetToken("alice-ws", both("alice")),
+		authn: newReplica}, h.held("mixed-new"), "bobs-old-agent")
+	assertForeignNamespace(t, "the new replica, a registrant from the old",
+		w.decide(call{token: w.approverTokenWith("bob-console", both("bob")),
+			authn: newReplica}, receipt), family, "bob")
+	// And a request the old replica made is stamped with the old scheme, so
+	// the new replica cannot decide it at all.
+	assertSchemeMoved(t, "an old replica's request on the new replica",
+		w.decide(call{token: w.approverTokenWith("carol-console", both("carol")),
+			authn: newReplica}, w.mustHold(call{
+			token: w.fleetToken("alice-ws", both("alice")), authn: oldReplica},
+			h.held("mixed-stamp"), "bobs-old-agent")))
 }

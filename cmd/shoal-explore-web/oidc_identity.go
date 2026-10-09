@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,6 +47,8 @@ const (
 	maxStableIdentityBytes = 256
 	// identitySchemeDigestTag domain-separates the identity scheme digest.
 	identitySchemeDigestTag = "shoal-explore-web/identity-scheme/v1"
+	// identityClaimPathTag domain-separates the claim path tag.
+	identityClaimPathTag = "shoal-explore-web/identity-claim-path/v1"
 )
 
 // mutableIdentityClaims are claims an issuer lets a human, or an
@@ -190,10 +193,33 @@ func stableIdentityValue(claims jwt.MapClaims, path []string) (string, error) {
 	return text, nil
 }
 
-// stableIdentity returns oidcid:<iss>#<value> and the raw value. The issuer
-// is this deployment's one configured issuer, so the value is everything
-// after the first '#' following the prefix; a value containing '#' is still
-// one identity.
+// claimPathTag is the namespace segment of a stable identity: the first 16
+// hex digits of a digest of the claim path. Two stable schemes on one issuer
+// therefore never share a namespace, so an identity minted under one cannot
+// be read as one minted under another.
+func claimPathTag(path []string) string {
+	var buffer bytes.Buffer
+	for _, segment := range path {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(segment)))
+		buffer.Write(length[:])
+		buffer.WriteString(segment)
+	}
+	digest := auth.DigestBytes(identityClaimPathTag, buffer.Bytes())
+	return hex.EncodeToString(digest[:8])
+}
+
+// stableIdentityNamespace is oidcid:<iss>#<path tag>#, the namespace every
+// identity of the scheme in force begins with.
+func (a *oidcAuthenticator) stableIdentityNamespace() string {
+	return oidcStableIdentityPrefix + a.expectedIssuer + "#" +
+		claimPathTag(a.identityClaim) + "#"
+}
+
+// stableIdentity returns oidcid:<iss>#<path tag>#<value> and the raw value.
+// The issuer is this deployment's one configured issuer and the tag is fixed
+// length, so the value is everything after the tag's '#'; a value containing
+// '#' is still one identity.
 func (a *oidcAuthenticator) stableIdentity(
 	claims jwt.MapClaims,
 ) (shoal.ID, string, error) {
@@ -201,8 +227,7 @@ func (a *oidcAuthenticator) stableIdentity(
 	if err != nil {
 		return "", "", err
 	}
-	return shoal.ID(oidcStableIdentityPrefix + a.expectedIssuer + "#" + value),
-		value, nil
+	return shoal.ID(a.stableIdentityNamespace() + value), value, nil
 }
 
 // oidcIdentityScheme is the identity scheme this authenticator mints under.
@@ -212,17 +237,32 @@ type oidcIdentityScheme struct {
 	// digest is the scheme: issuer, claim path and identity format. Every
 	// replica serving the issuer must agree on it.
 	digest auth.Digest
-	// approvals is what the approval service is told: the zero value under
-	// a sub-derived scheme, and under a stable one the scheme, its prefix,
-	// and the legacy namespaces whose identities cannot be compared with it.
+	// approvals is what the approval service is told: the namespace in
+	// force, the identity family it belongs to, and the stamp (zero under
+	// the default sub-derived scheme, which is what records written before
+	// the stamp existed decode as).
 	approvals fleet.IdentityScheme
 }
 
-// identityScheme describes the scheme in force. Under the stable scheme the
-// legacy namespaces are this issuer's oidc: identities and every entra:
-// identity. entra: identities are not issuer-scoped, and a deployment that
-// switches to the stable scheme has refused legacy Entra mode, so any entra:
-// identity it holds is a legacy one.
+// identityFamily is every namespace this authenticator could mint into for
+// its issuer under any scheme: sub-derived (oidc:<iss>#), any stable claim
+// path (oidcid:<iss>#), and legacy Entra (entra:, which is not issuer-scoped
+// but is only ever minted for the one configured Entra issuer).
+func (a *oidcAuthenticator) identityFamily(current string) []string {
+	family := []string{
+		oidcIdentityPrefix + a.expectedIssuer + "#",
+		oidcStableIdentityPrefix + a.expectedIssuer + "#",
+		legacyEntraPrefix,
+	}
+	for _, namespace := range family {
+		if strings.HasPrefix(current, namespace) {
+			return family
+		}
+	}
+	return append(family, current)
+}
+
+// identityScheme describes the scheme in force.
 func (a *oidcAuthenticator) identityScheme() oidcIdentityScheme {
 	var buffer bytes.Buffer
 	text := func(value string) {
@@ -233,7 +273,7 @@ func (a *oidcAuthenticator) identityScheme() oidcIdentityScheme {
 	}
 	scheme := oidcIdentityScheme{issuer: a.expectedIssuer}
 	if a.identityClaim != nil {
-		prefix := oidcStableIdentityPrefix + a.expectedIssuer + "#"
+		prefix := a.stableIdentityNamespace()
 		text("stable")
 		text(a.expectedIssuer)
 		text(fmt.Sprint(len(a.identityClaim)))
@@ -243,11 +283,8 @@ func (a *oidcAuthenticator) identityScheme() oidcIdentityScheme {
 		text(prefix)
 		scheme.digest = auth.DigestBytes(identitySchemeDigestTag, buffer.Bytes())
 		scheme.approvals = fleet.IdentityScheme{
-			Digest: scheme.digest,
-			Prefix: prefix,
-			Legacy: []string{
-				oidcIdentityPrefix + a.expectedIssuer + "#", legacyEntraPrefix,
-			},
+			Digest: scheme.digest, Prefix: prefix,
+			Family: a.identityFamily(prefix),
 		}
 		return scheme
 	}
@@ -258,5 +295,9 @@ func (a *oidcAuthenticator) identityScheme() oidcIdentityScheme {
 	text(a.identityPrefix)
 	text(fmt.Sprint(a.trimIdentityValues))
 	scheme.digest = auth.DigestBytes(identitySchemeDigestTag, buffer.Bytes())
+	// The stamp stays zero: sub-derived requests were always unstamped.
+	scheme.approvals = fleet.IdentityScheme{
+		Prefix: a.identityPrefix, Family: a.identityFamily(a.identityPrefix),
+	}
 	return scheme
 }

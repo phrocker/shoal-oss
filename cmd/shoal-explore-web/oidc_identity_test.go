@@ -272,14 +272,35 @@ func TestIdentitySchemeDigestNamesIssuerPathAndFormat(t *testing.T) {
 		}
 		seen[got.digest] = name
 	}
+	family := []string{
+		oidcIdentityPrefix + issuer.server.URL + "#",
+		oidcStableIdentityPrefix + issuer.server.URL + "#",
+		legacyEntraPrefix,
+	}
+	sameFamily := func(got []string) bool {
+		if len(got) != len(family) {
+			return false
+		}
+		for index := range got {
+			if got[index] != family[index] {
+				return false
+			}
+		}
+		return true
+	}
+	// The default scheme leaves the stamp zero (what unstamped records mean)
+	// and still holds approvals to its namespace.
 	if legacy := scheme(func(c *oidcConfig) {}); legacy.approvals.Digest != ([32]byte{}) ||
-		len(legacy.approvals.Legacy) != 0 {
+		legacy.approvals.Prefix != oidcIdentityPrefix+issuer.server.URL+"#" ||
+		!sameFamily(legacy.approvals.Family) {
 		t.Fatalf("the sub-derived scheme tells approvals %+v", legacy.approvals)
 	}
-	if stable.approvals.Prefix != oidcStableIdentityPrefix+issuer.server.URL+"#" ||
-		len(stable.approvals.Legacy) != 2 ||
-		stable.approvals.Legacy[0] != oidcIdentityPrefix+issuer.server.URL+"#" ||
-		stable.approvals.Legacy[1] != legacyEntraPrefix {
+	if stable.approvals.Prefix != oidcStableIdentityPrefix+issuer.server.URL+"#"+
+		claimPathTag([]string{"oid"})+"#" || !sameFamily(stable.approvals.Family) {
 		t.Fatalf("the stable scheme tells approvals %+v", stable.approvals)
+	}
+	nested := scheme(func(c *oidcConfig) { c.identityClaim = `["ext","oid"]` })
+	if nested.approvals.Prefix == stable.approvals.Prefix {
+		t.Fatal("two claim paths share a namespace")
 	}
 }

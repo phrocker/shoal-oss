@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -23,7 +24,20 @@ import (
 // the same way: a replica on the stable scheme beside one on sub would let
 // one human request through one and approve through the other. A replica
 // whose scheme differs from the recorded one therefore refuses to start, and
-// changing the scheme is an explicit operator act, -oidc-identity-scheme-migrate.
+// changing the scheme is an explicit operator act.
+//
+// The act is one-shot: -oidc-identity-scheme-migrate names the digest of the
+// scheme being replaced, and a replica proceeds only if the row holds exactly
+// that digest (it then records its own) or already holds its own (a later
+// replica of the same rollout). A flag left set therefore cannot move the
+// row again — after the switch the row holds the new scheme, which the flag
+// does not name — and two replicas on different schemes cannot flip it back
+// and forth, since each would need a flag naming the other's.
+//
+// The row is checked at startup only. A replica started before the switch
+// keeps serving until it is replaced; the approval service's namespace rule
+// refuses every approval that would compare identities across the two
+// schemes meanwhile, so a mixed rollout fails closed.
 //
 // Every OIDC deployment records its scheme, the sub-derived one included, so
 // that a later switch to a stable claim is seen as a switch.
@@ -38,11 +52,35 @@ var errIdentitySchemeMismatch = errors.New(
 	"the identity scheme configured for this issuer differs from the one " +
 		"recorded in the coordination store")
 
-// identitySchemeConfig is the OIDC identity scheme in force and whether the
-// operator has asked to replace a recorded one.
+// identitySchemeConfig is the OIDC identity scheme in force and, when the
+// operator is switching schemes, the digest of the scheme being replaced.
 type identitySchemeConfig struct {
-	scheme  oidcIdentityScheme
-	migrate bool
+	scheme oidcIdentityScheme
+	// migrateFrom is -oidc-identity-scheme-migrate: the recorded scheme this
+	// start may replace, or zero.
+	migrateFrom coordination.Digest
+}
+
+// parseIdentitySchemeMigrate reads -oidc-identity-scheme-migrate: empty, or
+// the 64 lowercase hex digits of the recorded scheme being replaced, as the
+// startup refusal prints it.
+func parseIdentitySchemeMigrate(raw string) (coordination.Digest, error) {
+	var digest coordination.Digest
+	if raw == "" {
+		return digest, nil
+	}
+	decoded, err := hex.DecodeString(raw)
+	if err != nil || len(decoded) != len(digest) ||
+		hex.EncodeToString(decoded) != raw {
+		return digest, fmt.Errorf("-oidc-identity-scheme-migrate must be the " +
+			"64 lowercase hex digits of the recorded identity scheme being " +
+			"replaced, as the startup refusal prints it")
+	}
+	copy(digest[:], decoded)
+	if digest == (coordination.Digest{}) {
+		return digest, fmt.Errorf("-oidc-identity-scheme-migrate names no scheme")
+	}
+	return digest, nil
 }
 
 // approvals is what the approval service is told; the zero value without an
@@ -96,7 +134,15 @@ func stampIdentityScheme(
 			return err
 		}
 		mutation := allocator.Mutation{Row: row}
+		configured := coordination.Digest(config.scheme.digest)
 		if len(cells) == 0 {
+			if config.migrateFrom != (coordination.Digest{}) {
+				return fmt.Errorf("refusing to start for issuer %s: "+
+					"-oidc-identity-scheme-migrate names scheme %s, but no "+
+					"scheme is recorded; upgrade every replica on the current "+
+					"scheme first, then switch", config.scheme.issuer,
+					config.migrateFrom)
+			}
 			mutation.Conditions = []allocator.Condition{{
 				Coordinate: coordinate, Absent: true,
 			}}
@@ -113,18 +159,20 @@ func stampIdentityScheme(
 				return fmt.Errorf("refusing to start: the recorded identity " +
 					"scheme names another issuer")
 			}
-			if stored.Scheme == coordination.Digest(config.scheme.digest) {
+			if stored.Scheme == configured {
 				return nil
 			}
-			if !config.migrate {
+			if config.migrateFrom != stored.Scheme {
 				return fmt.Errorf(
-					"refusing to start for issuer %s: %w; another replica, or "+
-						"this one before a restart, names principals "+
-						"differently, so one human could request through one "+
-						"and approve through the other. Configure every "+
-						"replica identically, or pass "+
-						"-oidc-identity-scheme-migrate to record this scheme",
-					config.scheme.issuer, errIdentitySchemeMismatch)
+					"refusing to start for issuer %s: %w (recorded %s, "+
+						"configured %s); another replica, or this one before a "+
+						"restart, names principals differently, so one human "+
+						"could request through one and approve through the "+
+						"other. Configure every replica identically, or, to "+
+						"switch, pass -oidc-identity-scheme-migrate=%s for "+
+						"this rollout",
+					config.scheme.issuer, errIdentitySchemeMismatch,
+					stored.Scheme, configured, stored.Scheme)
 			}
 			mutation.Conditions = []allocator.Condition{{
 				Coordinate: coordinate, Value: cells[0].Value,

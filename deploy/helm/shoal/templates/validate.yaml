@@ -105,6 +105,11 @@
 {{- fail "explorer.auth.oidc.identityClaim has a blank or non-string segment: each segment names one claim key, and the workspace refuses the flag at startup" -}}
 {{- end -}}
 {{- end -}}
+{{- with $oidc.identitySchemeMigrateFrom -}}
+{{- if not (regexMatch "^[0-9a-f]{64}$" (toString .)) -}}
+{{- fail (printf "explorer.auth.oidc.identitySchemeMigrateFrom must be the 64 lowercase hex digits of the recorded identity scheme this rollout replaces, as the workspace's startup refusal prints it (got %q): the switch is one-shot, and a value that names no scheme would be refused by every replica at startup" (toString .)) -}}
+{{- end -}}
+{{- end -}}
 {{- $approverMapping := default (dict) $oidc.approverMapping -}}
 {{- if not (kindIs "map" $approverMapping) -}}
 {{- fail "explorer.auth.oidc.approverMapping must be the shoal.approvers/v1 document as a map: the chart renders it into the file the workspace reads" -}}

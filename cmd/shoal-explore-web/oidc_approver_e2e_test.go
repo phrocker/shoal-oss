@@ -50,6 +50,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -62,8 +63,8 @@ type oidcApprovalWorld struct {
 	edit   func(*oidcConfig)
 	authn  atomic.Pointer[oidcAuthenticator]
 	digest atomic.Value // auth.Digest
-	// migrate is -oidc-identity-scheme-migrate for the next open (#526).
-	migrate bool
+	// migrateFrom is -oidc-identity-scheme-migrate for the next open (#526).
+	migrateFrom coordination.Digest
 
 	// server is a real listener. Its handler is rebuilt for every request
 	// from the service currently open, so a restart (h.reopen) and a
@@ -155,7 +156,7 @@ func (w *oidcApprovalWorld) configure(document map[string]any) {
 	// The identity scheme the binary would stamp and enforce (#526), taking
 	// effect at the next open, as the mapping does.
 	w.h.scheme = &identitySchemeConfig{
-		scheme: authenticator.identityScheme(), migrate: w.migrate,
+		scheme: authenticator.identityScheme(), migrateFrom: w.migrateFrom,
 	}
 }
 
@@ -367,6 +368,12 @@ func (w *oidcApprovalWorld) contextWire(deadline time.Time) map[string]any {
 
 func (w *oidcApprovalWorld) register(token string, id, parent shoal.ID) {
 	w.t.Helper()
+	w.registerWith(call{token: token}, id, parent)
+}
+
+// registerWith is register through the caller's authenticator.
+func (w *oidcApprovalWorld) registerWith(caller call, id, parent shoal.ID) {
+	w.t.Helper()
 	descriptor := map[string]any{
 		"id":                   b64([]byte(id)),
 		"authorization_domain": workspaceAuthorizationDomain,
@@ -380,7 +387,7 @@ func (w *oidcApprovalWorld) register(token string, id, parent shoal.ID) {
 	if parent != "" {
 		descriptor["parent_id"] = b64([]byte(parent))
 	}
-	got := w.post(call{token: token}, "/api/v1/fleet/agents", map[string]any{
+	got := w.post(caller, "/api/v1/fleet/agents", map[string]any{
 		"context":          w.contextWire(w.h.now().Add(time.Minute)),
 		"registration_key": b64([]byte("registration-" + string(id))),
 		"descriptor":       descriptor,

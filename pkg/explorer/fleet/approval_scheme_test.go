@@ -10,62 +10,101 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// TestIdentitySchemeShape (#526): the zero scheme is the legacy one and
-// carries nothing; a stable scheme names its prefix, and its legacy
-// namespaces are disjoint from it. An identity is under the stable scheme
-// only by its prefix, and anything else — including every identity under
-// the zero scheme — is legacy, which is what a record written before the
-// stamp decodes as.
+const testIssuerFamily = "https://issuer.example#"
+
+func testFamily() []string {
+	return []string{"oidc:" + testIssuerFamily, "oidcid:" + testIssuerFamily, "entra:"}
+}
+
+// TestIdentitySchemeShape (#526): the zero scheme configures no rule; a
+// configured one names a namespace in force inside its family. The stamp is
+// Digest only for an identity in the namespace in force.
 func TestIdentitySchemeShape(t *testing.T) {
 	stable := IdentityScheme{
 		Digest: auth.DigestBytes("scheme", []byte("stable")),
-		Prefix: "oidcid:https://issuer.example#",
-		Legacy: []string{"oidc:https://issuer.example#", "entra:"},
+		Prefix: "oidcid:" + testIssuerFamily + "0123456789abcdef#",
+		Family: testFamily(),
 	}
-	if err := stable.validate(); err != nil {
-		t.Fatalf("a stable scheme was refused: %v", err)
-	}
-	if err := (IdentityScheme{}).validate(); err != nil {
-		t.Fatalf("the legacy scheme was refused: %v", err)
+	subDerived := IdentityScheme{Prefix: "oidc:" + testIssuerFamily, Family: testFamily()}
+	for name, scheme := range map[string]IdentityScheme{
+		"none": {}, "stable": stable, "sub-derived": subDerived,
+	} {
+		if err := scheme.validate(); err != nil {
+			t.Fatalf("%s was refused: %v", name, err)
+		}
 	}
 	for name, scheme := range map[string]IdentityScheme{
-		"legacy with a prefix":    {Prefix: "oidcid:"},
-		"legacy with namespaces":  {Legacy: []string{"oidc:"}},
-		"stable without a prefix": {Digest: stable.Digest},
-		"empty namespace":         {Digest: stable.Digest, Prefix: stable.Prefix, Legacy: []string{""}},
-		"namespace covers prefix": {Digest: stable.Digest, Prefix: stable.Prefix, Legacy: []string{"oidc"}},
-		"prefix covers namespace": {Digest: stable.Digest, Prefix: "o", Legacy: []string{"oidc:"}},
+		"a digest without a prefix":   {Digest: stable.Digest},
+		"a family without a prefix":   {Family: testFamily()},
+		"a prefix outside its family": {Prefix: "mcp:", Family: testFamily()},
+		"an empty namespace":          {Prefix: stable.Prefix, Family: []string{""}},
 	} {
 		if err := scheme.validate(); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
 	}
 	for identity, want := range map[shoal.ID]auth.Digest{
-		"oidcid:https://issuer.example#oid-1": stable.Digest,
-		"oidc:https://issuer.example#sub-1":   {},
-		"oidcid:https://other.example#oid-1":  {},
-		"entra:oid-1":                         {},
+		shoal.ID(stable.Prefix + "oid-1"):                       stable.Digest,
+		"oidcid:" + testIssuerFamily + "fedcba9876543210#oid-1": {},
+		"oidc:" + testIssuerFamily + "sub-1":                    {},
+		"entra:oid-1":                                           {},
 	} {
 		if got := stable.of(identity); got != want {
-			t.Errorf("%s is under %x, want %x", identity, got, want)
+			t.Errorf("%s is stamped %x, want %x", identity, got, want)
 		}
-		if got := (IdentityScheme{}).of(identity); got != (auth.Digest{}) {
-			t.Errorf("under the legacy scheme %s is under %x", identity, got)
+		if got := subDerived.of(identity); got != (auth.Digest{}) {
+			t.Errorf("under the sub-derived scheme %s is stamped %x", identity, got)
 		}
 	}
-	involved := map[shoal.ID]struct{}{
-		"oidcid:https://issuer.example#oid-1": {}, "agent-7": {},
+}
+
+// TestIdentitySchemeOnlyTheNamespaceInForceIsComparable: within the family,
+// every namespace but the one in force is foreign — under a stable scheme
+// and under the default one alike, with no list of previous schemes — and
+// identities outside the family (development, service and MCP principals,
+// another issuer's) are never refused.
+func TestIdentitySchemeOnlyTheNamespaceInForceIsComparable(t *testing.T) {
+	oid := IdentityScheme{
+		Digest: auth.DigestBytes("scheme", []byte("oid")),
+		Prefix: "oidcid:" + testIssuerFamily + "0123456789abcdef#",
+		Family: testFamily(),
 	}
-	if got := stable.legacyNamespace(involved); got != "" {
-		t.Fatalf("no legacy identity is involved, got %q", got)
+	uid := IdentityScheme{
+		Digest: auth.DigestBytes("scheme", []byte("uid")),
+		Prefix: "oidcid:" + testIssuerFamily + "fedcba9876543210#",
+		Family: testFamily(),
 	}
-	involved["entra:oid-2"] = struct{}{}
-	involved["oidc:https://issuer.example#sub-1"] = struct{}{}
-	// In configured order, so the refusal names one namespace stably.
-	if got := stable.legacyNamespace(involved); got != "oidc:https://issuer.example#" {
-		t.Fatalf("legacy namespace = %q", got)
+	subDerived := IdentityScheme{Prefix: "oidc:" + testIssuerFamily, Family: testFamily()}
+	outside := []shoal.ID{
+		"alice", "dev-principal", "mcp:client-7", "service:indexer",
+		"oidc:https://other.example#bob", "oidcid:https://other.example#x#bob",
+		"gateway",
 	}
-	if got := (IdentityScheme{}).legacyNamespace(involved); got != "" {
-		t.Fatalf("the legacy scheme refuses %q", got)
+	for name, probe := range map[string]struct {
+		scheme  IdentityScheme
+		foreign shoal.ID
+		want    string
+	}{
+		"sub-derived identity under a stable scheme": {oid, "oidc:" + testIssuerFamily + "bob", "oidc:" + testIssuerFamily},
+		"another stable path under a stable scheme":  {oid, shoal.ID(uid.Prefix + "bob"), "oidcid:" + testIssuerFamily},
+		"entra under a stable scheme":                {oid, "entra:bob", "entra:"},
+		"stable identity under the default scheme":   {subDerived, shoal.ID(oid.Prefix + "bob"), "oidcid:" + testIssuerFamily},
+		"entra under the default scheme":             {subDerived, "entra:bob", "entra:"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			current := shoal.ID(probe.scheme.Prefix + "carol")
+			clean := append(append([]shoal.ID(nil), outside...), current)
+			if got := probe.scheme.foreignNamespace(clean); got != "" {
+				t.Fatalf("an identity outside the family, or in force, is foreign: %q", got)
+			}
+			if got := probe.scheme.foreignNamespace(
+				append(clean, probe.foreign)); got != probe.want {
+				t.Fatalf("foreign namespace = %q, want %q", got, probe.want)
+			}
+		})
+	}
+	if got := (IdentityScheme{}).foreignNamespace(
+		[]shoal.ID{"oidc:" + testIssuerFamily + "bob", "entra:bob"}); got != "" {
+		t.Fatalf("a host with no scheme refuses %q", got)
 	}
 }

@@ -145,7 +145,7 @@ asked as an approver:
 
   For an OIDC approver this is **one comparison, not two**. A mapped approver
   is minted with actor = subject (`oidc:<iss>#<sub>`, or
-  `oidcid:<iss>#<value>` under a stable identity claim; below), so the subject
+  `oidcid:<iss>#<tag>#<value>` under a stable identity claim; below), so the subject
   and actor checks test the same identity, and the separation margin is
   exactly "the approver's subject must not overlap anyone involved". That is
   not a weakening: before the mapping every OIDC token's actor was the
@@ -155,12 +155,12 @@ asked as an approver:
   OIDC request; the flow failed closed, under a refusal ("approver is not
   independent of the request") that misdescribed the cause.
 - The same identity scheme (#526). The approver must be named under the
-  scheme the request was stamped with; a request made before the issuer
-  switched to a stable identity claim cannot be decided
-  (`identity_scheme_moved`). And while a stable claim is in force, no
-  involved identity may be in a legacy namespace for the issuer
-  (`oidc:<iss>#`, or `entra:`): the refusal names the namespace. See
-  "Switching an issuer to the stable identity claim".
+  scheme the request was stamped with; a request made under another scheme
+  cannot be decided (`identity_scheme_moved`). And under every OIDC scheme,
+  the default one included, every involved identity in the issuer's OIDC
+  family (`oidc:<iss>#`, `oidcid:<iss>#`, `entra:`) must be in the namespace
+  in force; the refusal names the namespace. Identities outside the family
+  are not affected. See "Switching an issuer's identity scheme".
 - No delegation. A decision carrying `OnBehalfOf` is refused.
 - The approver must **fail** `dispatch`, `invoke` and `execute` on the scope.
   Under shared scopes, which every OIDC-minted principal has, holding approve
@@ -214,7 +214,7 @@ that promise, and every issuer needs one of them:
    Auth0 is expected to qualify this way; Okta too once the operator adds an
    `azp` claim.
 2. **A stable identity claim (#526).** With `-oidc-identity-claim`, both
-   branches name every principal `oidcid:<iss>#<value>`, read from the claim
+   branches name every principal `oidcid:<iss>#<tag>#<value>`, read from the claim
    the flag names by one shared derivation, and the subject-type statement is
    waived. This is how Microsoft Entra ID and Keycloak are supported.
 
@@ -293,18 +293,21 @@ asserts it by choosing the claim, per issuer as above. What the code
 guarantees:
 
 - **One derivation, both branches.** The workspace (requester) principal and
-  the approver principal are both named `oidcid:<iss>#<value>` by the same
-  helper. The value must be present and be a string of 1 to 256 bytes with no
+  the approver principal are both named `oidcid:<iss>#<tag>#<value>` by the
+  same helper, where `<tag>` is the first 16 hex digits of a digest of the
+  claim path. The value must be present and be a string of 1 to 256 bytes with no
   control character and no leading or trailing whitespace; it is never
   trimmed. Missing, `null`, empty, padded, too long, a number, an array or an
   object is the generic authentication denial on either branch. The flag is a
   JSON array of path segments, validated like the mapping's `claim`: a dotted
   string is refused, and a segment containing a dot names a key containing a
   dot, never a path.
-- **A namespace of its own.** `oidcid:` cannot equal or prefix an `oidc:` or
+- **A namespace per scheme.** `oidcid:` cannot equal or prefix an `oidc:` or
   `entra:` identity, so a stable identity never collides with a sub-derived
-  one, whatever either value is. The issuer is the one configured, so a value
-  containing `#` is still one identity.
+  one, whatever either value is; and the tag gives each claim path a
+  namespace of its own, so `["oid"]` and `["uid"]` identities never collide
+  either. The issuer is the one configured and the tag is fixed length, so a
+  value containing `#` is still one identity.
 - **Approvers.** Actor = subject = the stable identity. The client is still
   `oidc:<iss>#<azp>`, and `sub != azp` is still checked on the raw `sub`.
   `GrantProvenance` keeps the raw `sub` as `Subject` and records the claim
@@ -359,49 +362,79 @@ default subject claim (`sub`) and refuses the legacy Entra identity mode, in
 which the same human would carry an `entra:` identity as a requester and an
 `oidc:` one as an approver and could approve their own request.
 
-### Switching an issuer to the stable identity claim
+### Switching an issuer's identity scheme
 
 Changing how principals are named changes every identity, and an identity
-under the old scheme cannot be compared with one under the new: the same
-human can hold one of each. Independence therefore has to hold across the
-switch, and three things make it hold.
+under one scheme cannot be compared with one under another: the same human
+can hold one of each. That is as true of a switch from one stable claim to
+another, or back to `sub`, as of the first switch to a stable claim.
+Independence has to hold across every switch, and through the rollout that
+makes it, and three things make it hold.
 
-- **The scheme is recorded.** Every OIDC deployment writes a digest of its
-  identity scheme — the issuer, the claim path and the identity format — to
-  the `identity-scheme` row for its issuer in the coordination store, beside
-  the policy generation, the first time it starts, and checks it on every
-  start after. A replica whose scheme differs refuses to start, so one human
-  cannot request through a replica on `sub` and approve through one on the
-  stable claim. Changing the scheme needs `-oidc-identity-scheme-migrate`
-  for the one start that records the new scheme; leave it off afterwards, or
-  a misconfigured replica could rewrite the record. A deployment whose row
-  was never written (upgrading from a build before #526) records the scheme
-  it starts with.
+- **Only the namespace in force is comparable.** Under every OIDC scheme,
+  the default sub-derived one included, `eligibility` refuses an approval
+  when any involved identity — the requester's subject, actor and delegation
+  chain, the agent, its registrant, any ancestor's ID or registrant, and the
+  approver itself — is in the issuer's OIDC family (`oidc:<iss>#`,
+  `oidcid:<iss>#`, or `entra:`) but not in the namespace in force
+  (`oidc:<iss>#` under `sub`, `oidcid:<iss>#<tag>#` under a stable claim,
+  `entra:` under legacy Entra). There is no list of previous schemes to keep
+  complete: any identity minted under another scheme is refused, whatever the
+  switch history. Otherwise someone who registered an agent as
+  `oidc:<iss>#<sub>` could approve work on it as `oidcid:`, and someone who
+  registered under one stable claim could approve under another. Identities
+  outside the family — other issuers, development, service and MCP
+  principals — are not affected. The refusal names the namespace, never the
+  identity, and fails closed. **Adoption (#526, PR2) is how approvals
+  resume**: an adoption route will move a descriptor subtree into the
+  namespace in force, proved by the previous subject the same workspace token
+  yields, and audited with both identities. Until it ships, work on an agent
+  registered under another scheme cannot be approved; work on an agent
+  registered under the scheme in force can.
 - **Requests are stamped.** Each request records the scheme its requester
   was named under (`ApprovalRecord.IdentityScheme`, set once at request time;
-  the store refuses any write that changes it). A record written before the
-  stamp existed decodes with it empty, which is the sub-derived scheme those
-  records were made under, so a deployment that does not switch decides every
-  old request exactly as before. After a switch, a request made under the old
-  scheme cannot be decided — `decide` answers `409` (`identity_scheme_moved`,
-  `ErrIdentitySchemeMoved`), Pending skips it, an approver's Status answers
-  as for a missing ID, and the requester's Status reports `unresolvable` /
-  `identity_scheme_moved`. It can only expire. The requester makes a new
-  request under their new identity.
-- **Legacy registrations block approval.** While the stable scheme is in
-  force, `eligibility` refuses an approval when any involved identity — the
-  requester, the delegation chain, the agent, its registrant, or any
-  ancestor's ID or registrant — is in a legacy namespace for the issuer:
-  `oidc:<iss>#`, or `entra:` (every `entra:` identity is legacy once the
-  stable scheme is on, since the two modes cannot be combined). Otherwise
-  someone who registered an agent as `oidc:<iss>#<sub>` could approve work on
-  it as `oidcid:`. The refusal names the namespace, never the identity, and
-  fails closed. **Adoption (#526, PR2) is how approvals resume**: an adoption
-  route will move a descriptor subtree from the legacy namespace to the new
-  one, proved by the legacy subject the same workspace token yields, and
-  audited with both identities. Until it ships, work on an agent registered
-  before the switch cannot be approved; work on an agent registered under the
-  new identity can.
+  the store refuses any write that changes it). Requests under the default
+  scheme are not stamped, and a record written before the stamp existed
+  decodes with it empty too, so a deployment that does not switch decides
+  every old request exactly as before. After a switch, a request made under
+  another scheme cannot be decided — `decide` answers `409`
+  (`identity_scheme_moved`, `ErrIdentitySchemeMoved`), Pending skips it, an
+  approver's Status answers as for a missing ID, and the requester's Status
+  reports `unresolvable` / `identity_scheme_moved`. It can only expire. The
+  requester makes a new request under their new identity.
+- **The scheme is recorded, and switched once.** Every OIDC deployment
+  writes a digest of its identity scheme — the issuer, the claim path and the
+  identity format — to the `identity-scheme` row for its issuer in the
+  coordination store, beside the policy generation, the first time it starts,
+  and checks it on every start after; startup prints it. A replica whose
+  scheme differs refuses to start, and the refusal prints the recorded
+  digest. To switch, start the new configuration with
+  `-oidc-identity-scheme-migrate=<recorded digest>`: a replica starts only if
+  the row holds exactly that digest (it then records its own) or already
+  holds its own (a later replica of the same rollout). The flag is
+  therefore one-shot — once the row holds the new scheme it names nothing a
+  different configuration could replace — and two replicas on different
+  schemes cannot flip the row back and forth, since each would need a flag
+  naming the other's. Remove it after the rollout all the same. Switching
+  back is another explicit switch, naming the new digest.
+
+**Rolling out a switch.** The row is checked only when a replica starts, so
+replicas on the old configuration keep serving until they are replaced. That
+window is safe because of the first rule: an approval that would compare an
+identity minted by an old replica with one minted by a new one is refused on
+either replica, and a request made on one cannot be decided on the other.
+The order matters, though:
+
+1. **Upgrade every replica to this build on the scheme you already run**
+   (no `-oidc-identity-claim` change). Each records the scheme, if it was not
+   recorded, and from then on holds approvals to its namespace.
+2. **Then switch**: roll out the new configuration with
+   `-oidc-identity-scheme-migrate` naming the recorded digest, and remove the
+   flag afterwards.
+3. **Never roll back to a build before #553 across a switch.** Older builds
+   read neither the row nor the stamp, and do not hold approvals to a
+   namespace, so they would compare identities across schemes. Rolling back
+   to such a build is safe only while the scheme in force is the one it ran.
 
 **Minting is decided by audience and fails closed.** A token on a workspace
 audience is minted by the workspace mappings, which never grant approve. A
@@ -428,7 +461,7 @@ audience every one of these is required:
 
 Every failure is the same generic authentication denial. The decision grants
 `action_approve` and nothing else, with subject = actor = `oidc:<iss>#<sub>`
-(or `oidcid:<iss>#<value>` under a stable identity claim), client
+(or `oidcid:<iss>#<tag>#<value>` under a stable identity claim), client
 `oidc:<iss>#<azp>`, no `OnBehalfOf`, the workspace policy generation, and an
 `auth.GrantProvenance` of issuer, raw subject, claim path, matched value, the
 mapping digest and, under a stable claim, the identity claim path. The
@@ -682,9 +715,9 @@ tests remain the right tool for service-level properties below the transport.
 - Dataset export of approvals and refusals as adjudications (#401, #419). Every
   field it needs is stored on the approval record.
 - Approval lifecycle events (needs #480 item 1).
-- #526 PR2: the adoption route that moves a descriptor subtree from a legacy
-  identity namespace to the stable one (until then, legacy registrations
-  block approval under the stable scheme), and retiring legacy Entra mode.
+- #526 PR2: the adoption route that moves a descriptor subtree into the
+  identity namespace in force (until then, registrations under another
+  scheme block approval), and retiring legacy Entra mode.
 - Approver pools per action or descriptor (a later ATPL version may only
   reference an operator-defined pool), a second approver-only issuer, and
   quorum.

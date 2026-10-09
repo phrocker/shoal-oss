@@ -145,8 +145,8 @@ spec:
             {{- with $oidc.identityClaim }}
             - {{ printf "-oidc-identity-claim=%s" (toJson .) | quote }}
             {{- end }}
-            {{- if eq (toString $oidc.identitySchemeMigrate) "true" }}
-            - "-oidc-identity-scheme-migrate=true"
+            {{- with $oidc.identitySchemeMigrateFrom }}
+            - {{ printf "-oidc-identity-scheme-migrate=%v" (.) | quote }}
             {{- end }}
             {{- with $explorer.chat.provider }}
             - {{ printf "-chat-provider=%v" (.) | quote }}

@@ -350,11 +350,14 @@ explorer:
 APPROVERS
 assert_absent "no approver mapping unless configured" 'oidc-approver-mapping-file|approver-mapping|approvers.json' "${explorer_base[@]}"
 assert_absent "no identity claim unless configured" 'oidc-identity-claim' "${explorer_base[@]}"
-# Migrating the scheme is a one-off act: never rendered by default, and only
-# for an explicit true (a string "false" must not turn it on).
+# Migrating the scheme is one-shot: it names the recorded scheme it replaces,
+# never rendered by default, and held to the digest's shape so a boolean (the
+# old, advisory form) cannot be passed.
+scheme_digest=5a35ffaec1b6aafc2af35ed289def9bae8728339a3984691e2ad9818a1896a79
 assert_absent "no scheme migration unless asked for" 'oidc-identity-scheme-migrate' "${explorer_base[@]}"
-assert_absent "a string false does not migrate" 'oidc-identity-scheme-migrate' "${explorer_base[@]}" --set-string explorer.auth.oidc.identitySchemeMigrate=false
-assert_renders "a scheme migration when asked for" '^ +- "-oidc-identity-scheme-migrate=true"$' "${explorer_base[@]}" --set explorer.auth.oidc.identitySchemeMigrate=true
+assert_renders "a scheme migration names the scheme it replaces" '^ +- "-oidc-identity-scheme-migrate='"$scheme_digest"'"$' "${explorer_base[@]}" --set-string explorer.auth.oidc.identitySchemeMigrateFrom="$scheme_digest"
+refuses_citing "must be the 64 lowercase hex digits" "a boolean scheme migration" "${explorer_base[@]}" --set-string explorer.auth.oidc.identitySchemeMigrateFrom=true
+refuses_citing "must be the 64 lowercase hex digits" "an upper-case digest" "${explorer_base[@]}" --set-string explorer.auth.oidc.identitySchemeMigrateFrom=5A35FFAEC1B6AAFC2AF35ED289DEF9BAE8728339A3984691E2AD9818A1896A79
 assert_renders "the mapping file is passed" '^ +- "-oidc-approver-mapping-file=/etc/shoal/approvers/approvers.json"$' "${explorer_base[@]}" -f "$approvers_file"
 assert_renders "the identity claim is passed as one JSON argument" '^ +- "-oidc-identity-claim=\[\\"oid\\"\]"$' "${explorer_base[@]}" -f "$approvers_file"
 assert_renders "the mapping is mounted read-only" '^ +readOnly: true$' "${explorer_base[@]}" -f "$approvers_file"
