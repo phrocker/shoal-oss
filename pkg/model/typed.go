@@ -14,10 +14,11 @@ import (
 var ErrTypedContract = errors.New("model: typed decision contract violation")
 
 const (
-	MaxTypedStateBytes  = 1 << 20
-	MaxTypedQuestions   = 64
-	MaxTypedOptions     = 64
-	MaxTypedAnswerBytes = 4096
+	MaxTypedStateBytes    = 1 << 20
+	MaxTypedQuestions     = 64
+	MaxTypedOptions       = 64
+	MaxTypedAnswerBytes   = 4096
+	MaxTypedQuestionBytes = 4096
 )
 
 type TypedQuestionKind string
@@ -29,9 +30,11 @@ const (
 )
 
 type TypedQuestion struct {
-	ID      string
-	Kind    TypedQuestionKind
-	Options []string // required for choice and ordinal_score
+	ID                 string
+	Kind               TypedQuestionKind
+	Instructions       string
+	Options            []string // required for choice and ordinal_score
+	OptionDescriptions map[string]string
 }
 
 type TypedRequest struct {
@@ -159,6 +162,9 @@ func ValidateTypedRequest(req TypedRequest, identity TypedIdentity) error {
 			return typedErr("duplicate question id")
 		}
 		seen[q.ID] = struct{}{}
+		if len(q.Instructions) > MaxTypedQuestionBytes || q.Instructions != "" && strings.TrimSpace(q.Instructions) == "" {
+			return typedErr("question instructions exceed bound")
+		}
 		if q.Kind != TypedPropositionProbability && len(q.Options) < 2 {
 			return typedErr("choice and ordinal questions require options")
 		}
@@ -171,6 +177,14 @@ func ValidateTypedRequest(req TypedRequest, identity TypedIdentity) error {
 				return typedErr("duplicate question option")
 			}
 			optionSeen[option] = struct{}{}
+		}
+		if len(q.OptionDescriptions) > MaxTypedOptions {
+			return typedErr("too many option descriptions")
+		}
+		for option, description := range q.OptionDescriptions {
+			if _, ok := optionSeen[option]; !ok || len(description) == 0 || len(description) > MaxTypedQuestionBytes || strings.TrimSpace(description) == "" {
+				return typedErr("invalid option description")
+			}
 		}
 	}
 	return nil
@@ -267,6 +281,12 @@ func cloneTypedRequest(req TypedRequest) TypedRequest {
 	req.State = append([]byte(nil), req.State...)
 	for i := range req.Questions {
 		req.Questions[i].Options = append([]string(nil), req.Questions[i].Options...)
+		if req.Questions[i].OptionDescriptions != nil {
+			req.Questions[i].OptionDescriptions = make(map[string]string, len(req.Questions[i].OptionDescriptions))
+			for option, description := range req.Questions[i].OptionDescriptions {
+				req.Questions[i].OptionDescriptions[option] = description
+			}
+		}
 	}
 	return req
 }
