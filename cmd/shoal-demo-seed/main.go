@@ -312,6 +312,12 @@ func (c *config) validate() error {
 		if err := validateID(prefix+".oidc_subject_id", user.OIDCSubject); err != nil {
 			return err
 		}
+		// shoal-explore-web refuses a sub containing '#' (#546): under
+		// oidc:<iss>#<sub> it could read as a non-sub subject claim's
+		// oidc:<iss>#<tag>#<value>, and no token could ever mint it.
+		if strings.Contains(user.OIDCSubject, "#") {
+			return fmt.Errorf("%s.oidc_subject_id must not contain '#'", prefix)
+		}
 		if _, duplicate := seenSubjects[user.OIDCSubject]; duplicate {
 			return errors.New("users must have distinct oidc_subject_id values")
 		}
@@ -410,7 +416,7 @@ func validateIssuer(raw string) (string, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
 		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
-		strings.TrimSpace(raw) != raw {
+		strings.Contains(raw, "#") || strings.TrimSpace(raw) != raw {
 		return "", errors.New("must be an absolute HTTPS issuer URL")
 	}
 	return raw, nil

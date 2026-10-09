@@ -587,6 +587,11 @@ func (a *oidcAuthenticator) mintApprover(
 			return auth.Decision{}, err
 		}
 		identityClaimPath = append([]string(nil), a.identityClaim...)
+	} else if strings.Contains(subject, "#") {
+		// The sub-derived namespace holds no value containing '#' (#546),
+		// on this branch as on the workspace branch (identity).
+		a.hashRefusals.note("sub")
+		return auth.Decision{}, errMalformedClaim
 	}
 	return auth.NewDecision(auth.DecisionConfig{
 		Subject:             identity,

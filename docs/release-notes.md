@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### A non-sub subject claim has its own identity namespace (#546)
+
+`-oidc-subject-claim X` (any claim but `sub`) used to name principals
+`oidc:<iss>#<value>`, the same namespace as `sub`-derived principals. After
+a switch from `sub` to `X`, or from one claim to another, the old identities
+were still inside the namespace in force, so the approval service's
+namespace rule (#553) could not refuse them. A human's old registrations
+then counted as current identities under the new scheme, which is the same
+self-approval shape #553 closed for `oidcid:`. Now:
+
+- A non-default subject claim names principals `oidc:<iss>#<tag>#<value>`,
+  where the tag is 16 hex digits of a digest of the claim name. Its actor,
+  client and delegation values take the same prefix. Its requests are
+  stamped with its scheme.
+- The `sub` namespace `oidc:<iss>#` is flat (legacy Entra excepted). A `sub`, actor, client or
+  delegation value containing `#` is refused on both branches, and an
+  identity with a `#` after the issuer's is foreign under `sub`. So
+  `oidc:<iss>#<sub>` and `oidc:<iss>#<tag>#<value>` cannot be confused.
+- The default `sub` scheme and legacy Entra mode keep the same recorded
+  scheme digest and start without any flag. Every identity without a `#`
+  is unchanged.
+
+**Behaviour change on the default `sub` scheme: `#` is refused.** A token
+whose `sub`, or whose `-oidc-actor-claim`, `-oidc-client-id-claim` or
+`-oidc-delegation-claim` value, contains `#` is now refused with `401`, on
+the workspace branch and on the approver branch. The scheme digest does not
+change, so **nothing at startup warns about this**. If the client-ID or
+actor claim you configured routinely carries `#`, every user is locked out.
+Before upgrading, check that none of these claims can contain `#`. If one
+can, configure a different claim. The first refusal for each claim is
+logged at WARN, naming the claim but never the value, and the log repeats
+at most once a minute per claim. `shoal-demo-seed` likewise refuses an
+`oidc_subject_id` containing `#`, and an issuer containing one.
+
+**Upgrade action required for deployments that set `-oidc-subject-claim`.**
+The scheme digest covers the identity format, so such a deployment's
+recorded scheme no longer matches, and the server refuses to start. The
+refusal explains this and prints the digest to pass as
+`-oidc-identity-scheme-migrate`. After the migration, identities minted
+before the upgrade are refused wherever they are involved in an approval
+until #526's adoption route lands, and requests pending at the upgrade can
+only expire. See "Upgrading a deployment that sets `-oidc-subject-claim`" in
+`docs/shoal-explore-web-deploy.md`.
+
 ### Free-form visibility labels are enforced (#570)
 
 `metadata["shoal.visibility"]` labels used to be stored on a document's nodes

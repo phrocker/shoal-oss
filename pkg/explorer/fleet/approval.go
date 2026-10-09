@@ -558,11 +558,21 @@ type IdentityScheme struct {
 	// rule's business. Empty, with an empty Prefix and a zero Digest,
 	// configures no rule.
 	Family []string
+	// Flat narrows the namespace in force to Prefix followed by a value
+	// with no '#' in it (#546). Without it, every identity beginning with
+	// Prefix is in force. The sub-derived scheme's namespace oidc:<iss>#
+	// contains, as a string prefix, the namespace of every non-default
+	// subject claim, oidc:<iss>#<claim tag>#, so without Flat a human who
+	// registered under one could approve under the other. The host refuses
+	// '#' in every value it mints under a Flat prefix, so an identity that
+	// begins with Prefix and has a later '#' was minted under a nested
+	// scheme, and is foreign.
+	Flat bool
 }
 
 func (s IdentityScheme) validate() error {
 	if s.Prefix == "" {
-		if s.Digest != (auth.Digest{}) || len(s.Family) > 0 {
+		if s.Digest != (auth.Digest{}) || len(s.Family) > 0 || s.Flat {
 			return shoal.NewError(
 				shoal.ErrorInvalidArgument, "identity scheme prefix is required")
 		}
@@ -589,10 +599,19 @@ func (s IdentityScheme) validate() error {
 // of is the stamp for an identity: Digest when it is in the namespace in
 // force, and zero otherwise.
 func (s IdentityScheme) of(identity shoal.ID) auth.Digest {
-	if s.Prefix != "" && strings.HasPrefix(string(identity), s.Prefix) {
+	if s.inForce(identity) {
 		return s.Digest
 	}
 	return auth.Digest{}
+}
+
+// inForce reports whether an identity is in the namespace in force: it
+// begins with Prefix and, under a Flat scheme, has no '#' after it.
+func (s IdentityScheme) inForce(identity shoal.ID) bool {
+	if s.Prefix == "" || !strings.HasPrefix(string(identity), s.Prefix) {
+		return false
+	}
+	return !s.Flat || !strings.Contains(string(identity)[len(s.Prefix):], "#")
 }
 
 // foreignNamespace returns the family namespace of the first identity (in
@@ -605,8 +624,15 @@ func (s IdentityScheme) foreignNamespace(identities []shoal.ID) string {
 	sorted := append([]shoal.ID(nil), identities...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	for _, identity := range sorted {
-		if strings.HasPrefix(string(identity), s.Prefix) {
+		if s.inForce(identity) {
 			continue
+		}
+		if strings.HasPrefix(string(identity), s.Prefix) {
+			// Only under a Flat scheme: a namespace nested inside the one
+			// in force. It is named without the segment after Prefix, which
+			// in an identity minted before the host refused '#' could be
+			// part of a value.
+			return s.Prefix + nestedNamespace
 		}
 		for _, family := range s.Family {
 			if strings.HasPrefix(string(identity), family) {
@@ -616,6 +642,10 @@ func (s IdentityScheme) foreignNamespace(identities []shoal.ID) string {
 	}
 	return ""
 }
+
+// nestedNamespace stands, in a refusal, for the segment of a namespace
+// nested inside a Flat namespace in force.
+const nestedNamespace = "<nested>#"
 
 // namespaceOf names the namespace of a family identity for a refusal: the
 // family prefix and everything up to and including the first '#' after it,

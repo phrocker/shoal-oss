@@ -49,6 +49,8 @@ const (
 	identitySchemeDigestTag = "shoal-explore-web/identity-scheme/v1"
 	// identityClaimPathTag domain-separates the claim path tag.
 	identityClaimPathTag = "shoal-explore-web/identity-claim-path/v1"
+	// subjectClaimTagDomain domain-separates the subject claim tag (#546).
+	subjectClaimTagDomain = "shoal-explore-web/subject-claim/v1"
 )
 
 // mutableIdentityClaims are claims that do not name one human stably, and
@@ -231,6 +233,46 @@ func claimPathTag(path []string) string {
 	return hex.EncodeToString(digest[:8])
 }
 
+// subjectClaimTag is the namespace segment of a non-default subject claim
+// (#546): the first 16 hex digits of a digest of the claim name.
+//
+// A digest, not the name. -oidc-subject-claim accepts any name up to 256
+// bytes without NUL, CR or LF, so a name may itself contain '#' or ':'; a
+// name used as a tag would need a charset of its own and would still leave a
+// boundary to argue about. Sixteen lowercase hex digits are fixed length and
+// '#'-free, so in oidc:<iss>#<tag>#<value> the issuer ends at the first '#'
+// (#553 refuses '#' in the issuer), the tag at the second, and the value is
+// everything after it — '#' included. It is the shape #553 gave the stable
+// identity's claim path tag, under a domain of its own.
+func subjectClaimTag(claim string) string {
+	digest := auth.DigestBytes(subjectClaimTagDomain, []byte(claim))
+	return hex.EncodeToString(digest[:8])
+}
+
+// subjectIdentityPrefix is the identity prefix for the subject claim, and
+// whether it is flat — the sub-derived namespace oidc:<iss>#, under which no
+// value may contain '#'.
+//
+// sub keeps oidc:<iss>#<sub>, so default deployments are unchanged. Any other
+// subject claim mints oidc:<iss>#<claim tag>#<value> (#546): before, it
+// minted oidc:<iss>#<value>, the namespace of sub, so after a switch between
+// sub and the claim, or between two claims, the identities of the scheme
+// replaced sat inside the namespace in force and the approval service could
+// not tell them apart from current ones. A configured prefix — the legacy
+// Entra mode's entra: — is kept as it is.
+func subjectIdentityPrefix(
+	configured, issuer, subjectClaim string,
+) (string, bool) {
+	base := oidcIdentityPrefix + issuer + "#"
+	if configured != "" && configured != base {
+		return configured, false
+	}
+	if subjectClaim == "sub" {
+		return base, true
+	}
+	return base + subjectClaimTag(subjectClaim) + "#", false
+}
+
 // stableIdentityNamespace is oidcid:<iss>#<path tag>#, the namespace every
 // identity of the scheme in force begins with.
 func (a *oidcAuthenticator) stableIdentityNamespace() string {
@@ -264,6 +306,10 @@ type oidcIdentityScheme struct {
 	// the default sub-derived scheme, which is what records written before
 	// the stamp existed decode as).
 	approvals fleet.IdentityScheme
+	// sharedNamespaceDigest, for a non-default subject claim, is the digest
+	// the same configuration had before #546 gave the claim a namespace of
+	// its own; zero otherwise. It only explains a startup refusal.
+	sharedNamespaceDigest auth.Digest
 }
 
 // humanIdentityFamily are the prefixes of every identity this command mints
@@ -318,16 +364,35 @@ func (a *oidcAuthenticator) identityScheme() oidcIdentityScheme {
 		}
 		return scheme
 	}
-	text("subject")
-	text(a.expectedIssuer)
-	text(a.subjectClaim)
-	text(a.subjectFallbackClaim)
-	text(a.identityPrefix)
-	text(fmt.Sprint(a.trimIdentityValues))
-	scheme.digest = auth.DigestBytes(identitySchemeDigestTag, buffer.Bytes())
-	// The stamp stays zero: sub-derived requests were always unstamped.
+	subjectDigest := func(prefix string) auth.Digest {
+		buffer.Reset()
+		text("subject")
+		text(a.expectedIssuer)
+		text(a.subjectClaim)
+		text(a.subjectFallbackClaim)
+		text(prefix)
+		text(fmt.Sprint(a.trimIdentityValues))
+		return auth.DigestBytes(identitySchemeDigestTag, buffer.Bytes())
+	}
+	// The inputs and their encoding are those of every release before
+	// #546, so the default and legacy Entra schemes keep their digests. A
+	// non-default subject claim's digest moves with its new prefix.
+	scheme.digest = subjectDigest(a.identityPrefix)
 	scheme.approvals = fleet.IdentityScheme{
 		Prefix: a.identityPrefix, Family: a.identityFamily(a.identityPrefix),
+		Flat: a.flatIdentityValues,
 	}
+	if base := oidcIdentityPrefix + a.expectedIssuer + "#"; a.identityPrefix !=
+		base && strings.HasPrefix(a.identityPrefix, base) {
+		// A non-default subject claim. Before #546 it minted under the sub
+		// namespace; that scheme's digest is recognised at startup so the
+		// refusal can say why an unchanged configuration is a switch.
+		scheme.sharedNamespaceDigest = subjectDigest(base)
+		// And it stamps its requests, as a stable scheme does: a request
+		// made under one subject claim cannot be decided under another.
+		scheme.approvals.Digest = scheme.digest
+	}
+	// Otherwise the stamp stays zero: sub-derived and legacy Entra requests
+	// were always unstamped.
 	return scheme
 }

@@ -500,7 +500,9 @@ func TestOIDCClaimMappingPreservesIdentityAndDelegation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mapped token rejected: %v", err)
 	}
-	prefix := "oidc:" + issuer.server.URL + "#"
+	// A non-sub subject claim has a namespace of its own (#546), and the
+	// actor, client and delegation values are minted under the same prefix.
+	prefix := "oidc:" + issuer.server.URL + "#" + subjectClaimTag("principal") + "#"
 	if decision.Subject() != shoal.ID(prefix+" principal-7 ") ||
 		decision.Actor() != shoal.ID(prefix+" service-4 ") ||
 		decision.ClientID() != shoal.ID(prefix+" client-9 ") {

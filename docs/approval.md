@@ -342,12 +342,14 @@ guarantees:
   still be readable: an issuer whose discovery cannot be fetched is refused
   either way.
 
-**`-oidc-subject-claim oid` is not this.** `-oidc-subject-claim` names
-identities `oidc:<iss>#<value>` — the same namespace `sub` derives into — so a
-deployment that changes it, or two that differ, can give one human's `oid`
-and another human's `sub` the same identity. That overlap is latent today and
-tracked separately; it is why the approver mapping still refuses a non-default
-subject claim, and why the stable claim has a namespace of its own.
+**`-oidc-subject-claim oid` is not this.** `-oidc-subject-claim` changes the
+workspace branch only: the approver branch is always named by `sub`, so the
+approver mapping still refuses a non-default subject claim. Since #546 a
+non-default subject claim names identities `oidc:<iss>#<tag>#<value>`, in a
+namespace of its own (the tag is a digest of the claim name), not
+`oidc:<iss>#<value>` in the namespace of `sub`. Before that, a deployment
+that changed the claim, or two replicas that differed, could give one human's
+`oid` and another human's `sub` the same identity.
 
 **The issuer must state public subject identifiers only — without the stable
 claim.** Without `-oidc-identity-claim` the approval service separates people
@@ -395,8 +397,14 @@ makes it, and three things make it hold.
   chain, the agent, its registrant, any ancestor's ID or registrant, and the
   approver itself — is in the human OIDC family (`oidc:`, `oidcid:` or
   `entra:`, under **any** issuer) but not in the namespace in force
-  (`oidc:<iss>#` under `sub`, `oidcid:<iss>#<tag>#` under a stable claim,
-  `entra:` under legacy Entra). The family is not scoped to the issuer in
+  (`oidc:<iss>#` under `sub`, `oidc:<iss>#<tag>#` under another
+  `-oidc-subject-claim`, `oidcid:<iss>#<tag>#` under a stable claim,
+  `entra:` under legacy Entra). The namespace of `sub` is flat: an identity
+  in it has no `#` after the issuer's, and the server refuses a `sub`
+  containing `#`, so a subject claim's `oidc:<iss>#<tag>#<value>` (which
+  begins with `oidc:<iss>#` as a string) is foreign under `sub`, and a `sub`
+  identity is foreign under the claim (#546). The refusal names such a
+  nested namespace `oidc:<iss>#<nested>#`. The family is not scoped to the issuer in
   force: a deployment has one human issuer, so an identity under another
   issuer was minted before the issuer changed and may be the same human.
   There is no list of previous schemes or issuers to keep complete: any
@@ -416,7 +424,8 @@ makes it, and three things make it hold.
 - **Requests are stamped.** Each request records the scheme its requester
   was named under (`ApprovalRecord.IdentityScheme`, set once at request time;
   the store refuses any write that changes it). Requests under the default
-  scheme are not stamped, and a record written before the stamp existed
+  scheme and legacy Entra are not stamped (requests under a non-default
+  `-oidc-subject-claim` are, since #546), and a record written before the stamp existed
   decodes with it empty too, so a deployment that does not switch decides
   every old request exactly as before. After a switch, a request made under
   another scheme cannot be decided — `decide` answers `409`
