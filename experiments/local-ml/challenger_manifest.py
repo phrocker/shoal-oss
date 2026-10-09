@@ -33,6 +33,13 @@ def _digest_text(value, name):
         raise ValueError('invalid ' + name + ' digest')
 
 
+def _name_list(value, name, maximum):
+    if (not isinstance(value, list) or not value or len(value) > maximum or
+            any(not isinstance(item, str) or not item.strip() or len(item) > 512 for item in value) or
+            len(set(value)) != len(value)):
+        raise ValueError('invalid ' + name)
+
+
 def build_manifest(task_id, dataset_id, split_policy_id, feature_schema_id, feature_names,
                    label_policy_id, heldout_horizon, primary_metrics, search_budget, recipes):
     _text(task_id, 'task_id'); _text(dataset_id, 'dataset_id'); _text(split_policy_id, 'split_policy_id')
@@ -43,8 +50,7 @@ def build_manifest(task_id, dataset_id, split_policy_id, feature_schema_id, feat
     lowered = [name.lower() for name in feature_names]
     if len(set(lowered)) != len(lowered) or any(any(term in name for term in FORBIDDEN_FEATURE_TERMS) for name in lowered):
         raise ValueError('feature set includes forbidden label or future information')
-    if not isinstance(primary_metrics, list) or not primary_metrics or len(primary_metrics) > 16:
-        raise ValueError('invalid primary metrics')
+    _name_list(primary_metrics, 'primary metrics', 16)
     if not isinstance(search_budget, dict) or type(search_budget.get('max_trials')) is not int or not 0 < search_budget['max_trials'] <= 100:
         raise ValueError('invalid search budget')
     if not isinstance(recipes, list) or len(recipes) != len(CHALLENGERS) or set(recipe.get('name') for recipe in recipes) != set(CHALLENGERS):
@@ -69,7 +75,7 @@ def validate(manifest):
     for field in ('task_id', 'dataset_id', 'split_policy_id', 'feature_schema_id', 'label_policy_id', 'heldout_horizon'):
         _text(manifest.get(field), field)
     features = manifest.get('feature_names')
-    if not isinstance(features, list) or not features or len(features) > 256 or len(set(features)) != len(features):
+    if not isinstance(features, list) or not features or len(features) > 256 or len(set(features)) != len(features) or features != sorted(features):
         raise ValueError('invalid manifest feature names')
     lowered = [feature.lower() for feature in features]
     if any(any(term in feature for term in FORBIDDEN_FEATURE_TERMS) for feature in lowered):
@@ -77,8 +83,7 @@ def validate(manifest):
     budget = manifest.get('search_budget')
     if not isinstance(budget, dict) or type(budget.get('max_trials')) is not int or not 0 < budget['max_trials'] <= 100:
         raise ValueError('invalid manifest search budget')
-    if not isinstance(manifest.get('primary_metrics'), list) or not manifest['primary_metrics']:
-        raise ValueError('invalid manifest primary metrics')
+    _name_list(manifest.get('primary_metrics'), 'manifest primary metrics', 16)
     if len(manifest.get('recipes', [])) != len(CHALLENGERS) or set(recipe.get('name') for recipe in manifest.get('recipes', [])) != set(CHALLENGERS):
         raise ValueError('challenger recipe set mismatch')
     for recipe in manifest['recipes']:
@@ -93,8 +98,7 @@ def validate(manifest):
             raise ValueError('recipe input field includes forbidden label or future information')
         if recipe['name'] == 'catboost-structured-v1':
             _text(recipe.get('library_version'), 'CatBoost library version')
-            if not isinstance(recipe.get('categorical_features'), list):
-                raise ValueError('invalid CatBoost categorical features')
+            _name_list(recipe.get('categorical_features'), 'CatBoost categorical features', 256)
         if recipe['name'] == 'unixcoder-linear-v1':
             _text(recipe.get('model_repo'), 'UniXcoder model repo')
             _text(recipe.get('model_revision'), 'UniXcoder model revision')
