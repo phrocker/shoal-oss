@@ -322,11 +322,22 @@ func (w *Worker) setReady(reason NotReadyReason) {
 }
 
 // Kill abandons everything at once, as a crash would: in-flight requests are
-// cancelled and nothing more is reported. It exists for tests of crash
-// recovery and for a second signal during shutdown.
+// cancelled and nothing more is reported or written. It is SIGKILL, for tests
+// of crash recovery; a process that can still act uses HardStop.
 func (w *Worker) Kill() {
 	w.killed.Store(true)
 	w.kill()
+}
+
+// HardStop is the second signal: it stops at once, without draining, but
+// first does what a drain that runs out does (abandon) — every run whose
+// request may have reached the target, and whose outcome is not yet on the
+// record or in the log, goes to the unrecorded log as outcome_unknown in one
+// durable rewrite — and then cancels everything. It returns how many runs
+// were unfinished.
+func (w *Worker) HardStop() int {
+	w.killed.Store(true)
+	return w.abandon()
 }
 
 // Run retries the unrecorded log, then pulls and works actions until ctx is
@@ -434,6 +445,9 @@ func (w *Worker) drain() int {
 // reached the target, and whose outcome is not yet on the record or in the
 // log, is written to the unrecorded log as outcome_unknown. Then everything
 // still running is cancelled. It returns how many runs were unfinished.
+//
+// It is the one abandonment path: the drain bound running out and HardStop
+// both come here. A run already abandoned is not written twice.
 func (w *Worker) abandon() int {
 	w.runsMu.Lock()
 	runs := make([]*claimRun, 0, len(w.runs))
@@ -445,7 +459,7 @@ func (w *Worker) abandon() int {
 	var entries []UnrecordedEntry
 	for _, run := range runs {
 		run.mu.Lock()
-		write := run.attempted && !run.settled
+		write := run.attempted && !run.settled && !run.abandoned
 		run.abandoned, run.reported = true, true
 		run.mu.Unlock()
 		if write {
@@ -1289,6 +1303,12 @@ func (w *Worker) attempt(run *claimRun, bound BoundRequest, header, credential s
 		return Observation{Err: err}, 0, 0, 0
 	}
 	run.mu.Lock()
+	if run.abandoned {
+		// abandon decided what to write from attempted; a run it gave up on
+		// sends nothing after that decision.
+		run.mu.Unlock()
+		return Observation{Err: context.Canceled}, 0, 0, 0
+	}
 	run.inFlight, run.attempted = true, true
 	run.mu.Unlock()
 	defer func() {

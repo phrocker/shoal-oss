@@ -254,6 +254,17 @@ func TestASecondSignalIsAHardStop(t *testing.T) {
 	if got := w.explorer.completions(); len(got) != 0 {
 		t.Fatalf("a hard stop completed: %s", got)
 	}
+	// The request had reached the target: the hard stop wrote it to the
+	// unrecorded log before cancelling, as an outcome nobody knows.
+	stdout := &syncBuffer{}
+	if code := Main([]string{"unrecorded", "list", "-unrecorded-dir", w.dir}, Env{Stdout: stdout}); code != ExitOK {
+		t.Fatalf("list exit %d", code)
+	}
+	if !strings.Contains(stdout.String(), `"outcome":"outcome_unknown"`) ||
+		!strings.Contains(stdout.String(), `"action_id":"`+b64([]byte("act-hard"))+`"`) ||
+		strings.Count(stdout.String(), "\n") != 1 {
+		t.Fatalf("the hard stop left no unrecorded entry for the request in flight: %q", stdout)
+	}
 }
 
 // TestADrainThatRunsOutExitsDistinctly: the completion hangs, the drain

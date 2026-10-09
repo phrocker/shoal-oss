@@ -443,6 +443,13 @@ closed. The input-schema check matters because the explorer enforces it at
 enqueue: a looser one lets work be queued and claimed — setting
 `EffectPossible` — before the binder refuses it.
 
+The resolve, `VerifyDescriptor` and the attestation requirements
+(`AttestationRequirements`) are read **once, at startup**. A running gateway
+does not notice the descriptor being re-registered: a change to an action's
+effects, its schemas, or whether it requires attestation takes effect for the
+gateway only when it restarts, and is checked against the route table then.
+Restart the gateway after re-registering its descriptor.
+
 ## Classification
 
 `Classify` is a pure function of the route and one observed attempt.
@@ -576,8 +583,10 @@ each plane call, the completion budget, each report window — is measured on
 the worker's own clock, and stopping a renewal cancels its call in flight
 rather than waiting for it, so the honest worst path (request, completion,
 both fallback reports) fits inside the drain bound; a test drives it with
-every call blocking to its timeout and measures it. `Kill` abandons
-everything, as SIGKILL would; the next instance re-claims after the lapse and
+every call blocking to its timeout and measures it. `HardStop` (a second
+signal) takes the same abandonment path at once: the unrecorded-log write,
+then cancellation. `Kill` is SIGKILL itself, for tests: it abandons everything
+and writes nothing, and the next instance re-claims after the lapse and
 resends under the same `ExecutorKey`.
 
 ## The unrecorded log
@@ -642,9 +651,16 @@ shoal-gateway grace-period [-operation-timeout T] [-plane-timeout P]
 5. The worker runs: it retries the unrecorded log, then pulls.
 
 **Signals.** The first SIGTERM or SIGINT drains (above, *Shutdown*), within
-`DrainBound`. A second is a hard stop: everything in flight is abandoned as
-SIGKILL would abandon it, nothing more is reported, and the next instance
-re-claims after the lapse under the same `ExecutorKey`.
+`DrainBound`. A second is a hard stop (`Worker.HardStop`). It does not wait,
+but it is not SIGKILL either: before cancelling, it does what a drain that runs
+out does — every run whose request may have reached the target, and whose
+outcome is not yet on the record or in the log, is written to the unrecorded
+log as `outcome_unknown`, all in one durable rewrite — and then everything in
+flight is cancelled and nothing more is reported. Runs that sent nothing
+simply lapse, and the next instance re-claims them under the same
+`ExecutorKey`. A real SIGKILL (the kubelet after the grace period, or an OOM
+kill) still writes nothing; there the re-claim, resending under the same
+`ExecutorKey` to a target that deduplicates on it, is what covers the run.
 
 **Exit codes.**
 
@@ -654,7 +670,7 @@ re-claims after the lapse under the same `ExecutorKey`.
 | 1 | startup refused, or the worker failed |
 | 2 | the command line is wrong |
 | 3 | the drain bound ran out with work unfinished (`ErrDrainAbandoned`); every abandoned run whose request may have reached the target is in the unrecorded log |
-| 4 | a second signal stopped the gateway without draining |
+| 4 | a second signal stopped the gateway without draining; runs whose request may have reached the target are in the unrecorded log |
 
 **Health** (`-health-address`):
 
@@ -683,13 +699,17 @@ name or the correlation ID; the operator who needs the reference to reconcile
 reads `unrecorded.jsonl` itself.
 
 `unrecorded ack` clears the reports named, once the operator has reconciled
-each by other means, and logs an `unrecorded_cleared` event per entry. A bare
+each by other means, and logs an `unrecorded_cleared` event per entry. It is
+one durable rewrite (`UnrecordedLog.AckAll`): all of the named reports are
+cleared, or none. A bare
 action ID is accepted when exactly one report holds it; otherwise name the
 fence. Every name must match before anything is removed. `-all` clears
 everything.
 
-Both take the directory's lock, so both refuse while a gateway runs on the
-directory: the running gateway owns the log, holds it in memory, and would
+Neither creates the directory: a directory that does not exist is an error
+(exit 1), not an empty log, so a mistyped path cannot read as "nothing awaits
+reconciliation". Only `run` creates it. Both take the directory's lock, so
+both refuse while a gateway runs on the directory: the running gateway owns the log, holds it in memory, and would
 write back an entry acknowledged under it. Stop the gateway (or scale it to
 zero) first. A running gateway's backlog is visible meanwhile on `/metrics`
 and in its `unrecorded` log events.

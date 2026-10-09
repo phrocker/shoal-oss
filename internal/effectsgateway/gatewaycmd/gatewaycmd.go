@@ -232,7 +232,7 @@ func Run(args []string, env Env) int {
 	hard := g.hardStop
 	g.mu.Unlock()
 	if hard {
-		worker.Kill()
+		worker.HardStop()
 	}
 	if env.Started != nil {
 		env.Started(healthAddress)
@@ -242,7 +242,7 @@ func Run(args []string, env Env) int {
 	g.stopped = true
 	hard = g.hardStop
 	g.mu.Unlock()
-	// A drain that finished, or gave up, before a second signal's Kill took
+	// A drain that finished, or gave up, before a second signal's hard stop took
 	// effect is reported as what it was.
 	switch {
 	case err == nil:
@@ -251,7 +251,8 @@ func Run(args []string, env Env) int {
 		return failf(env, ExitDrainAbandoned, "%v; %d reports await reconciliation in the "+
 			"unrecorded log", err, log.Len())
 	case hard:
-		return failf(env, ExitHardStop, "stopped by a second signal without draining")
+		return failf(env, ExitHardStop, "stopped by a second signal without draining; %d reports await "+
+			"reconciliation in the unrecorded log", log.Len())
 	default:
 		return failf(env, ExitFailure, "%v", err)
 	}
@@ -284,7 +285,7 @@ func (g *gateway) watchSignals(signals <-chan os.Signal, drain context.CancelFun
 				worker := g.worker
 				g.mu.Unlock()
 				if worker != nil {
-					worker.Kill()
+					worker.HardStop()
 				}
 			}
 		}

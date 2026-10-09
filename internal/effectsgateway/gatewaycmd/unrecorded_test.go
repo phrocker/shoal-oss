@@ -19,6 +19,7 @@ package gatewaycmd
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -185,5 +186,32 @@ func TestUnrecordedRefusesWhileAGatewayRuns(t *testing.T) {
 	}
 	if code, _, _ := operator("list"); code != ExitUsage {
 		t.Fatalf("list without a directory: exit %d", code)
+	}
+}
+
+// TestOperatorCommandsNeverCreateTheDirectory: a mistyped directory is an
+// error, not an empty log that says nothing awaits reconciliation, and
+// neither list nor ack leaves a directory or lock behind. A file is refused
+// the same way.
+func TestOperatorCommandsNeverCreateTheDirectory(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nonexistent")
+	notADirectory := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADirectory, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{missing, notADirectory} {
+		for _, args := range [][]string{
+			{"list", "-unrecorded-dir", dir},
+			{"ack", "-unrecorded-dir", dir, "-all"},
+			{"ack", "-unrecorded-dir", dir, b64([]byte("act-1")) + ":1"},
+		} {
+			code, stdout, stderr := operator(args...)
+			if code != ExitFailure || stdout != "" || !strings.Contains(stderr, "not an existing directory") {
+				t.Fatalf("%q: exit %d, stdout %q, stderr %q", args, code, stdout, stderr)
+			}
+		}
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("an operator command created the directory: %v", err)
 	}
 }

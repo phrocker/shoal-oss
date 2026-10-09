@@ -25,6 +25,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -72,6 +73,13 @@ func parseInterleaved(flags *flag.FlagSet, args []string) ([]string, error) {
 func openForOperator(dir string, env Env) (*effectsgateway.UnrecordedLog, int) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, failf(env, ExitUsage, "-unrecorded-dir is required")
+	}
+	// An operator command never creates the directory: a mistyped path must
+	// be an error, not an empty log that says nothing awaits reconciliation.
+	// Only run creates it.
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return nil, failf(env, ExitFailure, "-unrecorded-dir %s is not an existing directory; "+
+			"name the directory the gateway runs with", dir)
 	}
 	log, err := effectsgateway.OpenUnrecordedLog(dir, env.Clock.Now)
 	if errors.Is(err, effectsgateway.ErrGatewayLocked) {
@@ -234,18 +242,28 @@ func ackUnrecorded(args []string, env Env) int {
 		chosen = append(chosen, matched[0])
 	}
 
-	logger := effectsgateway.NewLogger(env.Stdout, env.Clock.Now)
+	// One durable rewrite for all of them, or none: a failure part way never
+	// leaves some named reports cleared and others not.
+	keys := make([]effectsgateway.UnrecordedKey, 0, len(chosen))
+	named := map[string]bool{}
+	unique := chosen[:0:0]
 	for _, entry := range chosen {
-		removed, err := log.Ack(entry.ActionID, entry.Fence)
-		if err != nil {
-			return failf(env, ExitFailure, "%s: %v", entryID(entry), err)
+		if id := entryID(entry); !named[id] {
+			named[id] = true
+			unique = append(unique, entry)
+			keys = append(keys, effectsgateway.UnrecordedKey{ActionID: entry.ActionID, Fence: entry.Fence})
 		}
-		if removed {
-			logger.Log(effectsgateway.LogRecord{
-				Event: effectsgateway.EventUnrecordedCleared, ActionID: entry.ActionID,
-				Fence: entry.Fence, ClaimNonce: entry.ClaimNonce, Unrecorded: log.Len(),
-			})
-		}
+	}
+	if err := log.AckAll(keys); err != nil {
+		return failf(env, ExitFailure, "%v; nothing was acknowledged", err)
+	}
+	logger := effectsgateway.NewLogger(env.Stdout, env.Clock.Now)
+	remaining := log.Len()
+	for _, entry := range unique {
+		logger.Log(effectsgateway.LogRecord{
+			Event: effectsgateway.EventUnrecordedCleared, ActionID: entry.ActionID,
+			Fence: entry.Fence, ClaimNonce: entry.ClaimNonce, Unrecorded: remaining,
+		})
 	}
 	return ExitOK
 }

@@ -588,6 +588,47 @@ func (l *UnrecordedLog) Ack(actionID []byte, fence uint64) (bool, error) {
 	return l.remove(actionID, fence)
 }
 
+// UnrecordedKey names one entry: an action and the fence its report is for.
+type UnrecordedKey struct {
+	ActionID []byte
+	Fence    uint64
+}
+
+// AckAll removes several entries with one durable rewrite, or none: every
+// key must name a held entry, and a failed write restores the log as it was.
+// It is what `shoal-gateway unrecorded ack` calls, so an ack that fails part
+// way never leaves some of the named reports cleared and others not.
+func (l *UnrecordedLog) AckAll(keys []UnrecordedKey) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return errors.New("unrecorded log is closed")
+	}
+	previousEntries := append([]UnrecordedEntry(nil), l.entries...)
+	previousLines := append([][]byte(nil), l.lines...)
+	previousSize := l.size
+	restore := func() { l.entries, l.lines, l.size = previousEntries, previousLines, previousSize }
+	for _, key := range keys {
+		index := l.find(key.ActionID, key.Fence)
+		if index < 0 {
+			restore()
+			return fmt.Errorf("no held report for action %s fence %d",
+				base64.RawURLEncoding.EncodeToString(key.ActionID), key.Fence)
+		}
+		l.size -= len(l.lines[index])
+		l.entries = append(l.entries[:index:index], l.entries[index+1:]...)
+		l.lines = append(l.lines[:index:index], l.lines[index+1:]...)
+	}
+	if err := l.persist(); err != nil {
+		restore()
+		return err
+	}
+	return nil
+}
+
 // cleared removes an entry the explorer has now recorded.
 func (l *UnrecordedLog) cleared(actionID []byte, fence uint64) (bool, error) {
 	return l.remove(actionID, fence)
