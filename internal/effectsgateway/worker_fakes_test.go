@@ -77,6 +77,19 @@ func (c *timerClock) After(d time.Duration) <-chan time.Time {
 	return ch
 }
 
+// waiting reports whether a timer is pending that fires d from now: how a
+// test knows the code under test has armed the timer it is about to pass.
+func (c *timerClock) waiting(d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, waiter := range c.waiters {
+		if waiter.at.Equal(c.now.Add(d)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *timerClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -585,7 +585,15 @@ rather than waiting for it, so the honest worst path (request, completion,
 both fallback reports) fits inside the drain bound; a test drives it with
 every call blocking to its timeout and measures it. `HardStop` (a second
 signal) takes the same abandonment path at once: mark, cancel, then the
-unrecorded-log write, which `Run` waits for before it returns. `Kill` is SIGKILL itself, for tests: it abandons everything
+unrecorded-log write, which `Run` waits for before it returns; a `HardStop`
+after `Run` has returned does nothing. Both rely on one invariant, rather than
+on winning a race with the runs: a run whose request was handed to the target
+leaves the worker's set of runs only once it is settled — its outcome recorded
+on the plane or written to the unrecorded log — so a snapshot taken at any
+moment holds every effect not yet accounted for. A randomized stop-timing test
+(`TestEveryEffectIsAccountedForWhateverTheStopTiming`, 500 iterations) checks
+that every effect the target performed is accounted for however the signals
+land. `Kill` is SIGKILL itself, for tests: it abandons everything
 and writes nothing, and the next instance re-claims after the lapse and
 resends under the same `ExecutorKey`.
 

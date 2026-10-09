@@ -218,13 +218,25 @@ type Worker struct {
 	skipMu  sync.Mutex
 	skipped map[string]uint64
 
-	// runs are the claims in hand, for abandonment at the end of a drain.
+	// runs are the claims in hand, for abandonment.
+	//
+	// The invariant every stop path relies on: a run that has been
+	// attempted — a request handed to the target client, so the effect may
+	// have happened — leaves runs ONLY once it is settled, that is, its
+	// outcome is recorded on the plane or written to the unrecorded log.
+	// handle's exit keeps an attempted, unsettled run here; abandon removes
+	// the runs it wrote. So a snapshot of runs taken at any moment contains
+	// every effect not yet accounted for, whatever the run's goroutine is
+	// doing, and no stop needs to win a race against it.
 	runsMu sync.Mutex
 	runs   map[*claimRun]struct{}
-	// abandonMu is held for the whole of an abandonment, and Run takes it
-	// before returning, so a HardStop's write finishes before the caller
-	// closes the log.
+	// abandonMu serializes abandonment with Run's return. HardStop holds it
+	// from storing killed to the end of its write; Run takes it last and
+	// marks the worker finished, so a HardStop that saw killed finishes its
+	// write before Run returns, and one that starts after Run has returned
+	// does nothing.
 	abandonMu sync.Mutex
+	finished  bool
 
 	work sync.WaitGroup
 }
@@ -341,12 +353,44 @@ func (w *Worker) Kill() {
 // outcome_unknown in one durable rewrite. It returns how many runs were
 // unfinished. The write is bounded only by the disk: a stuck fsync holds it.
 func (w *Worker) HardStop() int {
-	// Stored before abandon takes its snapshot of the runs: a claim that
-	// would register after the snapshot sees it and is not registered, and
-	// a run that would send after it sees it and does not (attempt), so no
-	// request leaves that the write below does not account for.
+	w.abandonMu.Lock()
+	defer w.abandonMu.Unlock()
+	if w.finished {
+		// Run has returned: by the runs invariant nothing attempted is
+		// unaccounted for, and the caller may have closed the log.
+		return 0
+	}
+	// killed is stored and runs snapshotted under both locks. A claim
+	// registers under runsMu only if not killed, and a run sends only if not
+	// killed or abandoned (attempt), so the snapshot holds every run that
+	// can ever have sent; and by the invariant on runs, one that has sent
+	// and not settled is still there whatever its goroutine has done since.
+	w.runsMu.Lock()
 	w.killed.Store(true)
-	return w.abandon()
+	stopYield("hardstop:killed")
+	runs := w.snapshotLocked()
+	w.runsMu.Unlock()
+	stopYield("hardstop:snapshot")
+	return w.abandonRuns(runs)
+}
+
+// stopYield is a scheduling seam for the stop-timing stress test, which
+// sleeps at random here to widen the windows between a stop's steps and the
+// runs racing it. It does nothing in production.
+var stopYieldHook atomic.Pointer[func(string)]
+
+func stopYield(point string) {
+	if hook := stopYieldHook.Load(); hook != nil {
+		(*hook)(point)
+	}
+}
+
+func (w *Worker) snapshotLocked() []*claimRun {
+	runs := make([]*claimRun, 0, len(w.runs))
+	for run := range w.runs {
+		runs = append(runs, run)
+	}
+	return runs
 }
 
 // Run retries the unrecorded log, then pulls and works actions until ctx is
@@ -363,7 +407,8 @@ func (w *Worker) Run(ctx context.Context) error {
 	// HardStop from another goroutine) finishes its write before Run returns.
 	defer func() {
 		w.abandonMu.Lock()
-		w.abandonMu.Unlock() //nolint:staticcheck // a barrier, not a critical section
+		w.finished = true
+		w.abandonMu.Unlock()
 	}()
 	// The start-up retry stops on SIGTERM as well as on Kill; whatever it
 	// did not reach stays on disk for the next start.
@@ -467,11 +512,14 @@ func (w *Worker) abandon() int {
 	w.abandonMu.Lock()
 	defer w.abandonMu.Unlock()
 	w.runsMu.Lock()
-	runs := make([]*claimRun, 0, len(w.runs))
-	for run := range w.runs {
-		runs = append(runs, run)
-	}
+	runs := w.snapshotLocked()
 	w.runsMu.Unlock()
+	return w.abandonRuns(runs)
+}
+
+// abandonRuns does the work of abandon on a snapshot. The caller holds
+// abandonMu.
+func (w *Worker) abandonRuns(runs []*claimRun) int {
 	// Mark every run first: from here none sends (attempt refuses an
 	// abandoned run) and none reports.
 	var written []*claimRun
@@ -503,6 +551,15 @@ func (w *Worker) abandon() int {
 		}
 		record.Unrecorded = w.cfg.Unrecorded.Len()
 		w.log.Log(record)
+	}
+	if err == nil {
+		// Written, so settled: they may leave runs now.
+		w.runsMu.Lock()
+		for _, run := range written {
+			run.settle()
+			delete(w.runs, run)
+		}
+		w.runsMu.Unlock()
 	}
 	w.log.Log(LogRecord{Event: EventAbandoned, Abandoned: len(runs),
 		Unrecorded: w.cfg.Unrecorded.Len()})
@@ -748,6 +805,7 @@ func (w *Worker) pullOnce(ctx context.Context, held *ticket, cursor string) (boo
 			}
 			return claimedAny, "", err
 		}
+		stopYield("pull:claimed")
 		// Registered under runsMu with the killed check, so a HardStop's
 		// snapshot either includes this run or this run is never registered.
 		// An unregistered claim has sent nothing, and lapses.
@@ -1174,8 +1232,16 @@ func (w *Worker) handle(run *claimRun) {
 	defer w.work.Done()
 	defer w.release(run.ticket)
 	defer func() {
+		// The invariant on runs: an attempted run leaves only once settled.
+		// One that ends unsettled (stopped, or its report could not be
+		// written) stays for abandon to account for.
 		w.runsMu.Lock()
-		delete(w.runs, run)
+		run.mu.Lock()
+		keep := run.attempted && !run.settled
+		run.mu.Unlock()
+		if !keep {
+			delete(w.runs, run)
+		}
 		w.runsMu.Unlock()
 	}()
 	go w.renew(run)
@@ -1358,6 +1424,7 @@ func (w *Worker) attempt(run *claimRun, bound BoundRequest, header, credential s
 	}()
 	started := w.clock.Now()
 	response, err := w.cfg.Target.Do(request)
+	stopYield("attempt:returned")
 	if err != nil {
 		return Observation{Written: written.Load(), Err: err}, int64(len(bound.Body)), 0,
 			w.clock.Now().Sub(started)
