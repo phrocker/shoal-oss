@@ -152,3 +152,8 @@ All 20 Python tests, targeted Go race tests and vet passed. Review included stat
 analysis, syscall-order instrumentation and an externally timed numerical probe;
 it did not simulate a power loss or perform exhaustive fuzzing. No Copilot review
 or paid classifier experiment was requested.
+The same-picture challenger comparison persists both artifacts and a
+measurement-only report. `verify_comparison.py` independently checks the
+report digest, disjoint predeclared splits, candidate set, metric bounds,
+pinned threshold, and measurement-only disposition before a downstream
+evaluator consumes it.

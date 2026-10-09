@@ -5,6 +5,7 @@ from pathlib import Path
 
 import challenger_manifest as contract
 import compare_challengers
+import verify_comparison
 
 
 def manifest():
@@ -48,6 +49,23 @@ class ComparisonContractTests(unittest.TestCase):
         data = rows(); value = manifest()
         with self.assertRaisesRegex(ValueError, 'disjoint'):
             compare_challengers.compare(data[:4], data[3:5], value, lambda _: [], tempfile.mkdtemp())
+
+    def test_report_verifier_rejects_tampering(self):
+        report = contract.seal(
+            'challenger_comparison', manifest_id='a' * 64,
+            train_ids=['0', '1'], test_ids=['2', '3'],
+            candidates={'catboost': 'b' * 64, 'unixcoder': 'c' * 64},
+            metrics={name: {'examples': 2, 'positive_examples': 1, 'accuracy': 1.0,
+                            'positive_recall': 1.0, 'false_positive_rate': 0.0,
+                            'threshold': 0.5, 'threshold_predeclared': True,
+                            'predicted_positive': 1} for name in ('catboost', 'unixcoder')},
+            disposition='measurement_only', optimization_enabled=False,
+            limitation='Measurement only; no promotion or quality generalization.')
+        self.assertTrue(verify_comparison.verify(report)['verified'])
+        tampered = dict(report)
+        tampered['test_ids'] = ['1', '2']
+        with self.assertRaises(ValueError):
+            verify_comparison.verify(tampered)
 
 
 if __name__ == '__main__': unittest.main()
