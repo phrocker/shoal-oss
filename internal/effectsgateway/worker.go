@@ -237,6 +237,9 @@ type Worker struct {
 	// does nothing.
 	abandonMu sync.Mutex
 	finished  bool
+	// unwritten is set when an abandonment's write failed: an effect that
+	// may have happened is on no record and in no log.
+	unwritten atomic.Bool
 
 	work sync.WaitGroup
 }
@@ -405,11 +408,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	defer w.kill()
 	// Deferred after kill, so it runs first: an abandonment under way (a
 	// HardStop from another goroutine) finishes its write before Run returns.
-	defer func() {
-		w.abandonMu.Lock()
-		w.finished = true
-		w.abandonMu.Unlock()
-	}()
+	defer w.finish()
 	// The start-up retry stops on SIGTERM as well as on Kill; whatever it
 	// did not reach stays on disk for the next start.
 	retryCtx, stopRetry := context.WithCancel(ctx)
@@ -423,6 +422,14 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.refreshReadiness()
 	w.pullLoop(ctx)
 	abandoned := w.drain()
+	// Wait out any abandonment under way before deciding the outcome: its
+	// write is part of it.
+	w.finish()
+	// Ahead of every other outcome, a hard stop included: whatever else
+	// happened, an effect is on no record and in no log.
+	if w.unwritten.Load() {
+		return ErrUnrecordedUnwritten
+	}
 	if w.killed.Load() {
 		return errors.New("worker killed")
 	}
@@ -433,6 +440,15 @@ func (w *Worker) Run(ctx context.Context) error {
 		return ErrDrainAbandoned
 	}
 	return nil
+}
+
+// finish waits for an abandonment under way (a HardStop from another
+// goroutine) to end, and marks the worker finished, so a later HardStop does
+// nothing. It is idempotent.
+func (w *Worker) finish() {
+	w.abandonMu.Lock()
+	w.finished = true
+	w.abandonMu.Unlock()
 }
 
 // ErrUnrecordedUnwritten says the drain ended with an outcome that could not
@@ -579,6 +595,9 @@ func (w *Worker) abandonRuns(runs []*claimRun) int {
 	// bounded by the disk; a stuck fsync holds it, and nothing short of
 	// dropping the entries could do better.
 	err := w.cfg.Unrecorded.AppendAll(entries)
+	if err != nil && len(entries) > 0 {
+		w.unwritten.Store(true)
+	}
 	for _, run := range written {
 		record := w.record(run, EventUnrecorded)
 		record.Ambiguity = fleet.AmbiguityOutcomeUnknown

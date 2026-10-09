@@ -620,7 +620,9 @@ attempts is never "nothing to report" (#514). It is appended to
 - **A write that fails**: the run stays held with the entry it could not
   write. When the drain's work is done it retries that entry, once; if the
   write fails again, `Run` returns `ErrUnrecordedUnwritten` (the command exits
-  1), never a clean stop with an effect on no record and in no log.
+  1), never a clean stop with an effect on no record and in no log. The same
+  holds for a hard stop whose write fails: `Run` reports the failed write
+  ahead of the stop itself.
 - **Clearing**: otherwise only `UnrecordedLog.Ack` / `Worker.AckUnrecorded`,
   which the command exposes as `shoal-gateway unrecorded ack`. The ack opens
   the log, so it runs against a stopped gateway's directory (see
@@ -686,10 +688,10 @@ kill) still writes nothing; there the re-claim, resending under the same
 | code | meaning |
 |---|---|
 | 0 | drained cleanly |
-| 1 | startup refused, or the worker failed |
+| 1 | startup refused, or the worker failed — including any stop, a hard stop or a drain, that could not write an outcome to the unrecorded log (`ErrUnrecordedUnwritten`): an effect that may have happened is on no record and in no log, and only the gateway's `dispatch_error` events show it |
 | 2 | the command line is wrong |
 | 3 | the drain bound ran out with work unfinished (`ErrDrainAbandoned`); every abandoned run whose request may have reached the target is in the unrecorded log |
-| 4 | a second signal stopped the gateway without draining; runs whose request may have reached the target are in the unrecorded log |
+| 4 | a second signal stopped the gateway without draining, and every sent request is accounted for — on the record, or in the unrecorded log. A hard stop whose write failed exits 1, not 4 |
 
 **Health** (`-health-address`):
 

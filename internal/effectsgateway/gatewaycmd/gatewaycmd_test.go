@@ -345,3 +345,34 @@ func TestGracePeriodCommand(t *testing.T) {
 		t.Fatalf("a zero plane timeout: exit %d", code)
 	}
 }
+
+// TestAHardStopThatCannotWriteIsAFailure: exit 4 says every sent request is
+// accounted for. With the unrecorded directory unwritable, the hard stop's
+// write fails, so the command exits 1, not 4.
+func TestAHardStopThatCannotWriteIsAFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	w := newWorld(t)
+	w.target.hold = true
+	w.explorer.offerAction("act-unwritable")
+	run := start(t, w.args(nil), nil)
+	select {
+	case <-w.target.entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the target saw no request")
+	}
+	if err := os.Chmod(w.dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(w.dir, 0o700) })
+	run.signals <- syscall.SIGTERM
+	run.signals <- syscall.SIGINT
+	code, ok := run.exit(10 * time.Second)
+	if !ok {
+		t.Fatal("the hard stop did not stop the gateway")
+	}
+	if code != ExitFailure || !strings.Contains(run.stderr.String(), "no record and in no log") {
+		t.Fatalf("exit %d, want %d: %s", code, ExitFailure, run.stderr)
+	}
+}

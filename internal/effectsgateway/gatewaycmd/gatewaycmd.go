@@ -55,9 +55,10 @@ const (
 	// (effectsgateway.ErrDrainAbandoned). Every abandoned run whose request
 	// may have reached the target is in the unrecorded log.
 	ExitDrainAbandoned = 3
-	// ExitHardStop: a second signal stopped the gateway without draining.
-	// Claims in hand lapse and are re-claimed; nothing about them was
-	// reported.
+	// ExitHardStop: a second signal stopped the gateway without draining,
+	// and every sent request is accounted for: on the record, or written to
+	// the unrecorded log. Unsent claims lapse and are re-claimed. A hard stop
+	// whose write failed exits ExitFailure instead.
 	ExitHardStop = 4
 )
 
@@ -247,6 +248,11 @@ func Run(args []string, env Env) int {
 	switch {
 	case err == nil:
 		return ExitOK
+	case errors.Is(err, effectsgateway.ErrUnrecordedUnwritten):
+		// Ahead of the hard stop: exit 4 promises every sent request is
+		// accounted for, and here one is not.
+		return failf(env, ExitFailure, "%v; an effect that may have happened is on no record "+
+			"and in no log: reconcile from the gateway's dispatch_error events", err)
 	case errors.Is(err, effectsgateway.ErrDrainAbandoned):
 		return failf(env, ExitDrainAbandoned, "%v; %d reports await reconciliation in the "+
 			"unrecorded log", err, log.Len())

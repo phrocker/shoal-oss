@@ -686,3 +686,30 @@ func TestADrainThatCannotWriteIsNotClean(t *testing.T) {
 		t.Fatalf("Run = %v, want ErrUnrecordedUnwritten", err)
 	}
 }
+
+// TestAHardStopWhoseWriteFailsIsNotAKill: Run reports the failed write ahead
+// of the hard stop itself, so the caller never reads it as "every sent
+// request accounted for".
+func TestAHardStopWhoseWriteFailsIsNotAKill(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	gate := make(chan struct{})
+	h.target.mu.Lock()
+	h.target.gate = gate
+	h.target.mu.Unlock()
+	t.Cleanup(func() { close(gate) })
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.start()
+	select {
+	case <-h.target.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the target saw no request")
+	}
+	previous := fileSyncer
+	fileSyncer = func(*os.File) error { return errors.New("disk") }
+	t.Cleanup(func() { fileSyncer = previous })
+	h.cancel()
+	h.worker.HardStop()
+	if err := h.runResult(); !errors.Is(err, ErrUnrecordedUnwritten) {
+		t.Fatalf("Run = %v, want ErrUnrecordedUnwritten", err)
+	}
+}
