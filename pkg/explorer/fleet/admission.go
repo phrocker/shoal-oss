@@ -449,7 +449,9 @@ func (s *AdmissionService) Request(
 		SourceID: request.SourceID, PolicyID: request.PolicyID,
 		ObjectID: request.ObjectID, Input: request.Input,
 		Context: request.Context,
-	}, auth.OperationInvoke, now)
+	}, auth.OperationInvoke, now,
+		false,
+	)
 	if err != nil {
 		return AdmissionGrant{}, err
 	}

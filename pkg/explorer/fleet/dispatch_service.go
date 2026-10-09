@@ -55,13 +55,14 @@ func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
 }
 
 func (s *DispatchService) Enqueue(ctx context.Context, request EnqueueRequest) (ActionRecord, error) {
-	return s.enqueue(ctx, request, auth.OperationDispatch)
+	return s.enqueue(ctx, request, auth.OperationDispatch, false)
 }
 
 func (s *DispatchService) enqueue(
 	ctx context.Context,
 	request EnqueueRequest,
 	operation auth.Operation,
+	tolerateLapse bool,
 ) (ActionRecord, error) {
 	ctx, cancel := s.deadline(ctx, request.Context)
 	defer cancel()
@@ -87,7 +88,8 @@ func (s *DispatchService) enqueue(
 		return ActionRecord{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "action ID is reserved")
 	}
-	record, action, err := s.queuedRecord(ctx, decision, request, operation, now)
+	record, action, err := s.queuedRecord(
+		ctx, decision, request, operation, now, tolerateLapse)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -166,9 +168,10 @@ func (s *DispatchService) queuedRecord(
 	request EnqueueRequest,
 	operation auth.Operation,
 	now time.Time,
+	tolerateLapse bool,
 ) (ActionRecord, Action, error) {
 	record, action, _, err := s.queuedRecordBinding(
-		ctx, decision, request, operation, now)
+		ctx, decision, request, operation, now, tolerateLapse)
 	return record, action, err
 }
 
@@ -180,6 +183,19 @@ func (s *DispatchService) queuedRecordBinding(
 	request EnqueueRequest,
 	operation auth.Operation,
 	now time.Time,
+	// tolerateLapse resolves a descriptor whose lease has lapsed.
+	//
+	// Set only by Invoke, and only after an authorized read has established
+	// that the caller is the principal of an existing *terminal* record at
+	// this ID (#578). Under that condition it cannot admit new work: enqueue
+	// will either replay the record or conflict with it, never create. And
+	// it is not an oracle, because the read it is derived from answers a
+	// foreign ID and an absent one identically — so a caller who does not
+	// hold the record sees exactly the refusal it saw before.
+	//
+	// Revocation is still refused: activeChainLapsing checks RevokedAt
+	// regardless of this flag.
+	tolerateLapse bool,
 ) (ActionRecord, Action, string, error) {
 	if err := validateOpaque("action ID", request.ID, false); err != nil {
 		return ActionRecord{}, Action{}, "", err
@@ -201,13 +217,15 @@ func (s *DispatchService) queuedRecordBinding(
 	}
 	// Binding, not execution: queueing work for an executor that runs out of
 	// process must not require it to be runnable here.
-	descriptor, action, _, err := s.registry.resolveActionBinding(
+	descriptor, action, _, err := s.registry.resolveActionBindingLapsing(
 		ctx, decision, request.AgentID, request.AgentGeneration,
 		request.Capability, request.Action, request.SourceID, request.PolicyID,
 		request.ObjectID, operation, now,
 		// Pinned. The dispatcher read a descriptor and built this request
 		// from it, so it should fail if the descriptor moved underneath.
 		true,
+		tolerateLapse,
+		tolerateLapse,
 	)
 	if err != nil {
 		return ActionRecord{}, Action{}, "", err
@@ -241,7 +259,42 @@ func (s *DispatchService) queuedRecordBinding(
 }
 
 func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (ActionRecord, error) {
-	queued, err := s.enqueue(ctx, request.Enqueue, auth.OperationInvoke)
+	// Whether this caller already holds a terminal record at this ID,
+	// established before the enqueue and by an authorized read (#578).
+	//
+	// A caller retrying Invoke is typically the one that lost the response to
+	// a call whose effect already happened, and the replay branch below is
+	// its route to learning the outcome. Without this the enqueue's own
+	// resolve refuses first when the descriptor's lease has lapsed, so the
+	// record is intact and unreachable — the effect stranded at the caller
+	// instead of in the record.
+	//
+	// Why this is not the oracle enqueue defends against. That function
+	// refuses the admission span "before the store is read, and without
+	// regard to what is there", because an enqueue legitimately names an ID
+	// nobody holds and so cannot be principal-checked. This read *is*
+	// principal-checked: authorizedCurrentBinding answers a foreign ID and
+	// an absent one identically, with ObjectNotFound. So a caller that does
+	// not hold the record learns nothing it did not already know, and sees
+	// exactly the refusal it saw before.
+	//
+	// And it cannot admit new work. The flag is set only when a *terminal*
+	// record already exists, and enqueue then either replays it or conflicts
+	// with it — it never creates. Revocation is still refused, through
+	// activeChainLapsing's RevokedAt check.
+	tolerateLapse := false
+	if decision, now, beginErr := s.begin(
+		ctx, auth.OperationInvoke, request.Enqueue.Context,
+	); beginErr == nil {
+		if existing, _, _, readErr := s.authorizedCurrentBinding(
+			ctx, decision, request.Enqueue.ID, auth.OperationInvoke, true,
+			now, executorPhaseTerminalReplay, 0,
+		); readErr == nil && existing.State.terminal() {
+			tolerateLapse = true
+		}
+	}
+	queued, err := s.enqueue(
+		ctx, request.Enqueue, auth.OperationInvoke, tolerateLapse)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -253,8 +306,15 @@ func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (Ac
 		// The enqueue replay path: the caller is by definition the principal
 		// that enqueued, so the principal requirement is kept rather than
 		// relaxed with the claimant routes.
-		current, _, currentErr := s.authorizedCurrent(
+		// Named as a terminal replay rather than going through
+		// authorizedCurrent, which hardcodes executorPhaseNone and would
+		// refuse after a lapse — the refusal this change exists to remove.
+		// Reachable now that the pre-read above lets the enqueue resolve
+		// (#578); on its own it was a phase nothing could reach, which is
+		// why it was reverted from #577.
+		current, _, _, currentErr := s.authorizedCurrentBinding(
 			ctx, decision, queued.ID, auth.OperationInvoke, true, now,
+			executorPhaseTerminalReplay, 0,
 		)
 		if currentErr != nil {
 			return ActionRecord{}, currentErr
@@ -2733,6 +2793,12 @@ const (
 	executorPhaseExtend
 	executorPhaseComplete
 	executorPhaseAmbiguity
+	// executorPhaseTerminalReplay is a caller re-sending a request whose
+	// action is already terminal, and being handed the record back. It takes
+	// no new work and renews nothing, so it belongs with Complete and
+	// ReportAmbiguity: refusing it after a lapse strands the effect at the
+	// caller rather than in the record (#578).
+	executorPhaseTerminalReplay
 )
 
 // reportsOnClaim reports whether the phase reports on a claim already taken
@@ -2740,7 +2806,9 @@ const (
 // the claim was taken under, and tolerate a descriptor lease that lapsed after
 // the claim: a lapse never strands the report of an effect that happened.
 func (p executorPhase) reportsOnClaim() bool {
-	return p == executorPhaseComplete || p == executorPhaseAmbiguity
+	return p == executorPhaseComplete ||
+		p == executorPhaseAmbiguity ||
+		p == executorPhaseTerminalReplay
 }
 
 // executorBindingPermits is the executor binding rule (#391), pure so each
@@ -2771,7 +2839,12 @@ func executorBindingPermits(
 		return currentRef == binding
 	case executorPhaseExtend:
 		return currentRef == binding && claimedRef == binding
-	case executorPhaseComplete, executorPhaseAmbiguity:
+	case executorPhaseComplete, executorPhaseAmbiguity,
+		executorPhaseTerminalReplay:
+		// Handled explicitly rather than falling to default. default refuses,
+		// which would be fail-closed but silent, and a terminal replay is
+		// judged against the claimed reference for the same reason a
+		// completion is.
 		return claimedRef == "" || claimedRef == binding
 	default:
 		return false

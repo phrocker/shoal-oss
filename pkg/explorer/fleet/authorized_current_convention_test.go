@@ -32,9 +32,10 @@ func TestOnlyNonClaimantRoutesUseAuthorizedCurrent(t *testing.T) {
 	// Each entry is a route that reads or cancels rather than reporting on a
 	// claim, so executorPhaseNone is the right phase for it.
 	allowed := map[string]string{
-		"Invoke": "its authorizedCurrent call is the terminal-replay branch, " +
-			"which returns an existing terminal record rather than reporting " +
-			"an outcome",
+		// Invoke was here, exempted because its replay branch only reads.
+		// It names executorPhaseTerminalReplay now: refusing that read after
+		// a lapse strands the effect at the caller rather than in the record
+		// (#578). The stale-entry check below is what forced this removal.
 		"Cancel": "a cancellation is the enqueuer's lever under dispatch, not " +
 			"a report on a claim",
 		"Status": "a read",

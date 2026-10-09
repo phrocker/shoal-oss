@@ -842,7 +842,9 @@ func (s *ApprovalService) Request(
 	// makes, so the approval route cannot admit an input the dispatch route
 	// would refuse.
 	base, action, err := dispatch.queuedRecord(
-		ctx, decision, request, auth.OperationDispatch, now)
+		ctx, decision, request, auth.OperationDispatch, now,
+		false,
+	)
 	if err != nil {
 		return ApprovalReceipt{}, err
 	}
