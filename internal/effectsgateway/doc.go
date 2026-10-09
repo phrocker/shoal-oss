@@ -26,9 +26,13 @@
 // predicates, ExecutorKey handling, the egress-restricted target transport, an
 // internal client for the dispatch routes on main, and the logging policy.
 //
-// What is deliberately absent, and why, is in docs/effects-gateway-deploy.md:
-// the worker loop and a command need a principal that can claim work it did
-// not enqueue (#480), claim renewal (#430), an ambiguity route for a lost
-// fence (#484), and a heartbeat that does not invalidate live claims (#486).
-// Nothing in this package performs an effect on its own.
+// The client covers pull, claim, extend, complete (bound on the claim fence),
+// the lost-fence ambiguity report, the gateway's own descriptor resolve and
+// attestation presentation, each claim-scoped request carrying the record's
+// Shoal-Correlation-ID. It has no heartbeat: a worker cannot truthfully
+// assert a descriptor's liveness, so the gateway never heartbeats (#391).
+//
+// The worker loop and the command are not here yet; see
+// docs/effects-gateway-deploy.md. Nothing in this package performs an effect
+// on its own.
 package effectsgateway

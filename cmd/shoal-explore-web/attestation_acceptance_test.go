@@ -542,7 +542,9 @@ func TestSDKAttestationEffectsGatewayClaimAndComplete(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return effectsgateway.RequestContext{RequestID: id, ReasonCode: reason, Deadline: h.now().Add(30 * time.Second)}
+		// Every request about the action carries its record's correlation.
+		return effectsgateway.RequestContext{RequestID: id, ReasonCode: reason, Deadline: h.now().Add(30 * time.Second),
+			CorrelationID: []byte(queued.CorrelationID)}
 	}
 	claimID, _, err := effectsgateway.NewClaimID("pod-0", nil)
 	if err != nil {
@@ -579,11 +581,88 @@ func TestSDKAttestationEffectsGatewayClaimAndComplete(t *testing.T) {
 		t.Fatal("the claim does not name the presented attestation")
 	}
 	completed, err := gateway.Complete(ctx, claimed.ID, effectsgateway.Completion{
-		Context: gatewayContext("complete"), ExpectedVersion: claimed.Version,
+		Context: gatewayContext("complete"), ExpectedVersion: claimed.Version, ClaimFence: claimed.ClaimFence,
 		ClaimID: claimID, Output: json.RawMessage(`{"ok":true}`),
 	})
 	if err != nil || completed.State != fleet.DispatchSucceeded {
 		t.Fatalf("complete over HTTP = %+v, %v", completed.State, err)
+	}
+}
+
+// TestTheGatewayPresentsItsAttestationFromFiles: the dispatch client's
+// PresentAttestation, built on sdk.Attestation(), presents the statement and
+// key files for its bound ref over the real route, returns the receipt's
+// expires_at, and re-reads both files on every call — a rotated statement is
+// picked up by the next presentation. The executor-bound presenter is the
+// claimant's principal, so the claim it unlocks succeeds.
+func TestTheGatewayPresentsItsAttestationFromFiles(t *testing.T) {
+	h := newAttestationHarness(t)
+	server := newAttestationPlane(t, h, map[string]principal{
+		"presenter": attestedPresenter, "worker": attestedWorker,
+	})
+	base, _ := url.Parse(server.URL)
+	unbound, err := effectsgateway.NewDispatchClient(base, server.Client(),
+		func() (string, error) { return "presenter", nil }, h.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presenter, err := unbound.BindExecutor("local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	statementFile, keyFile := filepath.Join(dir, "statement"), filepath.Join(dir, "key")
+	write := func(statement []byte, key string) {
+		t.Helper()
+		if err := os.WriteFile(statementFile, statement, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(keyFile, []byte(key), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A statement bound to another key: the one opaque refusal.
+	write(h.statement(attestedPresenter, "k0", h.now(), time.Hour), "k1")
+	if _, err := presenter.PresentAttestation(ctx, statementFile, keyFile); effectsgateway.DispatchKind(err) !=
+		effectsgateway.DispatchAttestationRefused {
+		t.Fatalf("a statement for another key = %v", err)
+	}
+
+	issued := h.now()
+	write(h.statement(attestedPresenter, "k1", issued, 30*time.Minute), "k1")
+	expires, err := presenter.PresentAttestation(ctx, statementFile, keyFile)
+	if err != nil || !expires.Equal(issued.Add(30*time.Minute)) {
+		t.Fatalf("present = %v, %v; want %v", expires, err, issued.Add(30*time.Minute))
+	}
+	// Idempotent: the same files again are the same receipt.
+	if again, err := presenter.PresentAttestation(ctx, statementFile, keyFile); err != nil || !again.Equal(expires) {
+		t.Fatalf("re-present = %v, %v", again, err)
+	}
+
+	// Rotated by the operator's signer: the next call reads the new files.
+	h.advance(time.Minute)
+	rotated := h.now()
+	write(h.statement(attestedPresenter, "k2", rotated, time.Hour), "k2")
+	renewed, err := presenter.PresentAttestation(ctx, statementFile, keyFile)
+	if err != nil || !renewed.Equal(rotated.Add(time.Hour)) {
+		t.Fatalf("rotated present = %v, %v; want %v", renewed, err, rotated.Add(time.Hour))
+	}
+
+	// The attestation unlocks the claim, which never outlives it.
+	worker, _ := effectsgateway.NewDispatchClient(base, server.Client(),
+		func() (string, error) { return "worker", nil }, h.now)
+	queued := h.enqueueDeploy("deploy-files")
+	id, _ := effectsgateway.NewRequestID(nil)
+	claimID, _, _ := effectsgateway.NewClaimID("pod-0", nil)
+	claimed, err := worker.Claim(ctx, queued.ID, effectsgateway.ClaimRequest{
+		Context: effectsgateway.RequestContext{RequestID: id, ReasonCode: "claim",
+			Deadline: h.now().Add(30 * time.Second), CorrelationID: []byte(queued.CorrelationID)},
+		ExpectedVersion: queued.Version, ClaimID: claimID, Lease: time.Minute,
+	})
+	if err != nil || claimed.ClaimLeaseUntil.After(renewed) {
+		t.Fatalf("attested claim = %+v, %v", claimed, err)
 	}
 }
 
