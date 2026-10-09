@@ -17,7 +17,7 @@ func testTypedIdentity() TypedIdentity {
 
 func testTypedRequest() TypedRequest {
 	return TypedRequest{
-		ModelAlias: "laya-threat-v1", State: []byte("bounded picture"),
+		ModelAlias: "laya-threat-v1", QuestionSetID: "threat-triage-v1", State: []byte("bounded picture"),
 		Questions: []TypedQuestion{
 			{ID: "risk", Kind: TypedChoice, Options: []string{"low", "high"}},
 			{ID: "confidence", Kind: TypedPropositionProbability},

@@ -35,9 +35,10 @@ type TypedQuestion struct {
 }
 
 type TypedRequest struct {
-	ModelAlias string
-	State      []byte
-	Questions  []TypedQuestion
+	ModelAlias    string
+	QuestionSetID string
+	State         []byte
+	Questions     []TypedQuestion
 }
 
 type TypedIdentity struct {
@@ -139,6 +140,9 @@ func ValidateTypedRequest(req TypedRequest, identity TypedIdentity) error {
 	}
 	if strings.TrimSpace(req.ModelAlias) == "" || req.ModelAlias != identity.ModelAlias {
 		return typedErr("model alias does not match pinned identity")
+	}
+	if strings.TrimSpace(req.QuestionSetID) == "" {
+		return typedErr("question set identity is required")
 	}
 	if len(req.State) > MaxTypedStateBytes || len(req.Questions) == 0 || len(req.Questions) > MaxTypedQuestions {
 		return typedErr("request bounds violated")
