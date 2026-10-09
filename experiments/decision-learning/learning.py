@@ -74,7 +74,9 @@ def dataset(ledger, policy):
     if set(splits) != {e['family'] for e in examples.values()}:
         raise ValueError('every family needs exactly one split')
     assessments = {}
+    all_assessments = {}
     for a in ledger['assessments']:
+        all_assessments.setdefault(a['example_id'], []).append(a)
         if a['assessor'] in policy['assessors'] and a['status'] in policy['statuses']:
             assessments.setdefault(a['example_id'], []).append(a)
     held = {h for e in examples.values() if splits[e['family']] != 'train' for h in e['content_digests']}
@@ -82,7 +84,9 @@ def dataset(ledger, policy):
     for eid, e in sorted(examples.items()):
         labels = {a['label'] for a in assessments.get(eid, [])}
         reason = None
-        if not labels or 'unknown' in labels:
+        if any(a['assessor'] not in policy['assessors'] for a in all_assessments.get(eid, [])):
+            reason = 'unauthorized_assessment'
+        elif not labels or 'unknown' in labels:
             reason = 'missing_or_unknown_label'
         elif len(labels) != 1:
             reason = 'disputed_label'

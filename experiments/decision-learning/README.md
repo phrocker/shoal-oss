@@ -30,8 +30,8 @@ must enforce those boundaries around the records.
 
 `poisoning.py` runs a versioned deterministic attack corpus covering duplicate
 flooding, prediction-as-label injection, held-out overlap, failed evaluation,
-artifact substitution, and unauthorized promotion. It reports rejection and
-quarantine denominators with a clean control. The report is structural attack
+artifact substitution, unauthorized promotion, and an unlisted assessor. It
+reports rejection and quarantine denominators with a clean control. The report is structural attack
 evidence only; it does not estimate model quality, ground truth, influence, or
 machine unlearning.
 

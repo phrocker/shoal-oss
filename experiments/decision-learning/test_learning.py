@@ -55,6 +55,20 @@ class LearningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'predictions'):
             l.dataset(reseal(self.ledger),self.dp)
 
+    def test_unauthorized_assessment_is_explicitly_quarantined(self):
+        ledger = dict(self.ledger)
+        ledger['assessments'] = [dict(row) for row in self.ledger['assessments']]
+        ledger['assessments'][0]['assessor'] = 'untrusted'
+        result = l.dataset(reseal(ledger), self.dp)
+        self.assertIn('unauthorized_assessment', {row['reason'] for row in result['excluded']})
+
+    def test_mixed_authority_assessments_are_quarantined(self):
+        ledger = dict(self.ledger)
+        ledger['assessments'] = [dict(row) for row in self.ledger['assessments']]
+        ledger['assessments'].append(dict(ledger['assessments'][0], id='attacker', assessor='untrusted', label='routine'))
+        result = l.dataset(reseal(ledger), self.dp)
+        self.assertIn('unauthorized_assessment', {row['reason'] for row in result['excluded']})
+
     def test_missing_predictions_rejected(self):
         self.predictions['rows'].pop()
         with self.assertRaisesRegex(ValueError,'predictions'):
