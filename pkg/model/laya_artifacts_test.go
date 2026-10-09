@@ -4,9 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -73,6 +76,28 @@ func TestNewVerifiedLayaPredictorChecksBeforeConstruction(t *testing.T) {
 		t.Fatal("unverified artifact set accepted")
 	}
 }
+
+func TestNewVerifiedLayaPredictorHasNoNetworkSideEffects(t *testing.T) {
+	root := t.TempDir()
+	manifest := artifactTestManifest(t, root)
+	identity := testTypedIdentity()
+	identity.Revision = "rev-1"
+	var calls atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, errors.New("unexpected network call")
+	})}
+	if _, err := NewVerifiedLayaPredictor(LayaConfig{BaseURL: "http://worker.invalid", BearerToken: "token", Identity: identity, HTTPClient: client}, root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("construction made %d network calls", calls.Load())
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestLayaArtifactManifestRejectsTraversalAndSymlink(t *testing.T) {
 	bad := LayaArtifactManifest{Revision: "rev", Artifacts: []LayaArtifact{{Path: "../weights", Size: 0, SHA256: strings.Repeat("a", 64)}}}
