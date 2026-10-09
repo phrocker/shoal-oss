@@ -35,6 +35,12 @@ quarantine denominators with a clean control. The report is structural attack
 evidence only; it does not estimate model quality, ground truth, influence, or
 machine unlearning.
 
+`verify_poisoning.py` verifies a saved receipt without rerunning the attacks. It
+checks the pinned corpus/attack identities, fail-closed statuses, denominators,
+clean control, structural limitation, and content digest. A verified receipt is
+evidence that the recorded corpus run was not edited after the fact; it is not a
+claim that the boundary resists an unrepresented attack.
+
 Every output is content-addressed, schema-versioned JSON and created with
 exclusive file creation. A new batch produces a new ledger snapshot, never an
 in-place label correction. Conflicts stay excluded until a later explicitly
