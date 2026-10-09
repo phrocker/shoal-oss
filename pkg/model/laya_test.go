@@ -63,3 +63,30 @@ func TestLayaPredictorFailsClosedOnMalformedOrOversizedResponse(t *testing.T) {
 		server.Close()
 	}
 }
+
+func TestLayaPredictorCheckHealthIsAuthenticatedAndBounded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" || r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("health request = %s %s auth=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	p, err := NewLayaPredictor(LayaConfig{BaseURL: server.URL, BearerToken: "token", Identity: layaTestIdentity()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CheckHealth(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "starting", http.StatusServiceUnavailable) }))
+	defer bad.Close()
+	p, err = NewLayaPredictor(LayaConfig{BaseURL: bad.URL, BearerToken: "token", Identity: layaTestIdentity()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CheckHealth(context.Background()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("health error = %v", err)
+	}
+}

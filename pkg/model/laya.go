@@ -13,6 +13,7 @@ import (
 )
 
 const DefaultLayaMaxResponseBytes int64 = 4 << 20
+const MaxLayaHealthResponseBytes int64 = 64 << 10
 
 // LayaConfig describes one explicitly pinned, private Laya worker. It does
 // not discover checkpoints or fall back to a hosted provider.
@@ -59,6 +60,40 @@ func NewLayaPredictor(cfg LayaConfig) (*LayaPredictor, error) {
 }
 
 func (p *LayaPredictor) Identity() TypedIdentity { return p.id }
+
+// CheckHealth performs the worker's authenticated transport/readiness check.
+// A successful HTTP status proves only that the worker answered its health
+// endpoint; model quality and checkpoint correctness remain pinned by Identity
+// and are not inferred from this call.
+func (p *LayaPredictor) CheckHealth(ctx context.Context) error {
+	if p == nil {
+		return fmt.Errorf("%w: nil Laya predictor", ErrInvalidConfig)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/health", nil)
+	if err != nil {
+		return &Error{Kind: ErrInvalidRequest, Operation: "laya health"}
+	}
+	req.Header.Set("Authorization", "Bearer "+p.token)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return contextError("laya health", ctx.Err())
+		}
+		return &Error{Kind: ErrUnavailable, Operation: "laya health", Detail: err.Error(), Retryable: true}
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxLayaHealthResponseBytes+1))
+	if err != nil {
+		return &Error{Kind: ErrUnavailable, Operation: "laya health", Detail: err.Error(), Retryable: true}
+	}
+	if int64(len(body)) > MaxLayaHealthResponseBytes {
+		return &Error{Kind: ErrOversizedResponse, Operation: "laya health"}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return &Error{Kind: ErrUnavailable, Operation: "laya health", StatusCode: resp.StatusCode, Retryable: resp.StatusCode >= 500}
+	}
+	return nil
+}
 
 func (p *LayaPredictor) Predict(ctx context.Context, req TypedRequest) (TypedResult, error) {
 	if p == nil {
