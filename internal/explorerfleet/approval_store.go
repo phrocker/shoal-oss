@@ -68,25 +68,44 @@ func (s *ApprovalStore) readApproval(
 	if err := dispatchID(id); err != nil {
 		return fleet.ApprovalRecord{}, nil, err
 	}
-	head, _, err := s.runtime.ReadEntity(ctx, approvalEntity(id))
-	if err != nil {
-		if errors.Is(err, guard.ErrNotFound) ||
-			errors.Is(err, transaction.ErrNotFound) {
+	// Read together and re-read while the cell for the head's epoch is not
+	// visible; see readAction for why the lag is closed here rather than
+	// reported. approvalEntity and approvalRow are both keyed on id alone, so
+	// a non-nil head proves this row exists.
+	//
+	// ErrApprovalNotFound carries extra weight on this route: five call sites
+	// match it with errors.Is and several mean "absent, so create", so a
+	// transient that changed identity would break them the way it broke
+	// materializeRead.
+	var head *guard.Head
+	var cell explorercoord.CommittedCell
+	for attempt := 0; ; attempt++ {
+		var err error
+		head, _, err = s.runtime.ReadEntity(ctx, approvalEntity(id))
+		if err != nil {
+			if errors.Is(err, guard.ErrNotFound) ||
+				errors.Is(err, transaction.ErrNotFound) {
+				return fleet.ApprovalRecord{}, nil, fleet.ErrApprovalNotFound
+			}
+			return fleet.ApprovalRecord{}, nil, publicError("approval", err)
+		}
+		if head == nil {
 			return fleet.ApprovalRecord{}, nil, fleet.ErrApprovalNotFound
 		}
-		return fleet.ApprovalRecord{}, nil, publicError("approval", err)
-	}
-	if head == nil {
-		return fleet.ApprovalRecord{}, nil, fleet.ErrApprovalNotFound
-	}
-	cell, ok, err := s.runtime.ReadCommittedCell(
-		ctx, DispatchTable, approvalRow(id), dispatchFamily,
-		dispatchQualifier, s.visibility, head.Epoch)
-	if err != nil {
-		return fleet.ApprovalRecord{}, nil, publicError("approval", err)
-	}
-	if !ok {
-		return fleet.ApprovalRecord{}, nil, fleet.ErrApprovalNotFound
+		var ok bool
+		cell, ok, err = s.runtime.ReadCommittedCell(
+			ctx, DispatchTable, approvalRow(id), dispatchFamily,
+			dispatchQualifier, s.visibility, head.Epoch)
+		if err != nil {
+			return fleet.ApprovalRecord{}, nil, publicError("approval", err)
+		}
+		if ok {
+			break
+		}
+		if attempt == maxCommittedReadAttempts-1 {
+			return fleet.ApprovalRecord{}, nil,
+				committedValueNotVisible("approval")
+		}
 	}
 	record, err := decodeApproval(cell.Cell.Value)
 	if err != nil {
