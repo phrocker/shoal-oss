@@ -648,6 +648,12 @@ func validateIdentifier(name, value string, optional bool) error {
 	return nil
 }
 
+// ValidateLabel checks one free-form visibility label against the public
+// label charset [A-Za-z0-9_.:-] and the MaxVisibilityLabelSz bound. It never
+// folds, trims or otherwise rewrites the label: a label that is not already
+// exactly valid is refused.
+func ValidateLabel(label string) error { return validateLabel(label) }
+
 func validateLabel(label string) error {
 	if label == "" {
 		return shoal.NewError(
