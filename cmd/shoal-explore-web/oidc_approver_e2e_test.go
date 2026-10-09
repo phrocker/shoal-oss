@@ -624,10 +624,9 @@ func TestOIDCApproverApprovesAnOIDCRequest(t *testing.T) {
 		t.Fatal("no approved record was written")
 	}
 
-	// The interaction audit of the decision is attributed to bob and names
-	// the decision's request ID — the key that joins it to the record that
-	// carries bob's correlation. (The interaction session schema has no
-	// correlation field of its own; the durable record is where it lives.)
+	// The interaction audit of the decision is attributed to bob, names the
+	// decision's request ID, and carries bob's correlation (#532) — the same
+	// one the durable record holds.
 	h.close()
 	corpus, err := explorer.Open(filepath.Join(h.root, "corpus"))
 	if err != nil {
@@ -650,6 +649,7 @@ func TestOIDCApproverApprovesAnOIDCRequest(t *testing.T) {
 		}
 		if session.Actor.SubjectID == w.identity("bob") &&
 			session.RequestID == record.DecisionRequestID &&
+			session.CorrelationID == bobTrace &&
 			len(session.Turns) == 1 && session.Turns[0].ToolCall != nil &&
 			session.Turns[0].ToolCall.Kind ==
 				"fleet.action_approve.approval_decision" {

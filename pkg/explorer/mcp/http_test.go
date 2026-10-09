@@ -714,6 +714,14 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 		!reflect.DeepEqual(recorded.TouchedNodeIDs(), expectedTouched) {
 		t.Fatalf("recorded interaction = %+v", recorded)
 	}
+	// The MCP transport binds its own trusted session correlation onto the
+	// decision it re-mints (#350), and the trusted sink records it (#532).
+	if recorded.CorrelationID == "" ||
+		interaction.ValidateCorrelationID(recorded.CorrelationID) != nil ||
+		summaries[0].CorrelationID != recorded.CorrelationID {
+		t.Fatalf("MCP interaction correlation = %q (summary %q)",
+			recorded.CorrelationID, summaries[0].CorrelationID)
+	}
 	validatedID, validatedAt, validatedNodes := validator.observation()
 	if validatedID != shoal.ID(historical.ID) ||
 		!validatedAt.Equal(historical.AsOf) ||

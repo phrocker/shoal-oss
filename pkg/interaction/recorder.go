@@ -43,8 +43,9 @@ type ResultSink interface {
 }
 
 // ValidateRecordedSession checks a successful trusted sink receipt. The sink
-// may supply trusted admission time, actor and reason metadata, and a default
-// authorization operation, but cannot replace the recorded work or its pins.
+// may supply trusted admission time, actor, reason and correlation metadata,
+// and a default authorization operation, but cannot replace the recorded work
+// or its pins.
 // Callers must mark a validation failure as committed, since writing succeeded.
 func ValidateRecordedSession(requested, persisted Session) error {
 	expected, err := requested.Canonical()
@@ -58,6 +59,7 @@ func ValidateRecordedSession(requested, persisted Session) error {
 	expected.RecordedAt = actual.RecordedAt
 	expected.Actor = actual.Actor
 	expected.Reason = actual.Reason
+	expected.CorrelationID = actual.CorrelationID
 	if expected.AuthorizationOperation == "" {
 		expected.AuthorizationOperation = actual.AuthorizationOperation
 	}

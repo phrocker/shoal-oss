@@ -267,6 +267,10 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 		recordedAt = session.RecordedAt
 	}
 	session.RecordedAt = recordedAt
+	// Correlation is stamped from the decision below, as Actor is. A
+	// producer's value is never trusted, and is cleared before it can fail
+	// validation: correlation must never be the reason an audit fails.
+	session.CorrelationID = ""
 	if !durablePin && !interactionPinMatchesDecision(session, decision, now) {
 		return interaction.Session{}, authorizationDenied()
 	}
@@ -280,6 +284,11 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 		ClientID:   decision.ClientID(),
 		OnBehalfOf: decision.OnBehalfOf(),
 	}
+	// The decision's correlation (#532): metadata only, never identity. A
+	// value the session boundary would refuse is dropped, not refused, so
+	// the audited operation is never failed by its grouping label.
+	canonical.CorrelationID = interaction.RecordableCorrelationID(
+		decision.CorrelationID())
 	canonical.Reason = interaction.Reason{}
 	if decision.AuditPurpose() != "" {
 		canonical.Reason, err = interaction.NewReason(
@@ -323,6 +332,9 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 		} else {
 			retryCanonical := canonical
 			retryCanonical.RecordedAt = existingCanonical.RecordedAt
+			// A retry under another correlation is the same session; the
+			// first recorded correlation stands (#532).
+			retryCanonical.CorrelationID = existingCanonical.CorrelationID
 			matches = matches &&
 				reflect.DeepEqual(existingCanonical, retryCanonical)
 		}
@@ -425,6 +437,9 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 		returned, canonicalErr := persisted.Canonical()
 		expected := canonical
 		expected.RecordedAt = returned.RecordedAt
+		// A concurrent writer of the same session may have won with its own
+		// correlation; that is still this session.
+		expected.CorrelationID = returned.CorrelationID
 		if canonicalErr != nil || !reflect.DeepEqual(returned, expected) {
 			return persisted, explorer.MarkCommittedInteraction(
 				shoal.NewError(
@@ -508,6 +523,7 @@ func durableInteractionRetryMatches(
 	requested.RecordedAt = persisted.RecordedAt
 	requested.Actor = persisted.Actor
 	requested.Reason = persisted.Reason
+	requested.CorrelationID = persisted.CorrelationID
 	requested.SnapshotID = persisted.SnapshotID
 	requested.SnapshotAsOf = persisted.SnapshotAsOf
 	canonicalRequested, err := requested.Canonical()

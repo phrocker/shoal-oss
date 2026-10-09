@@ -145,6 +145,45 @@ node-kind and edge-type namespace. Phase 1 of issue #266 defines:
 - Interaction records are redacted by construction: they carry identities,
   digests, counts, and source node IDs, never the question, prompt, answer,
   evidence text, or model-chosen correlation strings.
+- A typed session carries one correlation string, `Session.CorrelationID`: the
+  correlation of the authenticated decision it was recorded under — the
+  `Shoal-Correlation-ID` a caller supplied, or the one its authenticator
+  generated (#527, #532). It lets one operation be followed across hops (a
+  gateway acting for a user, an approval and the dispatch it becomes), which a
+  request ID, naming one request, cannot.
+  - **Stamped by the trusted sink.** The authorizing sink sets it from the
+    decision, as it sets `Actor` and `Reason`, and ignores any value the
+    producer supplied. Producers and recorders accept the stamped value.
+  - **Metadata only.** It is caller-supplyable, so it decides nothing about
+    what a session is: it is not an input to any session ID, it is not
+    materialized into the interaction subgraph (no graph property carries it),
+    and it is excluded from `AuthorizationFingerprint`. A retry that differs
+    only in correlation is the same session; it neither conflicts nor
+    overwrites, and the first recorded correlation stands. A caller can
+    therefore neither split one session into two nor merge two into one by
+    choosing a header.
+  - **Bounded and printable.** The session boundary refuses a value over
+    1024 bytes, not valid UTF-8, containing a space, or containing a
+    non-printable character (control characters, bidi overrides) — the shape
+    the hosted authenticators already enforce at mint, checked again because a
+    decision can be minted elsewhere and a stored record can be read back.
+    The sink *drops* an unrecordable decision correlation rather than
+    refusing: correlation must never be why an otherwise authorized operation,
+    or its audit, fails. The session then records none rather than a
+    substitute.
+  - **Not integrity-protected, like every other field.** The durable record
+    has no MAC or digest over its fields; anyone who can rewrite the row can
+    rewrite `Actor` as easily. A digest of the correlation stored beside it
+    would be rewritten with it, so none is added; tamper evidence for the whole
+    record is a separate concern.
+  - **Compatibility.** Sessions are gob-encoded and gob matches fields by
+    name: a session written before #532 reads back with an empty correlation,
+    and the previous build reads a #532 session, ignoring the field.
+  - **Exposure.** It is served only where the session's actor already is —
+    `InteractionSummary`/`InteractionRecord` and the provenance list and
+    inspect views (`correlation_id`, omitted when empty) — and so only to a
+    caller already authorized to read that session. A tombstone keeps no
+    correlation.
 
 ### Fold summaries
 

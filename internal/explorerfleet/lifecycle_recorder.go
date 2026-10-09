@@ -159,6 +159,9 @@ func (r *LifecycleRecorder) RecordLifecycle(
 		OnBehalfOf: append(
 			[]shoal.ID(nil), lifecycle.OnBehalfOf...),
 	}
+	// Correlation is the trusted sink's, stamped from the recording decision
+	// (#532). It is metadata: accepted, never compared.
+	expected.CorrelationID = persisted.CorrelationID
 
 	if lifecycle.AuditPurpose != "" {
 		var err error
@@ -228,6 +231,9 @@ func validateLifecycleReplay(
 	expected.RecordedAt = canonical.RecordedAt
 	expected.Actor = canonical.Actor
 	expected.Reason = canonical.Reason
+	// A receipt recorded before #532, or under another request's
+	// correlation, is still this receipt.
+	expected.CorrelationID = canonical.CorrelationID
 	expected.SnapshotID = canonical.SnapshotID
 	expected.SnapshotAsOf = canonical.SnapshotAsOf
 	expected.AuthorizationFingerprint = canonical.AuthorizationFingerprint

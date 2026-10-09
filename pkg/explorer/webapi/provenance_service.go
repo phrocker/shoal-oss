@@ -61,9 +61,12 @@ type ProvenanceSummary struct {
 	Operation                interaction.Operation `json:"operation"`
 	Actor                    ProvenanceActor       `json:"actor"`
 	Reason                   interaction.Reason    `json:"reason"`
-	OutputVisibility         string                `json:"output_visibility"`
-	NodeCount                int                   `json:"node_count"`
-	EdgeCount                int                   `json:"edge_count"`
+	// CorrelationID is the recording decision's correlation (#532), shown
+	// beside the actor it travelled with and only where the actor is.
+	CorrelationID    string `json:"correlation_id,omitempty"`
+	OutputVisibility string `json:"output_visibility"`
+	NodeCount        int    `json:"node_count"`
+	EdgeCount        int    `json:"edge_count"`
 }
 
 type ProvenanceActor struct {
@@ -357,8 +360,10 @@ func provenanceSummary(value explorer.InteractionSummary) ProvenanceSummary {
 		AuthorizationExpiresAt:   value.AuthorizationExpiresAt,
 		EmbeddingSpaceID:         encodeOptionalID(value.EmbeddingSpaceID),
 		Operation:                value.Operation, Actor: provenanceActor(value.Actor),
-		Reason: value.Reason, OutputVisibility: value.Visibility,
-		NodeCount: value.NodeCount, EdgeCount: value.EdgeCount,
+		Reason:           value.Reason,
+		CorrelationID:    encodeOptionalID(value.CorrelationID),
+		OutputVisibility: value.Visibility,
+		NodeCount:        value.NodeCount, EdgeCount: value.EdgeCount,
 	}
 }
 
@@ -373,6 +378,7 @@ func provenanceSession(value interaction.Session) ProvenanceSession {
 			EmbeddingSpaceID:         encodeOptionalID(value.EmbeddingSpaceID),
 			Operation:                value.Operation, Actor: provenanceActor(value.Actor),
 			Reason:           value.Reason,
+			CorrelationID:    encodeOptionalID(value.CorrelationID),
 			OutputVisibility: interaction.Expression(value.RequiredVisibility),
 		},
 		RequestID:     encodeOptionalID(value.RequestID),
