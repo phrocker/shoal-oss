@@ -14,12 +14,14 @@ are recorded below so the local cache can be checked before replay:
 - `model.safetensors`: `891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c`
 - `tokenizer/tokenizer.json`: `6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30`
 
-`inputs.jsonl` contains four bounded source-change states. The expected labels
-were fixed before the run: routine, critical, critical, routine. The typed risk
-result was routine for all four: 2/4 overall and **0/2 on the two critical
-cases**. The fault score stayed in the none/minor range for all four. This is a
-negative viability signal for direct use of this generic checkpoint on this
-rubric, not evidence that a trained classifier cannot work.
+`inputs.jsonl` contains four bounded source-change states. `expected.json`
+records the analyst's expected labels (routine, critical, critical, routine),
+but does not attest that those labels were committed before inference. The
+typed risk result was routine for all four: 2/4 against those expectations and
+**0/2 on the two expected critical cases**. The fault score stayed in the
+none/minor range for all four. This is a negative viability signal for direct
+use of this generic checkpoint on this rubric, not evidence that a trained
+classifier cannot work.
 
 The checkpoint emitted a warning that one shipped temperature was outside its
 valid range and was clamped; confidence for affected entries is therefore
