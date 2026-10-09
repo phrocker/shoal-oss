@@ -206,7 +206,7 @@ def promote_candidate(candidate, evaluation, artifact, approval, predecessor_rel
     verify(evaluation, 'promotion_record')
     verify(artifact, 'candidate_artifact')
     verify(approval, 'promotion_approval')
-    if evaluation['candidate_id'] != candidate['id'] or artifact['candidate_id'] != candidate['id']:
+    if evaluation['candidate_id'] != candidate['id'] or evaluation['dataset_id'] != candidate['dataset_id'] or evaluation['evaluation_policy_id'] != candidate['evaluation_policy_id'] or artifact['candidate_id'] != candidate['id']:
         raise ValueError('candidate lineage mismatch')
     if artifact['evaluation_id'] != evaluation['id'] or artifact['dataset_id'] != candidate['dataset_id']:
         raise ValueError('artifact evaluation lineage mismatch')
