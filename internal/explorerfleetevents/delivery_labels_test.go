@@ -60,11 +60,15 @@ type catalogGate struct {
 	rules     map[shoal.ID][]string
 }
 
-func (g catalogGate) NodesVisibleToReader(
-	ctx context.Context, nodeIDs []shoal.ID,
+func (catalogGate) PathJoins(context.Context, []shoal.ID, []shoal.ID) (bool, error) {
+	return true, nil
+}
+
+func (g catalogGate) GraphVisibleToReader(
+	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
 ) (bool, error) {
 	var terms []string
-	for _, id := range nodeIDs {
+	for _, id := range append(append([]shoal.ID(nil), nodeIDs...), edgeIDs...) {
 		rule, ok := g.rules[id]
 		if !ok {
 			return false, nil

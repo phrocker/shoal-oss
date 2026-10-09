@@ -17,6 +17,7 @@ type ref struct {
 	name   string
 	labels []string
 	nodes  []shoal.ID
+	edges  []shoal.ID
 }
 
 // labelsHeld answers from a fixed set of held labels.
@@ -37,15 +38,19 @@ type nodesVisible struct {
 	err     error
 }
 
-func (n nodesVisible) NodesVisibleToReader(_ context.Context, ids []shoal.ID) (bool, error) {
+func (n nodesVisible) GraphVisibleToReader(_ context.Context, nodes, edges []shoal.ID) (bool, error) {
 	if n.err != nil {
 		return false, n.err
 	}
-	for _, id := range ids {
+	for _, id := range append(append([]shoal.ID(nil), nodes...), edges...) {
 		if !n.visible[id] {
 			return false, nil
 		}
 	}
+	return true, nil
+}
+
+func (nodesVisible) PathJoins(context.Context, []shoal.ID, []shoal.ID) (bool, error) {
 	return true, nil
 }
 
@@ -70,17 +75,19 @@ func TestFilterReferencesLetsCurrentNodesDecide(t *testing.T) {
 		{name: "nodeless-held", labels: []string{"a"}},
 		{name: "nodeless-unheld", labels: []string{"b"}},
 		{name: "nodeless-unlabelled"},
+		{name: "open-nodes-closed-edge", nodes: []shoal.ID{"n-loose"}, edges: []shoal.ID{"e-closed"}},
+		{name: "edge-only-open", labels: []string{"b"}, edges: []shoal.ID{"e-open"}},
 	}
 	labels := func(value ref) []string { return value.labels }
-	nodes := func(value ref) []shoal.ID { return value.nodes }
+	nodes := func(value ref) ([]shoal.ID, []shoal.ID) { return value.nodes, value.edges }
 	held := labelsHeld{"a": true}
-	gate := nodesVisible{visible: map[shoal.ID]bool{"n-loose": true}}
+	gate := nodesVisible{visible: map[shoal.ID]bool{"n-loose": true, "e-open": true}}
 
 	kept, withheld, err := FilterReferences(context.Background(), held, gate, values, labels, nodes)
 	if err != nil || !withheld {
 		t.Fatalf("withheld = %v, err = %v", withheld, err)
 	}
-	if got, want := names(kept), []string{"loosened", "nodeless-held", "nodeless-unlabelled"}; !reflect.DeepEqual(got, want) {
+	if got, want := names(kept), []string{"loosened", "nodeless-held", "nodeless-unlabelled", "edge-only-open"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("kept %v, want %v", got, want)
 	}
 

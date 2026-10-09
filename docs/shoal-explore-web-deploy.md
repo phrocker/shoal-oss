@@ -638,13 +638,18 @@ The same per-reference rule (`evidencelabels.FilterReferences`, #564) decides
 every dispatch read that returns a record (Status, the Pull and TeamActions
 pages, and the enqueue, invoke and approval replays) and every delivery:
 
-- A reference that names nodes is decided by those nodes' **current** access
-  rules (`authorized.NodeGate`), the same rules interaction reads re-check. A
+- A reference that names nodes or edges is decided by their **current**
+  access rules (`authorized.NodeGate`): every node, every edge's effective
+  rule (an extracted relation is bound to the document that asserted it), and
+  both endpoints of every edge, the same rules interaction reads re-check. A
+  node or edge the catalog does not know withholds the reference. At record
+  time a graph reference whose edges do not run between its nodes in sequence
+  is refused as `invalid_executor_evidence`. A
   document relabelled after the action ran therefore governs its evidence:
   tightened, a holder of only the old labels loses it; loosened, a reader of
   the new rule gains it. The labels stored with the reference are provenance
   only.
-- A reference that names no node has nothing current to consult and is
+- A reference that names no node or edge has nothing current to consult and is
   decided by its stored labels (`authorized.LabelVisibility`).
 
 `shoal-explore-web` wires the authorized client's gate and evaluator into

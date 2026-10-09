@@ -73,6 +73,14 @@ type planeOptions struct {
 	wireEvents  bool
 	label       string
 	ownerLabels [][]byte
+	// graphReference replaces the labelled document reference with the
+	// review's graph reference: the open document's own nodes, carrying
+	// the labelled document's contains edge.
+	graphReference bool
+	// wrapGate, when set, wraps the dispatch node gate.
+	wrapGate func(evidencelabels.NodeGate) evidencelabels.NodeGate
+	// refused is set when the completion is expected to be refused.
+	refused bool
 }
 
 func newLabelPlaneWith(t *testing.T, options planeOptions) labelPlane {
@@ -109,12 +117,18 @@ func newLabelPlaneWith(t *testing.T, options planeOptions) labelPlane {
 	// The labelled document, ingested by a principal holding its label.
 	ingester := bindPlaneSubjectWith(t, authority, now, "ingester",
 		allLabels(), auth.OperationIngest, auth.OperationRead,
-		auth.OperationRetrieve)
+		auth.OperationRetrieve, auth.OperationNeighborhood)
 	// What an executor reports: the node's shoal.visibility, free-form.
 	reported := ingestReference(t, client, ingester, "file:///b/closed.md",
 		"anchor-b-closed", options.label)
 	open := ingestReference(t, client, ingester, "file:///b/open.md",
 		"anchor-b-open", "")
+	if options.graphReference {
+		reported = graphReferenceAcross(t, client, ingester, open, reported)
+	}
+	if options.wrapGate != nil && labels.Nodes != nil {
+		labels.Nodes = options.wrapGate(labels.Nodes)
+	}
 
 	config := runtimeConfig(t.TempDir())
 	config = explorerfleet.ConfigureRuntime(config)
@@ -168,7 +182,14 @@ func newLabelPlaneWith(t *testing.T, options planeOptions) labelPlane {
 		t.Fatal(err)
 	}
 	completed, err := dispatch.ExecuteClaim(owner, claimed)
-	if err != nil || completed.State != fleet.DispatchSucceeded {
+	if options.refused {
+		if completed.State != fleet.DispatchFailed ||
+			completed.ErrorCode != "invalid_executor_evidence" || len(completed.Evidence) != 0 {
+			t.Fatalf("complete = %q / %q with %d references (%v), want "+
+				"refused as invalid_executor_evidence", completed.State,
+				completed.ErrorCode, len(completed.Evidence), err)
+		}
+	} else if err != nil || completed.State != fleet.DispatchSucceeded {
 		t.Fatalf("complete = %#v, %v", completed, err)
 	}
 	return labelPlane{
@@ -181,6 +202,47 @@ func newLabelPlaneWith(t *testing.T, options planeOptions) labelPlane {
 // allLabels is every label policy on B the tests use.
 func allLabels() [][]byte {
 	return [][]byte{sourceBLabelPolicy("secret"), sourceBLabelPolicy("pii")}
+}
+
+// graphReferenceAcross is the review's reference: graph evidence naming the
+// open document's own document and span nodes, whose one edge is the closed
+// document's contains edge, reported with the closed document's label. No
+// forgery is needed to build it: an executor reports whatever it saw.
+func graphReferenceAcross(
+	t *testing.T, client *authorized.Client, ctx context.Context,
+	open, closed fleet.EvidenceRef,
+) fleet.EvidenceRef {
+	t.Helper()
+	around, err := client.Neighborhood(ctx, explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{closed.Citation.DocumentID}, Depth: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var edge shoal.ID
+	for _, candidate := range around.Edges {
+		if candidate.From == closed.Citation.DocumentID {
+			edge = candidate.ID
+		}
+	}
+	if edge == "" {
+		t.Fatal("the closed document has no outgoing edge")
+	}
+	return fleet.EvidenceRef{
+		AnchorID: "anchor-b-graph", Kind: interaction.EvidenceGraph,
+		NodeIDs:    []shoal.ID{open.Citation.DocumentID, open.Citation.SpanID},
+		EdgeIDs:    []shoal.ID{edge},
+		Visibility: closed.Visibility,
+	}
+}
+
+// joinAnything is a dispatch gate that decides reads with the real gate but
+// accepts any path at record time, standing for a reference recorded before
+// join validation existed.
+type joinAnything struct{ evidencelabels.NodeGate }
+
+func (joinAnything) PathJoins(context.Context, []shoal.ID, []shoal.ID) (bool, error) {
+	return true, nil
 }
 
 // ingestReference ingests one document on B, labelled when label is set,

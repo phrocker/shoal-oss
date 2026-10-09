@@ -137,48 +137,56 @@ func Filter[T any](
 	return readable, true, nil
 }
 
-// NodeGate answers whether the reader behind ctx may see every node in
-// nodeIDs under the nodes' CURRENT access rules. It is the gate interaction
-// reads already apply to their touched nodes (#567), offered to the planes
-// that store evidence references, so that a document relabelled after an
-// action recorded evidence from it governs that evidence as it governs the
-// document. Implemented by the host that owns the policy catalog
-// (authorized.NodeGate).
+// NodeGate answers whether the reader behind ctx may see a stored evidence
+// reference's graph members under their CURRENT access rules: every node,
+// every edge's effective rule, and both endpoints of every edge. It is the
+// gate interaction reads already apply to their touched nodes and edges
+// (#567), offered to the planes that store evidence references, so that a
+// document relabelled after an action recorded evidence from it governs that
+// evidence as it governs the document. Implemented by the host that owns the
+// policy catalog (authorized.NodeGate).
 type NodeGate interface {
-	// NodesVisibleToReader reports whether the reader may see every node.
-	// A node the catalog no longer knows is not visible. An error is the
-	// question failing, never a refusal.
-	NodesVisibleToReader(ctx context.Context, nodeIDs []shoal.ID) (bool, error)
+	// GraphVisibleToReader reports whether the reader may see every node and
+	// edge. A node or edge the catalog does not know is not visible. An
+	// error is the question failing, never a refusal.
+	GraphVisibleToReader(
+		ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
+	) (bool, error)
+	// PathJoins reports whether edgeIDs join nodeIDs in sequence, edge i
+	// running from node i to node i+1, as the catalog records them. Used at
+	// record time to refuse a graph reference whose edges are not its path.
+	PathJoins(ctx context.Context, nodeIDs, edgeIDs []shoal.ID) (bool, error)
 }
 
 // FilterReferences is the per-reference rule for stored evidence (#564):
 //
-//   - A reference that names nodes is decided by those nodes' current rules,
-//     through nodes. Its stored visibility is provenance only and is not
-//     consulted: after a relabel it is wrong in both directions, admitting
-//     too much once a label was added and withholding too much once one was
-//     removed. A nil gate withholds it.
-//   - A reference that names no node has nothing current to consult, so it
-//     is decided by its stored labels exactly as Filter decides them.
+//   - A reference that names graph members (nodes or edges; every assertion
+//     is on one of its edges) is decided by their current rules, through gate. Its
+//     stored visibility is provenance only and is not consulted: after a
+//     relabel it is wrong in both directions, admitting too much once a label
+//     was added and withholding too much once one was removed. A nil gate
+//     withholds it.
+//   - A reference that names nothing has nothing current to consult, so it is
+//     decided by its stored labels exactly as Filter decides them.
 //
 // Withheld references are dropped whole with no count, and an error is
 // returned rather than read as a refusal, as for Filter. values is never
 // modified, and when nothing is withheld the input slice itself is returned.
 func FilterReferences[T any](
-	ctx context.Context, visibility Visibility, nodes NodeGate, values []T,
-	labels func(T) []string, nodeIDs func(T) []shoal.ID,
+	ctx context.Context, visibility Visibility, gate NodeGate, values []T,
+	labels func(T) []string, members func(T) (nodeIDs, edgeIDs []shoal.ID),
 ) (kept []T, withheld bool, err error) {
 	if len(values) == 0 {
 		return values, false, nil
 	}
 	readable := make([]T, 0, len(values))
 	for _, value := range values {
-		ids := nodeIDs(value)
-		if len(ids) > 0 {
-			if nodes == nil {
+		nodes, edges := members(value)
+		if len(nodes) > 0 || len(edges) > 0 {
+			if gate == nil {
 				continue
 			}
-			visible, err := nodes.NodesVisibleToReader(ctx, ids)
+			visible, err := gate.GraphVisibleToReader(ctx, nodes, edges)
 			if err != nil {
 				return nil, false, err
 			}
@@ -187,7 +195,7 @@ func FilterReferences[T any](
 			}
 			continue
 		}
-		// No node to consult: the stored labels are all there is.
+		// No graph member to consult: the stored labels are all there is.
 		single, _, err := Filter(ctx, visibility, []T{value}, labels)
 		if err != nil {
 			return nil, false, err

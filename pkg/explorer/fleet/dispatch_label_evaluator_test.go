@@ -15,6 +15,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -119,8 +120,12 @@ type catalogGate struct {
 	err       error
 }
 
-func (g *catalogGate) NodesVisibleToReader(
-	ctx context.Context, nodeIDs []shoal.ID,
+func (g *catalogGate) PathJoins(context.Context, []shoal.ID, []shoal.ID) (bool, error) {
+	return true, nil
+}
+
+func (g *catalogGate) GraphVisibleToReader(
+	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
 ) (bool, error) {
 	g.mu.Lock()
 	if g.err != nil {
@@ -128,7 +133,7 @@ func (g *catalogGate) NodesVisibleToReader(
 		return false, g.err
 	}
 	var terms []string
-	for _, id := range nodeIDs {
+	for _, id := range append(append([]shoal.ID(nil), nodeIDs...), edgeIDs...) {
 		rule, ok := g.rules[id]
 		if !ok {
 			g.mu.Unlock()
@@ -691,4 +696,26 @@ func TestARelabelGovernsEveryDispatchRead(t *testing.T) {
 			t.Fatal("a reader without the removed label did not see the reference after loosening")
 		}
 	})
+}
+
+// TestEvidenceAssertionsMustRideOnListedEdges pins what the read gate relies
+// on: a graph reference's assertion must be on one of its path edges
+// (interaction.EvidenceReference.Validate), so deciding the reference by its
+// edges decides the assertion too (#564).
+func TestEvidenceAssertionsMustRideOnListedEdges(t *testing.T) {
+	reference := EvidenceRef{
+		AnchorID: "anchor-graph", Kind: interaction.EvidenceGraph,
+		NodeIDs: []shoal.ID{"node-a", "node-b"}, EdgeIDs: []shoal.ID{"edge-ab"},
+		Assertions: []interaction.AssertionReference{{
+			AssertionID: "assertion", EdgeID: "edge-ab",
+			Origin: ontology.AssertionExplicit,
+		}},
+	}
+	if err := validateEvidence([]EvidenceRef{reference}); err != nil {
+		t.Fatalf("an assertion on a listed edge was refused: %v", err)
+	}
+	reference.Assertions[0].EdgeID = "edge-elsewhere"
+	if err := validateEvidence([]EvidenceRef{reference}); err == nil {
+		t.Fatal("an assertion on an unlisted edge was accepted")
+	}
 }

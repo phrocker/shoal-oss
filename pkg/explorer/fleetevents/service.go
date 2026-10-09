@@ -844,7 +844,11 @@ func (s *Service) readableEvidenceGroup(
 	kept, withheld, err := evidencelabels.FilterReferences(
 		ctx, s.evidenceVisibility, s.evidenceNodes, labelled,
 		func(value labelledReference) []string { return value.visibility },
-		func(value labelledReference) []shoal.ID { return value.reference.NodeIDs })
+		// Every assertion names one of the reference's EdgeIDs
+		// (interaction.EvidenceReference.Validate), so the edges cover them.
+		func(value labelledReference) ([]shoal.ID, []shoal.ID) {
+			return value.reference.NodeIDs, value.reference.EdgeIDs
+		})
 	if err != nil || !withheld {
 		return references, visibility, false, err
 	}

@@ -1315,6 +1315,18 @@ func (s *DispatchService) applyExecutionResult(
 			result.ErrorCode = "invalid_executor_evidence"
 			next.ErrorCodeOrigin = ErrorCodeOriginService
 		}
+	} else if joined, err := s.evidencePathsJoin(ctx, result.Evidence); err != nil {
+		return ActionRecord{}, false, err
+	} else if !joined {
+		next.Evidence = nil
+		next.EvidenceSnapshotID = ""
+		next.EvidenceSnapshotAsOf = time.Time{}
+		if executionErr == nil {
+			executionErr = shoal.NewError(shoal.ErrorInvalidArgument,
+				"graph evidence edges do not join its nodes")
+			result.ErrorCode = "invalid_executor_evidence"
+			next.ErrorCodeOrigin = ErrorCodeOriginService
+		}
 	} else {
 		evidence, err := s.structuredEvidence(ctx, result.Evidence)
 		if err != nil {
@@ -3640,6 +3652,32 @@ func withinScope(permitted [][]byte, scope []byte) bool {
 	return true
 }
 
+// evidencePathsJoin refuses, at record time, a graph reference whose edges
+// are not the path its nodes describe (#564). Validation already requires
+// one edge fewer than nodes and every assertion on a listed edge
+// (interaction.EvidenceReference.Validate); only the
+// catalog knows each edge's endpoints, so the join itself is asked of the
+// node gate. Without a gate nothing can confirm the join, and the reference
+// is recorded: every read then withholds it, since a nil gate withholds every
+// reference naming a graph member.
+func (s *DispatchService) evidencePathsJoin(
+	ctx context.Context, evidence []EvidenceRef,
+) (bool, error) {
+	if s.evidenceNodes == nil {
+		return true, nil
+	}
+	for _, reference := range evidence {
+		if reference.Kind != interaction.EvidenceGraph || len(reference.EdgeIDs) == 0 {
+			continue
+		}
+		joined, err := s.evidenceNodes.PathJoins(ctx, reference.NodeIDs, reference.EdgeIDs)
+		if err != nil || !joined {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
 // structuredEvidence is the record-time half of the label rule: each
 // reference's visibility is stored as the structured label-policy terms a
 // reader can be shown to hold, translated from the free-form labels the
@@ -3706,7 +3744,11 @@ func (s *DispatchService) readableRecord(
 	readable, withheld, err := evidencelabels.FilterReferences(
 		ctx, s.evidenceVisibility, s.evidenceNodes, record.Evidence,
 		func(reference EvidenceRef) []string { return reference.Visibility },
-		func(reference EvidenceRef) []shoal.ID { return reference.NodeIDs })
+		// Every assertion names one of the reference's EdgeIDs
+		// (interaction.EvidenceReference.Validate), so the edges cover them.
+		func(reference EvidenceRef) ([]shoal.ID, []shoal.ID) {
+			return reference.NodeIDs, reference.EdgeIDs
+		})
 	if err != nil {
 		return ActionRecord{}, err
 	}

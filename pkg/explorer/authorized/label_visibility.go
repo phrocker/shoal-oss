@@ -200,13 +200,16 @@ func (c *Client) LabelVisibility() *LabelVisibility {
 	return c.labelVisibility
 }
 
-// NodeGate decides whether the reader behind ctx may see nodes under their
-// current access rules: every term of every policy in each node's rule
-// (d:, s:, g:, svc:) must pass the reader label evaluator, which for a user
-// is exactly the domain, source and policy check AccessRule.Authorize makes
-// on interaction reads, and for a trusted service is additionally bounded
-// by its ceiling. A node the catalog does not know is not visible. It
-// implements evidencelabels.NodeGate for the dispatch and event planes.
+// NodeGate decides whether the reader behind ctx may see graph members under
+// their current access rules, the same effective rules the interaction read
+// gate applies (resolveNodes and resolveEdges, including the document-bound
+// rule of extracted entities and relations, #570/#585): every node, every
+// edge, and both endpoints of every edge. Every term of every policy in those
+// rules (d:, s:, g:, svc:) must pass the reader label evaluator, which for a
+// user is exactly the domain, source and policy check AccessRule.Authorize
+// makes, and for a trusted service is additionally bounded by its ceiling. A
+// node or edge the catalog does not know is not visible. It implements
+// evidencelabels.NodeGate for the dispatch and event planes.
 type NodeGate struct {
 	client *Client
 }
@@ -218,9 +221,9 @@ func (c *Client) NodeGate() *NodeGate {
 	return &NodeGate{client: c}
 }
 
-// NodesVisibleToReader implements evidencelabels.NodeGate.
-func (g *NodeGate) NodesVisibleToReader(
-	ctx context.Context, nodeIDs []shoal.ID,
+// GraphVisibleToReader implements evidencelabels.NodeGate.
+func (g *NodeGate) GraphVisibleToReader(
+	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
 ) (bool, error) {
 	if g == nil || g.client == nil {
 		return false, shoal.NewError(
@@ -236,9 +239,39 @@ func (g *NodeGate) NodesVisibleToReader(
 	}
 	now := c.clock()
 	terms := make([]string, 0)
-	for start := 0; start < len(nodeIDs); {
-		end := chunkEnd(start, len(nodeIDs), maxInteractionAuthorizationIDs)
-		chunk := nodeIDs[start:end]
+	add := func(rule AccessRule) bool {
+		if len(rule.policies) == 0 {
+			return false
+		}
+		for _, policy := range rule.policies {
+			policyTerms, err := policy.VisibilityTerms()
+			if err != nil {
+				return false
+			}
+			terms = append(terms, policyTerms...)
+		}
+		return true
+	}
+	nodes := append([]shoal.ID(nil), nodeIDs...)
+	for start := 0; start < len(edgeIDs); {
+		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
+		chunk := edgeIDs[start:end]
+		start = end
+		edges, err := c.resolveEdges(ctx, chunk)
+		if err != nil {
+			return false, err
+		}
+		for _, edgeID := range chunk {
+			registration, ok := edges[edgeID]
+			if !ok || registration.Edge.ID != edgeID || !add(registration.Rule) {
+				return false, nil
+			}
+			nodes = append(nodes, registration.Edge.From, registration.Edge.To)
+		}
+	}
+	for start := 0; start < len(nodes); {
+		end := chunkEnd(start, len(nodes), maxInteractionAuthorizationIDs)
+		chunk := nodes[start:end]
 		start = end
 		registrations, err := c.resolveNodes(ctx, chunk)
 		if err != nil {
@@ -246,15 +279,8 @@ func (g *NodeGate) NodesVisibleToReader(
 		}
 		for _, nodeID := range chunk {
 			registration, ok := registrations[nodeID]
-			if !ok || len(registration.Rule.policies) == 0 {
+			if !ok || !add(registration.Rule) {
 				return false, nil
-			}
-			for _, policy := range registration.Rule.policies {
-				policyTerms, err := policy.VisibilityTerms()
-				if err != nil {
-					return false, nil
-				}
-				terms = append(terms, policyTerms...)
 			}
 		}
 	}
@@ -262,6 +288,40 @@ func (g *NodeGate) NodesVisibleToReader(
 		return false, nil
 	}
 	return c.labelVisibility.permits(ctx, decision, terms, now)
+}
+
+// PathJoins implements evidencelabels.NodeGate: edge i must run from node i to
+// node i+1 as the catalog records it, and there is exactly one edge fewer
+// than nodes. An edge the catalog does not know does not join.
+func (g *NodeGate) PathJoins(
+	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
+) (bool, error) {
+	if g == nil || g.client == nil {
+		return false, shoal.NewError(
+			shoal.ErrorUnavailable, "node gate is unavailable")
+	}
+	if len(edgeIDs) == 0 {
+		return true, nil
+	}
+	if len(edgeIDs) != len(nodeIDs)-1 {
+		return false, nil
+	}
+	for start := 0; start < len(edgeIDs); {
+		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
+		edges, err := g.client.resolveEdges(ctx, edgeIDs[start:end])
+		if err != nil {
+			return false, err
+		}
+		for index := start; index < end; index++ {
+			registration, ok := edges[edgeIDs[index]]
+			if !ok || registration.Edge.From != nodeIDs[index] ||
+				registration.Edge.To != nodeIDs[index+1] {
+				return false, nil
+			}
+		}
+		start = end
+	}
+	return true, nil
 }
 
 // LabelTranslator rewrites a stored label set's free-form ingest terms into
