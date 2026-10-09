@@ -1091,6 +1091,36 @@ type DispatchConfig struct {
 	// nil means none is ever current, so every action that requires
 	// attestation is refused to every claimant (fail closed).
 	Attestations ExecutorAttestations
+	// EvidenceVisibility decides whether the reader of a dispatch record may
+	// see an evidence reference carrying a visibility expression.
+	//
+	// Optional, and nil means no reader may — so labelled evidence is
+	// withheld from every dispatch read, which is the fail-closed direction
+	// for the same reason Attestations takes it. A plane that cannot evaluate
+	// a label must not hand out identifiers the label exists to protect
+	// (#369).
+	EvidenceVisibility EvidenceVisibility
+}
+
+// EvidenceVisibility answers whether the current reader holds the labels an
+// evidence reference carries.
+//
+// It exists because label enforcement in this plane happens at the *scan*: a
+// document a reader may not see does not come back from storage, so no
+// service-layer filter was ever needed. An EvidenceRef on a dispatch record
+// is different — it was recorded by the action's principal and is stored as a
+// field of that record, so it is returned to whoever may read the record
+// rather than to whoever holds its labels (#369).
+//
+// Implemented by the host, because the reader's authorizations are
+// established where the request is authenticated and are not carried on an
+// auth.Decision.
+type EvidenceVisibility interface {
+	// VisibleToReader reports whether the reader behind ctx holds the labels
+	// in a visibility expression. An error is not a false answer: it is the
+	// question failing, and the caller returns it rather than silently
+	// withholding.
+	VisibleToReader(ctx context.Context, visibility []string) (bool, error)
 }
 
 func (r ActionRecord) Validate() error {

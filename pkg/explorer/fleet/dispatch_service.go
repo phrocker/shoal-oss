@@ -29,7 +29,8 @@ type DispatchService struct {
 	events   ActionEventPublisher
 	clock    func() time.Time
 	// attestations is consulted only for actions that require attestation.
-	attestations ExecutorAttestations
+	attestations       ExecutorAttestations
+	evidenceVisibility EvidenceVisibility
 }
 
 func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
@@ -47,6 +48,7 @@ func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
 		store: config.Store, registry: config.Registry, resolver: config.Resolver,
 		recorder: config.Recorder, events: config.Events, clock: config.Clock,
 		outbox: outbox, attestations: config.Attestations,
+		evidenceVisibility: config.EvidenceVisibility,
 	}
 	return service, nil
 }
@@ -2011,7 +2013,11 @@ func (s *DispatchService) Status(ctx context.Context, request StatusRequest) (Ac
 	if current.isAdmission() {
 		return ActionRecord{}, auth.ObjectNotFound()
 	}
-	return current, nil
+	// Evidence the reader's labels do not cover is removed here rather than
+	// in the handler, because the record is authorized on
+	// (domain, source, policy, object) and the evidence it carries may come
+	// from elsewhere entirely (#369).
+	return s.readableRecord(ctx, current)
 }
 
 // TeamActions returns a bounded page of action records authorized for the
@@ -2247,7 +2253,21 @@ func (s *DispatchService) scanDispatchActions(
 		}
 		result.Actions = append(result.Actions, record)
 	}
-	return result, nil
+	// The single filtering point for both page paths (#369).
+	//
+	// TeamActions and Pull both read the store through here, so redacting
+	// here covers both and there is one place for the rule to live. A first
+	// version also called readablePage at each path's own return; mutating
+	// those left every test green, because the records had already been
+	// filtered upstream — redundant, and three places for one rule to drift
+	// between.
+	//
+	// TeamActions is the widest audience: it is explicitly cross-principal,
+	// which is the point of an overview and also what extended the reach of
+	// evidence metadata past the labels that produced it. Pull is the path
+	// where a reader is least likely to hold them, since a worker receives
+	// records it did not enqueue.
+	return s.readablePage(ctx, result)
 }
 
 func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) (ActionPage, error) {
@@ -3306,4 +3326,78 @@ func withinScope(permitted [][]byte, scope []byte) bool {
 		}
 	}
 	return true
+}
+
+// readableRecord returns the record as this reader may see it, with evidence
+// references whose labels the reader does not hold removed.
+//
+// Dropped whole, and with no count of what was dropped. The alternative #369
+// weighed — anchor identity with citation detail elided — leaves the anchor
+// ID, which is itself an identifier of material in a source the reader may
+// not see, and a returned count that disagrees with the returned list is an
+// existence oracle for the rest. #398's rule applies: a standing refusal must
+// not be distinguishable from absence.
+//
+// What this gives up, stated rather than hidden: a reader cannot tell "this
+// action recorded no evidence" from "recorded evidence you may not see". That
+// is the correct trade — the alternative discloses the thing the label exists
+// to protect — but it means a partial evidence list is not a completeness
+// claim, and a reader reconciling grounding must not read it as one.
+//
+// Unlabelled references are returned unchanged. An EvidenceRef with no
+// visibility expression carries no label to lack, so withholding it would
+// redact something nothing asked to be protected — and that is what keeps
+// this from gutting the grounding every deployment without labels relies on.
+func (s *DispatchService) readableRecord(
+	ctx context.Context, record ActionRecord,
+) (ActionRecord, error) {
+	if len(record.Evidence) == 0 {
+		return record, nil
+	}
+	readable := make([]EvidenceRef, 0, len(record.Evidence))
+	for _, reference := range record.Evidence {
+		if len(reference.Visibility) == 0 {
+			readable = append(readable, reference)
+			continue
+		}
+		if s.evidenceVisibility == nil {
+			// Nothing can evaluate the label, so nothing may be shown it.
+			continue
+		}
+		visible, err := s.evidenceVisibility.VisibleToReader(
+			ctx, reference.Visibility)
+		if err != nil {
+			// The question failing is not a false answer. Returning the error
+			// keeps a transient fault from reading as a redaction, which
+			// would look identical to a permanent one.
+			return ActionRecord{}, err
+		}
+		if visible {
+			readable = append(readable, reference)
+		}
+	}
+	if len(readable) == len(record.Evidence) {
+		return record, nil
+	}
+	redacted := cloneActionRecord(record)
+	if len(readable) == 0 {
+		redacted.Evidence = nil
+	} else {
+		redacted.Evidence = readable
+	}
+	return redacted, nil
+}
+
+// readablePage applies readableRecord to every record in a page.
+func (s *DispatchService) readablePage(
+	ctx context.Context, page ActionPage,
+) (ActionPage, error) {
+	for index := range page.Actions {
+		readable, err := s.readableRecord(ctx, page.Actions[index])
+		if err != nil {
+			return ActionPage{}, err
+		}
+		page.Actions[index] = readable
+	}
+	return page, nil
 }
