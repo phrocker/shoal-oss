@@ -129,6 +129,10 @@ func (c *Client) ResolveMentions(
 	if err != nil {
 		return nil, policyCatalogReadError(ctx, err)
 	}
+	registrations, err = c.effectiveNodeRegistrations(ctx, registrations)
+	if err != nil {
+		return nil, err
+	}
 	allowed, err := allowedRegistrations(
 		registrations, batch[:len(distinct)], decision, now)
 	if err != nil {

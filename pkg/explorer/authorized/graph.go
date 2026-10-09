@@ -294,7 +294,11 @@ func (c *Client) resolveNodes(
 		}
 		resolved[nodeID] = registration
 	}
-	return resolved, nil
+	effective, err := c.effectiveNodeRegistrations(ctx, resolved)
+	if err != nil {
+		return nil, err
+	}
+	return effective, nil
 }
 
 // registeredEdges holds the edge registrations resolved for one page in a
@@ -407,6 +411,15 @@ func (c *Client) authorizedNode(
 	if err != nil {
 		return NodeRegistration{}, policyCatalogReadError(ctx, err)
 	}
+	if !ok {
+		return NodeRegistration{}, auth.ObjectNotFound()
+	}
+	effective, err := c.effectiveNodeRegistrations(
+		ctx, map[shoal.ID]NodeRegistration{nodeID: registration})
+	if err != nil {
+		return NodeRegistration{}, err
+	}
+	registration, ok = effective[nodeID]
 	if !ok {
 		return NodeRegistration{}, auth.ObjectNotFound()
 	}
