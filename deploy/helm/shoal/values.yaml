@@ -387,6 +387,7 @@ llmGateway:
   # request whose Host is not an exactly configured authority, which a kubelet
   # addressing the pod by its runtime-assigned IP can never satisfy.
   healthPort: 8101
+  metricsPort: 8102
   # Required. The external authorities this gateway answers to, exactly matched.
   # Empty means every request is refused with 421, so validate.yaml refuses to
   # render rather than deploy a gateway that governs nothing because it answers

@@ -86,6 +86,9 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"orchestrator probes. Empty disables it. It is a second listener "+
 			"because the request surface answers only the completions route "+
 			"and a probe must not be mistaken for a call")
+	metricsAddress := flags.String("metrics-address", "",
+		"Optional separate listener serving GET /metrics for Prometheus. Empty "+
+			"disables it. It is separate so scrapes cannot be mistaken for calls")
 	allowPlaintextAdmission := flags.Bool("allow-plaintext-admission", false,
 		"Accept a remote http:// -admission-url. Off by default: over "+
 			"plaintext the bearer token and the verdict both cross the "+
@@ -319,9 +322,19 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 
 	state := &healthsurface.State{}
 	health := (*healthsurface.Server)(nil)
+	metrics := (*metricsHTTPServer)(nil)
+	if address := strings.TrimSpace(*metricsAddress); address != "" {
+		metrics, err = startMetricsServer(address, governed.metricsHandler())
+		if err != nil {
+			listener.Close()
+			return fmt.Errorf("listen on %s: %w", address, err)
+		}
+		fmt.Fprintf(output, "Metrics surface listening at http://%s\n", metrics.Address())
+	}
 	if address := strings.TrimSpace(*healthAddress); address != "" {
 		health, err = healthsurface.Start(address, state)
 		if err != nil {
+			_ = metrics.Shutdown(context.Background())
 			listener.Close()
 			return fmt.Errorf("listen on %s: %w", address, err)
 		}
@@ -361,7 +374,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), drainWindow)
 		defer cancel()
-		shutdownDone <- drain(shutdown, state, server, health)
+		shutdownDone <- drain(shutdown, state, server, health, metrics)
 	}()
 	err = serve(server, listener, tlsConfig)
 	if errors.Is(err, http.ErrServerClosed) {
@@ -369,7 +382,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), drainWindow)
 	defer cancel()
-	_ = drain(shutdown, state, server, health)
+	_ = drain(shutdown, state, server, health, metrics)
 	return err
 }
 
