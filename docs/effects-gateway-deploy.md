@@ -617,6 +617,10 @@ attempts is never "nothing to report" (#514). It is appended to
 - **Retry**: every entry is presented again at start. One the explorer now
   records — an identical replay is accepted (#542) — leaves the log; the rest
   stay.
+- **A write that fails**: the run stays held with the entry it could not
+  write. When the drain's work is done it retries that entry, once; if the
+  write fails again, `Run` returns `ErrUnrecordedUnwritten` (the command exits
+  1), never a clean stop with an effect on no record and in no log.
 - **Clearing**: otherwise only `UnrecordedLog.Ack` / `Worker.AckUnrecorded`,
   which the command exposes as `shoal-gateway unrecorded ack`. The ack opens
   the log, so it runs against a stopped gateway's directory (see

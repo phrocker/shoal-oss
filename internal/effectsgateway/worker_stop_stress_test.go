@@ -51,6 +51,17 @@ import (
 // if the completion then commits, so one effect can be accounted for twice.
 // An effect accounted for nowhere is the failure.
 //
+// The test cannot pass vacuously: it counts, over the whole run, the effects
+// performed, those accounted for by a recorded completion, and those
+// accounted for only by an unrecorded-log entry, and requires all three to
+// have occurred.
+//
+// What it cannot reach is the keep in handle's exit (an attempted, unsettled
+// run stays in runs): with killed stored and runs snapshotted atomically, no
+// stop it can schedule leaves a sent run unsettled outside the snapshot, so
+// the two defences overlap. TestAnAttemptedRunLeavesRunsOnlyOnceSettled
+// covers the keep directly.
+//
 // SHOAL_STOP_STRESS_ITERATIONS overrides the iteration count (500; 50 with
 // -short). Each iteration logs its seed on failure.
 func TestEveryEffectIsAccountedForWhateverTheStopTiming(t *testing.T) {
@@ -65,13 +76,26 @@ func TestEveryEffectIsAccountedForWhateverTheStopTiming(t *testing.T) {
 	}
 	base := uint64(time.Now().UnixNano())
 	t.Cleanup(func() { stopYieldHook.Store(nil) })
+	var totals stressTotals
 	for i := 0; i < iterations; i++ {
 		seed := base + uint64(i)
-		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) { stopStressIteration(t, seed) })
+		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) { stopStressIteration(t, seed, &totals) })
 		if t.Failed() {
 			return
 		}
 	}
+	t.Logf("%d iterations: %d with an effect, %d effects; %d accounted for by a completion, "+
+		"%d by an accepted report, %d by the unrecorded log alone",
+		iterations, totals.iterationsWithEffect, totals.effects, totals.completed,
+		totals.reported, totals.logOnly)
+	if totals.effects == 0 || totals.completed == 0 || totals.logOnly == 0 {
+		t.Fatalf("the run exercised too little to mean anything: %+v", totals)
+	}
+}
+
+// stressTotals are counted across the run so the test cannot pass vacuously.
+type stressTotals struct {
+	iterationsWithEffect, effects, completed, reported, logOnly int
 }
 
 type lockedRand struct {
@@ -113,7 +137,7 @@ func pause(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func stopStressIteration(t *testing.T, seed uint64) {
+func stopStressIteration(t *testing.T, seed uint64, totals *stressTotals) {
 	random := &lockedRand{r: rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))}
 	h := newWorkerHarness(t, nil)
 	// Widen the windows between a stop's steps and the runs racing it: the
@@ -166,7 +190,9 @@ func stopStressIteration(t *testing.T, seed uint64) {
 	h.start()
 	// SIGTERM anywhere from before the first pull to after the last answer;
 	// the second signal at once, or a little later.
-	time.Sleep(random.upTo(15 * time.Millisecond))
+	// Biased late enough that most iterations reach the target: before it,
+	// an iteration has no effect to account for.
+	time.Sleep(5*time.Millisecond + random.upTo(15*time.Millisecond))
 	switch random.intN(5) {
 	case 0:
 		h.cancel() // SIGTERM alone: the drain finishes the work
@@ -200,6 +226,7 @@ func stopStressIteration(t *testing.T, seed uint64) {
 	for _, entry := range h.log.Entries() {
 		entries[string(entry.ActionID)] = true
 	}
+	hadEffect := false
 	for _, id := range ids {
 		mu.Lock()
 		performed := effects[testExecutorKey(t, id).HeaderValue()]
@@ -207,13 +234,26 @@ func stopStressIteration(t *testing.T, seed uint64) {
 		if !performed {
 			continue
 		}
+		hadEffect = true
+		totals.effects++
 		record := h.explorer.record(id)
 		completed := record.State == fleet.DispatchSucceeded || record.State == fleet.DispatchFailed
 		reported := len(record.AmbiguityReports) > 0
+		switch {
+		case completed:
+			totals.completed++
+		case reported:
+			totals.reported++
+		case entries[id]:
+			totals.logOnly++
+		}
 		if !completed && !reported && !entries[id] {
 			t.Fatalf("seed %d: %s's effect happened and is accounted for nowhere: "+
 				"record %s, no accepted report, no unrecorded entry\n%s",
 				seed, id, record.State, h.logs)
 		}
+	}
+	if hadEffect {
+		totals.iterationsWithEffect++
 	}
 }

@@ -426,10 +426,34 @@ func (w *Worker) Run(ctx context.Context) error {
 	if w.killed.Load() {
 		return errors.New("worker killed")
 	}
+	if w.unaccounted() > 0 {
+		return ErrUnrecordedUnwritten
+	}
 	if abandoned > 0 {
 		return ErrDrainAbandoned
 	}
 	return nil
+}
+
+// ErrUnrecordedUnwritten says the drain ended with an outcome that could not
+// be written to the unrecorded log even on the retry: it is in the process's
+// logs (the dispatch_error event) and nowhere durable.
+var ErrUnrecordedUnwritten = errors.New("an outcome could not be written to the unrecorded log")
+
+// unaccounted is how many runs in hand were attempted and are not settled:
+// effects that may have happened and are on no record and in no log.
+func (w *Worker) unaccounted() int {
+	w.runsMu.Lock()
+	defer w.runsMu.Unlock()
+	n := 0
+	for run := range w.runs {
+		run.mu.Lock()
+		if run.attempted && !run.settled {
+			n++
+		}
+		run.mu.Unlock()
+	}
+	return n
 }
 
 // withTimeout is context.WithTimeout on the worker's clock, so every bound
@@ -490,6 +514,12 @@ func (w *Worker) drain() int {
 	abandoned := 0
 	select {
 	case <-done:
+		// Every run has finished, but one whose report could not be written
+		// is still held (the invariant on runs): retry its entry now, once,
+		// rather than return as if nothing were left only in memory.
+		if w.unaccounted() > 0 {
+			w.abandon()
+		}
 	case <-w.clock.After(DrainBound(w.cfg.OperationTimeout, w.cfg.PlaneTimeout)):
 		// The grace period's exit margin is all that is left before the
 		// kubelet's SIGKILL, and it belongs to this: nothing that may have
@@ -528,9 +558,15 @@ func (w *Worker) abandonRuns(runs []*claimRun) int {
 		run.mu.Lock()
 		write := run.attempted && !run.settled && !run.abandoned
 		run.abandoned, run.reported = true, true
+		pending := run.pending
 		run.mu.Unlock()
 		if write {
 			written = append(written, run)
+			if pending != nil {
+				// The report's own entry, which a failed write left here.
+				entries = append(entries, *pending)
+				continue
+			}
 			entries = append(entries, run.unrecorded(w.cfg.SurfaceName,
 				fleet.AmbiguityOutcomeUnknown, "", nil))
 		}
@@ -966,6 +1002,8 @@ type claimRun struct {
 	attempted bool
 	settled   bool
 	abandoned bool
+	// pending is the entry a report could not write, for abandon to retry.
+	pending   *UnrecordedEntry
 	stopRenew chan struct{}
 	renewDone chan struct{}
 	// renewCtx bounds every call the renewal makes; stopping the renewal
@@ -1576,6 +1614,11 @@ func (w *Worker) report(run *claimRun, outcome fleet.AmbiguityOutcome, ref strin
 	}
 	entry := run.unrecorded(w.cfg.SurfaceName, outcome, ref, err)
 	if appendErr := w.cfg.Unrecorded.Append(entry); appendErr != nil {
+		// Unsettled, so the run stays in runs; the drain retries this
+		// entry rather than an outcome_unknown in its place.
+		run.mu.Lock()
+		run.pending = &entry
+		run.mu.Unlock()
 		record.Event, record.DispatchError = EventDispatch, DispatchKind(err)
 		w.log.Log(record)
 		return

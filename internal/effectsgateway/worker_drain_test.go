@@ -616,3 +616,73 @@ func TestAHardStopAfterRunHasReturnedDoesNothing(t *testing.T) {
 		t.Fatalf("a HardStop after Run returned abandoned %d, against a closed log", abandoned)
 	}
 }
+
+// unwritableReport drives one run to a lost-fence report the explorer will
+// not record, with the unrecorded log's writes failing until heal is called:
+// the report's own append fails, and the run is left attempted and unsettled.
+func unwritableReport(t *testing.T) (h *workerHarness, heal func()) {
+	t.Helper()
+	h = newWorkerHarness(t, nil)
+	h.explorer.onExtend = func(int, []byte, ExtendRequest) (Action, error, bool) {
+		return Action{}, &DispatchError{Op: "extend", Kind: DispatchFenceLost, Status: 409}, true
+	}
+	h.explorer.onAmbiguity = func(int, []byte, AmbiguityReport) (Action, error, bool) {
+		return Action{}, &DispatchError{Op: "ambiguity", Kind: DispatchAmbiguityUnrecorded, Status: 400}, true
+	}
+	var broken atomic.Bool
+	broken.Store(true)
+	previous := fileSyncer
+	fileSyncer = func(file *os.File) error {
+		if broken.Load() {
+			return errors.New("disk")
+		}
+		return file.Sync()
+	}
+	t.Cleanup(func() { fileSyncer = previous })
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.startGated()
+	h.clock.Advance(30 * time.Second)
+	eventually(t, "the fence to be lost", func() bool { return h.logs.has("fence_lost") })
+	h.release()
+	eventually(t, "the failed write", func() bool {
+		for _, line := range h.logs.lines() {
+			if line["event"] == string(EventDispatch) && line["ambiguity"] == string(fleet.AmbiguityEffectObserved) {
+				return true
+			}
+		}
+		return false
+	})
+	if h.log.Len() != 0 || h.worker.InFlight() != 1 {
+		t.Fatalf("after the failed write: %d entries, %d held", h.log.Len(), h.worker.InFlight())
+	}
+	return h, func() { broken.Store(false) }
+}
+
+// TestTheDrainRetriesAReportItCouldNotWrite: a report whose append failed
+// leaves its run held; the drain writes that report's own entry — the
+// outcome and reference it had, not an outcome_unknown in its place — and
+// Run returns cleanly only once it is written.
+func TestTheDrainRetriesAReportItCouldNotWrite(t *testing.T) {
+	h, heal := unwritableReport(t)
+	heal()
+	if err := h.stop(); err != nil {
+		t.Fatalf("Run = %v after the retry succeeded", err)
+	}
+	entries := h.log.Entries()
+	if len(entries) != 1 || string(entries[0].ActionID) != "a1" ||
+		entries[0].Outcome != fleet.AmbiguityEffectObserved || entries[0].Reference != "ch_1" {
+		t.Fatalf("entries = %+v", entries)
+	}
+	if n := h.worker.InFlight(); n != 0 {
+		t.Fatalf("%d runs still held after the retry", n)
+	}
+}
+
+// TestADrainThatCannotWriteIsNotClean: if the retry fails too, Run says so;
+// it never returns nil with an effect on no record and in no log.
+func TestADrainThatCannotWriteIsNotClean(t *testing.T) {
+	h, _ := unwritableReport(t)
+	if err := h.stop(); !errors.Is(err, ErrUnrecordedUnwritten) {
+		t.Fatalf("Run = %v, want ErrUnrecordedUnwritten", err)
+	}
+}
