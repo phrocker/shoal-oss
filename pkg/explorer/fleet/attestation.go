@@ -7,9 +7,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"strings"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -414,7 +414,7 @@ func (s *AttestationService) Present(
 		return AttestationReceipt{}, err
 	}
 	ref := presentation.ExecutorRef
-	if ref == "" || len(ref) > MaxExecutorRefBytes || strings.TrimSpace(ref) != ref ||
+	if executorref.ValidExecutorRef(ref) != nil ||
 		len(presentation.IdempotencyKey) == 0 ||
 		len(presentation.IdempotencyKey) > shoal.MaxIDBytes ||
 		len(presentation.Report) == 0 ||

@@ -24,8 +24,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
-	"unicode/utf8"
 
+	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -247,14 +247,11 @@ func compileExecutors(documents []Document) (map[string]ExecutorBound, error) {
 	for _, document := range documents {
 		for i, executor := range document.Executors {
 			path := "executors" + selector("ref", executor.Ref, i)
-			if !utf8.ValidString(executor.Ref) {
+			if err := executorref.ValidExecutorRef(executor.Ref); err != nil {
+				// An invalid ref is not echoed into the selector: it may be
+				// invisible, or not valid UTF-8.
 				return nil, refuse(document.name, "executors"+selector("", "", i)+".ref",
-					"is not valid UTF-8")
-			}
-			if executor.Ref == "" || len(executor.Ref) > fleet.MaxExecutorRefBytes ||
-				trimmed(executor.Ref) != executor.Ref {
-				return nil, refuse(document.name, path+".ref",
-					"executor reference is outside its bound")
+					err.Error())
 			}
 			if previous, duplicate := files[executor.Ref]; duplicate {
 				return nil, refuse(document.name, path, "executor is also declared in "+previous)

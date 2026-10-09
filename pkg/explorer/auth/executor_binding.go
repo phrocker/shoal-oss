@@ -20,10 +20,7 @@
 package auth
 
 import (
-	"strings"
-	"unicode"
-	"unicode/utf8"
-
+	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -34,10 +31,10 @@ import (
 // decision would claim a narrowing nothing enforces, and the role without one
 // would name no executor.
 //
-// A set binding is bounded like every other identity (shoal.MaxIDBytes, which
-// equals the fleet's executor-reference bound) and must be printable UTF-8
-// with no surrounding whitespace, so it can always equal a valid fleet
-// executor reference and never smuggles control bytes into logs.
+// A set binding must pass executorref.ValidExecutorRef, the same rule the
+// fleet registry, the ATPL compiler and attestation presentation apply, so a
+// binding can equal exactly the valid fleet executor references: every
+// reference a descriptor can register can be bound, and nothing else can.
 //
 // A bound decision also acts only as itself: it carries no on-behalf-of
 // chain. Chains hold workspace subjects that may collide across issuers
@@ -56,18 +53,9 @@ func validateExecutorBinding(
 		}
 		return nil
 	}
-	if err := shoal.ValidateRequiredID(
-		"executor binding", shoal.ID(binding),
-	); err != nil {
-		return err
-	}
-	if !utf8.ValidString(binding) || strings.TrimSpace(binding) != binding {
-		return invalidExecutorBinding()
-	}
-	for _, character := range binding {
-		if !unicode.IsPrint(character) {
-			return invalidExecutorBinding()
-		}
+	if err := executorref.ValidExecutorRef(binding); err != nil {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "executor binding: "+err.Error())
 	}
 	if len(onBehalfOf) != 0 {
 		return shoal.NewError(
@@ -76,11 +64,6 @@ func validateExecutorBinding(
 		)
 	}
 	return nil
-}
-
-func invalidExecutorBinding() error {
-	return shoal.NewError(
-		shoal.ErrorInvalidArgument, "executor binding must be printable text")
 }
 
 // ExecutorBinding returns the one executor reference an action-execution

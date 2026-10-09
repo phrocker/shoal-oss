@@ -229,9 +229,35 @@ can never be attested. The row key comes from the authentication
 decision; the body cannot name a principal. Every presentation is audited
 (`attestation_presented`, or `attestation_refused` with the typed reason); an
 accepted one is audited before it is stored, and a refused one stays refused
-if its audit fails. `pkg/attestation/api` (stdlib and `pkg/shoal` only, on the
-import-boundary allowlist) is the wire contract and client;
-`sdk.New(...).Attestation()` returns it.
+if its audit fails. `pkg/attestation/api` (stdlib, `pkg/shoal` and
+`pkg/executorref` only, on the import-boundary allowlist) is the wire contract
+and client; `sdk.New(...).Attestation()` returns it.
+
+An executor reference must pass `executorref.ValidExecutorRef`
+(`pkg/executorref`, #391). That is the one rule fleet registration, the ATPL
+compiler, attestation presentation (server and `pkg/attestation/api`) and an
+action-execution decision's executor binding all apply, so a parity test holds
+them to the same verdict. A reference must be non-empty, at most 1024 bytes,
+and valid UTF-8. Every rune must be printable, so control, format, zero-width
+and bidi characters are refused, and the only space allowed is an ASCII space
+that is not at either end. It must not begin with a combining mark, and it
+must already be in NFKC form. A reference that is not normalized is refused,
+never rewritten, because rewriting would change what fingerprints and digests
+cover. `café` written with precomposed `é` is accepted. `cafe` plus U+0301,
+the `ﬁ` ligature, full-width letters, a tab, U+200B, NBSP and U+2003 are
+refused.
+
+**Migration.** The rule tightens *registration*, as #544's floor did. Stored
+descriptors keep resolving. A descriptor whose reference the rule now refuses
+is refused at its next `Register`, or at the next ATPL `plan`/`apply` that
+declares it, with `invalid_argument` on the executor reference. A new
+attestation presentation for such a reference is refused the same way, and no
+executor binding can name it. If that happens to a descriptor that has worked for a long time,
+the control is working: rename the executor reference (and its host binding)
+to a plain form and re-register.
+A presentation naming a reference the rule refuses is
+`invalid_argument` before verification, and `attestationapi.NewRequest`
+refuses it on the client.
 
 Note for Path B: an admission caller authenticates under invoke, but presents
 under execute. The same (domain, subject, client) must hold both.

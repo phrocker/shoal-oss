@@ -154,7 +154,7 @@ func TestCompileRefusesNonUTF8FromCodeBuiltDocuments(t *testing.T) {
 		{"id", func(d *Document) { agentByID(d, "planner").ID = "planner\xff" }, ".id: is not valid UTF-8"},
 		{"domain", func(d *Document) { d.Agents[0].AuthorizationDomain = "domain\xff" }, ".authorization_domain: is not valid UTF-8"},
 		{"scope", func(d *Document) { d.Agents[0].Scopes[0].SourceID = "source\xfe" }, ".scopes[0].source_id: is not valid UTF-8"},
-		{"executor", func(d *Document) { d.Executors[0].Ref = "exec\xff" }, ".ref: is not valid UTF-8"},
+		{"executor", func(d *Document) { d.Executors[0].Ref = "exec\xff" }, ".ref: executor reference is not valid UTF-8"},
 	} {
 		t.Run(mutate.name, func(t *testing.T) {
 			document := base(t)

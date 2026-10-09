@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -38,7 +39,7 @@ const (
 	MaxCapabilities       = 64
 	MaxActions            = 256
 	MaxNameBytes          = 128
-	MaxExecutorRefBytes   = 1024
+	MaxExecutorRefBytes   = executorref.MaxExecutorRefBytes
 	MaxSchemaBytes        = 64 << 10
 	MaxDescriptorBytes    = 1 << 20
 	MaxLease              = 24 * time.Hour
@@ -664,9 +665,8 @@ func (s Spec) canonical(now time.Time) (Spec, error) {
 	if len(s.Scopes) == 0 || len(s.Scopes) > MaxScopes {
 		return Spec{}, shoal.NewError(shoal.ErrorInvalidArgument, "agent scopes are outside their bound")
 	}
-	if s.ExecutorRef == "" || len(s.ExecutorRef) > MaxExecutorRefBytes ||
-		strings.TrimSpace(s.ExecutorRef) != s.ExecutorRef {
-		return Spec{}, shoal.NewError(shoal.ErrorInvalidArgument, "executor reference is outside its bound")
+	if err := executorref.ValidExecutorRef(s.ExecutorRef); err != nil {
+		return Spec{}, shoal.NewError(shoal.ErrorInvalidArgument, err.Error())
 	}
 	if s.LeaseExpiresAt.IsZero() || s.LeaseExpiresAt.Location() != time.UTC ||
 		!now.Before(s.LeaseExpiresAt) || s.LeaseExpiresAt.Sub(now) > MaxLease {
