@@ -48,6 +48,18 @@ class CalibrationTests(unittest.TestCase):
         self.assertLessEqual(result['scores']['e'], .5)
         self.assertGreaterEqual(result['scores']['f'], .5)
 
+    def test_resealed_provenance_and_limitation_rejected(self):
+        scores, labels = self.fixture()
+        artifact = calibration.fit(scores, labels, model_id='m', runtime_id='r', validation_manifest_id='manifest')
+        for field, value in (('validation_scores_digest', 'bad'),
+                             ('validation_labels_digest', '0' * 63 + 'z'),
+                             ('limitation', 'promotion enabled')):
+            tampered = copy.deepcopy(artifact)
+            tampered[field] = value
+            tampered['id'] = calibration._digest({key: val for key, val in tampered.items() if key != 'id'})
+            with self.assertRaises(ValueError):
+                calibration.verify(tampered)
+
 
 if __name__ == '__main__':
     unittest.main()
