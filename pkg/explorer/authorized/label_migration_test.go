@@ -393,6 +393,12 @@ func TestLabelMigrationUntranslatableLabelsCloseTheDocument(t *testing.T) {
 						requireNotFound(t, reader+" Document", err)
 					}
 				}
+				// Its URI refuses every ingest, even by a principal holding
+				// every grant: no grant satisfies the untranslatable claim.
+				if _, err := w.clientA.Ingest(w.labelAdmin(t), labelledSource(
+					control.uri, "a relabel attempt", "secret")); err == nil {
+					t.Fatal("the untranslatable document's URI accepted an ingest")
+				}
 				// The other documents still follow the table.
 				summaries, err := w.clientA.Documents(w.secretHolder(t))
 				requireNoError(t, "Documents", err)

@@ -93,6 +93,14 @@ policy grants only; operations are unchanged. A label policy can never be
 named through `-identity-policy`, which refuses the whole `shoal.label/`
 namespace.
 
+Before serving the first tool call, `shoal-mcp` runs the same startup label
+migration as `shoal-explore-web`: documents labelled before labels were
+enforced are narrowed to their label policies, untranslatable ones become
+readable by nobody, and any error refuses to start. stderr stays silent unless
+the migration narrowed something or left documents unreadable. See "Upgrading:
+labelled documents are tightened at startup" in
+`docs/shoal-explore-web-deploy.md`.
+
 Generic interaction evidence is reauthorized with the legacy `retrieve`
 operation. An explicit identity therefore needs `retrieve` for tools whose
 records touch grounded source nodes. A source-free action record needs only
