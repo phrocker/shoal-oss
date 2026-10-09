@@ -15,7 +15,7 @@ def base():
     picture = op.picture(policy=policy, guide=guide, deployment=deployment, source=source,
                         observations=observations, history=history, operation='restart',
                         target='svc-a', actor='alice', requested_at=11, availability_cutoff=11)
-    current = {'policy_id': policy['id'], 'source_revision': source['revision'], 'target': 'svc-a',
+    current = {'policy_id': policy['id'], 'source_revision': source['revision'], 'target': 'svc-a', 'actor': 'alice',
                'deployment_id': deployment['id'], 'environment': 'prod', 'now': 11,
                'permission': True, 'policy': policy, 'guide': guide}
     return picture, current
@@ -42,6 +42,7 @@ class OperationPictureTests(unittest.TestCase):
     def test_substitution_and_revocation_abstain(self):
         picture, current = base()
         for mutation, reason in (({'target': 'svc-b'}, 'operation_substitution'),
+                                 ({'actor': 'mallory'}, 'operation_substitution'),
                                  ({'permission': False}, 'permission_revoked'),
                                  ({'source_revision': 'src-old'}, 'stale_deployment_mapping'),
                                  ({'now': 21}, 'stale_deployment_mapping'),
@@ -92,6 +93,11 @@ class OperationPictureTests(unittest.TestCase):
         result = op.assess(picture, malformed)
         op.verify(result, 'operation_assessment')
         self.assertEqual(result['abstention'], 'policy_substitution')
+
+    def test_oversized_evidence_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'evidence value'):
+            op.picture(**{**base_inputs(), 'availability_cutoff': 11,
+                          'observations': [{'id': 'o1', 'key': 'capacity', 'value': 'x' * 5000, 'observed_at': 10}]})
 
 
 def base_inputs():

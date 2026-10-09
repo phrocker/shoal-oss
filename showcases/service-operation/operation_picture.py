@@ -62,6 +62,11 @@ def picture(*, policy, guide, deployment, source, observations, history, operati
         if not isinstance(row, dict):
             raise ValueError('evidence row must be an object')
         _text(row.get('id'), 'evidence id'); _text(row.get('key'), 'evidence key')
+        try:
+            if len(json.dumps(row.get('value'), sort_keys=True, allow_nan=False)) > 4096:
+                raise ValueError('evidence value exceeds bound')
+        except (TypeError, ValueError):
+            raise ValueError('invalid evidence value')
         if row['id'] in evidence_ids:
             raise ValueError('duplicate evidence id')
         evidence_ids.add(row['id'])
@@ -83,7 +88,7 @@ def assess(picture_record, current):
     verify(picture_record, 'operation_picture')
     if not isinstance(current, dict):
         raise ValueError('current state must be an object')
-    for key in ('policy_id', 'source_revision', 'target', 'now', 'deployment_id', 'environment'):
+    for key in ('policy_id', 'source_revision', 'target', 'actor', 'now', 'deployment_id', 'environment'):
         if key not in current:
             raise ValueError('current state missing ' + key)
     _time(current['now'], 'current now')
@@ -96,6 +101,8 @@ def assess(picture_record, current):
     if current['now'] > picture_record['deployment_expires_at']:
         return _result(picture_record, 'abstain', 'stale_deployment_mapping')
     if current['target'] != picture_record['target']:
+        return _result(picture_record, 'abstain', 'operation_substitution')
+    if current['actor'] != picture_record['actor']:
         return _result(picture_record, 'abstain', 'operation_substitution')
     if current.get('permission') is not True:
         return _result(picture_record, 'abstain', 'permission_revoked')
