@@ -21,9 +21,10 @@ it among the three gateways.
 | **#484** | the lost-fence ambiguity route (`POST actions/{id}/ambiguity`) | a worker whose claim lapsed mid-effect has nowhere to record what it attempted |
 | **#486** | a heartbeat moves the descriptor generation, so `/complete` and `/ambiguity` answer 404 after one heartbeat | until fixed, the gateway must never register or heartbeat while holding claims |
 
-The dispatch client has no `extend` or `ambiguity` method on purpose: a method
-for a route that does not exist is one a worker could be written against and
-that fails only in production.
+Both routes now exist, and the dispatch client speaks them (`Extend`,
+`ReportAmbiguity`). It has no heartbeat method, and will not get one: a worker
+cannot truthfully assert a descriptor's liveness, so the gateway never
+heartbeats and carries no registrar credential (#391).
 
 ## What exists
 
@@ -35,7 +36,7 @@ that fails only in production.
 | `timing.go` | clock anchoring, PRECHECK predicates, the send gate, the grace-period formula |
 | `executorkey.go` | `ExecutorKey` decoding in both platform spellings |
 | `dialer.go` | the egress-restricted target transport and the separate explorer client |
-| `client.go` | the internal dispatch client: pull, claim, complete, resolve |
+| `client.go`, `client_ops.go` | the internal dispatch client: pull, claim, extend, complete (bound on the claim fence), ambiguity, resolve (its own ref only), attestation presentation; every claim-scoped request carries the record's `Shoal-Correlation-ID` |
 | `logging.go` | the one logging function, and the policy it enforces |
 
 The dispatch client is tested against the real explorer composition — the

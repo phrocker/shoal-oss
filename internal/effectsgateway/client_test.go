@@ -167,7 +167,7 @@ func TestDispatchClientRefusesLocallyBeforeSending(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	request := RequestContext{RequestID: []byte("r"), ReasonCode: "x", Deadline: time.Now().Add(time.Minute)}
+	request := RequestContext{RequestID: []byte("r"), ReasonCode: "x", Deadline: time.Now().Add(time.Minute), CorrelationID: []byte("trace")}
 	claimID := []byte("claim")
 	checks := map[string]error{}
 	_, checks["pull limit 0"] = client.Pull(ctx, request, "", 0)
@@ -178,11 +178,11 @@ func TestDispatchClientRefusesLocallyBeforeSending(t *testing.T) {
 	_, checks["claim no claim ID"] = client.Claim(ctx, []byte("a"), ClaimRequest{Context: request, ExpectedVersion: 1, Lease: time.Minute})
 	_, checks["claim zero lease"] = client.Claim(ctx, []byte("a"), ClaimRequest{Context: request, ExpectedVersion: 1, ClaimID: claimID})
 	_, checks["claim lease over ceiling"] = client.Claim(ctx, []byte("a"), ClaimRequest{Context: request, ExpectedVersion: 1, ClaimID: claimID, Lease: fleet.MaxActionClaimTTL + 1})
-	_, checks["complete both output and failure"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, Output: []byte(`{}`), Failed: true, ErrorCode: ErrorOutcomeUnknown})
-	_, checks["complete success with code"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, Output: []byte(`{}`), ErrorCode: ErrorOutcomeUnknown})
+	_, checks["complete both output and failure"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, ClaimFence: 1, Output: []byte(`{}`), Failed: true, ErrorCode: ErrorOutcomeUnknown})
+	_, checks["complete success with code"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, ClaimFence: 1, Output: []byte(`{}`), ErrorCode: ErrorOutcomeUnknown})
 	_, checks["complete success without output"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID})
-	_, checks["complete failure off vocabulary"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, Failed: true, ErrorCode: "executor_error"})
-	_, checks["complete failure without code"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, Failed: true})
+	_, checks["complete failure off vocabulary"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, ClaimFence: 1, Failed: true, ErrorCode: "executor_error"})
+	_, checks["complete failure without code"] = client.Complete(ctx, []byte("a"), Completion{Context: request, ExpectedVersion: 1, ClaimID: claimID, ClaimFence: 1, Failed: true})
 	_, checks["resolve no agent"] = client.Resolve(ctx, nil, request)
 	for name, err := range checks {
 		if DispatchKind(err) != DispatchRefusedLocal {
@@ -254,10 +254,16 @@ var indeterminate = []string{"Shoal-Commit-Outcome", "indeterminate"}
 
 func committed(t *testing.T, version uint64, state fleet.DispatchState, code, output string) string {
 	t.Helper()
+	return committedUnder(t, 1, version, state, code, output)
+}
+
+// committedUnder is committed() under a chosen claim fence.
+func committedUnder(t *testing.T, fence, version uint64, state fleet.DispatchState, code, output string) string {
+	t.Helper()
 	record := map[string]any{
 		"id": base64.RawURLEncoding.EncodeToString([]byte("action")), "version": version,
 		"state": state, "agent_id": "", "claim_id": base64.RawURLEncoding.EncodeToString([]byte("claim")),
-		"effect_possible": true,
+		"claim_fence": fence, "effect_possible": true,
 	}
 	if code != "" {
 		record["error_code"] = code
@@ -273,9 +279,9 @@ func committed(t *testing.T, version uint64, state fleet.DispatchState, code, ou
 }
 
 func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
-	failure := Completion{ExpectedVersion: 2, ClaimID: []byte("claim"), Failed: true,
+	failure := Completion{ExpectedVersion: 2, ClaimID: []byte("claim"), ClaimFence: 1, Failed: true,
 		ErrorCode: TargetRejected(422)}
-	success := Completion{ExpectedVersion: 2, ClaimID: []byte("claim"),
+	success := Completion{ExpectedVersion: 2, ClaimID: []byte("claim"), ClaimFence: 1,
 		Output: json.RawMessage(`{"status":200,"idempotency":"key","reference":"ch_1"}`)}
 	failedRecord := committed(t, 3, fleet.DispatchFailed, "target_rejected_422", "")
 	successRecord := committed(t, 3, fleet.DispatchSucceeded, "", `{"idempotency":"key","reference":"ch_1","status":200}`)
@@ -395,16 +401,27 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 		{"success recorded as failed", success,
 			[]func() (*http.Response, error){reply(400, `{}`), reply(200, committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""))},
 			DispatchRecordedOtherwise, 2},
-		// 200 comes only at exactly ExpectedVersion+1; anything else is not
-		// this report's record. But the route answered success, so something
-		// committed: resend and read the record through the replay branch,
-		// never protocol alone.
-		{"version past the report then the record", failure,
-			[]func() (*http.Response, error){reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", "")),
+		// With the fence, 200 comes for this claim generation's terminal
+		// record at any version past ExpectedVersion: an extension or an
+		// ambiguity report may have moved the version since the worker last
+		// saw it, and the fence, not the version, binds the completion.
+		{"version past the report under the fence", failure,
+			[]func() (*http.Response, error){reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", ""))},
+			"", 1},
+		// Another fence is another generation's record, never this report's.
+		// But the route answered success, so something committed: resend and
+		// read the record through the replay branch, never protocol alone.
+		{"another fence then the record", failure,
+			[]func() (*http.Response, error){reply(200, committedUnder(t, 2, 3, fleet.DispatchFailed, "target_rejected_422", "")),
 				reply(200, failedRecord)}, "", 2},
-		{"version past the report twice then the record", failure,
-			[]func() (*http.Response, error){reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", "")),
-				reply(200, committed(t, 5, fleet.DispatchFailed, "target_rejected_422", "")), reply(200, failedRecord)}, "", 3},
+		{"another fence twice then the record", failure,
+			[]func() (*http.Response, error){reply(200, committedUnder(t, 2, 3, fleet.DispatchFailed, "target_rejected_422", "")),
+				reply(200, committedUnder(t, 2, 3, fleet.DispatchFailed, "target_rejected_422", "")), reply(200, failedRecord)}, "", 3},
+		{"another fence three times", success,
+			[]func() (*http.Response, error){reply(200, committedUnder(t, 2, 3, fleet.DispatchSucceeded, "", `{}`)),
+				reply(200, committedUnder(t, 2, 3, fleet.DispatchSucceeded, "", `{}`)),
+				reply(200, committedUnder(t, 2, 3, fleet.DispatchSucceeded, "", `{}`))},
+			DispatchIndeterminate, 3},
 		{"version not past the report, three times", failure,
 			[]func() (*http.Response, error){reply(200, committed(t, 2, fleet.DispatchFailed, "target_rejected_422", "")),
 				reply(200, committed(t, 2, fleet.DispatchFailed, "target_rejected_422", "")),
@@ -455,7 +472,7 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 			t.Fatal(err)
 		}
 		completion := row.completion
-		completion.Context = RequestContext{RequestID: []byte("r"), ReasonCode: "gateway_complete",
+		completion.Context = RequestContext{CorrelationID: []byte("trace"), RequestID: []byte("r"), ReasonCode: "gateway_complete",
 			Deadline: time.Now().Add(time.Minute)}
 		action, err := client.Complete(context.Background(), []byte("action"), completion)
 		if DispatchKind(err) != row.kind {
@@ -494,11 +511,11 @@ func TestCompleteTakesARecordedOutcomeFromOneRequest(t *testing.T) {
 		state      fleet.DispatchState
 		code       string
 	}{
-		{"reported failure", Completion{ExpectedVersion: 2, ClaimID: []byte("claim"), Failed: true,
+		{"reported failure", Completion{ExpectedVersion: 2, ClaimID: []byte("claim"), ClaimFence: 1, Failed: true,
 			ErrorCode: TargetRejected(422)},
 			committed(t, 3, fleet.DispatchFailed, "target_rejected_422", ""),
 			"", fleet.DispatchFailed, "target_rejected_422"},
-		{"success recorded otherwise", Completion{ExpectedVersion: 2, ClaimID: []byte("claim"),
+		{"success recorded otherwise", Completion{ExpectedVersion: 2, ClaimID: []byte("claim"), ClaimFence: 1,
 			Output: json.RawMessage(`{"status":200}`)},
 			committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""),
 			DispatchRecordedOtherwise, fleet.DispatchFailed, "invalid_executor_output"},
@@ -517,7 +534,7 @@ func TestCompleteTakesARecordedOutcomeFromOneRequest(t *testing.T) {
 			t.Fatal(err)
 		}
 		completion := row.completion
-		completion.Context = RequestContext{RequestID: []byte("r"), ReasonCode: "gateway_complete",
+		completion.Context = RequestContext{CorrelationID: []byte("trace"), RequestID: []byte("r"), ReasonCode: "gateway_complete",
 			Deadline: time.Now().Add(time.Minute)}
 		action, err := client.Complete(context.Background(), []byte("action"), completion)
 		want := "POST /api/v1/fleet/actions/" + base64.RawURLEncoding.EncodeToString([]byte("action")) + "/complete"
@@ -563,7 +580,7 @@ func TestClaimPossiblyCommittedIsARepullSignal(t *testing.T) {
 			t.Fatal(err)
 		}
 		action, err := client.Claim(context.Background(), []byte("action"), ClaimRequest{
-			Context: RequestContext{RequestID: []byte("r"), ReasonCode: "gateway_claim",
+			Context: RequestContext{CorrelationID: []byte("trace"), RequestID: []byte("r"), ReasonCode: "gateway_claim",
 				Deadline: time.Now().Add(time.Minute)},
 			ExpectedVersion: 1, ClaimID: []byte("claim"), Lease: time.Minute,
 		})

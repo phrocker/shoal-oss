@@ -195,7 +195,12 @@ func (h *gatewayHarness) client() *effectsgateway.DispatchClient {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	return client
+	// The harness descriptor names the "gateway" ref; a client resolves only its own.
+	bound, err := client.BindExecutor("gateway")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return bound
 }
 
 // enqueue is the agent's side, over the same HTTP surface and principal.
@@ -361,7 +366,7 @@ func TestEffectsGatewayClientAgainstTheRealDispatchHandler(t *testing.T) {
 	}
 	sent := time.Now()
 	claimRequest := effectsgateway.ClaimRequest{
-		Context: requestContext(t, "gateway_claim"), ExpectedVersion: offered.Version,
+		Context: offered.Correlate(requestContext(t, "gateway_claim")), ExpectedVersion: offered.Version,
 		ClaimID: claimID, Lease: time.Minute,
 	}
 	claimed, err := client.Claim(ctx, offered.ID, claimRequest)
@@ -376,7 +381,7 @@ func TestEffectsGatewayClientAgainstTheRealDispatchHandler(t *testing.T) {
 		t.Fatalf("claimed = %#v", claimed)
 	}
 	// A transport retry of the same claim is answered by the replay branch.
-	claimRequest.Context = requestContext(t, "gateway_claim")
+	claimRequest.Context = offered.Correlate(requestContext(t, "gateway_claim"))
 	replayed, err := client.Claim(ctx, offered.ID, claimRequest)
 	if err != nil || replayed.Version != claimed.Version || !replayed.ExecutorKey.Equal(claimed.ExecutorKey) {
 		t.Fatalf("claim replay = %#v, %v", replayed, err)
@@ -385,7 +390,7 @@ func TestEffectsGatewayClientAgainstTheRealDispatchHandler(t *testing.T) {
 	// conflict, and either means "re-pull", never "gone".
 	rivalID, _, _ := effectsgateway.NewClaimID("pod-1", nil)
 	_, err = client.Claim(ctx, offered.ID, effectsgateway.ClaimRequest{
-		Context: requestContext(t, "gateway_claim"), ExpectedVersion: offered.Version,
+		Context: offered.Correlate(requestContext(t, "gateway_claim")), ExpectedVersion: offered.Version,
 		ClaimID: rivalID, Lease: time.Minute,
 	})
 	if kind := effectsgateway.DispatchKind(err); kind != effectsgateway.DispatchNotFound &&
@@ -432,7 +437,7 @@ func TestEffectsGatewayClientAgainstTheRealDispatchHandler(t *testing.T) {
 
 	// COMPLETE, under the claim, with the closed output.
 	completion := effectsgateway.Completion{
-		Context: requestContext(t, "gateway_complete"), ExpectedVersion: claimed.Version,
+		Context: claimed.Correlate(requestContext(t, "gateway_complete")), ExpectedVersion: claimed.Version, ClaimFence: claimed.ClaimFence,
 		ClaimID: claimID, Output: classified.Output,
 	}
 	completed, err := client.Complete(ctx, claimed.ID, completion)
@@ -444,7 +449,7 @@ func TestEffectsGatewayClientAgainstTheRealDispatchHandler(t *testing.T) {
 		t.Fatalf("completed = %#v (%s)", completed, completed.Output)
 	}
 	// A lost reply is resent with the same body and gets the committed record.
-	completion.Context = requestContext(t, "gateway_complete")
+	completion.Context = claimed.Correlate(requestContext(t, "gateway_complete"))
 	again, err := client.Complete(ctx, claimed.ID, completion)
 	if err != nil || again.Version != completed.Version {
 		t.Fatalf("complete replay = %#v, %v", again, err)
@@ -452,7 +457,7 @@ func TestEffectsGatewayClientAgainstTheRealDispatchHandler(t *testing.T) {
 	// A report under a claim that is not the one held is refused and visible.
 	stale := completion
 	stale.ClaimID = rivalID
-	stale.Context = requestContext(t, "gateway_complete")
+	stale.Context = claimed.Correlate(requestContext(t, "gateway_complete"))
 	if _, err := client.Complete(ctx, claimed.ID, stale); err == nil {
 		t.Fatal("a completion under a claim that was never held was accepted")
 	} else if kind := effectsgateway.DispatchKind(err); kind != effectsgateway.DispatchNotFound &&
@@ -486,7 +491,7 @@ func TestEffectsGatewayClientRecordsAFailureInOneRequest(t *testing.T) {
 	offered, _ := pulled(t, client, "action-raw")
 	rawClaim, _, _ := effectsgateway.NewClaimID("pod-0", nil)
 	claimed, err := client.Claim(ctx, offered.ID, effectsgateway.ClaimRequest{
-		Context: requestContext(t, "gateway_claim"), ExpectedVersion: offered.Version,
+		Context: offered.Correlate(requestContext(t, "gateway_claim")), ExpectedVersion: offered.Version,
 		ClaimID: rawClaim, Lease: time.Minute,
 	})
 	if err != nil {
@@ -532,14 +537,14 @@ func TestEffectsGatewayClientRecordsAFailureInOneRequest(t *testing.T) {
 	offered, _ = pulled(t, client, "action-failed")
 	claimID, _, _ := effectsgateway.NewClaimID("pod-0", nil)
 	claimed, err = client.Claim(ctx, offered.ID, effectsgateway.ClaimRequest{
-		Context: requestContext(t, "gateway_claim"), ExpectedVersion: offered.Version,
+		Context: offered.Correlate(requestContext(t, "gateway_claim")), ExpectedVersion: offered.Version,
 		ClaimID: claimID, Lease: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	failed, err := client.Complete(ctx, claimed.ID, effectsgateway.Completion{
-		Context: requestContext(t, "gateway_complete"), ExpectedVersion: claimed.Version,
+		Context: claimed.Correlate(requestContext(t, "gateway_complete")), ExpectedVersion: claimed.Version, ClaimFence: claimed.ClaimFence,
 		ClaimID: claimID, Failed: true, ErrorCode: effectsgateway.TargetRejected(422),
 	})
 	if err != nil {
@@ -553,13 +558,13 @@ func TestEffectsGatewayClientRecordsAFailureInOneRequest(t *testing.T) {
 	// Refused before anything is sent: an off-vocabulary code and an
 	// over-ceiling lease.
 	if _, err := client.Complete(ctx, claimed.ID, effectsgateway.Completion{
-		Context: requestContext(t, "gateway_complete"), ExpectedVersion: claimed.Version,
+		Context: claimed.Correlate(requestContext(t, "gateway_complete")), ExpectedVersion: claimed.Version, ClaimFence: claimed.ClaimFence,
 		ClaimID: claimID, Failed: true, ErrorCode: "the target said: no",
 	}); effectsgateway.DispatchKind(err) != effectsgateway.DispatchRefusedLocal {
 		t.Fatalf("off-vocabulary code = %v", err)
 	}
 	if _, err := client.Claim(ctx, offered.ID, effectsgateway.ClaimRequest{
-		Context: requestContext(t, "gateway_claim"), ExpectedVersion: offered.Version,
+		Context: offered.Correlate(requestContext(t, "gateway_claim")), ExpectedVersion: offered.Version,
 		ClaimID: claimID, Lease: fleet.MaxActionClaimTTL + time.Nanosecond,
 	}); effectsgateway.DispatchKind(err) != effectsgateway.DispatchRefusedLocal {
 		t.Fatalf("over-ceiling lease = %v", err)
@@ -611,14 +616,14 @@ func TestEffectsGatewayClientSurfacesAnOutcomeRecordedOtherwise(t *testing.T) {
 	offered, _ := pulled(t, client, "action-strict")
 	claimID, _, _ := effectsgateway.NewClaimID("pod-0", nil)
 	claimed, err := client.Claim(ctx, offered.ID, effectsgateway.ClaimRequest{
-		Context: requestContext(t, "gateway_claim"), ExpectedVersion: offered.Version,
+		Context: offered.Correlate(requestContext(t, "gateway_claim")), ExpectedVersion: offered.Version,
 		ClaimID: claimID, Lease: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	recorded, err := client.Complete(ctx, claimed.ID, effectsgateway.Completion{
-		Context: requestContext(t, "gateway_complete"), ExpectedVersion: claimed.Version,
+		Context: claimed.Correlate(requestContext(t, "gateway_complete")), ExpectedVersion: claimed.Version, ClaimFence: claimed.ClaimFence,
 		ClaimID: claimID, Output: json.RawMessage(`{"status":200,"idempotency":"key"}`),
 	})
 	if effectsgateway.DispatchKind(err) != effectsgateway.DispatchRecordedOtherwise {
