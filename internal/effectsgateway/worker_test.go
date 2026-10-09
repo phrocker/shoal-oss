@@ -83,9 +83,7 @@ func TestWorkerHappyPath(t *testing.T) {
 		t.Fatalf("not ready: %s", reason)
 	}
 	for _, event := range []string{"claimed", "sent", "completed"} {
-		if !h.logs.has(event) {
-			t.Fatalf("no %s event:\n%s", event, h.logs)
-		}
+		eventually(t, "the "+event+" event", func() bool { return h.logs.has(event) })
 	}
 	h.assertNoSecrets()
 	if err := h.stop(); err != nil {
@@ -335,9 +333,7 @@ func TestWorkerReportsAnExtensionRefusedMidFlight(t *testing.T) {
 	if _, _, _, completions, _ := h.explorer.counts(); completions != 0 {
 		t.Fatalf("completed after the fence was lost")
 	}
-	if !h.logs.has("ambiguity_reported") {
-		t.Fatal("no ambiguity_reported event")
-	}
+	eventually(t, "the ambiguity_reported event", func() bool { return h.logs.has("ambiguity_reported") })
 }
 
 // TestWorkerReportsRequestNotSentWhenTheFenceIsLostFirst: the fence is lost
