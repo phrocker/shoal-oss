@@ -102,7 +102,7 @@ func TestExtendTakesTheExplorersLeaseEndAndClassifiesRefusals(t *testing.T) {
 	deadline := time.Date(2026, 10, 9, 12, 3, 0, 0, time.UTC)
 	granted := deadline // clamped
 	renewed := claimedRecord(t, 3, 1, granted, deadline)
-	request := ExtendRequest{Context: opsContext(), ExpectedVersion: 2, ClaimID: []byte("claim"),
+	request := ExtendRequest{Context: opsContext(), ClaimID: []byte("claim"),
 		ClaimFence: 1, Lease: fleet.MaxActionClaimTTL}
 	for _, row := range []struct {
 		name    string
@@ -129,9 +129,10 @@ func TestExtendTakesTheExplorersLeaseEndAndClassifiesRefusals(t *testing.T) {
 		// version, past the deadline, or not decodable.
 		{"another fence then renewed", []func() (*http.Response, error){
 			reply(200, claimedRecord(t, 3, 2, granted, deadline)), reply(200, renewed)}, "", 0, 2},
-		{"another version twice", []func() (*http.Response, error){
-			reply(200, claimedRecord(t, 4, 1, granted, deadline)),
-			reply(200, claimedRecord(t, 4, 1, granted, deadline))}, DispatchIndeterminate, 0, 2},
+		// Bound on the fence, a renewal at a version the worker never saw
+		// (another holder's ambiguity report moved it) is this renewal.
+		{"renewed past an unseen version", []func() (*http.Response, error){
+			reply(200, claimedRecord(t, 9, 1, granted, deadline))}, "", 0, 1},
 		{"a lease past the deadline twice", []func() (*http.Response, error){
 			reply(200, claimedRecord(t, 3, 1, deadline.Add(time.Second), deadline)),
 			reply(200, claimedRecord(t, 3, 1, deadline.Add(time.Second), deadline))}, DispatchIndeterminate, 0, 2},
@@ -153,6 +154,14 @@ func TestExtendTakesTheExplorersLeaseEndAndClassifiesRefusals(t *testing.T) {
 			if !bytes.Equal(transport.bodies[i], transport.bodies[0]) {
 				t.Errorf("%s: the resend was not the identical body", row.name)
 			}
+		}
+		// #629: the renewal binds on the fence and pins no version.
+		var sent map[string]any
+		if err := json.Unmarshal(transport.bodies[0], &sent); err != nil {
+			t.Fatal(err)
+		}
+		if _, pinned := sent["expected_version"]; pinned || sent["claim_fence"] != float64(1) {
+			t.Errorf("%s: extend body %s, want claim_fence 1 and no expected_version", row.name, transport.bodies[0])
 		}
 		if row.kind == "" && !action.ClaimLeaseUntil.Equal(granted) {
 			t.Errorf("%s: lease end %v, want the explorer's %v", row.name, action.ClaimLeaseUntil, granted)
@@ -323,7 +332,7 @@ func TestCorrelationIsSentFromTheRecordAndCheckedFirst(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 	if _, err := client.Extend(ctx, action.ID, ExtendRequest{Context: action.Correlate(base),
-		ExpectedVersion: 2, ClaimID: []byte("claim"), ClaimFence: 1, Lease: time.Minute}); err != nil {
+		ClaimID: []byte("claim"), ClaimFence: 1, Lease: time.Minute}); err != nil {
 		t.Fatalf("extend: %v", err)
 	}
 	if _, err := client.ReportAmbiguity(ctx, action.ID, AmbiguityReport{Context: action.Correlate(base),
@@ -356,7 +365,7 @@ func TestCorrelationIsSentFromTheRecordAndCheckedFirst(t *testing.T) {
 		_, checks["claim"] = client.Claim(ctx, []byte("a"), ClaimRequest{Context: malformed,
 			ExpectedVersion: 1, ClaimID: []byte("claim"), Lease: time.Minute})
 		_, checks["extend"] = client.Extend(ctx, []byte("a"), ExtendRequest{Context: malformed,
-			ExpectedVersion: 1, ClaimID: []byte("claim"), ClaimFence: 1, Lease: time.Minute})
+			ClaimID: []byte("claim"), ClaimFence: 1, Lease: time.Minute})
 		_, checks["complete"] = client.Complete(ctx, []byte("a"), Completion{Context: malformed,
 			ExpectedVersion: 1, ClaimID: []byte("claim"), ClaimFence: 1, Output: json.RawMessage(`{}`)})
 		_, checks["ambiguity"] = client.ReportAmbiguity(ctx, []byte("a"), AmbiguityReport{Context: malformed,
@@ -379,11 +388,10 @@ func TestOpsRefuseLocallyBeforeSending(t *testing.T) {
 	client, transport := opsClient(t)
 	ctx := context.Background()
 	request := opsContext()
-	extend := ExtendRequest{Context: request, ExpectedVersion: 1, ClaimID: []byte("claim"),
+	extend := ExtendRequest{Context: request, ClaimID: []byte("claim"),
 		ClaimFence: 1, Lease: time.Minute}
 	checks := map[string]error{}
 	for name, mutate := range map[string]func(*ExtendRequest){
-		"no version": func(r *ExtendRequest) { r.ExpectedVersion = 0 },
 		"no claim":   func(r *ExtendRequest) { r.ClaimID = nil },
 		"no fence":   func(r *ExtendRequest) { r.ClaimFence = 0 },
 		"zero lease": func(r *ExtendRequest) { r.Lease = 0 },

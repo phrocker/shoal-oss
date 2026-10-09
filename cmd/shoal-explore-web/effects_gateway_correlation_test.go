@@ -69,7 +69,7 @@ func TestTheGatewayWorksAnActionWithAMaximalCorrelation(t *testing.T) {
 	client := g.gateway(testExecutorRef)
 	_, claimed, claimID := g.pullAndClaim(client, "stripe-long-trace", trace, time.Minute)
 	extended, err := client.Extend(ctx, claimed.ID, effectsgateway.ExtendRequest{
-		Context: claimed.Correlate(g.context("gateway_extend")), ExpectedVersion: claimed.Version,
+		Context: claimed.Correlate(g.context("gateway_extend")),
 		ClaimID: claimID, ClaimFence: claimed.ClaimFence, Lease: 2 * time.Minute,
 	})
 	if err != nil {

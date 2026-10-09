@@ -261,7 +261,7 @@ func TestTheGatewayExtendsToTheClampedDeadlineAndCompletesOnTheFence(t *testing.
 	_, claimed, claimID := g.pullAndClaim(client, "stripe-clamp", "alice-trace-clamp", time.Minute)
 	requested := fleet.MaxActionClaimTTL
 	extended, err := client.Extend(ctx, claimed.ID, effectsgateway.ExtendRequest{
-		Context: claimed.Correlate(g.context("gateway_extend")), ExpectedVersion: claimed.Version,
+		Context: claimed.Correlate(g.context("gateway_extend")),
 		ClaimID: claimID, ClaimFence: claimed.ClaimFence, Lease: requested,
 	})
 	if err != nil {
@@ -276,7 +276,7 @@ func TestTheGatewayExtendsToTheClampedDeadlineAndCompletesOnTheFence(t *testing.
 	}
 	// At the deadline already, a further extension cannot move the lease.
 	_, err = client.Extend(ctx, claimed.ID, effectsgateway.ExtendRequest{
-		Context: claimed.Correlate(g.context("gateway_extend")), ExpectedVersion: extended.Version,
+		Context: claimed.Correlate(g.context("gateway_extend")),
 		ClaimID: claimID, ClaimFence: claimed.ClaimFence, Lease: time.Minute,
 	})
 	if effectsgateway.DispatchKind(err) != effectsgateway.DispatchInvalid {
@@ -330,7 +330,7 @@ func TestTheGatewayCannotExtendAfterARebindButStillCompletes(t *testing.T) {
 	client = g.gateway(testExecutorRef)
 
 	_, err := client.Extend(ctx, claimed.ID, effectsgateway.ExtendRequest{
-		Context: claimed.Correlate(g.context("gateway_extend")), ExpectedVersion: claimed.Version,
+		Context: claimed.Correlate(g.context("gateway_extend")),
 		ClaimID: claimID, ClaimFence: claimed.ClaimFence, Lease: time.Minute,
 	})
 	var dispatchErr *effectsgateway.DispatchError
@@ -451,7 +451,7 @@ func TestTheGatewayThreadsTheRecordsCorrelation(t *testing.T) {
 	}
 	_, claimed, claimID := g.pullAndClaim(client, "stripe-trace", trace, time.Minute)
 	extended, err := client.Extend(ctx, claimed.ID, effectsgateway.ExtendRequest{
-		Context: claimed.Correlate(g.context("gateway_extend")), ExpectedVersion: claimed.Version,
+		Context: claimed.Correlate(g.context("gateway_extend")),
 		ClaimID: claimID, ClaimFence: claimed.ClaimFence, Lease: 2 * time.Minute,
 	})
 	if err != nil {
