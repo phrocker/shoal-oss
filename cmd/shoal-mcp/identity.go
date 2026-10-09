@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -57,13 +58,16 @@ var (
 )
 
 type identityOptions struct {
-	development      bool
-	subject          string
-	actor            string
-	clientID         string
-	domain           string
-	sourceID         string
-	policyID         string
+	development bool
+	subject     string
+	actor       string
+	clientID    string
+	domain      string
+	sourceID    string
+	policyID    string
+	// labels is -identity-labels: comma-separated <source>=<label> grants
+	// on the identity's own source (#570).
+	labels           string
 	operations       string
 	policyGeneration int64
 	lifetime         time.Duration
@@ -71,13 +75,16 @@ type identityOptions struct {
 }
 
 type identityConfig struct {
-	development      bool
-	subject          shoal.ID
-	actor            shoal.ID
-	clientID         shoal.ID
-	domain           []byte
-	sourceID         []byte
-	policyID         []byte
+	development bool
+	subject     shoal.ID
+	actor       shoal.ID
+	clientID    shoal.ID
+	domain      []byte
+	sourceID    []byte
+	policyID    []byte
+	// labelPolicyIDs are the label policies -identity-labels grants. They
+	// add visibility only; operations and the source are unchanged.
+	labelPolicyIDs   [][]byte
 	operations       []auth.Operation
 	policyGeneration int64
 	lifetime         time.Duration
@@ -105,6 +112,15 @@ func configureIdentity(options identityOptions) (identityConfig, error) {
 				"only from the label grant file",
 			config.policyID, auth.LabelPolicyNamespace)
 	}
+	// Labels come only from -identity-labels, and only on the identity's
+	// own source: the process decision permits that one source, so a grant
+	// on any other could never be used and is refused as unknown.
+	labels, err := authorized.ParseLabelGrantList(
+		options.labels, [][]byte{config.sourceID})
+	if err != nil {
+		return identityConfig{}, fmt.Errorf("-identity-labels: %w", err)
+	}
+	config.labelPolicyIDs = labels
 	return config, nil
 }
 
@@ -236,7 +252,7 @@ func (p *processIdentity) Decision(ctx context.Context) (auth.Decision, error) {
 		AuthorizationDomain:   p.config.domain,
 		AllowedOperations:     p.config.operations,
 		PermittedSourceIDs:    [][]byte{p.config.sourceID},
-		PermittedPolicyIDs:    [][]byte{p.config.policyID},
+		PermittedPolicyIDs:    append([][]byte{p.config.policyID}, p.config.labelPolicyIDs...),
 		PolicyGeneration:      p.config.policyGeneration,
 		AuthenticationExpires: now.Add(p.config.lifetime),
 		RequestID:             processTemplateRequestID,
@@ -266,6 +282,11 @@ func cloneIdentityConfig(config identityConfig) identityConfig {
 	config.domain = append([]byte(nil), config.domain...)
 	config.sourceID = append([]byte(nil), config.sourceID...)
 	config.policyID = append([]byte(nil), config.policyID...)
+	labels := make([][]byte, 0, len(config.labelPolicyIDs))
+	for _, label := range config.labelPolicyIDs {
+		labels = append(labels, append([]byte(nil), label...))
+	}
+	config.labelPolicyIDs = labels
 	config.operations = append([]auth.Operation(nil), config.operations...)
 	return config
 }
