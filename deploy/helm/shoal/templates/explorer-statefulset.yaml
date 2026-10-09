@@ -3,6 +3,7 @@
 {{- $oidc := $explorer.auth.oidc -}}
 {{- $approverMappingDir := "/etc/shoal/approvers" -}}
 {{- $labelGrantsDir := "/etc/shoal/label-grants" -}}
+{{- $executorMappingDir := "/etc/shoal/executors" -}}
 {{- /* Every value-derived string in this template is a quoted scalar: the
        container arguments as whole arguments, and the image, pull policy,
        credential references, mount path and storage request each on its own.
@@ -45,17 +46,20 @@ spec:
       labels:
         {{- include "shoal.explorerSelectorLabels" . | nindent 8 }}
         app.kubernetes.io/part-of: shoal-platform
-      {{- if or $oidc.approverMapping $oidc.labelGrants }}
-      # The approver mapping and the label grants are the settings that are
-      # files rather than arguments (they are documents, and the workspace
-      # reads them from disk once, at startup), so each carries the checksum
-      # that rolls the pod when it changes.
+      {{- if or $oidc.approverMapping $oidc.labelGrants $oidc.executorMapping }}
+      # The approver mapping, the label grants and the executor mapping are
+      # the settings that are files rather than arguments (they are
+      # documents, and the workspace reads them from disk once, at startup),
+      # so each carries the checksum that rolls the pod when it changes.
       annotations:
         {{- with $oidc.approverMapping }}
         checksum/approver-mapping: {{ toJson . | sha256sum | quote }}
         {{- end }}
         {{- with $oidc.labelGrants }}
         checksum/label-grants: {{ toJson . | sha256sum | quote }}
+        {{- end }}
+        {{- with $oidc.executorMapping }}
+        checksum/executor-mapping: {{ toJson . | sha256sum | quote }}
         {{- end }}
       {{- end }}
     spec:
@@ -152,6 +156,9 @@ spec:
             {{- if $oidc.labelGrants }}
             - {{ printf "-oidc-label-grants-file=%s/label-grants.json" $labelGrantsDir | quote }}
             {{- end }}
+            {{- if $oidc.executorMapping }}
+            - {{ printf "-oidc-executor-mapping-file=%s/executors.json" $executorMappingDir | quote }}
+            {{- end }}
             {{- with $oidc.identityClaim }}
             - {{ printf "-oidc-identity-claim=%s" (toJson .) | quote }}
             {{- end }}
@@ -236,6 +243,11 @@ spec:
               mountPath: {{ $labelGrantsDir | quote }}
               readOnly: true
             {{- end }}
+            {{- if $oidc.executorMapping }}
+            - name: executor-mapping
+              mountPath: {{ $executorMappingDir | quote }}
+              readOnly: true
+            {{- end }}
           # Both probes address the health port, never the workspace port. The
           # workspace refuses any request whose Host is not an exactly
           # configured authority, and a kubelet addresses the pod by its
@@ -282,6 +294,11 @@ spec:
         - name: label-grants
           configMap:
             name: {{ include "shoal.explorerLabelGrantsName" . | quote }}
+        {{- end }}
+        {{- if $oidc.executorMapping }}
+        - name: executor-mapping
+          configMap:
+            name: {{ include "shoal.explorerExecutorsName" . | quote }}
         {{- end }}
   volumeClaimTemplates:
     - metadata:

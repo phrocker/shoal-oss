@@ -36,7 +36,8 @@ import (
 //
 // Approver tokens get no labels: the approver branch mints approve and
 // nothing else, and approve reads nothing. Executor-bound decisions (#391)
-// are never minted by this authenticator, so they get none either.
+// get none either: the executor branch mints execute alone, under the
+// workspace policy and no label policy, whatever the token's claims say.
 const (
 	labelGrantsVersion = "shoal.label-grants/v1"
 	// labelGrantsMaxBytes bounds the file read at startup.

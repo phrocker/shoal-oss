@@ -161,6 +161,87 @@
 {{- end -}}
 {{- end -}}
 
+{{- /* The executor mapping (#391). The workspace refuses at startup a file
+       whose version is wrong, whose issuer is not an https URL without a
+       query or any '#', whose audience is one the human issuer's tokens are
+       minted on, whose service assertion is not a positive {claim, equals},
+       or whose entries are blank, outside the executor-reference charset, or
+       map a subject or a reference twice; refusing those here puts the
+       reason in the install instead of a pod log. A reference the workspace
+       does not configure would bind nothing, so it is refused too. Control
+       characters are refused by the line-break walk below, as in every other
+       value. Refusals name entries by position, never by value. */ -}}
+{{- $executorMapping := default (dict) $oidc.executorMapping -}}
+{{- if not (kindIs "map" $executorMapping) -}}
+{{- fail "explorer.auth.oidc.executorMapping must be the shoal.executors/v1 document as a map: the chart renders it into the file the workspace reads" -}}
+{{- end -}}
+{{- $executorValues := list -}}
+{{- if $executorMapping -}}
+{{- if ne (toString (get $executorMapping "version")) "shoal.executors/v1" -}}
+{{- fail (printf "explorer.auth.oidc.executorMapping.version must be shoal.executors/v1 (got %q): the workspace refuses any other version at startup" (toString (get $executorMapping "version"))) -}}
+{{- end -}}
+{{- $executorIssuer := toString (get $executorMapping "issuer") -}}
+{{- if not (regexMatch `^https://[a-z0-9.-]+(:[0-9]+)?(/[^?#[:space:]]*)?$` $executorIssuer) -}}
+{{- fail (printf "explorer.auth.oidc.executorMapping.issuer (%q) must be a canonical https URL with a lower-case host and no query, fragment or '#' anywhere: every executor identity is oidcexec:<issuer>#<subject>, so a '#' in the issuer would let two identities run into each other, and the workspace refuses it at startup" $executorIssuer) -}}
+{{- end -}}
+{{- $executorAudience := toString (get $executorMapping "audience") -}}
+{{- if not (trim $executorAudience) -}}
+{{- fail "explorer.auth.oidc.executorMapping.audience is required: executor tokens are minted on an audience of their own" -}}
+{{- end -}}
+{{- $humanAudiences := concat (default (list) $oidc.audiences) (list (toString (get $approverMapping "audience"))) -}}
+{{- if has $executorAudience $humanAudiences -}}
+{{- fail (printf "explorer.auth.oidc.executorMapping.audience (%q) must differ from explorer.auth.oidc.audiences and the approver mapping's audience: a token on both would be readable as a human's and a worker's, and the workspace refuses the overlap at startup" $executorAudience) -}}
+{{- end -}}
+{{- $assertion := get $executorMapping "service_assertion" -}}
+{{- if not (and (kindIs "map" $assertion) $assertion) -}}
+{{- fail "explorer.auth.oidc.executorMapping.service_assertion is required: a {claim, equals} only service tokens carry, such as claim [kubernetes.io, namespace] equal to the gateways' namespace" -}}
+{{- end -}}
+{{- $assertionClaim := get $assertion "claim" -}}
+{{- if not (and (kindIs "slice" $assertionClaim) $assertionClaim) -}}
+{{- fail "explorer.auth.oidc.executorMapping.service_assertion.claim must be a non-empty list of path segments: a dotted string is one claim whose name contains a dot, never a path" -}}
+{{- end -}}
+{{- range $assertionClaim -}}
+{{- if not (and (kindIs "string" .) (trim (toString .))) -}}
+{{- fail "explorer.auth.oidc.executorMapping.service_assertion.claim has a blank or non-string segment" -}}
+{{- end -}}
+{{- end -}}
+{{- if not (and (kindIs "string" (get $assertion "equals")) (trim (toString (get $assertion "equals")))) -}}
+{{- fail "explorer.auth.oidc.executorMapping.service_assertion.equals is required: the assertion is positive, a claim equal to a value. Absence proves nothing about who a token was issued to" -}}
+{{- end -}}
+{{- $executorEntries := get $executorMapping "executors" -}}
+{{- if not (and (kindIs "slice" $executorEntries) $executorEntries) -}}
+{{- fail "explorer.auth.oidc.executorMapping.executors must list at least one {subject, executor_ref}" -}}
+{{- end -}}
+{{- $seenSubjects := dict -}}
+{{- $seenRefs := dict -}}
+{{- range $index, $entry := $executorEntries -}}
+{{- if not (kindIs "map" $entry) -}}
+{{- fail (printf "explorer.auth.oidc.executorMapping.executors[%d] is not a {subject, executor_ref} map" $index) -}}
+{{- end -}}
+{{- $subject := toString (get $entry "subject") -}}
+{{- if or (not (kindIs "string" (get $entry "subject"))) (ne (trim $subject) $subject) (not $subject) -}}
+{{- fail (printf "explorer.auth.oidc.executorMapping.executors[%d].subject must be a non-empty string with no surrounding whitespace: the token's sub is compared byte for byte" $index) -}}
+{{- end -}}
+{{- $ref := toString (get $entry "executor_ref") -}}
+{{- if or (gt (len $ref) 1024) (not (regexMatch `^[A-Za-z0-9][A-Za-z0-9._:/@-]*$` $ref)) -}}
+{{- fail (printf "explorer.auth.oidc.executorMapping.executors[%d].executor_ref is outside the executor-reference charset: a reference is 1 to 1024 characters, starts with an ASCII letter or digit, and continues with ASCII letters, digits and . _ : / @ - only" $index) -}}
+{{- end -}}
+{{- if not (has $ref $explorer.fleet.executorRefs) -}}
+{{- fail (printf "explorer.auth.oidc.executorMapping.executors[%d].executor_ref is not in explorer.fleet.executorRefs: no descriptor can register against a reference the allow-list does not carry, so the credential would be bound to nothing" $index) -}}
+{{- end -}}
+{{- if hasKey $seenSubjects $subject -}}
+{{- fail (printf "explorer.auth.oidc.executorMapping.executors[%d].subject is mapped twice: one credential maps to one executor" $index) -}}
+{{- end -}}
+{{- if hasKey $seenRefs $ref -}}
+{{- fail (printf "explorer.auth.oidc.executorMapping.executors[%d].executor_ref is mapped twice: one executor has one credential" $index) -}}
+{{- end -}}
+{{- $_ := set $seenSubjects $subject true -}}
+{{- $_ := set $seenRefs $ref true -}}
+{{- $executorValues = append $executorValues $subject -}}
+{{- end -}}
+{{- $executorValues = concat $executorValues (list $executorIssuer $executorAudience) -}}
+{{- end -}}
+
 {{- /* Placeholders are not configuration. The shipped profile leaves these
        empty so the guards above fire, but a values file copied from the docs
        can still carry the marker text through, and a pod that authenticates
@@ -175,7 +256,7 @@
 {{- if kindIs "map" (get $labelGrants "grants") -}}
 {{- $labelGrantValues = keys (get $labelGrants "grants") -}}
 {{- end -}}
-{{- range (concat (list $oidc.issuer $oidc.authorizationClaim) $oidc.audiences $explorer.allowedHosts $oidc.readerValues $oidc.contributorValues $oidc.fleetValues $labelGrantValues) -}}
+{{- range (concat (list $oidc.issuer $oidc.authorizationClaim) $oidc.audiences $explorer.allowedHosts $oidc.readerValues $oidc.contributorValues $oidc.fleetValues $labelGrantValues $executorValues) -}}
 {{- if contains "REPLACE_ME" (toString .) -}}
 {{- fail (printf "explorer configuration still contains the placeholder %q: replace every REPLACE_ME before installing" (toString .)) -}}
 {{- end -}}

@@ -222,10 +222,10 @@ base64url; the report is the signed envelope byte for byte) answers
 `unauthorized` "attestation refused". The caller needs `OperationExecute`,
 gated exactly as the other execute routes (including the correlation ID,
 which the built-in authenticators mint or take from `Shoal-Correlation-ID`
-since #527). No shipped authenticator grants `OperationExecute` until #480,
-so in the shipped binary the route answers every caller with an
-authorization refusal; the development principal also has no client ID and
-can never be attested. The row key comes from the authentication
+since #527). The only credential that holds `OperationExecute` is one minted
+by the executor mapping (#391; `docs/effects-gateway-deploy.md`, "Issuing
+executor credentials"). The development principal holds no execute, has no
+client ID and can never be attested. The row key comes from the authentication
 decision; the body cannot name a principal. Every presentation is audited
 (`attestation_presented`, or `attestation_refused` with the typed reason); an
 accepted one is audited before it is stored, and a refused one stays refused
@@ -270,6 +270,21 @@ refuses it on the client.
 
 Note for Path B: an admission caller authenticates under invoke, but presents
 under execute. The same (domain, subject, client) must hold both.
+
+### Executor credentials
+
+A credential minted by the executor mapping is bound to one executor
+reference, and presentation requires `executor_ref` to equal that binding
+(#573). The statement's principal is the minted identity:
+- domain: the workspace authorization domain;
+- subject: `oidcexec:<issuer>#<sub>`;
+- client: the same identity.
+
+Here `<issuer>` is the mapping's issuer and `<sub>` is the projected token's
+raw subject, for example `system:serviceaccount:shoal-gateways:stripe`. A
+statement signed for any other subject, client or reference is refused. The
+subject does not depend on which pod or token presents, so a rotated
+projected token keeps presenting under the same principal.
 
 ### Host configuration
 

@@ -429,6 +429,61 @@ refuses_citing 'explorer.auth.oidc.labelGrants.claim[0] holds "\n"' "a newline i
 x'
 rm -f "$grants_file" "$approvers_file_both"
 
+note "== the executor mapping (#391) =="
+# The only source of the execute operation. Like the approver mapping it is a
+# document the workspace reads from disk once at startup, so it is a
+# chart-owned ConfigMap with a checksum that rolls the pod, and it never
+# appears unless configured. The shapes the workspace would refuse at startup
+# are refused at render, and so is a reference no descriptor could register
+# against.
+executors_file="$(mktemp)"
+cat > "$executors_file" <<'EXECUTORS'
+explorer:
+  fleet:
+    executorRefs: [stripe, ledger]
+  auth:
+    oidc:
+      executorMapping:
+        version: shoal.executors/v1
+        issuer: https://oidc.cluster.example.test/id/0123
+        audience: shoal-executors
+        service_assertion:
+          claim: [kubernetes.io, namespace]
+          equals: shoal-gateways
+        executors:
+          - subject: "system:serviceaccount:shoal-gateways:stripe"
+            executor_ref: stripe
+          - subject: "system:serviceaccount:shoal-gateways:ledger"
+            executor_ref: ledger
+EXECUTORS
+assert_absent "no executor mapping unless configured" 'oidc-executor-mapping-file|executor-mapping|executors.json' "${explorer_base[@]}"
+assert_renders "the executor mapping is passed" '^ +- "-oidc-executor-mapping-file=/etc/shoal/executors/executors.json"$' "${explorer_base[@]}" -f "$executors_file"
+assert_renders "the executor mapping is mounted read-only" '^ +mountPath: "/etc/shoal/executors"$' "${explorer_base[@]}" -f "$executors_file"
+assert_renders "the executor mapping is rendered as JSON" '^  executors.json: ".*\\"executor_ref\\":\\"stripe\\".*"$' "${explorer_base[@]}" -f "$executors_file"
+assert_renders "an executor mapping change rolls the pod" '^ +checksum/executor-mapping: "[0-9a-f]{64}"$' "${explorer_base[@]}" -f "$executors_file"
+assert_renders "the executor ConfigMap is chart-owned" '^  name: "[a-z0-9-]+-executors"$' "${explorer_base[@]}" -f "$executors_file"
+refuses_citing "must be the shoal.executors/v1 document as a map" "a mapping that is not a document" "${explorer_base[@]}" --set explorer.auth.oidc.executorMapping=executors.json
+refuses_citing "executorMapping.version must be shoal.executors/v1" "another version" "${explorer_base[@]}" -f "$executors_file" --set explorer.auth.oidc.executorMapping.version=shoal.executors/v2
+refuses_citing "must be a canonical https URL" "an http issuer" "${explorer_base[@]}" -f "$executors_file" --set explorer.auth.oidc.executorMapping.issuer=http://oidc.cluster.example.test
+refuses_citing "must be a canonical https URL" "an issuer with an empty fragment" "${explorer_base[@]}" -f "$executors_file" --set 'explorer.auth.oidc.executorMapping.issuer=https://x/#'
+refuses_citing "must be a canonical https URL" "an issuer with a query" "${explorer_base[@]}" -f "$executors_file" --set 'explorer.auth.oidc.executorMapping.issuer=https://x/?a=b'
+refuses_citing "must be a canonical https URL" "an upper-case issuer host" "${explorer_base[@]}" -f "$executors_file" --set 'explorer.auth.oidc.executorMapping.issuer=https://Cluster.example.test'
+refuses_citing "audience is required" "no audience" "${explorer_base[@]}" -f "$executors_file" --set explorer.auth.oidc.executorMapping.audience=
+refuses_citing "must differ from explorer.auth.oidc.audiences" "the workspace audience" "${explorer_base[@]}" -f "$executors_file" --set explorer.auth.oidc.executorMapping.audience=shoal
+refuses_citing "service_assertion is required" "no service assertion" "${explorer_base[@]}" -f "$executors_file" --set explorer.auth.oidc.executorMapping.service_assertion=null
+refuses_citing "service_assertion.equals is required" "an assertion with no value" "${explorer_base[@]}" -f "$executors_file" --set explorer.auth.oidc.executorMapping.service_assertion.equals=null
+refuses_citing "service_assertion.claim must be a non-empty list" "a dotted assertion claim" "${explorer_base[@]}" -f "$executors_file" --set explorer.auth.oidc.executorMapping.service_assertion.claim=kubernetes.io.namespace
+refuses_citing "must list at least one" "no executors" "${explorer_base[@]}" -f "$executors_file" --set explorer.auth.oidc.executorMapping.executors=null
+refuses_citing "executors[1].subject is mapped twice" "one subject, two references" "${explorer_base[@]}" -f "$executors_file" --set 'explorer.auth.oidc.executorMapping.executors[1].subject=system:serviceaccount:shoal-gateways:stripe'
+refuses_citing "executors[1].executor_ref is mapped twice" "two subjects, one reference" "${explorer_base[@]}" -f "$executors_file" --set 'explorer.auth.oidc.executorMapping.executors[1].executor_ref=stripe'
+refuses_citing "executors[0].executor_ref is outside the executor-reference charset" "a reference with a space" "${explorer_base[@]}" -f "$executors_file" --set-string 'explorer.auth.oidc.executorMapping.executors[0].executor_ref=str ipe'
+refuses_citing "executors[0].executor_ref is not in explorer.fleet.executorRefs" "a reference the workspace does not configure" "${explorer_base[@]}" -f "$executors_file" --set 'explorer.fleet.executorRefs={ledger}'
+refuses_citing "executors[0].subject must be a non-empty string" "a blank subject" "${explorer_base[@]}" -f "$executors_file" --set-string 'explorer.auth.oidc.executorMapping.executors[0].subject='
+refuses_citing "placeholder" "a placeholder issuer" "${explorer_base[@]}" -f "$executors_file" --set 'explorer.auth.oidc.executorMapping.issuer=https://replace-me.example.test/REPLACE_ME'
+refuses_citing 'explorer.auth.oidc.executorMapping.executors[0].subject holds "\n"' "a newline in a subject" "${explorer_base[@]}" -f "$executors_file" --set-string 'explorer.auth.oidc.executorMapping.executors[0].subject=system:serviceaccount:shoal-gateways:stripe
+x'
+rm -f "$executors_file"
+
 note "== a reference cannot carry a character that changes what the argument means =="
 # Every executor reference reaches the container inside one argument, and three
 # of the four settings are comma-joined into it. Two characters therefore cannot

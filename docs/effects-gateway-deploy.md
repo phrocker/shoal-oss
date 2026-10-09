@@ -42,7 +42,10 @@ The dispatch client is tested against the real explorer composition — the
 embedded store, the real recorder and publisher, the authenticated webapi
 handler, over a socket — in
 `cmd/shoal-explore-web/effects_gateway_client_test.go`. Its principal is the
-enqueuer's, which is the only claimant possible before #480.
+enqueuer's. A foreign claimant now has a credential: the executor mapping
+below (#391). `cmd/shoal-explore-web/oidc_executor_e2e_test.go` drives a mapped
+ServiceAccount token from a second issuer through pull, claim, extend and
+complete on the real routes.
 
 ## Configuration
 
@@ -131,6 +134,183 @@ shorter: nothing would ever be claimable, and the gateway would look idle.
 completion, the fallback ambiguity report, and five seconds to exit.
 `GracePeriodSeconds` rounds up. For `T = 10m` that is 615s; for the default
 `T = 3m`, 195s.
+
+## Issuing executor credentials
+
+A worker claims work it did not enqueue, so it needs `OperationExecute`. In
+the explorer exactly one thing grants it: the executor mapping,
+`-oidc-executor-mapping-file` (`SHOAL_OIDC_EXECUTOR_MAPPING_FILE`; chart value
+`explorer.auth.oidc.executorMapping`). No workspace, Fleet, development or
+approver mapping holds execute, and `oidc_execute_grant_test.go` asserts both
+halves. Without the file, no token can pull, claim, extend or complete queued
+work.
+
+The intended credential is a **projected ServiceAccount token**. The kubelet
+mints it for the gateway's pod, signs it with the cluster's service-account
+issuer, and rotates it. The gateway reads it from `-dispatch-token-file` on
+every call, so a rotated token takes effect without a restart.
+
+### The mapping file
+
+```json
+{
+  "version": "shoal.executors/v1",
+  "issuer": "https://oidc.eks.eu-west-1.amazonaws.com/id/0123456789ABCDEF",
+  "audience": "shoal-executors",
+  "service_assertion": {
+    "claim": ["kubernetes.io", "namespace"],
+    "equals": "shoal-gateways"
+  },
+  "executors": [
+    {"subject": "system:serviceaccount:shoal-gateways:stripe", "executor_ref": "stripe"},
+    {"subject": "system:serviceaccount:shoal-gateways:ledger", "executor_ref": "ledger"}
+  ]
+}
+```
+
+The file is decoded strictly. Unknown fields, duplicate keys, keys that match
+a field only up to case, and trailing data are all refused, at any depth. Any
+refusal stops the explorer from starting. A refusal names the entry's
+position, never its value.
+
+| field | rule |
+|---|---|
+| `version` | `shoal.executors/v1` |
+| `issuer` | The executor credentials' own issuer, which may differ from `-oidc-issuer`. It is held to the OIDC issuer rule (#553): an absolute `https` URL with a valid host, and no user info, query, or `#` anywhere (an empty fragment, `https://x/#`, included). It must also be canonical: exactly as `url.Parse` renders it, a lower-case host, no default port, no dot segments. A token's `iss` must equal it byte for byte. |
+| `jwks_uri` | Optional. Overrides discovery for this issuer, as `-oidc-jwks-uri` does for the human issuer. `https` only. |
+| `audience` | Required, and disjoint from `-oidc-audience` and the approver mapping's audience. |
+| `service_assertion` | Required, and positive: a claim path (a list of segments; a dotted string is one key, never a path) that must equal `equals` exactly. For projected ServiceAccount tokens, use the namespace claim `["kubernetes.io", "namespace"]`. For an IdP client-credentials token, use a marker such as Auth0's `["gty"]` = `client-credentials`. "Absent" is not an accepted form, because absence proves nothing about who a token was issued to. |
+| `executors` | 1 to 256 `{subject, executor_ref}` entries. A subject is compared byte for byte with the token's `sub`: no trimming, case folding or normalization. `executor_ref` must pass `executorref.ValidExecutorRef`. Subjects are unique and references are unique: one credential maps to one surface, and one surface has one credential. |
+
+**Choose a service assertion no human token can ever carry.** Good choices:
+- Kubernetes: the ServiceAccount claim `["kubernetes.io", "namespace"]`, or
+  `["kubernetes.io", "serviceaccount", "name"]`.
+- Entra: `["idtyp"]` = `app`. Entra sets it only on app-only tokens.
+
+Never assert a claim a user can be given, such as a group, a role or a
+scope. The assertion separates the two kinds of principal in both
+directions.
+
+**One principal is never both a human and an executor.** While the mapping is
+configured, the workspace and approver branches refuse any token that either:
+- (a) satisfies the service assertion, whichever issuer signed it; or
+- (b) is from the executor issuer and has a `sub` the mapping names.
+
+Both refusals are the generic `401`. The rule matters most when the mapping
+names `-oidc-issuer` itself, which is allowed on purpose: Entra workload
+identities share the tenant issuer with humans. Without the rule, a mapped
+service principal's token sent to the workspace audience would be minted as
+a reader, with any label grant its claims match. With it, that token is
+refused there and works only on the executor audience. A human of a
+*different* issuer whose `sub` happens to spell a mapped subject is
+unaffected by (b), but is still refused by (a) if their token carries the
+assertion.
+
+The second issuer gets its own discovery and JWKS cache, separate from the
+human issuer's. Both issuers may publish a key under the same `kid`. A key
+from one issuer still never verifies a token the other issuer's parser
+accepts. The mapping may also name `-oidc-issuer` itself; the audiences still
+keep the two branches apart. The executor branch accepts the same signing
+algorithms as `-oidc-allowed-algs`. Kubernetes signs with RS256, the default.
+
+The explorer must be able to fetch the issuer's discovery document
+(`<issuer>/.well-known/openid-configuration`) or the `jwks_uri` override over
+TLS that it trusts:
+- On a managed cluster, the public OIDC issuer URL works (EKS, GKE, AKS).
+- On a self-managed cluster, the API server serves discovery only to callers
+  the `system:service-account-issuer-discovery` ClusterRole is bound to, and
+  its certificate is usually signed by the cluster CA. Publish the issuer's
+  discovery and keys somewhere the explorer can reach and trust instead.
+
+### What a mapped token is minted as
+
+| | |
+|---|---|
+| operations | `execute`, and nothing else |
+| service role | `action_execution`. The role also lets the worker resolve the one descriptor its binding names. It cannot heartbeat or register. |
+| executor binding | the entry's `executor_ref`. The fleet narrows every execute route to it (#573). Another reference's work answers `not_found`. |
+| subject, actor, client ID | `oidcexec:<issuer>#<sub>`, one identity. It is outside the human identity family (`oidc:`, `oidcid:`, `entra:`), so it is never compared with a requester or an approver. The client ID is set because attestation requires one. |
+| on behalf of | none. A worker acts as itself. |
+| sources, policies | the workspace source and grant policy. **No label policy**, whatever the label grants file says, so labelled evidence stays redacted on a pull. |
+| provenance | the issuer, the raw `sub`, and the mapping digest |
+| correlation ID | taken from `Shoal-Correlation-ID`, or minted (`oidcexec-correlation-…`). Every dispatch route needs one (#527). |
+
+The explorer refuses a token on the executor audience when any of these is
+true:
+- it carries `act`, `may_act`, a claim-overage indicator (`_claim_names`,
+  `_claim_sources`, `hasgroups`) or the configured `-oidc-delegation-claim`;
+- it also names a workspace or approver audience (and a human token naming
+  the executor audience is refused on the human branch too);
+- the service assertion fails;
+- its `sub` is not mapped;
+- it is signed by any key other than the executor issuer's.
+
+The human branches refuse an executor's credential as described under "The
+mapping file". At startup the explorer also refuses a mapping entry whose
+`executor_ref` is not among `-fleet-executor-refs`, naming the entry's
+position. Every external reference must already be in that list. No
+descriptor could register against such a reference, so the credential would
+be bound to nothing.
+
+Every refusal is the same generic `401`. At startup the explorer prints the
+mapping digest and the number of executor credentials it holds.
+
+### Projecting the token
+
+Give each gateway its own ServiceAccount, so its token's `sub` is
+`system:serviceaccount:<namespace>:<name>`. Turn off automounting, and project
+a token on the executor audience:
+
+```yaml
+spec:
+  serviceAccountName: stripe
+  automountServiceAccountToken: false
+  containers:
+    - name: gateway
+      args:
+        - -dispatch-token-file=/var/run/shoal/dispatch/token
+      volumeMounts:
+        - name: dispatch-token
+          mountPath: /var/run/shoal/dispatch
+          readOnly: true
+  volumes:
+    - name: dispatch-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              audience: shoal-executors
+              expirationSeconds: 3600
+              path: token
+```
+
+The kubelet refreshes the file before the token expires (at 80% of its
+lifetime). The explorer adds `-oidc-clock-skew` to the token's `exp`, and no
+more.
+
+To revoke a credential, remove its entry and roll the explorer. To rotate one
+onto a new ServiceAccount, add the new subject under a new reference and
+re-register the descriptor; one reference never has two credentials.
+
+### In the chart
+
+Set `explorer.auth.oidc.executorMapping` to the document as a map. The chart:
+- renders it as JSON into a ConfigMap it owns (`<release>-executors`);
+- mounts it read-only at `/etc/shoal/executors` and passes
+  `-oidc-executor-mapping-file`;
+- puts its checksum on the pod template, so a changed mapping rolls the pod.
+
+`validate.yaml` refuses, at render time, the shapes the explorer would refuse
+at startup:
+- a wrong version;
+- a non-canonical or non-`https` issuer, or one with a query or a `#`;
+- a missing audience, or one shared with the human audiences;
+- a missing or non-positive service assertion;
+- blank, duplicate or out-of-charset entries;
+- a placeholder.
+
+It also refuses an `executor_ref` that is not in `explorer.fleet.executorRefs`:
+no descriptor could register against it, so the credential would be bound to
+nothing.
 
 ## Routes
 
