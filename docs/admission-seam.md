@@ -505,6 +505,17 @@ The same object is accepted and returned on
 `POST /api/v1/fleet/actions/{action}/complete`, which is the route a gateway
 performing external effects completes through.
 
+`shoal-llm-gateway` fills it. Every byte the caller can receive passes through
+a counting wrapper around the ResponseWriter: `bytes` is what each write
+accepted, `chunks` the flushes that pushed some of it — one per relayed SSE
+event. The count is read once, after the handler has stopped writing, and
+only for a failure that followed it: a truncated stream, a caller that
+disconnected, an upstream that broke mid-body, or a non-2xx body relayed in
+full. It is omitted when nothing left and when the gateway declares no
+`egresses-content` (a loopback provider), since the plane would refuse it
+there and leave the grant unreported. A report whose answer was lost is
+resent once, as the identical report.
+
 ## Outstanding
 
 `POST /api/v1/admission/outstanding` lists admissions this caller was granted

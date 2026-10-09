@@ -96,6 +96,14 @@ func newHandlerProxy(
 	t *testing.T, provider *handlerProvider, upstream *fakeUpstream,
 ) (*proxy, *[]string) {
 	t.Helper()
+	return newHandlerProxyOver(t, provider, upstream)
+}
+
+// newHandlerProxyOver is newHandlerProxy over any provider.
+func newHandlerProxyOver(
+	t *testing.T, provider webapi.AdmissionProvider, upstream *fakeUpstream,
+) (*proxy, *[]string) {
+	t.Helper()
 	handler, err := webapi.NewAdmissionHandler(provider)
 	if err != nil {
 		t.Fatal(err)

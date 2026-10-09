@@ -213,9 +213,10 @@ type Report struct {
 // That is also why it is never refined. Both gateways know the final count
 // at the moment they report — the LLM gateway after its response handler has
 // returned, when the bytes passed to the ResponseWriter can no longer grow;
-// the effects gateway when its send completes or fails, with any partial
-// write counted by the dialer's wrapped conn — so the first report is the
-// whole report, which is what lets the field be write-once.
+// the effects gateway when its send completes or fails (its client carries
+// the field on /complete; the worker that will perform the send, and count a
+// partial write, is not in this tree yet) — so the first report is the whole
+// report, which is what lets the field be write-once.
 
 // Fixed integers, not a unit/value pair: a unit label would be
 // caller-controlled text on a durable record. A gateway with a tokenizer
