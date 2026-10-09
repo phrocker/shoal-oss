@@ -38,7 +38,7 @@ func (c *Client) FoldInteractions(
 	if err != nil {
 		return explorer.FoldResult{}, err
 	}
-	_, guard, _, err := c.begin(ctx, auth.OperationConnect)
+	decision, guard, _, err := c.begin(ctx, auth.OperationConnect)
 	if err != nil {
 		return explorer.FoldResult{}, err
 	}
@@ -63,13 +63,19 @@ func (c *Client) FoldInteractions(
 	}
 	// The durable winner is authoritative for retries. Reauthorize every one
 	// of its canonical members rather than only the caller-supplied request.
-	for _, member := range fold.Members {
-		if _, err := c.Interaction(ctx, member.SessionID); err != nil {
-			return committedFoldFailure(err)
-		}
+	allowed, recorders, err := c.foldMembersVisible(
+		ctx, fold, readerFingerprint(decision))
+	if err != nil {
+		return committedFoldFailure(err)
+	}
+	if !allowed {
+		return committedFoldFailure(auth.ObjectNotFound())
 	}
 	if err := guard.Check(ctx); err != nil {
 		return committedFoldFailure(err)
+	}
+	if !recorders.all {
+		result.Visibility = ""
 	}
 	return result, nil
 }
@@ -145,10 +151,11 @@ func (c *Client) Folds(ctx context.Context) ([]explorer.FoldSummary, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, guard, _, err := c.begin(ctx, auth.OperationRead)
+	decision, guard, _, err := c.begin(ctx, auth.OperationRead)
 	if err != nil {
 		return nil, err
 	}
+	reader := readerFingerprint(decision)
 	values, err := store.Folds(ctx)
 	if err != nil {
 		return nil, directBaseError(err)
@@ -164,13 +171,18 @@ func (c *Client) Folds(ctx context.Context) ([]explorer.FoldSummary, error) {
 			}
 			return nil, directBaseError(readErr)
 		}
-		allowed, authorizationErr := c.foldMembersVisible(ctx, fold)
+		allowed, recorders, authorizationErr := c.foldMembersVisible(
+			ctx, fold, reader)
 		if authorizationErr != nil {
 			return nil, authorizationErr
 		}
-		if allowed {
-			visible = append(visible, value)
+		if !allowed {
+			continue
 		}
+		if !recorders.all {
+			value.Visibility = ""
+		}
+		visible = append(visible, value)
 	}
 	if err := guard.Check(ctx); err != nil {
 		return nil, err
@@ -217,7 +229,7 @@ func (c *Client) RehydrateFold(
 	if err != nil {
 		return interaction.Fold{}, err
 	}
-	_, guard, _, err := c.begin(ctx, auth.OperationRead)
+	decision, guard, _, err := c.begin(ctx, auth.OperationRead)
 	if err != nil {
 		return interaction.Fold{}, err
 	}
@@ -230,7 +242,8 @@ func (c *Client) RehydrateFold(
 		}
 		return interaction.Fold{}, directBaseError(err)
 	}
-	allowed, err := c.foldMembersVisible(ctx, fold)
+	allowed, recorders, err := c.foldMembersVisible(
+		ctx, fold, readerFingerprint(decision))
 	if err != nil {
 		return interaction.Fold{}, err
 	}
@@ -240,21 +253,33 @@ func (c *Client) RehydrateFold(
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Fold{}, err
 	}
-	return fold, nil
+	return withholdFoldLabels(fold, recorders), nil
 }
 
+// foldMembersVisible reauthorizes every member session of a fold for the
+// current caller and reports which of them the caller recorded (see
+// label_withholding.go). A fold spans several recorders, so its own conjoined
+// label expression is shown only when the caller recorded all of them.
 func (c *Client) foldMembersVisible(
-	ctx context.Context, fold interaction.Fold,
-) (bool, error) {
-	for _, member := range fold.Members {
-		if _, err := c.Interaction(ctx, member.SessionID); err != nil {
-			if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-				return false, nil
-			}
-			return false, err
-		}
+	ctx context.Context, fold interaction.Fold, reader shoal.ID,
+) (bool, foldRecorders, error) {
+	recorders := foldRecorders{
+		members: make([]bool, len(fold.Members)),
+		all:     len(fold.Members) > 0,
 	}
-	return true, nil
+	for index, member := range fold.Members {
+		session, err := c.Interaction(ctx, member.SessionID)
+		if err != nil {
+			if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				return false, foldRecorders{}, nil
+			}
+			return false, foldRecorders{}, err
+		}
+		recorders.members[index] = readerRecorded(
+			session.AuthorizationFingerprint, reader)
+		recorders.all = recorders.all && recorders.members[index]
+	}
+	return true, recorders, nil
 }
 
 func (c *Client) foldStore() (FoldStore, error) {

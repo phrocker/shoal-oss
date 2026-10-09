@@ -3555,6 +3555,15 @@ async function foldSelectedProvenance(container) {
   return value;
 }
 
+// A provenance record's output label is shown only to the principal that
+// recorded it until per-reader label evaluation lands (#564, #567, #568).
+// Every other reader receives it empty, exactly as for a record with no label,
+// so an empty label is rendered as nothing at all: calling it "public" would
+// misstate a withheld label, and any other wording would mark it.
+function outputLabelClause(value) {
+  return value ? `; output: ${value}` : "";
+}
+
 function appendProvenanceCards(results, value, before = null) {
   const append = (card) => before ? results.insertBefore(card, before) : results.append(card);
   for (const item of value.interactions || []) {
@@ -3568,7 +3577,7 @@ function appendProvenanceCards(results, value, before = null) {
     appendText(label, "span", ` ${item.operation} · ${new Date(item.recorded_at).toLocaleString()}`);
     card.append(label);
     appendText(card, "p", `Session: ${displayOpaqueID(item.session_id)}`, "provenance-meta");
-    appendText(card, "p", `Actor: ${displayOpaqueID(item.actor && item.actor.actor_id)}; output: ${item.output_visibility || "public"}`, "provenance-meta");
+    appendText(card, "p", `Actor: ${displayOpaqueID(item.actor && item.actor.actor_id)}${outputLabelClause(item.output_visibility)}`, "provenance-meta");
     const inspect = document.createElement("button");
     inspect.type = "button";
     inspect.textContent = "Inspect exact provenance";
@@ -3580,7 +3589,7 @@ function appendProvenanceCards(results, value, before = null) {
     const card = document.createElement("article");
     card.className = "provenance-card";
     appendText(card, "strong", `Native provenance fold (${item.member_count} sessions)`);
-    appendText(card, "p", `Fold: ${displayOpaqueID(item.fold_id)}; output: ${item.output_visibility || "public"}`, "provenance-meta");
+    appendText(card, "p", `Fold: ${displayOpaqueID(item.fold_id)}${outputLabelClause(item.output_visibility)}`, "provenance-meta");
     const unfold = document.createElement("button");
     unfold.type = "button";
     unfold.textContent = "Unfold exact members";

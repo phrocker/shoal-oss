@@ -582,10 +582,11 @@ func (c *Client) InteractionRecords(
 	if err != nil {
 		return nil, err
 	}
+	fingerprint := readerFingerprint(decision)
 	visible := make([]explorer.InteractionRecord, 0, len(records))
 	for index, record := range records {
 		if allowed[index] {
-			visible = append(visible, record)
+			visible = append(visible, withholdInteractionLabels(record, fingerprint))
 		}
 	}
 	if err := guard.Check(ctx); err != nil {
@@ -795,7 +796,7 @@ func (c *Client) InteractionRecord(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.InteractionRecord{}, err
 	}
-	return record, nil
+	return withholdInteractionLabels(record, readerFingerprint(decision)), nil
 }
 
 // Interaction returns one authorized typed interaction. It is an explicit
@@ -845,7 +846,9 @@ func (c *Client) InteractionSubgraph(
 		if err := guard.Check(ctx); err != nil {
 			return explorer.Neighborhood{}, err
 		}
-		return subgraph, nil
+		return withholdSubgraphLabels(
+			subgraph, record.Summary.AuthorizationFingerprint,
+			readerFingerprint(decision)), nil
 	}
 	if len(record.TouchedNodeIDs) == 0 &&
 		!summaryFingerprintMatchesDecision(record.Summary, decision) {
@@ -875,7 +878,9 @@ func (c *Client) InteractionSubgraph(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.Neighborhood{}, err
 	}
-	return subgraph, nil
+	return withholdSubgraphLabels(
+		subgraph, record.Summary.AuthorizationFingerprint,
+		readerFingerprint(decision)), nil
 }
 
 func interactionSubgraphIsTombstone(subgraph explorer.Neighborhood) bool {

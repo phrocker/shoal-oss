@@ -347,6 +347,13 @@ The same workspace header applies to provenance list/inspection and unfold
 under `read`, and to provenance fold under `connect`. These are provenance
 folds, not context compression.
 
+Until per-reader label evaluation lands (#564), a session's or fold's
+`output_visibility` label expression is returned only to the principal that
+recorded it (for a fold, only to a principal that recorded every member). Any
+other reader receives it empty, exactly as for an unlabelled record, over HTTP,
+MCP, and team overview alike; session and fold IDs and digests remain visible.
+See "Output-label exposure" in `docs/explorer-public-contract.md`.
+
 The following local acceptance matrix exercises REST ask, SSE chat, and HTTP
 MCP ask with 24 cited documents, a nonpublic workspace output policy, and
 provenance inspection/fold/unfold. It verifies complete citation sets and
