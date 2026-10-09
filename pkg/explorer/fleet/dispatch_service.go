@@ -2655,6 +2655,9 @@ func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision
 		// approvalGate and attestationGate. See resolveActionBinding.
 		false,
 		executeRoute && phase.reportsOnClaim(),
+		// Not gated on the route: a rebind must not strand a completion
+		// whichever operation it arrives under (#391 follow-up).
+		phase.reportsOnClaim(),
 	)
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
@@ -2840,6 +2843,12 @@ func (s *DispatchService) claimableBy(
 			// approvalGate and attestationGate. See resolveActionBinding.
 			false,
 			executeRoute && phase.reportsOnClaim(),
+			// Also here, and not false: claimableBy is on the completion
+			// path too — applyExecutionResult re-confirms the claim through
+			// it after the effect — so leaving it false would fire the
+			// ceiling re-check at completion by this route and strand the
+			// effect anyway, with the other call site fixed.
+			phase.reportsOnClaim(),
 		)
 		if err == nil && executeRoute && !executeRoutePermits(
 			phase, decision, descriptor.ExecutorRef,
@@ -3201,7 +3210,7 @@ func (s *Service) resolveActionBinding(
 ) (Descriptor, Action, any, error) {
 	return s.resolveActionBindingLapsing(ctx, decision, agentID, generation,
 		capabilityName, actionName, sourceID, policyID, objectID, operation,
-		now, pinned, false)
+		now, pinned, false, false)
 }
 
 // resolveActionBindingLapsing is resolveActionBinding that, when
@@ -3224,6 +3233,18 @@ func (s *Service) resolveActionBindingLapsing(
 	now time.Time,
 	pinned bool,
 	allowLapsed bool,
+	// reportingOnClaim is set when the caller is reporting on a claim already
+	// taken rather than taking or renewing one — Complete or ReportAmbiguity.
+	// It suppresses the effect ceiling and floor re-checks below, for the
+	// reason executorPhase.reportsOnClaim already states about a lapsed
+	// lease: a rebind must never strand the report of an effect that
+	// happened.
+	//
+	// Separate from allowLapsed rather than folded into it, because that one
+	// is additionally gated on the execute route at its call site and this
+	// one must not be. The effect happened whichever route the completion
+	// arrives by.
+	reportingOnClaim bool,
 ) (Descriptor, Action, any, error) {
 	// Caller-only authorization first, before anything is looked up.
 	//
@@ -3308,7 +3329,25 @@ func (s *Service) resolveActionBindingLapsing(
 	// executor reference to a narrower ceiling while descriptors registered
 	// under the old one are still live, and those must stop resolving rather
 	// than keep running against a binding that no longer permits them.
-	if selected.Effects.exceeds(executorCeiling(raw)) {
+	//
+	// "Stop resolving" is true of *taking* work and false of *finishing* it.
+	// Completion and an ambiguity report describe an effect that already
+	// happened, and refusing them does not un-happen it — it loses the
+	// record, which is the failure EffectPossible and the ambiguity route
+	// exist to prevent. So both re-checks are skipped when the caller is
+	// reporting on a claim already taken, and applied at Pull, Claim, Invoke
+	// and Extend, which is the split executorBindingPermits already draws.
+	//
+	// This grants a worker nothing: selected.Effects is the descriptor's
+	// declaration, validated at registration and again when the work was
+	// claimed. Skipping the re-check declines to re-litigate a declaration
+	// that was admitted when the work was taken.
+	//
+	// Pinning the claimed reference instead was considered and does not
+	// work. ClaimExecutorRef pins the *ref*, not the ceiling: a host that
+	// rebinds ref X from a wide executor to a narrow one leaves X resolving
+	// to the narrow ceiling, so the refusal returns one step later.
+	if !reportingOnClaim && selected.Effects.exceeds(executorCeiling(raw)) {
 		return Descriptor{}, Action{}, nil, shoal.NewError(
 			shoal.ErrorUnavailable,
 			"action declares effects its executor is not bound to perform")
@@ -3317,7 +3356,7 @@ func (s *Service) resolveActionBindingLapsing(
 	// rebind a reference to an executor that now always transmits, and a
 	// descriptor registered against the old binding must stop resolving rather
 	// than keep running while understating what it does.
-	if selected.Effects.omits(executorFloor(raw)) {
+	if !reportingOnClaim && selected.Effects.omits(executorFloor(raw)) {
 		return Descriptor{}, Action{}, nil, shoal.NewError(
 			shoal.ErrorUnavailable,
 			"action omits effects its executor causes on every invocation")
