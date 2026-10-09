@@ -176,9 +176,11 @@ func (e *digestEncoder) grantProvenance(p GrantProvenance) {
 	e.bytes(p.MappingDigest[:])
 	// The identity claim path (#526) is appended only when present, behind
 	// its own marker, so a provenance minted from sub keeps the fingerprint
-	// it had before the field existed.
+	// it had before the field existed. The marker is 4: each marker in the
+	// fingerprint names one section, and 1 (ontology), 2 (provenance) and 3
+	// (the executor binding, #557) are taken.
 	if len(p.IdentityClaimPath) > 0 {
-		e.uint64(3)
+		e.uint64(4)
 		e.uint64(uint64(len(p.IdentityClaimPath)))
 		for _, segment := range p.IdentityClaimPath {
 			e.text(segment)
