@@ -41,6 +41,13 @@ clean control, structural limitation, and content digest. A verified receipt is
 evidence that the recorded corpus run was not edited after the fact; it is not a
 claim that the boundary resists an unrepresented attack.
 
+`quality.py` produces a sealed provider-neutral quality report for a predeclared
+test cohort. It keeps unknown/disputed rows out of resolved metrics while
+recording their denominators, reports confusion metrics, Brier score, ECE,
+Wilson recall intervals, family count, and bounded training/inference/labeling
+costs. Targeted samples cannot make a population claim, and every report has
+`promotion_eligible: false`.
+
 Every output is content-addressed, schema-versioned JSON and created with
 exclusive file creation. A new batch produces a new ledger snapshot, never an
 in-place label correction. Conflicts stay excluded until a later explicitly
