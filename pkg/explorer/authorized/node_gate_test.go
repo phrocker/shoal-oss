@@ -24,10 +24,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/inference"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
+	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -106,11 +110,12 @@ func newGateWorld(t *testing.T) gateWorld {
 
 func (g gateWorld) visible(t *testing.T, ctx context.Context, nodes, edges []shoal.ID) bool {
 	t.Helper()
-	visible, err := g.client.NodeGate().GraphVisibleToReader(ctx, nodes, edges)
+	visible, err := g.client.NodeGate().GraphsVisibleToReader(ctx,
+		[]evidencelabels.Graph{{NodeIDs: nodes, EdgeIDs: edges}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return visible
+	return visible[0]
 }
 
 func (g gateWorld) holder() context.Context   { return g.f.labelIngester(g.t, "holder", "secret") }
@@ -158,29 +163,93 @@ func TestTheNodeGateDecidesEdgesEndpointsAndUnknowns(t *testing.T) {
 	}
 }
 
-// TestPathJoinsRequiresTheEdgesToBeThePath: at record time a graph
-// reference's edge i must run from node i to node i+1.
-func TestPathJoinsRequiresTheEdgesToBeThePath(t *testing.T) {
+// relationAssertions is the assertion the corpus records on the relation,
+// as graph evidence must carry it.
+func (g gateWorld) relationAssertions(t *testing.T) []interaction.AssertionReference {
+	t.Helper()
+	around, err := g.f.base.Neighborhood(context.Background(), explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{g.from}, Depth: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result []interaction.AssertionReference
+	for _, assertion := range around.Assertions {
+		edge := shoal.ID(assertion.Metadata()["shoal.graph.edge_id"])
+		if assertion.Origin() == ontology.AssertionDerived {
+			edge = assertion.ID()
+		}
+		if edge == g.relation {
+			result = append(result, interaction.AssertionReference{
+				AssertionID: assertion.ID(), EdgeID: g.relation, Origin: assertion.Origin(),
+			})
+		}
+	}
+	if len(result) == 0 {
+		t.Fatal("the relation carries no assertion; the probe would not reach it")
+	}
+	return result
+}
+
+// TestGraphEvidenceValidRequiresAnAuthoritativePath: at record time a graph
+// reference's edge i must run from node i to node i+1, and its assertions
+// must be exactly the ones the corpus records on those edges at the pinned
+// snapshot, checked as the interaction recorder checks them.
+func TestGraphEvidenceValidRequiresAnAuthoritativePath(t *testing.T) {
 	g := newGateWorld(t)
 	gate := g.client.NodeGate()
+	snapshot, err := g.f.base.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := exactAuthorizedGraphEvidenceWith(t, g.f.base, graph.Edge{
+		ID: g.relation, From: g.from, To: g.to,
+	}, g.relationAssertions(t))
+	mutate := func(change func(*interaction.EvidenceReference)) interaction.EvidenceReference {
+		reference := own
+		reference.NodeIDs = append([]shoal.ID(nil), own.NodeIDs...)
+		reference.EdgeIDs = append([]shoal.ID(nil), own.EdgeIDs...)
+		reference.Assertions = append([]interaction.AssertionReference(nil), own.Assertions...)
+		change(&reference)
+		return reference
+	}
 	for _, probe := range []struct {
-		name         string
-		nodes, edges []shoal.ID
-		want         bool
+		name      string
+		reference interaction.EvidenceReference
+		want      bool
 	}{
-		{"the relation's own path", []shoal.ID{g.from, g.to}, []shoal.ID{g.relation}, true},
-		{"reversed", []shoal.ID{g.to, g.from}, []shoal.ID{g.relation}, false},
-		{"another path's nodes", []shoal.ID{g.publicFrom, g.publicTo}, []shoal.ID{g.relation}, false},
-		{"an unknown edge", []shoal.ID{g.from, g.to}, []shoal.ID{"edge-never-registered"}, false},
-		{"one edge too many", []shoal.ID{g.from}, []shoal.ID{g.relation}, false},
+		{"the relation's own path", own, true},
+		{"its assertion omitted", mutate(func(r *interaction.EvidenceReference) {
+			r.Assertions = nil
+		}), false},
+		{"an assertion that is not on it", mutate(func(r *interaction.EvidenceReference) {
+			r.Assertions[0].AssertionID = "assertion-never-made"
+		}), false},
+		{"reversed", mutate(func(r *interaction.EvidenceReference) {
+			r.NodeIDs[0], r.NodeIDs[1] = r.NodeIDs[1], r.NodeIDs[0]
+		}), false},
+		{"another path's nodes", mutate(func(r *interaction.EvidenceReference) {
+			r.NodeIDs = []shoal.ID{g.publicFrom, g.publicTo}
+		}), false},
+		{"an unknown edge", mutate(func(r *interaction.EvidenceReference) {
+			r.EdgeIDs = []shoal.ID{"edge-never-registered"}
+			r.Assertions = nil
+		}), false},
 	} {
-		joined, err := gate.PathJoins(context.Background(), probe.nodes, probe.edges)
+		valid, err := gate.GraphEvidenceValid(context.Background(),
+			shoal.ID(snapshot.ID), snapshot.AsOf,
+			[]interaction.EvidenceReference{probe.reference})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if joined != probe.want {
-			t.Fatalf("%s: joined = %v, want %v", probe.name, joined, probe.want)
+		if valid != probe.want {
+			t.Fatalf("%s: valid = %v, want %v", probe.name, valid, probe.want)
 		}
+	}
+	valid, err := gate.GraphEvidenceValid(context.Background(),
+		"snapshot-never-taken", snapshot.AsOf, []interaction.EvidenceReference{own})
+	if err != nil || valid {
+		t.Fatalf("an untrusted snapshot pin: valid = %v, err = %v", valid, err)
 	}
 }
 
@@ -242,4 +311,44 @@ func TestTheNodeGateAndInteractionReadsAgreeOnAnEdge(t *testing.T) {
 		shoal.Metadata{interaction.PropertyVisibility: "secret"})
 	check("outsider after tightening", g.outsider(), false, false)
 	check("holder after tightening", g.holder(), true, false)
+}
+
+// exactAuthorizedGraphEvidenceWith is exactAuthorizedGraphEvidence for an edge
+// that carries assertions: its anchor identity covers them.
+func exactAuthorizedGraphEvidenceWith(
+	t testing.TB, corpus *explorer.Explorer, edge graph.Edge,
+	assertions []interaction.AssertionReference,
+) interaction.EvidenceReference {
+	t.Helper()
+	around, err := corpus.Neighborhood(context.Background(), explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{edge.From}, Depth: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := map[shoal.ID]graph.Node{}
+	for _, node := range around.Nodes {
+		nodes[node.ID] = node
+	}
+	var exact graph.Edge
+	for _, candidate := range around.Edges {
+		if candidate.ID == edge.ID {
+			exact = candidate
+		}
+	}
+	if exact.ID == "" || nodes[edge.From].ID == "" || nodes[edge.To].ID == "" {
+		t.Fatal("exact graph evidence is unavailable")
+	}
+	anchor, err := inference.NewGraphAnchorWithAssertions(graph.Path{
+		Nodes: []graph.Node{nodes[edge.From], nodes[edge.To]},
+		Edges: []graph.Edge{exact},
+	}, assertions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := anchor.EvidenceReference()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reference
 }

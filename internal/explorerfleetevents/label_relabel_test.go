@@ -181,11 +181,18 @@ func TestATightenedLabelWithholdsRecordedEvidence(t *testing.T) {
 	}
 }
 
-// TestALoosenedLabelReleasesRecordedEvidence: recorded while the document was
-// labelled secret&pii, then loosened to secret. The stored terms still name
-// pii, but they are provenance only: a reader holding secret now sees the
-// reference everywhere, as it now sees the document.
-func TestALoosenedLabelReleasesRecordedEvidence(t *testing.T) {
+// TestALoosenedLabelDoesNotReleaseTheCitedRevision: recorded while the
+// document was labelled secret&pii, then loosened to secret. The stored
+// terms are provenance only and are not what keeps the reference closed. The
+// reference cites the revision that was labelled secret&pii, and a document
+// reference is decided by its cited revision's own rule as well as the
+// current one (#564 round 3; #585 for historical reads). Section and span
+// identities do not change with the revision, so without that rule an
+// unlabelled current revision would open a labelled historical one. A reader
+// holding secret therefore stays refused; a holder of both still sees it.
+// A reference naming only nodes and edges is released by loosening, which
+// the fleet package's relabel test pins.
+func TestALoosenedLabelDoesNotReleaseTheCitedRevision(t *testing.T) {
 	plane := newLabelPlaneWith(t, planeOptions{
 		choose: fullLabels, wireEvents: true, label: "secret&pii",
 		ownerLabels: [][]byte{sourceBLabelPolicy("secret")},
@@ -200,10 +207,14 @@ func TestALoosenedLabelReleasesRecordedEvidence(t *testing.T) {
 	}
 
 	plane.relabel(t, "secret")
-	assertAll(t, "a secret holder after", plane.dispatchVerdicts(t, plane.reader(t, "secret")), true)
-	assertAll(t, "the enqueuer after", plane.replayVerdicts(t, owner), true)
-	if !plane.deliveredTo(t, "after-secret", "secret") {
-		t.Fatal("a secret holder was not delivered the reference after it was loosened")
+	assertAll(t, "a secret holder after", plane.dispatchVerdicts(t, plane.reader(t, "secret")), false)
+	assertAll(t, "the enqueuer after", plane.replayVerdicts(t, owner), false)
+	if plane.deliveredTo(t, "after-secret", "secret") {
+		t.Fatal("a secret holder was delivered a reference citing a revision labelled secret&pii")
+	}
+	assertAll(t, "a holder of both after", plane.dispatchVerdicts(t, plane.reader(t, "secret", "pii")), true)
+	if !plane.deliveredTo(t, "after-both", "secret", "pii") {
+		t.Fatal("a holder of both labels lost the reference")
 	}
 	assertAll(t, "a holder of neither", plane.dispatchVerdicts(t, plane.reader(t)), false)
 }
@@ -243,14 +254,18 @@ func (p labelPlane) recordSession(t *testing.T, id shoal.ID) {
 // same readers, against an expected verdict table for each plane, so that
 // neither can drift from the other silently.
 //
-// They agree everywhere but one cell, and that cell is pinned too. After a
-// tightening the base explorer refuses an interaction record to every reader,
-// holders of the new labels included, until it is re-recorded
-// (staleDerivedVisibilityError: the record's stored visibility no longer
-// covers its sources). Dispatch has no such rule: it decides a reference by
-// the node's current rule, so a holder of the new labels sees it. Once the
-// label is loosened again the stored visibility covers the sources and the
-// planes agree again.
+// They disagree in two pinned places.
+//
+//   - After a tightening the base explorer refuses an interaction record to
+//     every reader, holders of the new labels included, until it is
+//     re-recorded (staleDerivedVisibilityError: the record's stored
+//     visibility no longer covers its sources). Dispatch decides a reference
+//     by the current rules, so a holder of the new labels sees it.
+//   - After loosening to unlabelled, the interaction record is visible to
+//     every reader, since its touched nodes are now public. The dispatch
+//     reference cites the revision that was labelled secret, and a document
+//     reference also requires its cited revision's own rule, so it stays
+//     closed to readers without secret.
 func TestDispatchAndInteractionReadsAgreeAcrossARelabel(t *testing.T) {
 	plane := newLabelPlaneWith(t, planeOptions{
 		choose: fullLabels, wireEvents: true, label: "secret",
@@ -266,7 +281,7 @@ func TestDispatchAndInteractionReadsAgreeAcrossARelabel(t *testing.T) {
 	}{
 		{"recorded", "", []bool{false, true, false, true}, []bool{false, true, false, true}},
 		{"tightened", "secret&pii", []bool{false, false, false, true}, []bool{false, false, false, false}},
-		{"loosened", "-", []bool{true, true, true, true}, []bool{true, true, true, true}},
+		{"loosened", "-", []bool{false, true, false, true}, []bool{true, true, true, true}},
 	} {
 		switch stage.labels {
 		case "":
@@ -288,7 +303,7 @@ func TestDispatchAndInteractionReadsAgreeAcrossARelabel(t *testing.T) {
 					"interaction visible = %v (want %v)", stage.name, labels,
 					dispatch, stage.dispatch[index], interactions, stage.interactions[index])
 			}
-			if stage.name != "tightened" && dispatch != interactions {
+			if stage.name == "recorded" && dispatch != interactions {
 				t.Fatalf("%s, reader holding %v: the planes disagree", stage.name, labels)
 			}
 		}

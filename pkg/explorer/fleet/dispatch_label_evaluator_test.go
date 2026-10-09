@@ -14,6 +14,7 @@ import (
 	"github.com/phrocker/shoal-oss/accumulo"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -120,11 +121,27 @@ type catalogGate struct {
 	err       error
 }
 
-func (g *catalogGate) PathJoins(context.Context, []shoal.ID, []shoal.ID) (bool, error) {
+func (*catalogGate) GraphEvidenceValid(
+	context.Context, shoal.ID, time.Time, []interaction.EvidenceReference,
+) (bool, error) {
 	return true, nil
 }
 
-func (g *catalogGate) GraphVisibleToReader(
+func (g *catalogGate) GraphsVisibleToReader(
+	ctx context.Context, graphs []evidencelabels.Graph,
+) ([]bool, error) {
+	verdicts := make([]bool, len(graphs))
+	for index, graph := range graphs {
+		visible, err := g.graphVisible(ctx, graph.NodeIDs, graph.EdgeIDs)
+		if err != nil {
+			return nil, err
+		}
+		verdicts[index] = visible
+	}
+	return verdicts, nil
+}
+
+func (g *catalogGate) graphVisible(
 	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
 ) (bool, error) {
 	g.mu.Lock()
@@ -717,5 +734,56 @@ func TestEvidenceAssertionsMustRideOnListedEdges(t *testing.T) {
 	reference.Assertions[0].EdgeID = "edge-elsewhere"
 	if err := validateEvidence([]EvidenceRef{reference}); err == nil {
 		t.Fatal("an assertion on an unlisted edge was accepted")
+	}
+}
+
+// countingGate counts how often the dispatch plane asks its node gate.
+type countingGate struct {
+	*catalogGate
+	calls int
+}
+
+func (g *countingGate) GraphsVisibleToReader(
+	ctx context.Context, graphs []evidencelabels.Graph,
+) ([]bool, error) {
+	g.calls++
+	return g.catalogGate.GraphsVisibleToReader(ctx, graphs)
+}
+
+// TestADispatchPageAsksTheGateOnce: a page of many records, each with several
+// references, is decided in one gate call, so its catalog reads are bounded
+// by the gate's batching rather than multiplied by references (#564).
+func TestADispatchPageAsksTheGateOnce(t *testing.T) {
+	labelled, open := structuredEvidence(t)
+	fixture := labelledFixture(t, labelled, open)
+	gate := &countingGate{catalogGate: fixture.service.evidenceNodes.(*catalogGate)}
+	fixture.service.evidenceNodes = gate
+	base := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	for index := range 9 {
+		record := cloneActionRecord(base)
+		record.ID = []byte("page-action-" + string(rune('a'+index)))
+		record.IdempotencyKey = []byte("page-idempotency-" + string(rune('a'+index)))
+		fixture.dispatchStore.records[string(record.ID)] = record
+	}
+	overseer := bindDecision(t, fixture.authority, labelHolder(t,
+		auth.OperationTeamOverviewRead))
+	page, err := fixture.service.TeamActions(overseer, TeamActionListRequest{
+		Limit: 10, SourceIDs: [][]byte{[]byte("source")},
+		PolicyIDs: [][]byte{[]byte("policy")},
+		Context:   dispatchContext(fixture.now, "request"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Actions) != 10 {
+		t.Fatalf("TeamActions returned %d actions, want 10", len(page.Actions))
+	}
+	for _, action := range page.Actions {
+		if !hasAnchor(action.Evidence, "anchor-secret") {
+			t.Fatal("the holder lost a reference")
+		}
+	}
+	if gate.calls != 1 {
+		t.Fatalf("a page of 10 records and 20 references asked the gate %d times, want 1", gate.calls)
 	}
 }

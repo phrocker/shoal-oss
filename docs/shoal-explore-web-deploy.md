@@ -642,9 +642,17 @@ pages, and the enqueue, invoke and approval replays) and every delivery:
   access rules (`authorized.NodeGate`): every node, every edge's effective
   rule (an extracted relation is bound to the document that asserted it), and
   both endpoints of every edge, the same rules interaction reads re-check. A
-  node or edge the catalog does not know withholds the reference. At record
-  time a graph reference whose edges do not run between its nodes in sequence
-  is refused as `invalid_executor_evidence`. A
+  document reference also needs its cited revision's own rule (and the
+  current revision's, as historical document reads do): section and span
+  identities do not change with the revision, so an unlabelled current
+  revision must not open a labelled historical one. A loosened document
+  therefore does not release evidence citing a revision that was labelled.
+  A node, edge or revision the catalog does not know withholds the
+  reference. Every reference on a page or delivery is decided in one batch.
+  At record time a graph reference is refused as `invalid_executor_evidence`
+  unless its edges run between its nodes in sequence and its assertions are
+  exactly the corpus's at the executor's pinned snapshot, as the interaction
+  recorder requires. A
   document relabelled after the action ran therefore governs its evidence:
   tightened, a holder of only the old labels loses it; loosened, a reader of
   the new rule gains it. The labels stored with the reference are provenance

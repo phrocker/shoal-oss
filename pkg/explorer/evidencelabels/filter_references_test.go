@@ -6,10 +6,12 @@ package evidencelabels
 
 import (
 	"context"
+	"time"
 	"errors"
 	"reflect"
 	"testing"
 
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -38,19 +40,25 @@ type nodesVisible struct {
 	err     error
 }
 
-func (n nodesVisible) GraphVisibleToReader(_ context.Context, nodes, edges []shoal.ID) (bool, error) {
+func (n nodesVisible) GraphsVisibleToReader(_ context.Context, graphs []Graph) ([]bool, error) {
 	if n.err != nil {
-		return false, n.err
+		return nil, n.err
 	}
-	for _, id := range append(append([]shoal.ID(nil), nodes...), edges...) {
-		if !n.visible[id] {
-			return false, nil
+	verdicts := make([]bool, len(graphs))
+	for index, graph := range graphs {
+		verdicts[index] = true
+		for _, id := range append(append([]shoal.ID(nil), graph.NodeIDs...), graph.EdgeIDs...) {
+			if !n.visible[id] {
+				verdicts[index] = false
+			}
 		}
 	}
-	return true, nil
+	return verdicts, nil
 }
 
-func (nodesVisible) PathJoins(context.Context, []shoal.ID, []shoal.ID) (bool, error) {
+func (nodesVisible) GraphEvidenceValid(
+	context.Context, shoal.ID, time.Time, []interaction.EvidenceReference,
+) (bool, error) {
 	return true, nil
 }
 
@@ -79,7 +87,7 @@ func TestFilterReferencesLetsCurrentNodesDecide(t *testing.T) {
 		{name: "edge-only-open", labels: []string{"b"}, edges: []shoal.ID{"e-open"}},
 	}
 	labels := func(value ref) []string { return value.labels }
-	nodes := func(value ref) ([]shoal.ID, []shoal.ID) { return value.nodes, value.edges }
+	nodes := func(value ref) Graph { return Graph{NodeIDs: value.nodes, EdgeIDs: value.edges} }
 	held := labelsHeld{"a": true}
 	gate := nodesVisible{visible: map[shoal.ID]bool{"n-loose": true, "e-open": true}}
 

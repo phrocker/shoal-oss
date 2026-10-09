@@ -45,6 +45,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -160,6 +161,39 @@ func (v *LabelVisibility) VisibleToReader(
 	return v.permits(ctx, decision, visibility, v.clock())
 }
 
+// evaluatorFor resolves the reader's ceiling once and returns the evaluation
+// for that decision, so a batch of label sets costs one ceiling resolution.
+func (v *LabelVisibility) evaluatorFor(
+	ctx context.Context, decision auth.Decision, now time.Time,
+) (func([]string) (bool, error), error) {
+	if !decision.TrustedService() {
+		return func(labels []string) (bool, error) {
+			if len(labels) == 0 {
+				return true, nil
+			}
+			return auth.VisibilityPermittedForUser(decision, labels, now)
+		}, nil
+	}
+	var ceiling auth.ServiceCeiling
+	if v.ceilings != nil {
+		resolved, err := v.ceilings.ResolveServiceCeiling(ctx, decision)
+		if err != nil {
+			if contextErr := contextFailure(ctx); contextErr != nil {
+				return nil, contextErr
+			}
+			return nil, shoal.NewError(
+				shoal.ErrorUnavailable, "service ceiling resolution unavailable")
+		}
+		ceiling = resolved
+	}
+	return func(labels []string) (bool, error) {
+		if len(labels) == 0 {
+			return true, nil
+		}
+		return auth.VisibilityPermittedForService(decision, labels, ceiling, now)
+	}, nil
+}
+
 // permits is the one evaluation: the exported seam above and this package's
 // interaction and fold reads both reach it, with the decision each has
 // already resolved.
@@ -221,99 +255,242 @@ func (c *Client) NodeGate() *NodeGate {
 	return &NodeGate{client: c}
 }
 
-// GraphVisibleToReader implements evidencelabels.NodeGate.
-func (g *NodeGate) GraphVisibleToReader(
-	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
-) (bool, error) {
+// GraphsVisibleToReader implements evidencelabels.NodeGate. The whole batch
+// costs one decision resolution, one ceiling resolution, chunked edge, node
+// and current-revision lookups for the distinct members of every graph, and
+// one revision lookup per distinct cited (document, revision): never a
+// round trip per reference.
+func (g *NodeGate) GraphsVisibleToReader(
+	ctx context.Context, graphs []evidencelabels.Graph,
+) ([]bool, error) {
 	if g == nil || g.client == nil {
-		return false, shoal.NewError(
+		return nil, shoal.NewError(
 			shoal.ErrorUnavailable, "node gate is unavailable")
 	}
 	c := g.client
 	if err := contextFailure(ctx); err != nil {
-		return false, err
+		return nil, err
 	}
 	decision, err := c.resolver.Resolve(ctx)
 	if err != nil {
-		return false, resolverFailure(ctx, err)
+		return nil, resolverFailure(ctx, err)
 	}
-	now := c.clock()
-	terms := make([]string, 0)
-	add := func(rule AccessRule) bool {
-		if len(rule.policies) == 0 {
-			return false
-		}
-		for _, policy := range rule.policies {
-			policyTerms, err := policy.VisibilityTerms()
-			if err != nil {
-				return false
+	permits, err := c.labelVisibility.evaluatorFor(ctx, decision, c.clock())
+	if err != nil {
+		return nil, err
+	}
+
+	// Gather the distinct members of every graph.
+	var edgeIDs []shoal.ID
+	seenEdges := map[shoal.ID]bool{}
+	type revisionKey struct{ document, revision shoal.ID }
+	revisions := map[revisionKey]*RevisionRegistration{}
+	for _, graph := range graphs {
+		for _, id := range graph.EdgeIDs {
+			if !seenEdges[id] {
+				seenEdges[id] = true
+				edgeIDs = append(edgeIDs, id)
 			}
-			terms = append(terms, policyTerms...)
 		}
-		return true
+		if graph.DocumentID != "" || graph.RevisionID != "" {
+			revisions[revisionKey{graph.DocumentID, graph.RevisionID}] = nil
+		}
 	}
-	nodes := append([]shoal.ID(nil), nodeIDs...)
+	edges := registeredEdges{}
 	for start := 0; start < len(edgeIDs); {
 		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
-		chunk := edgeIDs[start:end]
-		start = end
-		edges, err := c.resolveEdges(ctx, chunk)
+		resolved, err := c.resolveEdges(ctx, edgeIDs[start:end])
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		for _, edgeID := range chunk {
-			registration, ok := edges[edgeID]
-			if !ok || registration.Edge.ID != edgeID || !add(registration.Rule) {
-				return false, nil
-			}
-			nodes = append(nodes, registration.Edge.From, registration.Edge.To)
+		for id, registration := range resolved {
+			edges[id] = registration
+		}
+		start = end
+	}
+	var nodeIDs []shoal.ID
+	seenNodes := map[shoal.ID]bool{}
+	addNode := func(id shoal.ID) {
+		if !seenNodes[id] {
+			seenNodes[id] = true
+			nodeIDs = append(nodeIDs, id)
 		}
 	}
-	for start := 0; start < len(nodes); {
-		end := chunkEnd(start, len(nodes), maxInteractionAuthorizationIDs)
-		chunk := nodes[start:end]
-		start = end
-		registrations, err := c.resolveNodes(ctx, chunk)
-		if err != nil {
-			return false, err
+	for _, graph := range graphs {
+		for _, id := range graph.NodeIDs {
+			addNode(id)
 		}
-		for _, nodeID := range chunk {
-			registration, ok := registrations[nodeID]
+	}
+	for _, registration := range edges {
+		addNode(registration.Edge.From)
+		addNode(registration.Edge.To)
+	}
+	nodes := registeredNodes{}
+	for start := 0; start < len(nodeIDs); {
+		end := chunkEnd(start, len(nodeIDs), maxInteractionAuthorizationIDs)
+		resolved, err := c.resolveNodes(ctx, nodeIDs[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for id, registration := range resolved {
+			nodes[id] = registration
+		}
+		start = end
+	}
+	// The cited revision's own rule and, for a historical revision, the
+	// current revision's: revisionAllows, decided by terms (#585).
+	var documents []shoal.ID
+	for key := range revisions {
+		registration, ok, err := c.policyStore.Revision(ctx, key.document, key.revision)
+		if err != nil {
+			return nil, policyCatalogReadError(ctx, err)
+		}
+		if ok && registration.DocumentID == key.document {
+			found := registration
+			revisions[key] = &found
+			if !registration.Current {
+				documents = append(documents, key.document)
+			}
+		}
+	}
+	current := currentRevisions{}
+	for start := 0; start < len(documents); {
+		end := chunkEnd(start, len(documents), maxInteractionAuthorizationIDs)
+		resolved, err := c.resolveCurrentRevisions(ctx, documents[start:end])
+		if err != nil {
+			return nil, err
+		}
+		for id, registration := range resolved {
+			current[id] = registration
+		}
+		start = end
+	}
+
+	verdicts := make([]bool, len(graphs))
+	for index, graph := range graphs {
+		var terms []string
+		add := func(rule AccessRule) bool {
+			if len(rule.policies) == 0 {
+				return false
+			}
+			for _, policy := range rule.policies {
+				policyTerms, err := policy.VisibilityTerms()
+				if err != nil {
+					return false
+				}
+				terms = append(terms, policyTerms...)
+			}
+			return true
+		}
+		known := true
+		members := append([]shoal.ID(nil), graph.NodeIDs...)
+		for _, id := range graph.EdgeIDs {
+			registration, ok := edges[id]
+			if !ok || registration.Edge.ID != id || !add(registration.Rule) {
+				known = false
+				break
+			}
+			members = append(members, registration.Edge.From, registration.Edge.To)
+		}
+		for _, id := range members {
+			if !known {
+				break
+			}
+			registration, ok := nodes[id]
 			if !ok || !add(registration.Rule) {
-				return false, nil
+				known = false
 			}
 		}
+		if known && (graph.DocumentID != "" || graph.RevisionID != "") {
+			revision := revisions[revisionKey{graph.DocumentID, graph.RevisionID}]
+			switch {
+			case revision == nil || !add(revision.Rule):
+				known = false
+			case !revision.Current:
+				latest, ok := current[graph.DocumentID]
+				if !ok || latest.DocumentID != graph.DocumentID || !add(latest.Rule) {
+					known = false
+				}
+			}
+		}
+		if !known || len(terms) == 0 {
+			continue
+		}
+		visible, err := permits(terms)
+		if err != nil {
+			return nil, err
+		}
+		verdicts[index] = visible
 	}
-	if len(terms) == 0 {
-		return false, nil
-	}
-	return c.labelVisibility.permits(ctx, decision, terms, now)
+	return verdicts, nil
 }
 
-// PathJoins implements evidencelabels.NodeGate: edge i must run from node i to
-// node i+1 as the catalog records it, and there is exactly one edge fewer
-// than nodes. An edge the catalog does not know does not join.
-func (g *NodeGate) PathJoins(
-	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
+// GraphEvidenceValid implements evidencelabels.NodeGate. Each graph
+// reference's edge i must run from node i to node i+1 as the catalog records
+// it; then every graph reference is validated by the trusted evidence
+// snapshot validator at the executor's pinned snapshot, exactly as the
+// interaction recorder validates graph evidence: the path, the anchor
+// identity, and the assertions, which must be precisely the ones the corpus
+// records on the path's edges. A reference, snapshot or validator the corpus
+// cannot vouch for is not valid.
+func (g *NodeGate) GraphEvidenceValid(
+	ctx context.Context, snapshotID shoal.ID, snapshotAsOf time.Time,
+	references []interaction.EvidenceReference,
 ) (bool, error) {
 	if g == nil || g.client == nil {
 		return false, shoal.NewError(
 			shoal.ErrorUnavailable, "node gate is unavailable")
 	}
-	if len(edgeIDs) == 0 {
+	var graphs []interaction.EvidenceReference
+	var nodeIDs, edgeIDs []shoal.ID
+	for _, reference := range references {
+		if reference.Kind != interaction.EvidenceGraph {
+			continue
+		}
+		joined, err := g.pathJoins(ctx, reference.NodeIDs, reference.EdgeIDs)
+		if err != nil || !joined {
+			return false, err
+		}
+		graphs = append(graphs, reference)
+		nodeIDs = append(nodeIDs, reference.NodeIDs...)
+		edgeIDs = append(edgeIDs, reference.EdgeIDs...)
+	}
+	if len(graphs) == 0 {
 		return true, nil
 	}
+	validator, ok := g.client.snapshotValidator.(EvidenceSnapshotValidator)
+	if !ok || isNilDependency(g.client.snapshotValidator) {
+		return false, nil
+	}
+	err := validator.ValidateEvidenceSnapshot(
+		ctx, snapshotID, snapshotAsOf, nodeIDs, edgeIDs, graphs)
+	switch {
+	case err == nil:
+		return true, nil
+	case shoal.IsErrorCode(err, shoal.ErrorConflict),
+		shoal.IsErrorCode(err, shoal.ErrorInvalidArgument),
+		shoal.IsErrorCode(err, shoal.ErrorNotFound):
+		return false, nil
+	default:
+		return false, directBaseError(err)
+	}
+}
+
+// pathJoins reports whether edgeIDs join nodeIDs in sequence in the catalog.
+func (g *NodeGate) pathJoins(
+	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
+) (bool, error) {
 	if len(edgeIDs) != len(nodeIDs)-1 {
 		return false, nil
 	}
 	for start := 0; start < len(edgeIDs); {
 		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
-		edges, err := g.client.resolveEdges(ctx, edgeIDs[start:end])
+		resolved, err := g.client.resolveEdges(ctx, edgeIDs[start:end])
 		if err != nil {
 			return false, err
 		}
 		for index := start; index < end; index++ {
-			registration, ok := edges[edgeIDs[index]]
+			registration, ok := resolved[edgeIDs[index]]
 			if !ok || registration.Edge.From != nodeIDs[index] ||
 				registration.Edge.To != nodeIDs[index+1] {
 				return false, nil

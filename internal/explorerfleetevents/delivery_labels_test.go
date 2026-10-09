@@ -60,11 +60,27 @@ type catalogGate struct {
 	rules     map[shoal.ID][]string
 }
 
-func (catalogGate) PathJoins(context.Context, []shoal.ID, []shoal.ID) (bool, error) {
+func (catalogGate) GraphEvidenceValid(
+	context.Context, shoal.ID, time.Time, []interaction.EvidenceReference,
+) (bool, error) {
 	return true, nil
 }
 
-func (g catalogGate) GraphVisibleToReader(
+func (g catalogGate) GraphsVisibleToReader(
+	ctx context.Context, graphs []evidencelabels.Graph,
+) ([]bool, error) {
+	verdicts := make([]bool, len(graphs))
+	for index, graph := range graphs {
+		visible, err := g.graphVisible(ctx, graph.NodeIDs, graph.EdgeIDs)
+		if err != nil {
+			return nil, err
+		}
+		verdicts[index] = visible
+	}
+	return verdicts, nil
+}
+
+func (g catalogGate) graphVisible(
 	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
 ) (bool, error) {
 	var terms []string

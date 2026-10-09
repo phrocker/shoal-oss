@@ -574,7 +574,13 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 					authorizedPage = append(authorizedPage, delivered)
 				}
 			}
-			page = authorizedPage
+			// The label check projects the authorized page in one batch, so
+			// a page costs a bounded number of catalog reads however many
+			// references it carries (#564).
+			page, err = s.readableEvents(ctx, authorizedPage)
+			if err != nil {
+				return Page{}, err
+			}
 			// Global stream positions and the count of filtered events are
 			// internal cursor state. Exposing them would reveal hidden objects.
 			for i := range page {
@@ -758,59 +764,111 @@ func (s *Service) authorizeDelivery(
 	if !matchesFilter(subscription.Filter, event) {
 		return Event{}, false, nil
 	}
-	delivered, err := s.readableEvent(ctx, event)
-	if err != nil {
-		return Event{}, false, err
-	}
 	if err := guard.Check(ctx); err != nil {
 		return Event{}, false, err
 	}
-	return delivered, true, nil
+	return event, true, nil
 }
 
-// readableEvent returns the event as the subscriber behind ctx may see it:
-// every exact evidence reference whose labels the subscriber does not hold is
-// removed whole — identifiers, anchor, citation and label expression — along
-// with any authorization join entry that points at it (#562).
+// readableEvents returns each event as the subscriber behind ctx may see it:
+// every exact evidence reference the subscriber may not see is removed whole
+// (identifiers, anchor, citation and label expression) along with any
+// authorization join entry that points at it (#562).
 //
-// The decision is evidencelabels.Filter, the same one the dispatch read paths
-// use (#369), so the stream and Status/Pull/TeamActions cannot answer the
-// same question differently. No count of what was withheld is added anywhere
-// (#398), so a partial evidence list is not a completeness claim.
+// The decision is evidencelabels.Verdicts, the same one the dispatch read
+// paths use (#369), taken once for every reference of every event. No count
+// of what was withheld is added anywhere (#398), so a partial evidence list
+// is not a completeness claim.
 //
-// event is not modified: it may be the durable record's own value, and the
-// durable record stays complete for the same reason the action record does.
-func (s *Service) readableEvent(ctx context.Context, event Event) (Event, error) {
-	consumed, consumedVisibility, consumedWithheld, err := s.readableEvidenceGroup(
-		ctx, event.ConsumedEvidence, event.ConsumedEvidenceVisibility)
+// events are not modified: they may be the durable records' own values, and
+// the durable record stays complete for the same reason the action record
+// does.
+func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, error) {
+	var labelled []labelledReference
+	for _, event := range events {
+		for _, group := range []struct {
+			references []interaction.EvidenceReference
+			visibility [][]string
+		}{
+			{event.ConsumedEvidence, event.ConsumedEvidenceVisibility},
+			{event.CitedEvidence, event.CitedEvidenceVisibility},
+		} {
+			if len(group.visibility) != 0 && len(group.visibility) != len(group.references) {
+				// normalizeEvent refuses this at publish; a stored event
+				// that carries it is corrupt, and guessing an alignment
+				// could hand a reference the wrong label.
+				return nil, shoal.NewError(
+					shoal.ErrorInternal,
+					"stored event evidence visibility does not align with its references")
+			}
+			for i := range group.references {
+				value := labelledReference{reference: group.references[i]}
+				if len(group.visibility) != 0 {
+					value.visibility = group.visibility[i]
+				}
+				labelled = append(labelled, value)
+			}
+		}
+	}
+	verdicts, err := evidencelabels.Verdicts(
+		ctx, s.evidenceVisibility, s.evidenceNodes, labelled,
+		func(value labelledReference) []string { return value.visibility },
+		func(value labelledReference) evidencelabels.Graph {
+			// Every assertion names one of the reference's EdgeIDs
+			// (interaction.EvidenceReference.Validate), so the edges cover
+			// them; a document reference also names its cited revision.
+			graph := evidencelabels.Graph{
+				NodeIDs: value.reference.NodeIDs, EdgeIDs: value.reference.EdgeIDs,
+			}
+			if value.reference.Kind == interaction.EvidenceDocument {
+				graph.DocumentID = value.reference.Citation.DocumentID
+				graph.RevisionID = value.reference.Citation.RevisionID
+			}
+			return graph
+		})
 	if err != nil {
-		return Event{}, err
+		return nil, err
 	}
-	cited, citedVisibility, citedWithheld, err := s.readableEvidenceGroup(
-		ctx, event.CitedEvidence, event.CitedEvidenceVisibility)
-	if err != nil {
-		return Event{}, err
+	result := make([]Event, len(events))
+	offset := 0
+	take := func(references []interaction.EvidenceReference, visibility [][]string) (
+		[]interaction.EvidenceReference, [][]string, bool,
+	) {
+		count := len(references)
+		group := labelled[offset : offset+count]
+		decided := verdicts[offset : offset+count]
+		offset += count
+		return readableEvidenceGroup(references, visibility, group, decided)
 	}
-	if !consumedWithheld && !citedWithheld {
-		return event, nil
-	}
-	result := cloneEvent(event)
-	result.ConsumedEvidence = cloneEvidenceReferences(consumed)
-	result.ConsumedEvidenceVisibility = cloneVisibilityGroup(consumedVisibility)
-	result.CitedEvidence = cloneEvidenceReferences(cited)
-	result.CitedEvidenceVisibility = cloneVisibilityGroup(citedVisibility)
-	join := make([]Evidence, 0, len(result.Evidence))
-	for _, item := range result.Evidence {
-		// An entry naming a withheld reference names material in a source
-		// the subscriber may not see — its object ID was chosen from that
-		// reference's own identifiers — so it goes with the reference.
-		if item.Reference != nil &&
-			!containsReference(*item.Reference, consumed, cited) {
+	for index, event := range events {
+		consumed, consumedVisibility, consumedWithheld := take(
+			event.ConsumedEvidence, event.ConsumedEvidenceVisibility)
+		cited, citedVisibility, citedWithheld := take(
+			event.CitedEvidence, event.CitedEvidenceVisibility)
+		if !consumedWithheld && !citedWithheld {
+			result[index] = event
 			continue
 		}
-		join = append(join, item)
+		projected := cloneEvent(event)
+		projected.ConsumedEvidence = cloneEvidenceReferences(consumed)
+		projected.ConsumedEvidenceVisibility = cloneVisibilityGroup(consumedVisibility)
+		projected.CitedEvidence = cloneEvidenceReferences(cited)
+		projected.CitedEvidenceVisibility = cloneVisibilityGroup(citedVisibility)
+		join := make([]Evidence, 0, len(projected.Evidence))
+		for _, item := range projected.Evidence {
+			// An entry naming a withheld reference names material in a
+			// source the subscriber may not see (its object ID was chosen
+			// from that reference's own identifiers), so it goes with the
+			// reference.
+			if item.Reference != nil &&
+				!containsReference(*item.Reference, consumed, cited) {
+				continue
+			}
+			join = append(join, item)
+		}
+		projected.Evidence = join
+		result[index] = projected
 	}
-	result.Evidence = join
 	return result, nil
 }
 
@@ -819,41 +877,17 @@ type labelledReference struct {
 	visibility []string
 }
 
-func (s *Service) readableEvidenceGroup(
-	ctx context.Context,
+// readableEvidenceGroup applies one group's verdicts.
+func readableEvidenceGroup(
 	references []interaction.EvidenceReference, visibility [][]string,
-) ([]interaction.EvidenceReference, [][]string, bool, error) {
-	if len(references) == 0 {
-		return references, visibility, false, nil
-	}
-	if len(visibility) != 0 && len(visibility) != len(references) {
-		// normalizeEvent refuses this at publish; a stored event that
-		// carries it is corrupt, and guessing an alignment could hand a
-		// reference the wrong label.
-		return nil, nil, false, shoal.NewError(
-			shoal.ErrorInternal,
-			"stored event evidence visibility does not align with its references")
-	}
-	labelled := make([]labelledReference, len(references))
-	for i := range references {
-		labelled[i].reference = references[i]
-		if len(visibility) != 0 {
-			labelled[i].visibility = visibility[i]
-		}
-	}
-	kept, withheld, err := evidencelabels.FilterReferences(
-		ctx, s.evidenceVisibility, s.evidenceNodes, labelled,
-		func(value labelledReference) []string { return value.visibility },
-		// Every assertion names one of the reference's EdgeIDs
-		// (interaction.EvidenceReference.Validate), so the edges cover them.
-		func(value labelledReference) ([]shoal.ID, []shoal.ID) {
-			return value.reference.NodeIDs, value.reference.EdgeIDs
-		})
+	labelled []labelledReference, verdicts []bool,
+) ([]interaction.EvidenceReference, [][]string, bool) {
+	kept, withheld, err := evidencelabels.Apply(labelled, verdicts)
 	if err != nil || !withheld {
-		return references, visibility, false, err
+		return references, visibility, false
 	}
 	if len(kept) == 0 {
-		return nil, nil, true, nil
+		return nil, nil, true
 	}
 	keptReferences := make([]interaction.EvidenceReference, len(kept))
 	keptVisibility := make([][]string, len(kept))
@@ -862,11 +896,11 @@ func (s *Service) readableEvidenceGroup(
 		keptVisibility[i] = value.visibility
 	}
 	// The visibility group's shape must not outlive what it described. A
-	// group whose every remaining entry is empty is returned as nil — the
-	// exact shape of an event that never carried labelled evidence —
-	// because a non-nil array of empty entries would itself say "a labelled
+	// group whose every remaining entry is empty is returned as nil (the
+	// exact shape of an event that never carried labelled evidence) because
+	// a non-nil array of empty entries would itself say "a labelled
 	// reference was here and was withheld" (#398).
-	return keptReferences, canonicalVisibilityGroup(keptVisibility), true, nil
+	return keptReferences, canonicalVisibilityGroup(keptVisibility), true
 }
 
 func containsReference(

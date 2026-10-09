@@ -241,7 +241,9 @@ func graphReferenceAcross(
 // join validation existed.
 type joinAnything struct{ evidencelabels.NodeGate }
 
-func (joinAnything) PathJoins(context.Context, []shoal.ID, []shoal.ID) (bool, error) {
+func (joinAnything) GraphEvidenceValid(
+	context.Context, shoal.ID, time.Time, []interaction.EvidenceReference,
+) (bool, error) {
 	return true, nil
 }
 
