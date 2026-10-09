@@ -97,11 +97,22 @@ func newOIDCApprovalWorldWith(
 	subjectTypes []string, document func(issuer string) map[string]any,
 ) *oidcApprovalWorld {
 	t.Helper()
+	return newOIDCApprovalWorldOn(t, edit, registrant, subjectTypes, document, nil)
+}
+
+// newOIDCApprovalWorldOn is newOIDCApprovalWorldWith over the executor
+// references given (nil: "local" alone).
+func newOIDCApprovalWorldOn(
+	t *testing.T, edit func(*oidcConfig), registrant jwt.MapClaims,
+	subjectTypes []string, document func(issuer string) map[string]any,
+	executors configuredFleetExecutors,
+) *oidcApprovalWorld {
+	t.Helper()
 	w := &oidcApprovalWorld{t: t, issuer: newFakeOIDCIssuer(t), edit: edit}
 	if subjectTypes != nil {
 		w.issuer.subjectTypes = subjectTypes
 	}
-	h := &approvalHarness{t: t, root: t.TempDir()}
+	h := &approvalHarness{t: t, root: t.TempDir(), executors: executors}
 	h.clock.Store(time.Now().UTC().Add(time.Minute).Truncate(time.Second).UnixNano())
 	authority, err := auth.NewAuthorityWithClock(h.now)
 	if err != nil {

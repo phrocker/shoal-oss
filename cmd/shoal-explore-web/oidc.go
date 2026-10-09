@@ -205,9 +205,11 @@ var oidcFleetOperations = []auth.Operation{
 	// the exact property the operation exists to prevent, so it stays
 	// unreachable through this mapping until it has one of its own.
 	//
-	// The consequence, stated plainly: #437's capability is real in the
-	// authorization model and not reachable by an OIDC-minted token yet. A
-	// claim mapping is a prerequisite for using it, not a refinement of it.
+	// Execute has a mapping of its own since #391: the executor mint
+	// (oidc_executor.go), on an audience and possibly an issuer of its own,
+	// which binds each credential to one executor reference under
+	// ServiceRoleActionExecution. oidc_execute_grant_test.go asserts that it
+	// is the only source of execute in this command.
 	//
 	// OperationActionApprove is absent for a related reason (#451). This list
 	// also grants dispatch and invoke, and the approval service refuses any
@@ -286,6 +288,9 @@ type oidcConfig struct {
 	// means this command's one configured source, workspaceSourceID; only a
 	// test sets it, to name a second source the server does not ingest into.
 	labelGrantSources [][]byte
+	// executorMappingFile names the operator executor mapping (#391).
+	// Empty means no executors: no token mints OperationExecute.
+	executorMappingFile string
 
 	// httpClient and clock are injected by tests; production leaves them nil.
 	httpClient *http.Client
@@ -306,7 +311,8 @@ func (c oidcConfig) configured() bool {
 		c.browserClientID != "" ||
 		c.browserScope != "" || c.authorizationEndpoint != "" ||
 		c.tokenEndpoint != "" || c.approverMappingFile != "" ||
-		c.identityClaim != "" || c.labelGrantsFile != ""
+		c.identityClaim != "" || c.labelGrantsFile != "" ||
+		c.executorMappingFile != ""
 }
 
 // oidcAuthenticator validates bearer tokens against the issuer's JWKS
@@ -351,6 +357,10 @@ type oidcAuthenticator struct {
 	// workspace branch reads it, and only for a token a role mapping has
 	// already granted.
 	labelGrants *labelGrants
+	// executor is the executor branch (#391), or nil. It has its own
+	// issuer, parser and key cache, and is the only source of
+	// OperationExecute in this command.
+	executor *oidcExecutorBranch
 }
 
 func newOIDCAuthenticator(
@@ -517,6 +527,22 @@ func newOIDCAuthenticator(
 		algorithmNames = append(algorithmNames, name)
 	}
 
+	var executor *oidcExecutorBranch
+	if path := strings.TrimSpace(config.executorMappingFile); path != "" {
+		// Disjoint from every audience the human issuer's tokens are
+		// minted on, so no token is addressed to both branches.
+		reserved := append([]string(nil), audiences...)
+		if approver != nil {
+			reserved = append(reserved, approver.audience)
+		}
+		mapping, err := loadExecutorMapping(path, reserved, allowLoopbackHTTP)
+		if err != nil {
+			return nil, err
+		}
+		executor = newOIDCExecutorBranch(
+			mapping, algorithmNames, skew, clock, httpClient, allowLoopbackHTTP)
+	}
+
 	parser := jwt.NewParser(
 		jwt.WithValidMethods(algorithmNames),
 		jwt.WithIssuer(issuer),
@@ -571,6 +597,7 @@ func newOIDCAuthenticator(
 		workspaceAudiences:         workspaceAudiences,
 		identityClaim:              identityClaim,
 		labelGrants:                grants,
+		executor:                   executor,
 	}, nil
 }
 
@@ -840,11 +867,26 @@ func (a *oidcAuthenticator) authenticate(
 	if err != nil {
 		return auth.Decision{}, err
 	}
+	// A token addressed to the executor audience is validated by the
+	// executor branch alone: its issuer, its keys, its audience. Nothing
+	// here trusts the unverified audience beyond choosing which verifier
+	// runs, and each verifier accepts only its own issuer's signatures.
+	if a.executor != nil && a.executor.addressed(raw) {
+		return a.authenticateExecutor(request, raw)
+	}
 	ctx := request.Context()
 	claims := jwt.MapClaims{}
 	keyFunc := a.keyFuncForContext(ctx)
 	if _, err := a.parser.ParseWithClaims(raw, claims, keyFunc); err != nil {
 		return auth.Decision{}, err
+	}
+	// Unreachable through the routing above, and kept so that a change
+	// to it cannot let a token carrying the executor audience be minted
+	// as a human.
+	if a.executor != nil {
+		if err := a.executor.refuseOnHumanBranch(claims); err != nil {
+			return auth.Decision{}, err
+		}
 	}
 	correlationID, err := correlationIDFor(request, "oidc-correlation-")
 	if err != nil {
@@ -870,6 +912,13 @@ func (a *oidcAuthenticator) authenticate(
 //     switch would reject it via the default arm — a different, assertable
 //     reason, so removing either layer changes an observable outcome.
 func (a *oidcAuthenticator) keyFuncForContext(ctx context.Context) jwt.Keyfunc {
+	return keyFuncFor(ctx, a.keys)
+}
+
+// keyFuncFor is keyFuncForContext over one issuer's key cache. Each issuer
+// has its own cache, and a keyfunc reads exactly one, so a key published by
+// one issuer can never verify a token the other issuer's parser accepts.
+func keyFuncFor(ctx context.Context, keys *jwksCache) jwt.Keyfunc {
 	return func(token *jwt.Token) (interface{}, error) {
 		kid, _ := token.Header["kid"].(string)
 		if strings.TrimSpace(kid) == "" {
@@ -883,7 +932,7 @@ func (a *oidcAuthenticator) keyFuncForContext(ctx context.Context) jwt.Keyfunc {
 		default:
 			return nil, errUnexpectedSigningMethod
 		}
-		key, err := a.keys.keyForID(ctx, kid, token.Method.Alg())
+		key, err := keys.keyForID(ctx, kid, token.Method.Alg())
 		if err != nil {
 			return nil, err
 		}

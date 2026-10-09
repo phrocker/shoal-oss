@@ -48,6 +48,8 @@ func TestNoMintedPrincipalCanApprove(t *testing.T) {
 		{"oidcReaderOperations", oidcReaderOperations, false},
 		{"workspaceOperations", workspaceOperations, false},
 		{"oidcApproverOperations", oidcApproverOperations, true},
+		// The executor mint (#391): execute and nothing else.
+		{"oidcExecutorOperations", oidcExecutorOperations, false},
 	}
 	covered := make([]string, len(lists))
 	for i, list := range lists {

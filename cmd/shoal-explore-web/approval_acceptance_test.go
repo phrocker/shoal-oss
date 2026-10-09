@@ -51,6 +51,9 @@ type approvalHarness struct {
 	// recorded is the scheme of the last successful open: what the
 	// coordination store's row holds.
 	recorded *identitySchemeConfig
+	// executors is the configured executor references; nil means "local"
+	// alone.
+	executors configuredFleetExecutors
 }
 
 func newApprovalHarness(t *testing.T) *approvalHarness {
@@ -92,9 +95,7 @@ func (h *approvalHarness) tryOpen() error {
 		backend: "embedded", data: filepath.Join(h.root, "corpus"),
 		policyDir: filepath.Join(h.root, "policy"),
 		resolver:  h.authority.Resolver(), clock: h.now,
-		executors: configuredFleetExecutors{
-			"local": configuredFleetExecutor{reference: "local"},
-		},
+		executors:         h.configuredExecutors(),
 		generationReader:  h.reader,
 		wrapApprovalStore: h.wrap,
 		approverMapping:   h.mapping,
@@ -111,6 +112,16 @@ func (h *approvalHarness) tryOpen() error {
 	h.opened, h.isOpen = opened, true
 	h.recorded = h.scheme
 	return nil
+}
+
+// configuredExecutors is h.executors, or "local" alone.
+func (h *approvalHarness) configuredExecutors() configuredFleetExecutors {
+	if h.executors != nil {
+		return h.executors
+	}
+	return configuredFleetExecutors{
+		"local": configuredFleetExecutor{reference: "local"},
+	}
 }
 
 func (h *approvalHarness) close() {

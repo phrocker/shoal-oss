@@ -362,6 +362,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"operation; without it no token holds any label, and labelled "+
 			"content is visible to nobody. Environment fallback "+
 			"SHOAL_OIDC_LABEL_GRANTS_FILE")
+	oidcExecutorMappingFile := flags.String(
+		"oidc-executor-mapping-file", "",
+		"Operator file (shoal.executors/v1) mapping service credentials of "+
+			"an issuer it names (such as the cluster's ServiceAccount issuer) "+
+			"to one executor reference each, on an audience of its own (#391). "+
+			"It is the only source of the execute operation; without it no "+
+			"token may pull, claim or complete queued work. Environment "+
+			"fallback SHOAL_OIDC_EXECUTOR_MAPPING_FILE")
 	oidcIdentitySchemeMigrate := flags.String(
 		"oidc-identity-scheme-migrate", "",
 		"One-shot identity scheme switch: the digest (64 hex digits, as the "+
@@ -514,6 +522,9 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			*oidcIdentityClaim, os.Getenv("SHOAL_OIDC_IDENTITY_CLAIM")),
 		labelGrantsFile: firstNonEmpty(
 			*oidcLabelGrantsFile, os.Getenv("SHOAL_OIDC_LABEL_GRANTS_FILE")),
+		executorMappingFile: firstNonEmpty(
+			*oidcExecutorMappingFile,
+			os.Getenv("SHOAL_OIDC_EXECUTOR_MAPPING_FILE")),
 	}, legacyEntraConfig{
 		tenantID: firstNonEmpty(
 			*entraTenant, os.Getenv("SHOAL_ENTRA_TENANT")),
@@ -588,6 +599,10 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// Zero when none is configured.
 	var labelGrantsDigest auth.Digest
 	var labelGrantCount int
+	// The executor mapping in force (#391): its digest and entry count.
+	// Zero when none is configured.
+	var executorMappingDigest auth.Digest
+	var executorCount int
 	if oidcAuthenticator, ok := authenticator.(*oidcAuthenticator); ok {
 		// An approver mapping needs an issuer that states public subject
 		// identifiers only, unless a stable identity claim is configured;
@@ -605,6 +620,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		}
 		approverMapping = oidcAuthenticator.approverMappingDigest()
 		labelGrantsDigest, labelGrantCount = oidcAuthenticator.labelGrantsDigest()
+		executorMappingDigest, executorCount = oidcAuthenticator.executorMappingDigest()
 		migrateFrom, err := parseIdentitySchemeMigrate(
 			strings.TrimSpace(*oidcIdentitySchemeMigrate))
 		if err != nil {
@@ -918,6 +934,16 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			fmt.Fprintf(output,
 				"No OIDC label grants are configured: labelled content is "+
 					"visible to nobody\n")
+		}
+		if executorMappingDigest != (auth.Digest{}) {
+			fmt.Fprintf(output,
+				"OIDC executor mapping is in force (%s): %d executor "+
+					"credential(s), each bound to one executor reference\n",
+				executorMappingDigest, executorCount)
+		} else {
+			fmt.Fprintf(output,
+				"No OIDC executor mapping is configured: no token may "+
+					"execute queued work\n")
 		}
 	}
 	if *backend == "embedded" {
