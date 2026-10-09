@@ -81,6 +81,45 @@ func typedConsts(t *testing.T, dir, typeName string) map[string]string {
 	return out
 }
 
+// untypedStringConsts reads untyped string constants whose names begin with
+// prefix. typedConsts cannot: these carry no named type, deliberately, because
+// a reason is compared against values that arrive as plain strings from a
+// predictor and from storage.
+func untypedStringConsts(
+	t *testing.T, dir, prefix string,
+) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, f := range parseDir(t, dir) {
+		for _, d := range f.Decls {
+			gen, ok := d.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok || value.Type != nil || len(value.Names) != len(value.Values) {
+					continue
+				}
+				for i, name := range value.Names {
+					if !strings.HasPrefix(name.Name, prefix) {
+						continue
+					}
+					literal, ok := stringLit(value.Values[i])
+					if !ok {
+						continue
+					}
+					out[name.Name] = literal
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("no untyped %s* string constants in %s", prefix, dir)
+	}
+	return out
+}
+
 func values(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for _, v := range m {
@@ -204,6 +243,7 @@ func sourceGatewayCodes(t *testing.T) (codes []string, prefix string) {
 func sourceDecisionServiceReasons(t *testing.T) map[decision.ResultStatus][]string {
 	t.Helper()
 	statuses := typedConsts(t, decisionDir, "ResultStatus")
+	reasons := untypedStringConsts(t, decisionDir, "Reason")
 	out := map[decision.ResultStatus][]string{}
 	seen := map[string]bool{}
 	for _, f := range parseDir(t, decisionServiceDir) {
@@ -220,9 +260,23 @@ func sourceDecisionServiceReasons(t *testing.T) map[decision.ResultStatus][]stri
 				t.Errorf("terminal status is not a decision constant: %T", call.Args[1])
 				return true
 			}
-			reason, ok := stringLit(call.Args[2])
+			// A decision.Reason* constant, not a literal. The reasons are
+			// reserved (decision.ReservedServiceReason), so one written as a
+			// bare literal here would be a reason the service establishes
+			// that a predictor is still free to claim — which is #509
+			// reopening. Requiring the constant makes that unwriteable.
+			reasonSel, ok := call.Args[2].(*ast.SelectorExpr)
 			if !ok {
-				t.Errorf("terminal reason is not a string literal")
+				t.Errorf("terminal reason is not a decision.Reason* "+
+					"constant (%T): a literal reason is not reserved, so a "+
+					"predictor could return it and the record would read as "+
+					"the service's own finding", call.Args[2])
+				return true
+			}
+			reason, ok := reasons[reasonSel.Sel.Name]
+			if !ok {
+				t.Errorf("terminal reason %q is not a constant in %s",
+					reasonSel.Sel.Name, decisionDir)
 				return true
 			}
 			status := decision.ResultStatus(statuses[sel.Sel.Name])
