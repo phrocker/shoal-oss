@@ -223,6 +223,17 @@ explorer:
       # -oidc-approver-mapping-file; a checksum annotation rolls the pod when
       # it changes, because the workspace reads it once at startup.
       approverMapping: {}
+      # The label grants (#570; docs/shoal-explore-web-deploy.md, "Granting
+      # visibility labels"): the shoal.label-grants/v1 document itself, as a
+      # map. A grant gives a claim value one free-form label on one source,
+      # and adds visibility only to a token a role mapping above already
+      # grants. Empty means no token holds any label, so labelled content is
+      # visible to nobody, its ingesters included. Rendered into a ConfigMap
+      # this chart owns, mounted read-only and passed as
+      # -oidc-label-grants-file; a checksum annotation rolls the pod when it
+      # changes. Every grant's source must be shoal-explore-web/workspace,
+      # the one source the workspace configures.
+      labelGrants: {}
       # A stable identity claim (#526) as a list of path segments, for example
       # [oid] for Entra on a tenant issuer. Requesters and approvers are then
       # named oidcid:<issuer>#<path tag>#<value> on both branches.

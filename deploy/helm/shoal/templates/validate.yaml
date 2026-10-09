@@ -121,6 +121,46 @@
 {{- end -}}
 {{- end -}}
 
+{{- /* The label grants (#570). The workspace refuses at startup a file
+       whose version is wrong, whose issuer is not -oidc-issuer byte for
+       byte, or whose grants name a source it does not configure or a label
+       outside the label charset; refusing those here puts the reason in the
+       install instead of a pod log. The workspace configures one source,
+       so that is the only one a grant may name. Control characters are
+       refused by the line-break walk below, as in every other value. */ -}}
+{{- $labelGrants := default (dict) $oidc.labelGrants -}}
+{{- if not (kindIs "map" $labelGrants) -}}
+{{- fail "explorer.auth.oidc.labelGrants must be the shoal.label-grants/v1 document as a map: the chart renders it into the file the workspace reads" -}}
+{{- end -}}
+{{- if $labelGrants -}}
+{{- if ne (toString (get $labelGrants "version")) "shoal.label-grants/v1" -}}
+{{- fail (printf "explorer.auth.oidc.labelGrants.version must be shoal.label-grants/v1 (got %q): the workspace refuses any other version at startup" (toString (get $labelGrants "version"))) -}}
+{{- end -}}
+{{- if ne (toString (get $labelGrants "issuer")) (toString $oidc.issuer) -}}
+{{- fail (printf "explorer.auth.oidc.labelGrants.issuer (%q) must equal explorer.auth.oidc.issuer (%q) byte for byte: the grant file names claim values of one issuer, and the workspace refuses it at startup otherwise" (toString (get $labelGrants "issuer")) (toString $oidc.issuer)) -}}
+{{- end -}}
+{{- $grants := get $labelGrants "grants" -}}
+{{- if not (and (kindIs "map" $grants) $grants) -}}
+{{- fail "explorer.auth.oidc.labelGrants.grants must map at least one claim value to its list of {source, label} grants" -}}
+{{- end -}}
+{{- range $value, $pairs := $grants -}}
+{{- if not (and (kindIs "slice" $pairs) $pairs) -}}
+{{- fail (printf "explorer.auth.oidc.labelGrants.grants[%q] must be a non-empty list of {source, label} grants" $value) -}}
+{{- end -}}
+{{- range $pairs -}}
+{{- if not (kindIs "map" .) -}}
+{{- fail (printf "explorer.auth.oidc.labelGrants.grants[%q] holds a grant that is not a {source, label} map" $value) -}}
+{{- end -}}
+{{- if ne (toString (get . "source")) "shoal-explore-web/workspace" -}}
+{{- fail (printf "explorer.auth.oidc.labelGrants.grants[%q] names the source %q: the workspace configures one source, shoal-explore-web/workspace, and refuses a grant on any other at startup. A label is granted per source, so a grant written for another source opens nothing here" $value (toString (get . "source"))) -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9_.:-]{1,256}$" (toString (get . "label"))) -}}
+{{- fail (printf "explorer.auth.oidc.labelGrants.grants[%q] names the label %q, which is not a visibility label: 1 to 256 of A-Z a-z 0-9 _ . : - exactly as documents carry it, never folded or trimmed" $value (toString (get . "label"))) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* Placeholders are not configuration. The shipped profile leaves these
        empty so the guards above fire, but a values file copied from the docs
        can still carry the marker text through, and a pod that authenticates
@@ -131,7 +171,11 @@
        non-working deployment, it is a working one that authorizes exactly the
        literal claim value "REPLACE_ME" — so every real caller is denied while
        the chart reports success. */ -}}
-{{- range (concat (list $oidc.issuer $oidc.authorizationClaim) $oidc.audiences $explorer.allowedHosts $oidc.readerValues $oidc.contributorValues $oidc.fleetValues) -}}
+{{- $labelGrantValues := list -}}
+{{- if kindIs "map" (get $labelGrants "grants") -}}
+{{- $labelGrantValues = keys (get $labelGrants "grants") -}}
+{{- end -}}
+{{- range (concat (list $oidc.issuer $oidc.authorizationClaim) $oidc.audiences $explorer.allowedHosts $oidc.readerValues $oidc.contributorValues $oidc.fleetValues $labelGrantValues) -}}
 {{- if contains "REPLACE_ME" (toString .) -}}
 {{- fail (printf "explorer configuration still contains the placeholder %q: replace every REPLACE_ME before installing" (toString .)) -}}
 {{- end -}}

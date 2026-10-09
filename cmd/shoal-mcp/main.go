@@ -261,6 +261,14 @@ func parseCommandConfig(
 		"identity-policy", getenv("SHOAL_MCP_IDENTITY_POLICY"),
 		"Permitted policy and static grant policy ID (environment: SHOAL_MCP_IDENTITY_POLICY)",
 	)
+	labels := flags.String(
+		"identity-labels", getenv("SHOAL_MCP_IDENTITY_LABELS"),
+		"Comma-separated label grants (#570), each <source>=<label> with the "+
+			"source exactly the identity source; without them the identity "+
+			"holds no label and can neither ingest nor read labelled content. "+
+			"Label policies cannot be named with -identity-policy "+
+			"(environment: SHOAL_MCP_IDENTITY_LABELS)",
+	)
 	operations := flags.String(
 		"identity-operations", getenv("SHOAL_MCP_IDENTITY_OPERATIONS"),
 		"Comma-separated operations: ingest,list,read,connect,neighborhood,retrieve,validation (environment: SHOAL_MCP_IDENTITY_OPERATIONS)",
@@ -341,6 +349,7 @@ func parseCommandConfig(
 		domain:           *domain,
 		sourceID:         *sourceID,
 		policyID:         *policyID,
+		labels:           *labels,
 		operations:       *operations,
 		policyGeneration: policyGeneration,
 		lifetime:         decisionLifetime,

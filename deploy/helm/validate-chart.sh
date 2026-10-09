@@ -348,6 +348,8 @@ explorer:
           equals: human
         identity_claim: [oid]
 APPROVERS
+approvers_file_both="$(mktemp)"
+cp "$approvers_file" "$approvers_file_both"
 assert_absent "no approver mapping unless configured" 'oidc-approver-mapping-file|approver-mapping|approvers.json' "${explorer_base[@]}"
 assert_absent "no identity claim unless configured" 'oidc-identity-claim' "${explorer_base[@]}"
 # Migrating the scheme is one-shot: it names the recorded scheme it replaces,
@@ -381,6 +383,51 @@ refuses_citing 'explorer.auth.oidc.identityClaim[0] holds "\u2028"' "U+2028 in a
 refuses_citing 'explorer.auth.oidc.approverMapping.values[0] holds "\n"' "a newline in a mapped value" "${explorer_base[@]}" -f "$approvers_file" --set-string 'explorer.auth.oidc.approverMapping.values[0]=shoal-approvers
 x'
 rm -f "$approvers_file"
+
+note "== the label grants (#570) =="
+# Like the approver mapping, the grant file is a document the workspace reads
+# from disk once at startup, so it is a chart-owned ConfigMap with a checksum
+# that rolls the pod. It never appears unless configured, and the shapes the
+# workspace would refuse at startup are refused at render: the version, the
+# issuer, a source other than the workspace's one, a label outside the label
+# charset, and a placeholder claim value.
+grants_file="$(mktemp)"
+cat > "$grants_file" <<'GRANTS'
+explorer:
+  auth:
+    oidc:
+      labelGrants:
+        version: shoal.label-grants/v1
+        issuer: https://issuer.example.test/
+        claim: [groups]
+        max_values: 64
+        grants:
+          secret-readers:
+            - source: shoal-explore-web/workspace
+              label: secret
+            - source: shoal-explore-web/workspace
+              label: "pii:eu"
+GRANTS
+assert_absent "no label grants unless configured" 'oidc-label-grants-file|label-grants' "${explorer_base[@]}"
+assert_renders "the grant file is passed" '^ +- "-oidc-label-grants-file=/etc/shoal/label-grants/label-grants.json"$' "${explorer_base[@]}" -f "$grants_file"
+assert_renders "the grant file is mounted read-only" '^ +mountPath: "/etc/shoal/label-grants"$' "${explorer_base[@]}" -f "$grants_file"
+assert_renders "the grant file is rendered as JSON" '^  label-grants.json: ".*\\"label\\":\\"pii:eu\\".*"$' "${explorer_base[@]}" -f "$grants_file"
+assert_renders "a grant change rolls the pod" '^ +checksum/label-grants: "[0-9a-f]{64}"$' "${explorer_base[@]}" -f "$grants_file"
+assert_renders "the ConfigMap is chart-owned" '^  name: "[a-z0-9-]+-label-grants"$' "${explorer_base[@]}" -f "$grants_file"
+renders "label grants beside an approver mapping" "${explorer_base[@]}" -f "$grants_file" -f "$approvers_file_both"
+refuses_citing "must be the shoal.label-grants/v1 document as a map" "grants that are not a document" "${explorer_base[@]}" --set explorer.auth.oidc.labelGrants=label-grants.json
+refuses_citing "labelGrants.version must be shoal.label-grants/v1" "another version" "${explorer_base[@]}" -f "$grants_file" --set explorer.auth.oidc.labelGrants.version=shoal.label-grants/v2
+refuses_citing "must equal explorer.auth.oidc.issuer" "another issuer" "${explorer_base[@]}" -f "$grants_file" --set explorer.auth.oidc.labelGrants.issuer=https://issuer.example.test
+refuses_citing "must map at least one claim value" "no grants" "${explorer_base[@]}" -f "$grants_file" --set explorer.auth.oidc.labelGrants.grants=null
+refuses_citing "configures one source" "a grant on another source" "${explorer_base[@]}" -f "$grants_file" --set 'explorer.auth.oidc.labelGrants.grants.secret-readers[0].source=other/source'
+refuses_citing "is not a visibility label" "a label with a slash" "${explorer_base[@]}" -f "$grants_file" --set 'explorer.auth.oidc.labelGrants.grants.secret-readers[0].label=a/b'
+refuses_citing "is not a visibility label" "an empty label" "${explorer_base[@]}" -f "$grants_file" --set 'explorer.auth.oidc.labelGrants.grants.secret-readers[0].label='
+refuses_citing "placeholder" "a placeholder claim value" "${explorer_base[@]}" -f "$grants_file" --set 'explorer.auth.oidc.labelGrants.grants.REPLACE_ME[0].source=shoal-explore-web/workspace' --set 'explorer.auth.oidc.labelGrants.grants.REPLACE_ME[0].label=secret'
+refuses_citing "is not a visibility label" "a newline in a label" "${explorer_base[@]}" -f "$grants_file" --set-string 'explorer.auth.oidc.labelGrants.grants.secret-readers[0].label=secret
+x'
+refuses_citing 'explorer.auth.oidc.labelGrants.claim[0] holds "\n"' "a newline in the claim path" "${explorer_base[@]}" -f "$grants_file" --set-string 'explorer.auth.oidc.labelGrants.claim[0]=groups
+x'
+rm -f "$grants_file" "$approvers_file_both"
 
 note "== a reference cannot carry a character that changes what the argument means =="
 # Every executor reference reaches the container inside one argument, and three
