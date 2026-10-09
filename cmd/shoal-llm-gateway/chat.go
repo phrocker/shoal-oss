@@ -107,6 +107,14 @@ func parseChatRequest(raw []byte) (chatRequest, error) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return chatRequest{}, fmt.Errorf("malformed request body")
 	}
+	// A body carrying attribution is decoded again, strictly, before anything
+	// reads it: see decodeStrictBody. A body without it is parsed exactly as
+	// before, so an unmodified client meets no new refusal.
+	if strictBodyRequired(body) {
+		if err := decodeStrictBody(raw); err != nil {
+			return chatRequest{}, err
+		}
+	}
 	result := chatRequest{body: body}
 	if encoded, ok := body["model"]; ok {
 		if err := json.Unmarshal(encoded, &result.model); err != nil {
@@ -268,13 +276,18 @@ func classifyModel(model string, allowed map[string]struct{}) string {
 // because the proxy must not be the reason a provider feature nobody here has
 // heard of stops working — which is the whole reason the body is a map rather
 // than a struct.
+//
+// shoal_attribution is removed for the same reasons and one more: its digests
+// are derived from governed content.
 func (r chatRequest) outbound() map[string]json.RawMessage {
-	if _, ok := r.body[shoalReferencesField]; !ok {
+	_, references := r.body[shoalReferencesField]
+	_, attribution := r.body[shoalAttributionField]
+	if !references && !attribution {
 		return r.body
 	}
 	body := make(map[string]json.RawMessage, len(r.body))
 	for key, value := range r.body {
-		if key == shoalReferencesField {
+		if key == shoalReferencesField || key == shoalAttributionField {
 			continue
 		}
 		body[key] = value
@@ -312,84 +325,4 @@ func (r chatRequest) declaration(
 		"reference_count": len(references),
 	})
 	return encoded
-}
-
-// applyObligations reports whether the obligations returned can be satisfied,
-// and returns the request to forward when there are none.
-//
-// The earlier version of this comment said it "drops the withheld references
-// and the messages that carry them" and "never has to find them inside prompt
-// text". Both claims were wrong, and the second one was the mistake that
-// produced the first: there is no mapping from a reference to the content that
-// carries it. shoal_references is a flat list of IDs, the material lives in
-// messages[].content as free text, and nothing connects the two. So the proxy
-// cannot identify the messages to drop, and what the code actually did was
-// remove the ID from the declaration and forward every message untouched.
-//
-// That satisfied nothing. A caller could declare a restricted document, paste
-// its text into a message, and the text reached the provider with only its
-// label removed — and because providers ignore unknown fields, removing the
-// label did not change what the model received either.
-//
-// So a withhold obligation is unsatisfiable on this request shape, and
-// unsatisfiable is what this reports. #390 asks for exactly that ordering:
-// apply the obligations, and refuse only when they cannot be satisfied. The
-// honest consequence is that withholding is currently as strong as a denial
-// here, which is a real loss of the behaviour #390 wanted and is tracked as
-// its own decision rather than papered over.
-func (r chatRequest) applyObligations(withhold []string) (json.RawMessage, bool, error) {
-	if len(withhold) == 0 {
-		encoded, err := json.Marshal(r.outbound())
-		return encoded, true, err
-	}
-	denied := make(map[string]struct{}, len(withhold))
-	for _, reference := range withhold {
-		denied[reference] = struct{}{}
-	}
-	references, err := r.references()
-	if err != nil {
-		return nil, false, err
-	}
-	// Checked separately from the refusal below because it is a different
-	// diagnosis: an obligation naming a reference the caller never declared
-	// means the plane and the caller disagree about what this call is, where a
-	// declared one means the proxy simply cannot locate the content. Neither
-	// may be silently ignored — the plane believes it has constrained the call.
-	for reference := range denied {
-		found := false
-		for _, declared := range references {
-			if declared == reference {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, false, nil
-		}
-	}
-	// Every withheld reference was declared, and the obligation is still
-	// unsatisfiable on this request shape. This is the honest answer and it is
-	// worth being blunt about why, because the previous behaviour looked like
-	// enforcement and was not.
-	//
-	// Withholding means the material must not reach the provider. On an
-	// OpenAI-compatible request the material lives in messages[].content as
-	// free text, and shoal_references is a flat list of IDs with no mapping to
-	// the content that carries them. So the proxy cannot find the bytes it has
-	// been told to remove. What it used to do was drop the ID from the
-	// declaration and forward the messages untouched — which satisfies nothing:
-	// a caller can declare a restricted document, paste its text into a
-	// message, and the text went upstream with only the label removed. The
-	// provider ignores unknown fields, so editing the declaration did not even
-	// change what the model received.
-	//
-	// #390 anticipates this: "apply returned obligations to the outbound
-	// request; refuse only when obligations cannot be satisfied." It cannot be
-	// satisfied here, so this refuses, and the plane is told the obligation was
-	// unsatisfiable rather than that the caller went dark. Refusing is a real
-	// cost — a withhold obligation is currently as strong as a denial on this
-	// surface — and that cost is the finding, not a workaround for it. Making
-	// withholding do what it says needs a request shape that attributes content
-	// to the reference it came from, which is a decision rather than a patch.
-	return nil, false, nil
 }

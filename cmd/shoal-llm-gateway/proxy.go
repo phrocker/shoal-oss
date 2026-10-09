@@ -172,6 +172,13 @@ func (p *proxy) admitAndForward(writer http.ResponseWriter, request *http.Reques
 		p.refuse(writer, http.StatusBadRequest, "invalid_request", err.Error())
 		return nil
 	}
+	// Validated in full before admission, digests included, so a malformed
+	// attribution is a 400 that spends no decision.
+	attributed, err := parsed.attribution(references)
+	if err != nil {
+		p.refuse(writer, http.StatusBadRequest, "invalid_request", err.Error())
+		return nil
+	}
 	identity, err := newCallerIdentity()
 	if err != nil {
 		// No identity means no admission, and no admission means no call.
@@ -207,18 +214,27 @@ func (p *proxy) admitAndForward(writer http.ResponseWriter, request *http.Reques
 		return nil
 	}
 
-	outbound, satisfiable, err := parsed.applyObligations(granted.Withhold)
-	if err != nil || !satisfiable {
+	applied := parsed.applyObligations(granted.Withhold, references, attributed)
+	if applied.refusal != "" {
 		// The obligation could not be met. This is the one place refusal is
 		// correct rather than lazy, and it is reported so the plane learns the
 		// obligation was unsatisfiable rather than that the caller went dark.
-		p.log("obligation unsatisfiable request_id=%s withheld=%d",
-			identity.RequestID, len(granted.Withhold))
+		//
+		// Counts and the refusal class only. Never content, digests, reference
+		// IDs or offsets: the class says which rule refused, which is what an
+		// operator needs, and nothing about what was being withheld.
+		p.log("obligation unsatisfiable request_id=%s withheld=%d class=%s",
+			identity.RequestID, len(granted.Withhold), applied.refusal)
 		p.reportFailure(request.Context(), granted.token, identity, "obligation_unsatisfiable")
 		p.refuse(writer, http.StatusForbidden, "obligation_unsatisfiable",
 			"the call cannot be made within the obligations returned")
 		return nil
 	}
+	if len(granted.Withhold) > 0 {
+		p.log("obligation applied request_id=%s references=%d segments=%d bytes=%d",
+			identity.RequestID, applied.references, applied.segments, applied.bytes)
+	}
+	outbound := applied.body
 
 	return p.forward(writer, request, granted, identity, outbound, parsed.stream)
 }

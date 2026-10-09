@@ -205,7 +205,8 @@ the same reason.
 ## Order
 
 1. **LLM gateway.** Built. Open: #424 (plaintext listener), #425 (denials an
-   operator can monitor), #426 (withhold obligations).
+   operator can monitor). Withhold obligations apply to caller-attributed
+   content (#426, `docs/llm-gateway-deploy.md`).
 2. **Effects gateway, HTTP.** Blocked on #435 (worker never receives input),
    #436 (no external-effect executor ceiling), #437 (claimant must be
    enqueuer), #438 (nowhere to record a lost-fence ambiguity) and #430 (claims
