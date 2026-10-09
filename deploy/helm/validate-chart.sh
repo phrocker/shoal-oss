@@ -323,6 +323,65 @@ renders "lexical embedding"                 "${explorer_base[@]}" --set explorer
 renders "scaled to zero"                    "${explorer_base[@]}" --set explorer.replicas=0
 renders "values around the blanks are trimmed" "${explorer_base[@]}" --set 'explorer.allowedHosts={ shoal.example.test , }'
 
+note "== the approver mapping and the stable identity claim (#451, #526) =="
+# The mapping is a document the workspace reads from disk, so it is the one
+# setting the chart renders into a ConfigMap; the identity claim is an argument
+# like every other. Neither appears unless asked for, the mapping must restate
+# the claim exactly when it is set (the workspace refuses to start otherwise),
+# and the claim is a list of segments, never a dotted string.
+approvers_file="$(mktemp)"
+cat > "$approvers_file" <<'APPROVERS'
+explorer:
+  auth:
+    oidc:
+      identityClaim: [oid]
+      approverMapping:
+        version: shoal.approvers/v1
+        issuer: https://issuer.example.test/
+        audience: https://shoal.example.test/approvals
+        client_ids: [shoal-console]
+        claim: [roles]
+        values: [shoal-approvers]
+        max_values: 64
+        human_assertion:
+          claim: [principal_type]
+          equals: human
+        identity_claim: [oid]
+APPROVERS
+assert_absent "no approver mapping unless configured" 'oidc-approver-mapping-file|approver-mapping|approvers.json' "${explorer_base[@]}"
+assert_absent "no identity claim unless configured" 'oidc-identity-claim' "${explorer_base[@]}"
+# Migrating the scheme is one-shot: it names the recorded scheme it replaces,
+# never rendered by default, and held to the digest's shape so a boolean (the
+# old, advisory form) cannot be passed.
+scheme_digest=5a35ffaec1b6aafc2af35ed289def9bae8728339a3984691e2ad9818a1896a79
+assert_absent "no scheme migration unless asked for" 'oidc-identity-scheme-migrate' "${explorer_base[@]}"
+assert_renders "a scheme migration names the scheme it replaces" '^ +- "-oidc-identity-scheme-migrate='"$scheme_digest"'"$' "${explorer_base[@]}" --set-string explorer.auth.oidc.identitySchemeMigrateFrom="$scheme_digest"
+refuses_citing "must be the 64 lowercase hex digits" "a boolean scheme migration" "${explorer_base[@]}" --set-string explorer.auth.oidc.identitySchemeMigrateFrom=true
+refuses_citing "must be the 64 lowercase hex digits" "an upper-case digest" "${explorer_base[@]}" --set-string explorer.auth.oidc.identitySchemeMigrateFrom=5A35FFAEC1B6AAFC2AF35ED289DEF9BAE8728339A3984691E2AD9818A1896A79
+assert_renders "the mapping file is passed" '^ +- "-oidc-approver-mapping-file=/etc/shoal/approvers/approvers.json"$' "${explorer_base[@]}" -f "$approvers_file"
+assert_renders "the identity claim is passed as one JSON argument" '^ +- "-oidc-identity-claim=\[\\"oid\\"\]"$' "${explorer_base[@]}" -f "$approvers_file"
+assert_renders "the mapping is mounted read-only" '^ +readOnly: true$' "${explorer_base[@]}" -f "$approvers_file"
+assert_renders "the mapping is rendered as JSON" '^  approvers.json: ".*\\"identity_claim\\":\[\\"oid\\"\].*"$' "${explorer_base[@]}" -f "$approvers_file"
+assert_renders "a mapping change rolls the pod" '^ +checksum/approver-mapping: "[0-9a-f]{64}"$' "${explorer_base[@]}" -f "$approvers_file"
+renders "a mapping without the stable claim" "${explorer_base[@]}" -f "$approvers_file" --set explorer.auth.oidc.identityClaim=null --set explorer.auth.oidc.approverMapping.identity_claim=null
+renders "the stable claim without a mapping" "${explorer_base[@]}" --set 'explorer.auth.oidc.identityClaim={oid}'
+refuses_citing "must restate explorer.auth.oidc.identityClaim" "the claim without the mapping restating it" "${explorer_base[@]}" -f "$approvers_file" --set explorer.auth.oidc.approverMapping.identity_claim=null
+refuses_citing "must restate explorer.auth.oidc.identityClaim" "the mapping restating a claim that is not set" "${explorer_base[@]}" -f "$approvers_file" --set explorer.auth.oidc.identityClaim=null
+refuses_citing "must restate explorer.auth.oidc.identityClaim" "a mapping restating another claim" "${explorer_base[@]}" -f "$approvers_file" --set 'explorer.auth.oidc.approverMapping.identity_claim={sub_id}'
+refuses_citing "must restate explorer.auth.oidc.identityClaim" "a dotted restatement of a nested claim" "${explorer_base[@]}" -f "$approvers_file" --set 'explorer.auth.oidc.identityClaim={ext,oid}' --set 'explorer.auth.oidc.approverMapping.identity_claim={ext.oid}'
+refuses_citing "must be a list of path segments" "a dotted string as the claim" "${explorer_base[@]}" --set explorer.auth.oidc.identityClaim=ext.oid
+refuses_citing "blank or non-string segment" "a blank claim segment" "${explorer_base[@]}" --set 'explorer.auth.oidc.identityClaim={ }'
+refuses_citing "must be the shoal.approvers/v1 document as a map" "a mapping that is not a document" "${explorer_base[@]}" --set explorer.auth.oidc.approverMapping=approvers.json
+# The control-character guard: both reach the pod inside a quoted scalar, and
+# the line-break walk refuses the character so a quoted remainder cannot name
+# a different claim.
+refuses_citing 'explorer.auth.oidc.identityClaim[0] holds "\n"' "a newline in a claim segment" "${explorer_base[@]}" --set-string 'explorer.auth.oidc.identityClaim[0]=oid
+            - -conceal-withholding=false'
+refuses_citing 'explorer.auth.oidc.identityClaim[0] holds "\u2028"' "U+2028 in a claim segment" "${explorer_base[@]}" --set-string "explorer.auth.oidc.identityClaim[0]=oid"$' '"x"
+refuses_citing 'explorer.auth.oidc.approverMapping.values[0] holds "\n"' "a newline in a mapped value" "${explorer_base[@]}" -f "$approvers_file" --set-string 'explorer.auth.oidc.approverMapping.values[0]=shoal-approvers
+x'
+rm -f "$approvers_file"
+
 note "== a reference cannot carry a character that changes what the argument means =="
 # Every executor reference reaches the container inside one argument, and three
 # of the four settings are comma-joined into it. Two characters therefore cannot

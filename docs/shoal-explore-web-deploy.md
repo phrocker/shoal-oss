@@ -168,7 +168,9 @@ closed. Authentication never falls back to anonymous or development authority.
 | `-oidc-reader-values` / `SHOAL_OIDC_READER_VALUES` | Comma-separated claim values granting list, read, connect, neighborhood, retrieve, workspace-settings read, and agent resolve. |
 | `-oidc-contributor-values` / `SHOAL_OIDC_CONTRIBUTOR_VALUES` | Comma-separated claim values granting ingest and workspace-settings write in addition to reader operations. |
 | `-oidc-fleet-values` / `SHOAL_OIDC_FLEET_VALUES` | Comma-separated claim values granting Fleet control-plane access: agent register/heartbeat/revoke, delegation for child-agent registration, dispatch/invoke, subscription create/delete/deliver, and event publication. |
-| `-oidc-approver-mapping-file` / `SHOAL_OIDC_APPROVER_MAPPING_FILE` | Operator file (`shoal.approvers/v1`) mapping OIDC humans on a dedicated approver audience to `action_approve` and nothing else. Without it no token may approve. Requires an issuer whose discovery states `subject_types_supported: ["public"]` only and whose access tokens carry `azp` (expected: Auth0; Okta with a custom `azp` claim; startup and minting enforce both, so a non-qualifying issuer is refused). Keycloak and Entra advertise pairwise subjects and are refused until #526. See `docs/approval.md`, "The OIDC approver mapping". |
+| `-oidc-approver-mapping-file` / `SHOAL_OIDC_APPROVER_MAPPING_FILE` | Operator file (`shoal.approvers/v1`) mapping OIDC humans on a dedicated approver audience to `action_approve` and nothing else. Without it no token may approve. Requires access tokens that carry `azp`, and either an issuer whose discovery states `subject_types_supported: ["public"]` only (expected: Auth0; Okta with a custom `azp` claim) or `-oidc-identity-claim` (Entra, Keycloak); startup and minting enforce both, so a non-qualifying issuer is refused. See `docs/approval.md`, "The OIDC approver mapping". |
+| `-oidc-identity-claim` / `SHOAL_OIDC_IDENTITY_CLAIM` | A stable identity claim (#526), as a JSON array of path segments such as `'["oid"]'`. Requesters and approvers are then named `oidcid:<issuer>#<tag>#<value>` (the tag is a digest of the claim path) on both branches, read by one derivation (present, a string of 1–256 bytes, no control characters, never trimmed), and the approver mapping's public-subjects check is waived. The approver mapping must restate it as `identity_claim`. Refused: `["sub"]`; a last segment that does not name one human stably — editable and profile fields (`email`, `preferred_username`, `upn`, `unique_name`, `name`, `nickname`, `given_name`, `family_name`, `locale`, `picture`, `website`, `zoneinfo`), per-session or per-token claims (`sid`, `session_state`, `jti`, `nonce`, `at_hash`, `c_hash`, `auth_time`, `iat`, `exp`, `nbf`, `acr`, `amr`) and per-client claims (`azp`, `client_id`, `cid`); never choose a path under a user-editable parent either; an issuer containing `#`; combination with a non-default `-oidc-subject-claim`, legacy Entra mode, `-oidc-actor-claim` or `-oidc-delegation-claim`; an issuer path naming `common`, `organizations` or `{tenantid}`. Use `oid` on Entra's tenant issuer, or a Keycloak User Property `id` mapper on a client scope shared by both clients. See `docs/approval.md`, "Supported issuers". |
+| `-oidc-identity-scheme-migrate` | One-shot identity scheme switch: the digest (64 lowercase hex digits) of the scheme recorded for `-oidc-issuer` that this rollout replaces, as the startup refusal prints it. Every OIDC replica records its scheme (issuer, claim path, identity format) in the coordination store and refuses to start when it differs from the recorded one; with this flag a replica starts only if the recorded scheme is the one named (it then records its own) or already its own. Remove it after the rollout. Changing `-oidc-issuer` (Entra v1 to v2, a hostname move) is a scheme switch too and needs this flag. Upgrade every replica to this build on the current scheme before switching, and never roll back to a build before #553 across a switch. A request made under the previous scheme can then only expire. See `docs/approval.md`, "Switching an issuer's identity scheme". |
 
 At least one reader, contributor, or Fleet value is required. A missing,
 malformed, or unmapped authorization claim is denied before a service operation runs.
@@ -188,6 +190,13 @@ claim mappings preserve richer decision identity and delegation:
 When an optional mapping is configured, that claim becomes required and must
 have the expected string shape. Token-derived identities are namespaced by the
 validated issuer so subjects from different issuers cannot collide.
+
+`-oidc-subject-claim` names identities `oidc:<iss>#<value>`, the same
+namespace `sub` derives into, so changing it (for example to `oid`) can give
+one human's value and another human's `sub` the same identity. For a stable,
+cross-client identity use `-oidc-identity-claim` instead, which has a
+namespace of its own (`oidcid:`) and cannot be combined with a non-default
+subject claim.
 
 ### Discovery, keys, and validation options
 
@@ -495,6 +504,7 @@ The refusals:
 | `explorer.auth.mode: oidc` | The only valid value. `-dev-auth` is refused on any non-loopback listener, and a pod reached through a Service must bind one, so a chart could only render it into a workspace that cannot start. |
 | `explorer.allowedHosts` | An empty allow-list answers every request `421` (see host authority, above). |
 | `explorer.auth.oidc.issuer`, `audiences`, `authorizationClaim` | Each is required for token validation; a blank or whitespace-only value is treated as missing, because the workspace drops empty entries and then reports the setting absent. |
+| `explorer.auth.oidc.approverMapping.identity_claim` not restating `explorer.auth.oidc.identityClaim` exactly, an `identityClaim` that is not a list of non-blank segments, or an `approverMapping` that is not a map | The workspace refuses to start when the mapping and the flag disagree, and a dotted string is one claim name, never a path. |
 | one of `readerValues` / `contributorValues` / `fleetValues` | A claim mapped to nothing denies every authenticated caller, which is fail-closed but indistinguishable from an outage. |
 | `explorer.replicas` above 1 | The corpus, workspace settings and policy catalog share one state root on a `ReadWriteOnce` volume, with no coordination protocol between two processes over it. |
 | a remote chat or embedding provider without a credential Secret | The credential is read at request time and nothing projects it into the pod. |
@@ -508,6 +518,18 @@ split-brain guard exists to prevent. And **every setting is a container
 argument**, not a ConfigMap, so a changed setting rolls the pod on its own; a
 ConfigMap without a checksum annotation would leave the running process on the
 old disclosure posture while the chart claimed the new one.
+
+The approver mapping is the one exception, because the workspace reads it as a
+file. `explorer.auth.oidc.approverMapping` holds the `shoal.approvers/v1`
+document as a map; the chart renders it as JSON into a ConfigMap it owns,
+mounts it read-only at `/etc/shoal/approvers`, passes
+`-oidc-approver-mapping-file`, and puts its checksum on the pod template so a
+changed mapping rolls the pod. `explorer.auth.oidc.identityClaim` is a list of
+path segments rendered as the `-oidc-identity-claim` argument, and the mapping
+must restate it as `identity_claim`. `explorer.auth.oidc.identitySchemeMigrateFrom`
+renders `-oidc-identity-scheme-migrate` with the digest of the recorded scheme
+being replaced; it can move the record only once, so unset it after the
+rollout (`docs/approval.md`).
 
 Probes address the health port below, never the workspace port.
 

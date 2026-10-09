@@ -45,6 +45,12 @@ type approvalHarness struct {
 	// mapping is the approver mapping digest the service is opened with;
 	// nil means none, as in the shipped binary without the mapping file.
 	mapping func(context.Context) (auth.Digest, error)
+	// scheme is the OIDC identity scheme the service is opened under
+	// (#526); nil means none, as for a non-OIDC authenticator.
+	scheme *identitySchemeConfig
+	// recorded is the scheme of the last successful open: what the
+	// coordination store's row holds.
+	recorded *identitySchemeConfig
 }
 
 func newApprovalHarness(t *testing.T) *approvalHarness {
@@ -74,6 +80,14 @@ func (h *approvalHarness) advance(by time.Duration) {
 
 func (h *approvalHarness) open() {
 	h.t.Helper()
+	if err := h.tryOpen(); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// tryOpen is open that returns the startup refusal instead of failing.
+func (h *approvalHarness) tryOpen() error {
+	h.t.Helper()
 	opened, err := openService(context.Background(), serviceConfig{
 		backend: "embedded", data: filepath.Join(h.root, "corpus"),
 		policyDir: filepath.Join(h.root, "policy"),
@@ -84,9 +98,10 @@ func (h *approvalHarness) open() {
 		generationReader:  h.reader,
 		wrapApprovalStore: h.wrap,
 		approverMapping:   h.mapping,
+		identityScheme:    h.scheme,
 	})
 	if err != nil {
-		h.t.Fatal(err)
+		return err
 	}
 	if opened.approvals == nil || opened.fleetDispatch == nil ||
 		opened.admission == nil {
@@ -94,6 +109,8 @@ func (h *approvalHarness) open() {
 		h.t.Fatal("embedded service did not compose approvals")
 	}
 	h.opened, h.isOpen = opened, true
+	h.recorded = h.scheme
+	return nil
 }
 
 func (h *approvalHarness) close() {

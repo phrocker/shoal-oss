@@ -53,6 +53,7 @@ const (
 	KindAllocatorHead
 	KindPartitionCommitCopy
 	KindTxnLease
+	KindIdentityScheme
 )
 
 const (
@@ -77,6 +78,7 @@ const (
 	VersionAllocatorHeadV1       uint16 = 1
 	VersionPartitionCommitCopyV1 uint16 = 1
 	VersionTxnLeaseV1            uint16 = 1
+	VersionIdentitySchemeV1      uint16 = 1
 
 	envelopeMagic      = "SHOALCO\x00"
 	envelopeHeaderSize = len(envelopeMagic) + 2 + 2 + 4

@@ -123,6 +123,10 @@ type approverMappingFile struct {
 	Values         []string                 `json:"values"`
 	MaxValues      int                      `json:"max_values"`
 	HumanAssertion *approverHumanAssertJSON `json:"human_assertion"`
+	// IdentityClaim restates -oidc-identity-claim (#526). It must equal the
+	// flag segment for segment, byte for byte, whenever either is set, so
+	// the mapping digest pins the identity scheme approvers are named under.
+	IdentityClaim []string `json:"identity_claim"`
 }
 
 // approverHumanAssertJSON says what makes a token a human's: a claim that
@@ -149,7 +153,9 @@ type approverMapping struct {
 	values    map[string]struct{}
 	maxValues int
 	human     approverHumanAssertion
-	digest    auth.Digest
+	// identityClaim is the stable identity claim path (#526), or nil.
+	identityClaim []string
+	digest        auth.Digest
 }
 
 type approverHumanAssertion struct {
@@ -158,9 +164,10 @@ type approverHumanAssertion struct {
 }
 
 // loadApproverMapping reads and validates the operator file. issuer is the
-// trimmed -oidc-issuer and audiences the workspace audiences.
+// trimmed -oidc-issuer, audiences the workspace audiences and identityClaim
+// the parsed -oidc-identity-claim, or nil.
 func loadApproverMapping(
-	path string, issuer string, audiences []string,
+	path string, issuer string, audiences []string, identityClaim []string,
 ) (*approverMapping, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -174,7 +181,7 @@ func loadApproverMapping(
 	if len(raw) > approverMappingMaxBytes {
 		return nil, approverMappingInvalid("the file exceeds its size bound")
 	}
-	return parseApproverMapping(raw, issuer, audiences)
+	return parseApproverMapping(raw, issuer, audiences, identityClaim)
 }
 
 func approverMappingInvalid(reason string) error {
@@ -184,7 +191,7 @@ func approverMappingInvalid(reason string) error {
 }
 
 func parseApproverMapping(
-	raw []byte, issuer string, audiences []string,
+	raw []byte, issuer string, audiences []string, identityClaim []string,
 ) (*approverMapping, error) {
 	if !utf8.Valid(raw) {
 		return nil, approverMappingInvalid("the file is not UTF-8")
@@ -255,10 +262,23 @@ func parseApproverMapping(
 	human := approverHumanAssertion{
 		claim: humanClaim, equals: *file.HumanAssertion.Equals,
 	}
+	var mappedIdentityClaim []string
+	if file.IdentityClaim != nil {
+		mappedIdentityClaim, err = approverPath("identity_claim", file.IdentityClaim)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !sameClaimPath(mappedIdentityClaim, identityClaim) {
+		return nil, approverMappingInvalid(
+			"identity_claim must restate -oidc-identity-claim exactly, and " +
+				"be present exactly when the flag is set")
+	}
 	mapping := &approverMapping{
 		issuer: file.Issuer, audience: file.Audience,
 		clientIDs: clientIDs, claim: claim, values: values,
 		maxValues: file.MaxValues, human: human,
+		identityClaim: mappedIdentityClaim,
 	}
 	mapping.digest = mapping.computeDigest()
 	return mapping, nil
@@ -322,6 +342,20 @@ func approverPath(name string, segments []string) ([]string, error) {
 	return append([]string(nil), segments...), nil
 }
 
+// sameClaimPath compares two claim paths segment for segment, byte for byte.
+// nil and nil are the same; nil and any path are not.
+func sameClaimPath(left, right []string) bool {
+	if (left == nil) != (right == nil) || len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 // computeDigest is a canonical, length-framed digest of everything that
 // decides who is an approver. Set members are sorted, so reordering the file
 // does not move it; any change to what the mapping means does.
@@ -357,6 +391,12 @@ func (m *approverMapping) computeDigest() auth.Digest {
 	list(m.human.claim)
 	text("equals")
 	text(m.human.equals)
+	// Appended only when present, so a mapping without it keeps the digest
+	// every approval it decided was pinned to.
+	if m.identityClaim != nil {
+		text("identity_claim")
+		list(m.identityClaim)
+	}
 	return auth.DigestBytes(approverMappingDigestTag, buffer.Bytes())
 }
 
@@ -587,6 +627,16 @@ func (a *oidcAuthenticator) mintApprover(
 	// counts the request's actor as involved, so an approver minted with it
 	// overlapped every OIDC requester and no approval could succeed.
 	identity := shoal.ID(oidcIdentityPrefix + mapping.issuer + "#" + subject)
+	var identityClaimPath []string
+	if a.identityClaim != nil {
+		// The stable identity, through the one derivation the workspace
+		// branch also uses (#526). The raw sub stays in the provenance.
+		identity, _, err = a.stableIdentity(claims)
+		if err != nil {
+			return auth.Decision{}, err
+		}
+		identityClaimPath = append([]string(nil), a.identityClaim...)
+	}
 	return auth.NewDecision(auth.DecisionConfig{
 		Subject:             identity,
 		Actor:               identity,
@@ -606,9 +656,10 @@ func (a *oidcAuthenticator) mintApprover(
 		AuditPurpose:  oidcApproverAuditPurpose,
 		GrantProvenance: auth.GrantProvenance{
 			Issuer: mapping.issuer, Subject: subject,
-			ClaimPath:     append([]string(nil), mapping.claim...),
-			MatchedValue:  matched,
-			MappingDigest: mapping.digest,
+			ClaimPath:         append([]string(nil), mapping.claim...),
+			MatchedValue:      matched,
+			MappingDigest:     mapping.digest,
+			IdentityClaimPath: identityClaimPath,
 		},
 	})
 }
@@ -646,6 +697,12 @@ func approverSubjectTypesPublic(metadata oidcMetadata) bool {
 // discovery is a refusal. It is called at startup, so the server does not
 // start, and again on every approver mint against the cached discovery
 // document, so a mint can never rest on a check that did not happen.
+//
+// The subject-types statement is waived when, and only when, a stable
+// identity claim is configured (#526): identities then do not come from sub,
+// so whether sub is pairwise no longer decides independence. Discovery must
+// still be readable; an issuer whose discovery cannot be read is refused
+// either way.
 func (a *oidcAuthenticator) verifyApproverDiscovery(ctx context.Context) error {
 	if a == nil || a.approver == nil {
 		return nil
@@ -653,6 +710,9 @@ func (a *oidcAuthenticator) verifyApproverDiscovery(ctx context.Context) error {
 	metadata, err := a.keys.metadata.get(ctx, false)
 	if err != nil {
 		return errApproverSubjectTypes
+	}
+	if a.identityClaim != nil {
+		return nil
 	}
 	if !approverSubjectTypesPublic(metadata) {
 		return errApproverSubjectTypes

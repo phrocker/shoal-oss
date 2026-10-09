@@ -50,6 +50,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -62,6 +63,8 @@ type oidcApprovalWorld struct {
 	edit   func(*oidcConfig)
 	authn  atomic.Pointer[oidcAuthenticator]
 	digest atomic.Value // auth.Digest
+	// migrateFrom is -oidc-identity-scheme-migrate for the next open (#526).
+	migrateFrom coordination.Digest
 
 	// server is a real listener. Its handler is rebuilt for every request
 	// from the service currently open, so a restart (h.reopen) and a
@@ -83,7 +86,21 @@ func newOIDCApprovalWorld(
 	t *testing.T, edit func(*oidcConfig), registrant jwt.MapClaims,
 ) *oidcApprovalWorld {
 	t.Helper()
+	return newOIDCApprovalWorldWith(t, edit, registrant, nil, approverMappingDocument)
+}
+
+// newOIDCApprovalWorldWith is newOIDCApprovalWorld with the issuer's
+// discovery subject types (nil keeps ["public"]) and the mapping document
+// chosen by the caller.
+func newOIDCApprovalWorldWith(
+	t *testing.T, edit func(*oidcConfig), registrant jwt.MapClaims,
+	subjectTypes []string, document func(issuer string) map[string]any,
+) *oidcApprovalWorld {
+	t.Helper()
 	w := &oidcApprovalWorld{t: t, issuer: newFakeOIDCIssuer(t), edit: edit}
+	if subjectTypes != nil {
+		w.issuer.subjectTypes = subjectTypes
+	}
 	h := &approvalHarness{t: t, root: t.TempDir()}
 	h.clock.Store(time.Now().UTC().Add(time.Minute).Truncate(time.Second).UnixNano())
 	authority, err := auth.NewAuthorityWithClock(h.now)
@@ -94,7 +111,7 @@ func newOIDCApprovalWorld(
 	h.reader = &mutableFleetGeneration{}
 	h.reader.value.Store(workspacePolicyGeneration)
 	w.h = h
-	w.configure(approverMappingDocument(w.issuer.server.URL))
+	w.configure(document(w.issuer.server.URL))
 	h.mapping = func(context.Context) (auth.Digest, error) {
 		return w.digest.Load().(auth.Digest), nil
 	}
@@ -136,6 +153,11 @@ func (w *oidcApprovalWorld) configure(document map[string]any) {
 	authenticator := newTestOIDCAuthenticator(w.t, config)
 	w.authn.Store(authenticator)
 	w.digest.Store(authenticator.approverMappingDigest())
+	// The identity scheme the binary would stamp and enforce (#526), taking
+	// effect at the next open, as the mapping does.
+	w.h.scheme = &identitySchemeConfig{
+		scheme: authenticator.identityScheme(), migrateFrom: w.migrateFrom,
+	}
 }
 
 func (w *oidcApprovalWorld) sign(claims jwt.MapClaims) string {
@@ -346,6 +368,12 @@ func (w *oidcApprovalWorld) contextWire(deadline time.Time) map[string]any {
 
 func (w *oidcApprovalWorld) register(token string, id, parent shoal.ID) {
 	w.t.Helper()
+	w.registerWith(call{token: token}, id, parent)
+}
+
+// registerWith is register through the caller's authenticator.
+func (w *oidcApprovalWorld) registerWith(caller call, id, parent shoal.ID) {
+	w.t.Helper()
 	descriptor := map[string]any{
 		"id":                   b64([]byte(id)),
 		"authorization_domain": workspaceAuthorizationDomain,
@@ -359,7 +387,7 @@ func (w *oidcApprovalWorld) register(token string, id, parent shoal.ID) {
 	if parent != "" {
 		descriptor["parent_id"] = b64([]byte(parent))
 	}
-	got := w.post(call{token: token}, "/api/v1/fleet/agents", map[string]any{
+	got := w.post(caller, "/api/v1/fleet/agents", map[string]any{
 		"context":          w.contextWire(w.h.now().Add(time.Minute)),
 		"registration_key": b64([]byte("registration-" + string(id))),
 		"descriptor":       descriptor,
