@@ -43,7 +43,7 @@ def fit_head(embeddings, labels, l2=1e-3):
     import numpy as np
     matrix = np.asarray(embeddings, dtype=float)
     target = np.asarray(labels, dtype=float)
-    if matrix.ndim != 2 or target.shape != (matrix.shape[0],) or matrix.shape[0] < 2 or len(set(target.tolist())) != 2:
+    if matrix.ndim != 2 or matrix.shape[1] == 0 or matrix.shape[1] > 8192 or target.shape != (matrix.shape[0],) or matrix.shape[0] < 2 or len(set(target.tolist())) != 2:
         raise ValueError('invalid embedding training shape')
     if not np.isfinite(matrix).all() or not np.isfinite(target).all() or l2 <= 0:
         raise ValueError('invalid embedding values')
