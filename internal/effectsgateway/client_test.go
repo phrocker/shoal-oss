@@ -220,13 +220,15 @@ func (c *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 // answers, which the real handler cannot be made to produce on demand; the
 // wire shapes themselves are pinned against the real handler.
 type scriptedTransport struct {
-	replies []func() (*http.Response, error)
-	bodies  [][]byte
+	replies  []func() (*http.Response, error)
+	bodies   [][]byte
+	requests []string // method and path of every request, in order
 }
 
 func (s *scriptedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	body, _ := io.ReadAll(request.Body)
 	s.bodies = append(s.bodies, body)
+	s.requests = append(s.requests, request.Method+" "+request.URL.Path)
 	if len(s.replies) == 0 {
 		return nil, errors.New("script exhausted")
 	}
@@ -469,6 +471,65 @@ func TestCompleteRecoversOnlyWhatTheResendConfirms(t *testing.T) {
 		}
 		if row.kind == DispatchRecordedOtherwise && action.State == "" {
 			t.Errorf("%s: recorded_otherwise without the committed record", row.name)
+		}
+	}
+}
+
+// A server with #547 answers the completion of a reported failure, and of a
+// success it records otherwise, with 200 and the committed record. The client
+// takes that record from the one answer: exactly one completion request, no
+// resend, no read. (The wire shape against the real handler is pinned in
+// cmd/shoal-explore-web, TestEffectsGatewayClientRecordsAFailureInOneRequest.)
+//
+// The pre-#547 answer — 500 or 400 while the record committed — still
+// converges through the resend: see "#492 workaround: 500 then the recorded
+// failure" and "success recorded as failed" in
+// TestCompleteRecoversOnlyWhatTheResendConfirms.
+func TestCompleteTakesARecordedOutcomeFromOneRequest(t *testing.T) {
+	for _, row := range []struct {
+		name       string
+		completion Completion
+		record     string
+		kind       DispatchErrorKind
+		state      fleet.DispatchState
+		code       string
+	}{
+		{"reported failure", Completion{ExpectedVersion: 2, ClaimID: []byte("claim"), Failed: true,
+			ErrorCode: TargetRejected(422)},
+			committed(t, 3, fleet.DispatchFailed, "target_rejected_422", ""),
+			"", fleet.DispatchFailed, "target_rejected_422"},
+		{"success recorded otherwise", Completion{ExpectedVersion: 2, ClaimID: []byte("claim"),
+			Output: json.RawMessage(`{"status":200}`)},
+			committed(t, 3, fleet.DispatchFailed, "invalid_executor_output", ""),
+			DispatchRecordedOtherwise, fleet.DispatchFailed, "invalid_executor_output"},
+	} {
+		transport := &scriptedTransport{replies: []func() (*http.Response, error){
+			reply(200, row.record),
+			// Anything past the first answer is a resend or a read, which
+			// this test exists to rule out; these keep such a request from
+			// failing for a different reason.
+			reply(200, row.record), reply(200, row.record),
+		}}
+		base, _ := url.Parse("https://explorer.invalid")
+		client, err := NewDispatchClient(base, &http.Client{Transport: transport},
+			func() (string, error) { return "token", nil }, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		completion := row.completion
+		completion.Context = RequestContext{RequestID: []byte("r"), ReasonCode: "gateway_complete",
+			Deadline: time.Now().Add(time.Minute)}
+		action, err := client.Complete(context.Background(), []byte("action"), completion)
+		want := "POST /api/v1/fleet/actions/" + base64.RawURLEncoding.EncodeToString([]byte("action")) + "/complete"
+		if len(transport.requests) != 1 || transport.requests[0] != want {
+			t.Errorf("%s: requests %q, want exactly [%q]", row.name, transport.requests, want)
+		}
+		if DispatchKind(err) != row.kind {
+			t.Errorf("%s: %v (kind %q), want kind %q", row.name, err, DispatchKind(err), row.kind)
+		}
+		if !bytes.Equal(action.ID, []byte("action")) || !bytes.Equal(action.ClaimID, []byte("claim")) ||
+			action.Version != 3 || action.State != row.state || action.ErrorCode != row.code {
+			t.Errorf("%s: returned %#v, want the committed record", row.name, action)
 		}
 	}
 }

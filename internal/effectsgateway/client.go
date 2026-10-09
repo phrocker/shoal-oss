@@ -591,8 +591,8 @@ type Completion struct {
 //
 //   - a resend answered by a transport error, any 503, or a 502 or 504 is
 //     DispatchIndeterminate;
-//   - a resend answered by anything else that is not a record — 409, 404, the
-//     #492 400/500, a 2xx that is not this report's record, or any other
+//   - a resend answered by anything else that is not a record — 409, 404, a
+//     400/500, a 2xx that is not this report's record, or any other
 //     status — is followed by one third read
 //     through the replay branch, and anything but a record is
 //     DispatchIndeterminate.
@@ -610,16 +610,20 @@ type Completion struct {
 // A resend answered 400 or 500 is not definite either (#492): the first
 // attempt may have committed, or — if the first answer was a genuine error
 // that committed nothing — the resend may have committed and had its record
-// discarded. So the record is read a third time through the replay branch,
-// and anything but a record is DispatchIndeterminate.
+// discarded by a server before #547. So the record is read a third time
+// through the replay branch, and anything but a record is
+// DispatchIndeterminate.
 //
-// The 400 and 500 triggers are a workaround for #492, to be removed when it
-// lands. On main, CompleteClaim returns the committed record together with an
-// error for a reported failure ("remote executor reported failure") and for a
-// success whose output the explorer refuses (recorded as failed,
-// invalid_executor_output), and the /complete handler discards the record and
-// answers 500 and 400 respectively — a terminal record that was durably
-// written, indistinguishable from a refusal that wrote nothing.
+// The 400 and 500 triggers exist for servers before #547 (#492). There, the
+// /complete handler discarded the committed record of a reported failure and
+// of a success whose output the explorer refuses (recorded as failed,
+// invalid_executor_output) and answered 500 and 400 — a durably written
+// terminal record, indistinguishable from a refusal that wrote nothing. A
+// current server answers both with 200 and the committed record, so they
+// complete in one request. A gateway cannot tell which server it talks to, so
+// the triggers stay; the cost is that a genuine 400 or 500 refusal from a
+// current server still takes the three-request path and ends
+// DispatchIndeterminate.
 //
 // When the committed record is terminal under this claim but differs from
 // what was reported — state, error code, or output — Complete returns it
@@ -703,7 +707,7 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 			return Action{}, unconfirmed(err)
 		default:
 			// Not a record, and not definite after a possibly-committed
-			// first answer. For the #492 400/500 (workaround): whatever
+			// first answer. For a 400/500 (pre-#547 servers): whatever
 			// preceded it — a lost response, or a 400/500 that may have been
 			// a genuine error committing nothing — this resend may itself
 			// have committed the report and then had its record discarded.
@@ -726,10 +730,11 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 	return action, nil
 }
 
-// hidesCommittedRecord is the #492 shape: a 400 or 500 from /complete may be
-// a terminal record that was written and then discarded by the handler.
-// Workaround for #492; remove when the handler returns the committed record
-// it is given alongside an error.
+// hidesCommittedRecord is the #492 shape: from a server before #547, a 400 or
+// 500 from /complete may be a terminal record that was written and then
+// discarded by the handler. A current server answers those outcomes 200 with
+// the record, but the gateway cannot tell the generations apart, so this
+// stays.
 func hidesCommittedRecord(err error) bool {
 	var dispatchErr *DispatchError
 	return errors.As(err, &dispatchErr) &&
