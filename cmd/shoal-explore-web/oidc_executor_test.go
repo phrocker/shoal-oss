@@ -706,3 +706,113 @@ func TestExecutorMappingDigestPinsTheMapping(t *testing.T) {
 		}
 	}
 }
+
+// TestAnExecutorCredentialIsNeverAHuman is the #626 review finding: with the
+// executor issuer equal to the human issuer (an Entra workload identity shares
+// the tenant issuer), a mapped service account's token sent to the workspace
+// audience was minted as a reader. Both human branches now refuse a token
+// that (a) satisfies the executor service assertion, or (b) names a mapped
+// executor subject of the executor issuer. Each rule is exercised alone.
+func TestAnExecutorCredentialIsNeverAHuman(t *testing.T) {
+	human := newFakeOIDCIssuer(t)
+	now := time.Now()
+	shared := newTestOIDCAuthenticator(t, executorTestConfig(
+		t, human, human, fixedClock(now), executorMappingDocument(human.server.URL)))
+	sign := func(claims jwt.MapClaims) *http.Request {
+		return bearerRequest(human.signRS256(t, testKID, claims))
+	}
+	refused := func(t *testing.T, authenticator *oidcAuthenticator, name string, request *http.Request) {
+		t.Helper()
+		if _, err := authenticator.authenticate(request); !errors.Is(err, errExecutorOnHumanBranch) {
+			t.Fatalf("%s = %v, want the executor-on-a-human-branch refusal", name, err)
+		}
+		if _, err := authenticator.Authenticate(request); err == nil ||
+			err.Error() != oidcDenied().Error() {
+			t.Fatalf("%s: Authenticate = %v, want the generic denial", name, err)
+		}
+	}
+	// workspace is the reviewer's scratch case: the executor's own claims,
+	// re-addressed to the workspace audience, with a reader mapping and a
+	// granted label group.
+	workspace := func(subject string, assertion bool) jwt.MapClaims {
+		claims := executorClaims(human, now, subject)
+		claims["aud"] = []string{testAudience}
+		claims["access"] = []string{"reader"}
+		claims["groups"] = []string{labelGroupSecret}
+		if !assertion {
+			delete(claims, "kubernetes.io")
+		}
+		return claims
+	}
+	approver := func(subject string, assertion bool) jwt.MapClaims {
+		claims := approverClaims(human, now, subject)
+		if assertion {
+			claims["kubernetes.io"] = map[string]any{"namespace": testExecutorNamespace}
+		}
+		return claims
+	}
+	const stranger = "system:serviceaccount:shoal:not-mapped"
+
+	refused(t, shared, "the scratch case: assertion and mapped sub, workspace audience",
+		sign(workspace(testExecutorSubject, true)))
+	refused(t, shared, "the same on the approver audience",
+		sign(approver(testExecutorSubject, true)))
+	// (a) alone: the assertion, an unmapped sub.
+	refused(t, shared, "the assertion alone, workspace", sign(workspace(stranger, true)))
+	refused(t, shared, "the assertion alone, approver", sign(approver(stranger, true)))
+	// (b) alone: a mapped sub of the shared issuer, no assertion.
+	refused(t, shared, "a mapped sub alone, workspace", sign(workspace(testExecutorSubject, false)))
+	refused(t, shared, "a mapped sub alone, approver", sign(approver(testExecutorSubject, false)))
+
+	// A normal human still works on both branches.
+	if decision, err := shared.Authenticate(sign(human.defaultClaims(now))); err != nil ||
+		decision.Subject() != shoal.ID("oidc:"+human.server.URL+"#"+testSubject) {
+		t.Fatalf("a reader = %v", err)
+	}
+	if _, err := shared.Authenticate(sign(approverClaims(human, now, "bob"))); err != nil {
+		t.Fatalf("an approver = %v", err)
+	}
+
+	// (b) is per issuer: with a separate executor issuer, a human of the
+	// human issuer whose sub happens to spell a mapped subject is a human.
+	// (a) still holds across issuers.
+	f := newExecutorFixture(t)
+	claims := f.human.defaultClaims(f.now)
+	claims["sub"] = testExecutorSubject
+	if _, err := f.authn.Authenticate(bearerRequest(f.human.signRS256(t, testKID, claims))); err != nil {
+		t.Fatalf("a human whose sub spells another issuer's executor = %v", err)
+	}
+	claims["kubernetes.io"] = map[string]any{"namespace": testExecutorNamespace}
+	refused(t, f.authn, "the assertion on a human-issuer token",
+		bearerRequest(f.human.signRS256(t, testKID, claims)))
+}
+
+// TestRunRefusesAnExecutorMappingToAnUnconfiguredReference: the binary, like
+// the chart, refuses at startup a mapping entry whose executor_ref the host
+// does not configure, naming its position and not its value. The same
+// mapping starts once every reference is configured.
+func TestRunRefusesAnExecutorMappingToAnUnconfiguredReference(t *testing.T) {
+	mapping := writeExecutorMapping(t, executorMappingDocument("https://cluster.example.test"))
+	args := func(refs string) []string {
+		return []string{
+			"-listen", "127.0.0.1:0", "-data", t.TempDir(),
+			"-oidc-issuer", "https://issuer.example.test",
+			"-oidc-audience", testAudience,
+			"-oidc-authorization-claim", "access",
+			"-oidc-reader-values", "reader",
+			"-oidc-executor-mapping-file", mapping,
+			"-fleet-executor-refs", refs,
+		}
+	}
+	err := runBounded(t, args(testExecutorRef))
+	if err == nil || !strings.Contains(err.Error(),
+		"executors[1].executor_ref is not configured by -fleet-executor-refs") {
+		t.Fatalf("a mapping naming an unconfigured reference = %v", err)
+	}
+	if strings.Contains(err.Error(), testOtherExecutorRef) {
+		t.Fatalf("the refusal %q echoes the reference", err)
+	}
+	if err := runBounded(t, args(testExecutorRef+","+testOtherExecutorRef)); err != nil {
+		t.Fatalf("a mapping naming configured references = %v", err)
+	}
+}

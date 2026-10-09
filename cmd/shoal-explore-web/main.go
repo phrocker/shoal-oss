@@ -618,6 +618,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 					"would let one human approve their own request): %w",
 				listener.Addr(), err)
 		}
+		// Every mapped executor reference must be one this host configures.
+		if err := oidcAuthenticator.refuseUnconfiguredExecutorRefs(executors); err != nil {
+			listener.Close()
+			return err
+		}
 		approverMapping = oidcAuthenticator.approverMappingDigest()
 		labelGrantsDigest, labelGrantCount = oidcAuthenticator.labelGrantsDigest()
 		executorMappingDigest, executorCount = oidcAuthenticator.executorMappingDigest()

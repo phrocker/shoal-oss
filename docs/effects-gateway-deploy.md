@@ -182,6 +182,30 @@ position, never its value.
 | `service_assertion` | Required, and positive: a claim path (a list of segments; a dotted string is one key, never a path) that must equal `equals` exactly. For projected ServiceAccount tokens, use the namespace claim `["kubernetes.io", "namespace"]`. For an IdP client-credentials token, use a marker such as Auth0's `["gty"]` = `client-credentials`. "Absent" is not an accepted form, because absence proves nothing about who a token was issued to. |
 | `executors` | 1 to 256 `{subject, executor_ref}` entries. A subject is compared byte for byte with the token's `sub`: no trimming, case folding or normalization. `executor_ref` must pass `executorref.ValidExecutorRef`. Subjects are unique and references are unique: one credential maps to one surface, and one surface has one credential. |
 
+**Choose a service assertion no human token can ever carry.** Good choices:
+- Kubernetes: the ServiceAccount claim `["kubernetes.io", "namespace"]`, or
+  `["kubernetes.io", "serviceaccount", "name"]`.
+- Entra: `["idtyp"]` = `app`. Entra sets it only on app-only tokens.
+
+Never assert a claim a user can be given, such as a group, a role or a
+scope. The assertion separates the two kinds of principal in both
+directions.
+
+**One principal is never both a human and an executor.** While the mapping is
+configured, the workspace and approver branches refuse any token that either:
+- (a) satisfies the service assertion, whichever issuer signed it; or
+- (b) is from the executor issuer and has a `sub` the mapping names.
+
+Both refusals are the generic `401`. The rule matters most when the mapping
+names `-oidc-issuer` itself, which is allowed on purpose: Entra workload
+identities share the tenant issuer with humans. Without the rule, a mapped
+service principal's token sent to the workspace audience would be minted as
+a reader, with any label grant its claims match. With it, that token is
+refused there and works only on the executor audience. A human of a
+*different* issuer whose `sub` happens to spell a mapped subject is
+unaffected by (b), but is still refused by (a) if their token carries the
+assertion.
+
 The second issuer gets its own discovery and JWKS cache, separate from the
 human issuer's. Both issuers may publish a key under the same `kid`. A key
 from one issuer still never verifies a token the other issuer's parser
@@ -220,6 +244,13 @@ true:
 - the service assertion fails;
 - its `sub` is not mapped;
 - it is signed by any key other than the executor issuer's.
+
+The human branches refuse an executor's credential as described under "The
+mapping file". At startup the explorer also refuses a mapping entry whose
+`executor_ref` is not among `-fleet-executor-refs`, naming the entry's
+position. Every external reference must already be in that list. No
+descriptor could register against such a reference, so the credential would
+be bound to nothing.
 
 Every refusal is the same generic `401`. At startup the explorer prints the
 mapping digest and the number of executor credentials it holds.

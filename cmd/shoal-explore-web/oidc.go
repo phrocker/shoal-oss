@@ -880,9 +880,10 @@ func (a *oidcAuthenticator) authenticate(
 	if _, err := a.parser.ParseWithClaims(raw, claims, keyFunc); err != nil {
 		return auth.Decision{}, err
 	}
-	// Unreachable through the routing above, and kept so that a change
-	// to it cannot let a token carrying the executor audience be minted
-	// as a human.
+	// The executor audience is unreachable here through the routing above,
+	// and is refused anyway; an executor's credential sent to a human
+	// audience (by its service assertion, or its mapped subject of the
+	// executor issuer) is refused on both human branches.
 	if a.executor != nil {
 		if err := a.executor.refuseOnHumanBranch(claims); err != nil {
 			return auth.Decision{}, err

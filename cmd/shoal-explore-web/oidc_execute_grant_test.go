@@ -4,10 +4,19 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"go/ast"
+	"go/constant"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -101,60 +110,22 @@ func TestExecuteComesOnlyFromTheExecutorMint(t *testing.T) {
 			oidcExecutorOperations)
 	}
 
-	// In source: the identifier auth.OperationExecute appears in this
-	// command's non-test code only inside the oidcExecutorOperations
-	// declaration. A grant built anywhere else — a new list, an append, a
-	// literal in a DecisionConfig — fails here.
-	files := token.NewFileSet()
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatal(err)
+	// In source, resolved by go/types: no expression in this command's
+	// non-test code denotes execute — auth.OperationExecute through any
+	// import name (an alias, a dot import), or any constant of type
+	// auth.Operation equal to "execute", such as auth.Operation("execute")
+	// — except inside the oidcExecutorOperations declaration, where it
+	// appears once.
+	scanner := newExecuteGrantScanner(t)
+	files := scanner.parseDir(t, ".")
+	inside, outside := scanner.sites(t, files)
+	for _, site := range outside {
+		t.Errorf("%s denotes OperationExecute outside oidcExecutorOperations; "+
+			"the executor mint is the only source of execute", site)
 	}
-	found := 0
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") ||
-			strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		parsed, err := parser.ParseFile(files, name, nil, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var inside []ast.Node
-		ast.Inspect(parsed, func(node ast.Node) bool {
-			if spec, ok := node.(*ast.ValueSpec); ok {
-				for _, identifier := range spec.Names {
-					if identifier.Name == "oidcExecutorOperations" {
-						inside = append(inside, spec)
-					}
-				}
-			}
-			return true
-		})
-		ast.Inspect(parsed, func(node ast.Node) bool {
-			selector, ok := node.(*ast.SelectorExpr)
-			if !ok || selector.Sel.Name != "OperationExecute" {
-				return true
-			}
-			if pkg, ok := selector.X.(*ast.Ident); !ok || pkg.Name != "auth" {
-				return true
-			}
-			for _, spec := range inside {
-				if selector.Pos() >= spec.Pos() && selector.End() <= spec.End() {
-					found++
-					return true
-				}
-			}
-			t.Errorf("%s uses auth.OperationExecute outside "+
-				"oidcExecutorOperations; the executor mint is the only "+
-				"source of execute", files.Position(selector.Pos()))
-			return true
-		})
-	}
-	if found != 1 {
-		t.Fatalf("auth.OperationExecute appears %d times in "+
-			"oidcExecutorOperations, want once", found)
+	if inside != 1 {
+		t.Fatalf("execute appears %d times in oidcExecutorOperations, want once",
+			inside)
 	}
 
 	// In behaviour: every kind of token this authenticator mints, with
@@ -220,5 +191,193 @@ func TestExecuteComesOnlyFromTheExecutorMint(t *testing.T) {
 	if _, err := plain.Authenticate(bearerRequest(
 		f.human.signRS256(t, testKID, claims))); err == nil {
 		t.Fatal("an executor-audience token was minted with no executor mapping")
+	}
+}
+
+// authPackagePath is the import path of the package that defines
+// OperationExecute.
+const authPackagePath = "github.com/phrocker/shoal-oss/pkg/explorer/auth"
+
+// executeGrantScanner type-checks this command's sources against the
+// compiler's export data, so an expression is judged by what it denotes and
+// not by how it is spelled.
+type executeGrantScanner struct {
+	fset     *token.FileSet
+	importer types.Importer
+}
+
+func newExecuteGrantScanner(t *testing.T) *executeGrantScanner {
+	t.Helper()
+	command := exec.Command("go", "list", "-export", "-deps", "-json=ImportPath,Export", ".")
+	command.Stderr = io.Discard
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("go list -export: %v", err)
+	}
+	exports := map[string]string{}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	for {
+		var entry struct{ ImportPath, Export string }
+		if err := decoder.Decode(&entry); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		exports[entry.ImportPath] = entry.Export
+	}
+	if exports[authPackagePath] == "" {
+		t.Fatalf("no export data for %s", authPackagePath)
+	}
+	fset := token.NewFileSet()
+	return &executeGrantScanner{
+		fset: fset,
+		importer: importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
+			file, ok := exports[path]
+			if !ok || file == "" {
+				return nil, errors.New("no export data for " + path)
+			}
+			return os.Open(file)
+		}),
+	}
+}
+
+// parseDir parses the non-test Go files of dir.
+func (s *executeGrantScanner) parseDir(t *testing.T, dir string) []*ast.File {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []*ast.File
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") ||
+			strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(s.fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, parsed)
+	}
+	return files
+}
+
+// sites type-checks files as one package and returns how many outermost
+// expressions denoting execute lie inside an oidcExecutorOperations
+// declaration, and the positions of those that lie anywhere else.
+func (s *executeGrantScanner) sites(t *testing.T, files []*ast.File) (int, []string) {
+	t.Helper()
+	info := &types.Info{
+		Types: map[ast.Expr]types.TypeAndValue{},
+		Uses:  map[*ast.Ident]types.Object{},
+	}
+	config := types.Config{Importer: s.importer}
+	if _, err := config.Check("main", s.fset, files, info); err != nil {
+		t.Fatalf("type-check: %v", err)
+	}
+	denotesExecute := func(expression ast.Expr) bool {
+		if identifier, ok := expression.(*ast.Ident); ok {
+			if object, ok := info.Uses[identifier].(*types.Const); ok &&
+				object.Pkg() != nil && object.Pkg().Path() == authPackagePath &&
+				object.Name() == "OperationExecute" {
+				return true
+			}
+		}
+		if selector, ok := expression.(*ast.SelectorExpr); ok {
+			if object, ok := info.Uses[selector.Sel].(*types.Const); ok &&
+				object.Pkg() != nil && object.Pkg().Path() == authPackagePath &&
+				object.Name() == "OperationExecute" {
+				return true
+			}
+		}
+		value, ok := info.Types[expression]
+		if !ok || value.Value == nil || value.Value.Kind() != constant.String ||
+			constant.StringVal(value.Value) != string(auth.OperationExecute) {
+			return false
+		}
+		named, ok := value.Type.(*types.Named)
+		return ok && named.Obj().Pkg() != nil &&
+			named.Obj().Pkg().Path() == authPackagePath &&
+			named.Obj().Name() == "Operation"
+	}
+	inside := 0
+	var outside []string
+	for _, file := range files {
+		var allowed []ast.Node
+		ast.Inspect(file, func(node ast.Node) bool {
+			if spec, ok := node.(*ast.ValueSpec); ok {
+				for _, identifier := range spec.Names {
+					if identifier.Name == "oidcExecutorOperations" {
+						allowed = append(allowed, spec)
+					}
+				}
+			}
+			return true
+		})
+		ast.Inspect(file, func(node ast.Node) bool {
+			expression, ok := node.(ast.Expr)
+			if !ok || !denotesExecute(expression) {
+				return true
+			}
+			for _, spec := range allowed {
+				if expression.Pos() >= spec.Pos() && expression.End() <= spec.End() {
+					inside++
+					return false
+				}
+			}
+			outside = append(outside, s.fset.Position(expression.Pos()).String())
+			return false
+		})
+	}
+	return inside, outside
+}
+
+// TestTheExecuteGrantScannerSeesThroughSpelling is the scanner's own
+// mutation check: an aliased import, a dot import, a conversion of the
+// string "execute", a local typed constant and an untyped literal passed as
+// an auth.Operation are each found outside the list.
+func TestTheExecuteGrantScannerSeesThroughSpelling(t *testing.T) {
+	scanner := newExecuteGrantScanner(t)
+	for name, source := range map[string]string{
+		"aliased import": `package main
+import a "` + authPackagePath + `"
+var granted = []a.Operation{a.OperationExecute}`,
+		"dot import": `package main
+import . "` + authPackagePath + `"
+var granted = []Operation{OperationExecute}`,
+		"conversion": `package main
+import "` + authPackagePath + `"
+var granted = []auth.Operation{auth.Operation("execute")}`,
+		"local typed constant": `package main
+import "` + authPackagePath + `"
+const run auth.Operation = "execute"
+var granted = []auth.Operation{run}`,
+		"untyped literal": `package main
+import "` + authPackagePath + `"
+var granted = append([]auth.Operation(nil), "execute")`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := parser.ParseFile(scanner.fset, name+".go", source, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, outside := scanner.sites(t, []*ast.File{parsed}); len(outside) == 0 {
+				t.Fatal("the scanner did not see execute")
+			}
+		})
+	}
+	// Control: the same shapes inside oidcExecutorOperations are allowed,
+	// and an unrelated "execute" string is not execute.
+	parsed, err := parser.ParseFile(scanner.fset, "control.go", `package main
+import a "`+authPackagePath+`"
+var oidcExecutorOperations = []a.Operation{a.Operation("execute")}
+var label = "execute"`, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inside, outside := scanner.sites(t, []*ast.File{parsed}); inside != 1 || len(outside) != 0 {
+		t.Fatalf("control: inside %d, outside %v", inside, outside)
 	}
 }

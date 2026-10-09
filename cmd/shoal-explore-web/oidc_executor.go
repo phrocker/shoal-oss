@@ -93,6 +93,11 @@ var (
 	// errExecutorNotService is returned when the service assertion fails.
 	errExecutorNotService = shoal.NewError(
 		shoal.ErrorUnauthorized, "executor token is not a service's")
+	// errExecutorOnHumanBranch is returned for a token on a workspace or
+	// approver audience that satisfies the executor service assertion or
+	// names a mapped executor subject of the executor issuer.
+	errExecutorOnHumanBranch = shoal.NewError(
+		shoal.ErrorUnauthorized, "an executor credential is not a human's")
 	// errExecutorUnmapped is returned when the subject maps to no executor.
 	errExecutorUnmapped = shoal.NewError(
 		shoal.ErrorUnauthorized, "executor token subject is not mapped")
@@ -132,7 +137,10 @@ type executorMapping struct {
 	jwksURI   string
 	assertion executorServiceAssertion
 	// refs maps an exact subject to its executor reference.
-	refs   map[string]string
+	refs map[string]string
+	// order is the references in file order, so a startup refusal can name
+	// an entry's position.
+	order  []string
 	digest auth.Digest
 }
 
@@ -226,6 +234,7 @@ func parseExecutorMapping(
 		return nil, executorMappingInvalid("executors exceeds its bound")
 	}
 	refs := make(map[string]string, len(file.Executors))
+	order := make([]string, 0, len(file.Executors))
 	bound := make(map[string]struct{}, len(file.Executors))
 	for index, entry := range file.Executors {
 		// Positions, never values: a refusal must not echo a subject or a
@@ -260,13 +269,14 @@ func parseExecutorMapping(
 		}
 		refs[subject] = ref
 		bound[ref] = struct{}{}
+		order = append(order, ref)
 	}
 	mapping := &executorMapping{
 		issuer: file.Issuer, audience: file.Audience, jwksURI: file.JWKSURI,
 		assertion: executorServiceAssertion{
 			claim: claim, equals: *file.ServiceAssertion.Equals,
 		},
-		refs: refs,
+		refs: refs, order: order,
 	}
 	mapping.digest = mapping.computeDigest()
 	return mapping, nil
@@ -433,7 +443,8 @@ func (e *oidcExecutorBranch) addressed(raw string) bool {
 }
 
 // refuseOnHumanBranch refuses a verified human-issuer token that also carries
-// the executor audience.
+// the executor audience, or that is an executor's token by its service
+// assertion or its mapped subject.
 func (e *oidcExecutorBranch) refuseOnHumanBranch(claims jwt.MapClaims) error {
 	audiences, err := claims.GetAudience()
 	if err != nil {
@@ -442,6 +453,23 @@ func (e *oidcExecutorBranch) refuseOnHumanBranch(claims jwt.MapClaims) error {
 	for _, audience := range audiences {
 		if audience == e.mapping.audience {
 			return errExecutorAudienceConfusion
+		}
+	}
+	// One principal cannot be both a human and an executor. A token on a
+	// human audience that carries the executor service assertion, or whose
+	// issuer is the executor issuer and whose sub is a mapped executor, is
+	// refused here, on the workspace and approver branches alike. Without
+	// this, a mapped service account of a shared issuer (an Entra workload
+	// identity on the tenant issuer) sending its token to the workspace
+	// audience would be minted as a reader, and with label grants.
+	if e.mapping.assertion.holds(claims) == nil {
+		return errExecutorOnHumanBranch
+	}
+	if issuer, err := claims.GetIssuer(); err == nil && issuer == e.mapping.issuer {
+		if subject, ok := claims["sub"].(string); ok {
+			if _, mapped := e.mapping.refs[subject]; mapped {
+				return errExecutorOnHumanBranch
+			}
 		}
 	}
 	return nil
@@ -554,6 +582,30 @@ func (a *oidcAuthenticator) mintExecutor(
 			MappingDigest: mapping.digest,
 		},
 	})
+}
+
+// refuseUnconfiguredExecutorRefs refuses a mapping that binds a credential to
+// a reference this host does not configure (-fleet-executor-refs, which every
+// external reference must also appear in). No descriptor can register
+// against such a reference, so the credential would be bound to nothing: an
+// operator error worth refusing at startup rather than a worker that pulls
+// an empty queue forever. The refusal names the entry's position, never the
+// reference.
+func (a *oidcAuthenticator) refuseUnconfiguredExecutorRefs(
+	executors configuredFleetExecutors,
+) error {
+	if a == nil || a.executor == nil {
+		return nil
+	}
+	for index, ref := range a.executor.mapping.order {
+		if _, configured := executors.ResolveExecutor(ref); !configured {
+			return executorMappingInvalid(fmt.Sprintf(
+				"executors[%d].executor_ref is not configured by "+
+					"-fleet-executor-refs: no descriptor can register against "+
+					"it, so the credential would be bound to nothing", index))
+		}
+	}
+	return nil
 }
 
 // executorMappingDigest returns the in-force executor mapping digest and its
