@@ -27,10 +27,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -201,17 +201,32 @@ func correlationIDFor(
 			return validateSuppliedCorrelationID(values[0])
 		}
 	}
-	return newCorrelationID(prefix)
+	generated, err := newCorrelationID(prefix)
+	if err != nil {
+		return "", err
+	}
+	// The generated value meets the same rule a supplied one does, so every
+	// correlation a decision carries is one the interaction audit records.
+	if err := interaction.ValidateCorrelationID(generated); err != nil {
+		return "", shoal.WrapError(shoal.ErrorInternal,
+			"generated correlation ID is not recordable", err)
+	}
+	return generated, nil
 }
 
 // validateSuppliedCorrelationID refuses a caller's value that this process
 // would not want in an audit record.
 //
-// shoal.ValidateRequiredID checks emptiness and the byte bound and nothing
-// about the characters, so the printable check is explicit here for the same
-// reason the ambiguity target's is: the value is caller-controlled and reaches
-// a durable record that something eventually renders, where a control
-// character is at best unreadable and at worst a terminal escape.
+// The character rule is interaction.ValidateCorrelationID, the same function
+// the interaction session boundary applies (#532), so one rule governs what is
+// minted and what is recorded. Its own loop here once ranged over the string,
+// which turns an invalid UTF-8 byte into U+FFFD — printable — so a header
+// net/http accepts as obs-text passed the mint, reached the approval and
+// action records raw, and was then silently dropped from the audit session.
+// The value is caller-controlled and reaches durable records that something
+// eventually renders, where a control character is at best unreadable and at
+// worst a terminal escape. Only the header-specific checks — padding and
+// emptiness — are made here.
 func validateSuppliedCorrelationID(value string) (shoal.ID, error) {
 	id := shoal.ID(strings.TrimSpace(value))
 	if string(id) != value {
@@ -222,12 +237,8 @@ func validateSuppliedCorrelationID(value string) (shoal.ID, error) {
 	if err := shoal.ValidateRequiredID("correlation ID", id); err != nil {
 		return "", err
 	}
-	for _, candidate := range string(id) {
-		if !unicode.IsPrint(candidate) || candidate == ' ' {
-			return "", shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"correlation ID must be printable and contain no spaces")
-		}
+	if err := interaction.ValidateCorrelationID(id); err != nil {
+		return "", err
 	}
 	return id, nil
 }

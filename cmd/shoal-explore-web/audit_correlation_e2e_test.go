@@ -10,9 +10,12 @@ package main
 // what the shipped authenticator mints.
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
+	"io/fs"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -161,8 +164,10 @@ func TestGeneratedCorrelationAppearsOnTheAudit(t *testing.T) {
 	decision := w.decisionRecord(request.id)
 	held, decided := decision.Request.CorrelationID, decision.DecisionCorrelationID
 	for _, generated := range []shoal.ID{held, decided} {
-		if !strings.HasPrefix(string(generated), "oidc-correlation-") {
-			t.Fatalf("correlation %q was not generated", generated)
+		if !strings.HasPrefix(string(generated), "oidc-correlation-") ||
+			interaction.ValidateCorrelationID(generated) != nil {
+			t.Fatalf("correlation %q was not generated, or is not recordable",
+				generated)
 		}
 	}
 
@@ -184,4 +189,118 @@ func TestGeneratedCorrelationAppearsOnTheAudit(t *testing.T) {
 			returned)
 	}
 	assertCorrelation(t, action, returned)
+}
+
+// TestNonUTF8CorrelationIsRefusedAtTheEdge: net/http admits a header byte
+// above 0x7f as obs-text, and #527's printable check ranged over the string,
+// where such a byte decodes to U+FFFD and passes. Such a value reached the
+// approval and action records raw and was then dropped from the audit
+// session. The mint now applies the session boundary's own rule
+// (interaction.ValidateCorrelationID), so the header is refused at
+// authentication on every hop of the approval route.
+//
+// A 401 alone would not show the bytes went nowhere, so after the whole route
+// has run, the approval records, the action record, every interaction session
+// and every file under the data root are searched for them, raw and as the
+// U+FFFD a lossy decoder would have made of them. The control threads a valid
+// header through the same route end to end — hold, decide, materialize — so
+// the tightening has not closed the ordinary path.
+func TestNonUTF8CorrelationIsRefusedAtTheEdge(t *testing.T) {
+	const (
+		invalid = "bad\xffbyte"
+		trace   = "upstream-control-532"
+	)
+	w := newOIDCApprovalWorld(t, nil, nil)
+	request := w.h.held("oidc-non-utf8-trace")
+	alice := w.fleetToken("alice", nil)
+	bob := w.approverToken("bob")
+
+	refused := func(hop string, got answer) {
+		t.Helper()
+		if got.status != http.StatusUnauthorized {
+			t.Fatalf("%s with a non-UTF-8 correlation = %d %s, want 401",
+				hop, got.status, got.raw)
+		}
+	}
+	refused("hold", w.request(call{token: alice, correlation: invalid}, request, "gateway"))
+	if records := w.records(request.id); len(records) != 0 {
+		t.Fatalf("a refused hold wrote %d approval records", len(records))
+	}
+
+	receipt := w.mustHold(call{token: alice, correlation: trace}, request, "gateway")
+	refused("decide", w.decide(call{token: bob, correlation: invalid}, receipt))
+	if records := w.records(request.id); len(records) != 1 {
+		t.Fatalf("a refused decision wrote: %d approval records, want 1",
+			len(records))
+	}
+	w.mustDecide(call{token: bob, correlation: trace}, receipt)
+	refused("materialize", w.request(call{token: alice, correlation: invalid}, request, "gateway"))
+	enqueued := w.request(call{token: alice, correlation: trace}, request, "gateway")
+	if enqueued.status != http.StatusCreated || enqueued.State != "enqueued" ||
+		enqueued.materialized() == nil ||
+		enqueued.materialized().CorrelationID != b64([]byte(trace)) {
+		t.Fatalf("the valid header did not thread to the action: %d %s",
+			enqueued.status, enqueued.raw)
+	}
+
+	forms := [][]byte{[]byte(invalid), []byte("bad�byte")}
+	for _, record := range w.records(request.id) {
+		for _, value := range []shoal.ID{
+			record.Request.CorrelationID, record.Request.TransitionCorrelationID,
+			record.DecisionCorrelationID,
+		} {
+			if value != "" && value != trace {
+				t.Fatalf("an approval record holds correlation %q", value)
+			}
+		}
+	}
+	if strings.Contains(string(enqueued.raw), "bad") {
+		t.Fatalf("the action record names the refused correlation: %s",
+			enqueued.raw)
+	}
+
+	sessions := auditedSessions(t, w)
+	for _, kind := range []string{
+		"fleet.dispatch.approval_request",
+		"fleet.action_approve.approval_decision",
+		"fleet.dispatch.approval_materialize",
+		"fleet.dispatch.approval_enqueue",
+	} {
+		assertCorrelation(t, one(t, sessions, kind, request.id), trace)
+	}
+	for _, list := range sessions {
+		for _, audited := range list {
+			if id := audited.session.CorrelationID; id != "" && id != trace &&
+				!strings.HasPrefix(string(id), "oidc-correlation-") {
+				t.Fatalf("an audit session holds correlation %q", id)
+			}
+		}
+	}
+	found := 0
+	if err := filepath.WalkDir(w.h.root, func(
+		path string, entry fs.DirEntry, err error,
+	) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, form := range forms {
+			if bytes.Contains(content, form) {
+				t.Fatalf("%s holds the refused correlation %q", path, form)
+			}
+		}
+		if bytes.Contains(content, []byte(trace)) {
+			found++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The search reads where correlations land: the valid one is on disk.
+	if found == 0 {
+		t.Fatal("the valid correlation is in no file; the search proves nothing")
+	}
 }

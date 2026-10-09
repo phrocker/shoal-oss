@@ -35,6 +35,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -514,6 +515,15 @@ func TestEveryShippedAuthenticatorMintsACorrelationID(t *testing.T) {
 		t.Fatal("the development authenticator mints no correlation ID, so " +
 			"every dispatch, admission and approval route refuses it")
 	}
+	// The generated value is one the interaction audit records (#532): the
+	// mint and the session boundary apply one rule.
+	if err := interaction.ValidateCorrelationID(
+		decision.CorrelationID()); err != nil ||
+		interaction.RecordableCorrelationID(decision.CorrelationID()) !=
+			decision.CorrelationID() {
+		t.Fatalf("generated correlation %q is not recordable: %v",
+			decision.CorrelationID(), err)
+	}
 	if decision.RequestID() == decision.CorrelationID() {
 		t.Fatalf("the request and correlation identities are the same value "+
 			"(%q), so the correlation threads nothing and cannot be told "+
@@ -556,6 +566,10 @@ func TestEveryShippedAuthenticatorMintsACorrelationID(t *testing.T) {
 		{"a space inside", []string{"two words"}},
 		{"a control character", []string{"trace\x00"}},
 		{"a bidi override", []string{"trace‮txt"}},
+		// Ranging over the string decodes a bad byte to U+FFFD, which is
+		// printable; net/http admits it as obs-text (#532 review).
+		{"invalid UTF-8", []string{"bad\xffbyte"}},
+		{"a truncated rune", []string{"trace\xe2\x80"}},
 		{"repeated", []string{"one", "two"}},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
