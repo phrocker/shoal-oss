@@ -61,6 +61,9 @@ func NewLayaPredictor(cfg LayaConfig) (*LayaPredictor, error) {
 func (p *LayaPredictor) Identity() TypedIdentity { return p.id }
 
 func (p *LayaPredictor) Predict(ctx context.Context, req TypedRequest) (TypedResult, error) {
+	if p == nil {
+		return TypedResult{}, fmt.Errorf("%w: nil Laya predictor", ErrInvalidConfig)
+	}
 	if err := ValidateTypedRequest(req, p.id); err != nil {
 		return TypedResult{}, err
 	}
