@@ -86,6 +86,35 @@ action states cannot overwrite an earlier unpublished transition. Lifecycle
 interaction sinks authorize exact evidence with the transition's `dispatch` or
 `invoke` operation, rather than requiring unrelated `retrieve` permission.
 
+Evidence visibility labels are checked per subscriber at delivery (#562). A
+lifecycle envelope carries, alongside each exact evidence reference, the
+visibility expression the executor recorded it under
+(`Event.ConsumedEvidenceVisibility` / `CitedEvidenceVisibility`). The
+`(domain, source, policy, object)` authorization delivery performs is not a
+label check, so `Service.authorizeDelivery` — the one gate every
+subscriber-facing read passes through: backfill from the retained floor,
+resume from a cursor, long-poll, and the HTTP pull route — then asks
+`fleetevents.Config.EvidenceVisibility` whether the subscriber, under its own
+context at delivery, holds each reference's labels. That seam is
+`evidencelabels.Visibility`, the same single type and the same
+`evidencelabels.Filter` rule the dispatch read paths use for #369
+(`fleet.DispatchConfig.EvidenceVisibility` is an alias of it). A reference the
+subscriber may not see is dropped whole — anchor, citation, node and edge IDs,
+offsets, label expression, and the authorization join entry naming it. Nil
+means no subscriber may see labelled evidence; unlabelled references are
+delivered unchanged; an evaluator error fails the pull rather than reading as
+a redaction. The rule is evaluated at delivery, never at publish: the
+publisher is the wrong identity to ask, and the durable event — like the
+action record and the lifecycle audit receipt — keeps every reference.
+
+No count of withheld references is delivered, and nothing marks that one was
+withheld. This is #398's rule: a standing refusal must be indistinguishable
+from absence, and a count that disagrees with the delivered list is an
+existence oracle for the rest. The consequence is stated rather than hidden —
+a delivered evidence list makes no completeness claim, and a subscriber cannot
+tell "recorded no evidence" from "recorded evidence you may not see". Events
+written before the visibility fields existed decode as unlabelled.
+
 `webapi.NewFleetEventsHandler` serves the `/api/v1/fleet/events/` subtree and
 `webapi.Handler.MountFleetEvents` mounts it once through the existing
 authenticated handler. Routes cover subscription create/delete, event publish,

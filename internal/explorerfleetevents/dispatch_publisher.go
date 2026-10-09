@@ -93,7 +93,12 @@ func (p *ActionEventPublisher) PublishActionEvent(
 		Reason:             record.Reason,
 		Evidence:           evidence,
 		ConsumedEvidence:   references,
-		OccurredAt:         record.UpdatedAt,
+		// Carried, not applied. The publisher is the wrong identity to ask
+		// about labels — the audience is each subscriber at delivery — and
+		// the event is the durable record of the transition, which stays
+		// complete. fleetevents asks each subscriber at delivery (#562).
+		ConsumedEvidenceVisibility: actionEvidenceVisibility(record.Evidence),
+		OccurredAt:                 record.UpdatedAt,
 	}
 
 	_, err = p.service.PublishLifecycle(
@@ -225,6 +230,29 @@ func cloneActionEvidenceReference(
 	value.Assertions = append(
 		[]interaction.AssertionReference(nil), value.Assertions...)
 	return value
+}
+
+// actionEvidenceVisibility returns each evidence reference's visibility
+// expression, index for index with actionEvidenceReferences, or nil when none
+// is labelled.
+func actionEvidenceVisibility(values []fleet.EvidenceRef) [][]string {
+	labelled := false
+	for _, value := range values {
+		if len(value.Visibility) > 0 {
+			labelled = true
+			break
+		}
+	}
+	if !labelled {
+		return nil
+	}
+	result := make([][]string, len(values))
+	for i, value := range values {
+		if len(value.Visibility) > 0 {
+			result[i] = append([]string(nil), value.Visibility...)
+		}
+	}
+	return result
 }
 
 func actionEvidenceReferences(
