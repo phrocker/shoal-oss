@@ -1164,7 +1164,10 @@ func (s *ApprovalService) replayMaterialized(
 	); err != nil {
 		return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 	}
-	return cloneActionRecord(current), nil
+	// Redacted like every other read (#369). A re-request whose work has
+	// already run hands the requester a terminal record, and the evidence on
+	// it belongs to whoever executed rather than to whoever asked.
+	return s.dispatch.readableRecord(ctx, cloneActionRecord(current))
 }
 
 // isMaterializationOf reports whether an action is the work this approval

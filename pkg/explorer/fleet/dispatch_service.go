@@ -98,7 +98,12 @@ func (s *DispatchService) enqueue(
 			); err != nil {
 				return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 			}
-			return cloneActionRecord(current), nil
+			// Redacted like every other read (#369). An idempotent re-enqueue
+			// of an action that has since completed hands the enqueuer a
+			// terminal record, and the evidence on it was recorded by whoever
+			// executed — which since #437 may be an execute-authorized worker
+			// retrieving under its own labels.
+			return s.readableRecord(ctx, cloneActionRecord(current))
 		}
 		return ActionRecord{}, ErrActionConflict
 	} else if !errors.Is(readErr, ErrActionNotFound) {
@@ -259,7 +264,10 @@ func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (Ac
 		); err != nil {
 			return ActionRecord{}, errors.Join(ErrActionCommitted, err)
 		}
-		return current, nil
+		// #369, for the same reason as the enqueue replay above: the caller
+		// is by definition the principal that enqueued, and the evidence is
+		// whoever executed's.
+		return s.readableRecord(ctx, current)
 	}
 	if queued.State == DispatchClaimed &&
 		bytes.Equal(queued.ClaimID, request.ClaimID) &&
