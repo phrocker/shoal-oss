@@ -88,6 +88,9 @@ type attributedSegment struct {
 	// claimed for them. Neither is ever logged or sent to the plane.
 	text   string
 	digest []byte
+	// source is the whole decoded string the segment was taken from, so
+	// adjacent segments can be joined from the original bytes.
+	source string
 }
 
 // attribution validates shoal_attribution against the declared references and
@@ -209,7 +212,7 @@ func locateEntry(
 	}
 	return attributedSegment{
 		reference: *entry.Reference, message: message, part: part,
-		start: start, end: end, text: text[start:end], digest: digest,
+		start: start, end: end, text: text[start:end], digest: digest, source: text,
 	}, nil
 }
 
@@ -482,7 +485,7 @@ func (r chatRequest) applyObligations(
 	for _, text := range texts {
 		result.bytes += len(text)
 	}
-	switch residueFound(body, texts) {
+	switch residueFound(body, withheldRuns(withheld, segments)) {
 	case residueHit:
 		result.refusal = refusalResidue
 		return result
@@ -492,6 +495,43 @@ func (r chatRequest) applyObligations(
 	}
 	result.body = body
 	return result
+}
+
+// withheldRuns is the union of withheld text as the residue check sees it:
+// segments attributed to withheld references, joined wherever they are
+// contiguous in the same string, whatever their references.
+//
+// Without the join, splitting the material into adjacent segments under
+// residueWindow bytes — to one reference or alternating between two — left
+// nothing to sample, and a verbatim copy elsewhere was forwarded in full. The
+// union's contiguous runs are exactly these merged spans, so the guarantee is
+// any verbatim run of residueRun bytes of the union. Segments separated by even
+// one unattributed byte are not joined: that byte is the caller's, not
+// withheld, and the check claims nothing across it.
+func withheldRuns(withheld map[string]struct{}, segments []attributedSegment) []string {
+	type location struct{ message, part int }
+	grouped := map[location][]attributedSegment{}
+	for _, segment := range segments {
+		if _, ok := withheld[segment.reference]; ok {
+			key := location{segment.message, segment.part}
+			grouped[key] = append(grouped[key], segment)
+		}
+	}
+	var runs []string
+	for _, list := range grouped {
+		sort.Slice(list, func(i, j int) bool { return list[i].start < list[j].start })
+		start, end := list[0].start, list[0].end
+		for _, segment := range list[1:] {
+			if segment.start == end {
+				end = segment.end
+				continue
+			}
+			runs = append(runs, list[0].source[start:end])
+			start, end = segment.start, segment.end
+		}
+		runs = append(runs, list[0].source[start:end])
+	}
+	return runs
 }
 
 // The residue check.

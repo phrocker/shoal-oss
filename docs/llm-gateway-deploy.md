@@ -276,8 +276,12 @@ is stripped from what the provider receives.
 ### The residue check
 
 Every string the provider would receive — every value and key, in every message
-and in fields the gateway does not know — is searched for withheld text. Each
-withheld segment is sampled as 64-byte windows every 32 bytes; every forwarded
+and in fields the gateway does not know — is searched for withheld text.
+Withheld segments that are contiguous in the same string are joined first,
+whatever their references, so attributing material as many short adjacent
+segments does not shrink what is searched for; the check covers any verbatim
+run of 96 bytes or more of that union. Each joined run is sampled as 64-byte
+windows every 32 bytes; every forwarded
 string is scanned with a rolling hash of the same width, and each hit is
 confirmed by comparing bytes and extended to see whether it is part of a
 verbatim run of 96 bytes or more. Any run that long contains a sampled window,
@@ -288,7 +292,9 @@ rather than forwarded unexamined.
 **Known gaps:**
 
 - Splitting across messages, normalization changes and runs under 96 bytes all
-  get past the residue check.
+  get past the residue check. Withheld segments separated by even one
+  unattributed byte are not joined, so neither side of that byte counts toward
+  the other's 96.
 - Assistant turns, `tool_calls` arguments and images are not covered. The
   residue check still scans every string in them for a verbatim run, but nothing
   else about them is withheld.
