@@ -42,8 +42,10 @@ const (
 	// AttributedToPredictor is text a decision predictor returned.
 	AttributedToPredictor Attribution = "predictor"
 	// AttributedToPredictorOrService is a whole-request decision reason:
-	// the decision service writes its own, and passes a predictor's through,
-	// and the record does not say which.
+	// the decision service writes its own and passes a predictor's through,
+	// and the record does not say which. Since #556 a predictor cannot claim
+	// one of the service's reasons, but a result written before then could,
+	// and nothing on a result says which build wrote it.
 	AttributedToPredictorOrService Attribution = "predictor_or_service"
 	// AttributedToEvidenceBuilder is text a picture's builder recorded.
 	AttributedToEvidenceBuilder Attribution = "evidence_builder"
