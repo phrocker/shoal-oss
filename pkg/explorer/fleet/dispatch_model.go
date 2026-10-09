@@ -418,6 +418,10 @@ type ActionRecord struct {
 	// (#427). Zero on every other record, including every success: a
 	// completed egress's volume is not what this answers.
 	//
+	// An upper bound on what may have left, never a receipt — see
+	// EffectedVolume. A reader states "at most N bytes may have reached the
+	// caller", not "N bytes were received".
+	//
 	// Written exactly once, by the terminal transition, and immutable after —
 	// the store enforces that (#461). An operator reconciling a failed
 	// external call reads it to tell "nothing left" from "two megabytes

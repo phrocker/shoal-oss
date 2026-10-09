@@ -237,6 +237,19 @@ type AdmissionReport struct {
 
 // EffectedVolume is how much left, in units the plane already understands.
 //
+// An UPPER BOUND on what may have left, never a receipt. It counts bytes
+// handed to the transport, which is the most any sender can know: kernel
+// buffers and intermediate proxies sit between the write and the reader, so
+// "N bytes were received" is not a statement a gateway can make. Read it as
+// "at most N bytes may have reached the caller".
+//
+// That is also why it is never refined. Both gateways know the final count
+// at the moment they report — the LLM gateway after its response handler has
+// returned, when the bytes passed to the ResponseWriter can no longer grow;
+// the effects gateway when its send completes or fails, with any partial
+// write counted by the dialer's wrapped conn — so the first report is the
+// whole report, which is what lets the field be write-once.
+
 // Fixed integers rather than a unit/value pair, deliberately. A label would
 // be caller-controlled text on a durable record, and this record's byte
 // accounting is adjacent to the claim-holder chain whose bound has already

@@ -561,6 +561,9 @@ type fleetCompletionWire struct {
 // fleetEffectedWire is the volume of a partial egress. Fixed integers, for
 // the reason fleet.EffectedVolume gives: a unit label would be
 // caller-controlled text on a durable record.
+//
+// An upper bound on what may have left — bytes handed to the transport —
+// never a receipt that they arrived. See fleet.EffectedVolume.
 type fleetEffectedWire struct {
 	Bytes  int64 `json:"bytes"`
 	Chunks int64 `json:"chunks,omitempty"`
