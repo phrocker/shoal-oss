@@ -64,6 +64,30 @@ class QualityReportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             quality.verify(tampered)
 
+    def test_resealed_structurally_invalid_report_rejected(self):
+        labels, scores, groups, sample = self.fixture()
+        report = quality.evaluate(labels, scores, groups, sample=sample)
+        mutations = []
+        bad_counts = copy.deepcopy(report)
+        bad_counts['counts']['resolved'] = 99
+        mutations.append(bad_counts)
+        bad_metrics = copy.deepcopy(report)
+        bad_metrics['metrics']['accuracy'] = 2
+        mutations.append(bad_metrics)
+        bad_bins = copy.deepcopy(report)
+        bad_bins['calibration'][0]['count'] = 0
+        mutations.append(bad_bins)
+        for mutation in mutations:
+            mutation['id'] = quality._digest({key: value for key, value in mutation.items() if key != 'id'})
+            with self.assertRaises(ValueError):
+                quality.verify(mutation)
+        empty = copy.deepcopy(report)
+        for key in empty['counts']:
+            empty['counts'][key] = 0
+        empty['id'] = quality._digest({key: value for key, value in empty.items() if key != 'id'})
+        with self.assertRaises(ValueError):
+            quality.verify(empty)
+
     def test_costs_are_bounded_and_recorded(self):
         labels, scores, groups, sample = self.fixture()
         report = quality.evaluate(labels, scores, groups, sample=sample, costs={'inference_seconds': 1.5, 'training_seconds': 2, 'label_seconds': 3})

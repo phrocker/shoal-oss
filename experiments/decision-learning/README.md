@@ -47,6 +47,9 @@ recording their denominators, reports confusion metrics, Brier score, ECE,
 Wilson recall intervals, family count, and bounded training/inference/labeling
 costs. Targeted samples cannot make a population claim, and every report has
 `promotion_eligible: false`.
+The verifier also checks denominator, confusion, calibration, uncertainty,
+sampling, cost, and population-claim consistency before accepting a sealed
+report.
 
 `calibration.py` fits a deterministic temperature artifact on validation scores
 only and applies it only to disjoint test/inference IDs. The artifact binds the
