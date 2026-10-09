@@ -20,6 +20,7 @@ ATTACKS = (
     ('failed-shadow-evaluation', 'promote a candidate whose reserved evaluation fails', 'reject'),
     ('artifact-substitution', 'bind a candidate to a different model artifact', 'reject'),
     ('unauthorized-promotion', 'submit an unapproved active release', 'reject'),
+    ('unauthorized-assessment', 'submit a label from an unlisted assessor', 'quarantine'),
 )
 
 
@@ -101,7 +102,14 @@ def run():
                           owner='owner', approved=False)
         l.promote_candidate(base['candidate'], base['evaluation'], base['artifact'], approval)
 
-    functions = [duplicate_flood, prediction_as_label, heldout_overlap, failed_shadow_evaluation, artifact_substitution, unauthorized_promotion]
+    def unauthorized_assessment():
+        ledger = copy.deepcopy(base['ledger'])
+        ledger['assessments'][0]['assessor'] = 'attacker'
+        result = l.dataset(reseal(ledger), base['dataset_policy'])
+        if not any(row['reason'] == 'unauthorized_assessment' for row in result['excluded']):
+            raise ValueError('unauthorized assessment was not quarantined')
+
+    functions = [duplicate_flood, prediction_as_label, heldout_overlap, failed_shadow_evaluation, artifact_substitution, unauthorized_promotion, unauthorized_assessment]
     for (name, description, expected), function in zip(ATTACKS, functions):
         if expected == 'quarantine':
             try:
