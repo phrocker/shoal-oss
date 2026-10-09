@@ -21,9 +21,10 @@ it among the three gateways.
 | **#484** | the lost-fence ambiguity route (`POST actions/{id}/ambiguity`) | a worker whose claim lapsed mid-effect has nowhere to record what it attempted |
 | **#486** | a heartbeat moves the descriptor generation, so `/complete` and `/ambiguity` answer 404 after one heartbeat | until fixed, the gateway must never register or heartbeat while holding claims |
 
-The dispatch client has no `extend` or `ambiguity` method on purpose: a method
-for a route that does not exist is one a worker could be written against and
-that fails only in production.
+Both routes now exist, and the dispatch client speaks them (`Extend`,
+`ReportAmbiguity`). It has no heartbeat method, and will not get one: a worker
+cannot truthfully assert a descriptor's liveness, so the gateway never
+heartbeats and carries no registrar credential (#391).
 
 ## What exists
 
@@ -35,7 +36,7 @@ that fails only in production.
 | `timing.go` | clock anchoring, PRECHECK predicates, the send gate, the grace-period formula |
 | `executorkey.go` | `ExecutorKey` decoding in both platform spellings |
 | `dialer.go` | the egress-restricted target transport and the separate explorer client |
-| `client.go` | the internal dispatch client: pull, claim, complete, resolve |
+| `client.go`, `client_ops.go` | the internal dispatch client: pull, claim, extend, complete (bound on the claim fence), ambiguity, resolve (its own ref only), attestation presentation; every claim-scoped request carries the record's `Shoal-Correlation-ID` |
 | `logging.go` | the one logging function, and the policy it enforces |
 
 The dispatch client is tested against the real explorer composition — the
@@ -226,8 +227,8 @@ TLS that it trusts:
 
 | | |
 |---|---|
-| operations | `execute`, and nothing else |
-| service role | `action_execution`. The role also lets the worker resolve the one descriptor its binding names. It cannot heartbeat or register. |
+| operations | `execute` and `agent_resolve`, and nothing else. `agent_resolve` is confined to the descriptor the binding names: resolving another reference's descriptor answers `not_found`, and a list holds only the bound descriptor (`resolvableUnderBinding`, #573). The gateway resolves its own descriptor at startup. |
+| service role | `action_execution`. It cannot heartbeat or register: a worker cannot truthfully assert a descriptor's liveness. |
 | executor binding | the entry's `executor_ref`. The fleet narrows every execute route to it (#573). Another reference's work answers `not_found`. |
 | subject, actor, client ID | `oidcexec:<issuer>#<sub>`, one identity. It is outside the human identity family (`oidc:`, `oidcid:`, `entra:`), so it is never compared with a requester or an approver. The client ID is set because attestation requires one. |
 | on behalf of | none. A worker acts as itself. |

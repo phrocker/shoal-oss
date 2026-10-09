@@ -81,7 +81,7 @@ func TestEffectsGatewayClientReportsAPartialSendOnce(t *testing.T) {
 	offered, _ := pulled(t, client, "action-partial")
 	claimID, _, _ := effectsgateway.NewClaimID("pod-0", nil)
 	claimed, err := client.Claim(ctx, offered.ID, effectsgateway.ClaimRequest{
-		Context: requestContext(t, "gateway_claim"), ExpectedVersion: offered.Version,
+		Context: offered.Correlate(requestContext(t, "gateway_claim")), ExpectedVersion: offered.Version,
 		ClaimID: claimID, Lease: time.Minute,
 	})
 	if err != nil {
@@ -89,7 +89,7 @@ func TestEffectsGatewayClientReportsAPartialSendOnce(t *testing.T) {
 	}
 	volume := fleet.EffectedVolume{Bytes: 517, Chunks: 1}
 	completion := effectsgateway.Completion{
-		Context: requestContext(t, "gateway_complete"), ExpectedVersion: claimed.Version,
+		Context: claimed.Correlate(requestContext(t, "gateway_complete")), ExpectedVersion: claimed.Version, ClaimFence: claimed.ClaimFence,
 		ClaimID: claimID, Failed: true, ErrorCode: effectsgateway.ErrorOutcomeUnknown,
 		Effected: volume,
 	}
@@ -109,7 +109,7 @@ func TestEffectsGatewayClientReportsAPartialSendOnce(t *testing.T) {
 	// says the outcome was recorded otherwise rather than taking it as this
 	// report.
 	different := completion
-	different.Context = requestContext(t, "gateway_complete")
+	different.Context = claimed.Correlate(requestContext(t, "gateway_complete"))
 	different.Effected = fleet.EffectedVolume{Bytes: volume.Bytes + 1, Chunks: 1}
 	action, err := client.Complete(ctx, claimed.ID, different)
 	if effectsgateway.DispatchKind(err) != effectsgateway.DispatchRecordedOtherwise {

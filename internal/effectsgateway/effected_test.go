@@ -61,9 +61,9 @@ func effectedClient(t *testing.T, replies ...func() (*http.Response, error)) (*D
 
 func partialFailure(volume fleet.EffectedVolume) Completion {
 	return Completion{
-		Context: RequestContext{RequestID: []byte("r"), ReasonCode: "gateway_complete",
+		Context: RequestContext{CorrelationID: []byte("trace"), RequestID: []byte("r"), ReasonCode: "gateway_complete",
 			Deadline: time.Now().Add(time.Minute)},
-		ExpectedVersion: 2, ClaimID: []byte("claim"), Failed: true,
+		ExpectedVersion: 2, ClaimID: []byte("claim"), ClaimFence: 1, Failed: true,
 		ErrorCode: ErrorOutcomeUnknown, Effected: volume,
 	}
 }
