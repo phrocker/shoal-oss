@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/phrocker/shoal-oss/internal/strictjson"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -196,18 +196,15 @@ func parseApproverMapping(
 	if !utf8.Valid(raw) {
 		return nil, approverMappingInvalid("the file is not UTF-8")
 	}
-	if err := refuseDuplicateJSONKeys(raw); err != nil {
-		return nil, approverMappingInvalid(err.Error())
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
+	// strictjson refuses duplicate keys, keys that match a field only up to
+	// case, unknown fields and trailing data, at every level. encoding/json
+	// alone matches field names case-insensitively, so {"values": [...],
+	// "VALUES": [...]} passed a duplicate-key check that compares exactly
+	// and the later key won: the file said one thing to a reviewer and
+	// another to this program.
 	var file approverMappingFile
-	if err := decoder.Decode(&file); err != nil {
+	if err := strictjson.Decode(raw, &file); err != nil {
 		return nil, approverMappingInvalid(err.Error())
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return nil, approverMappingInvalid("the file must hold one JSON object")
 	}
 	if file.Version != approverMappingVersion {
 		return nil, approverMappingInvalid(
@@ -398,52 +395,6 @@ func (m *approverMapping) computeDigest() auth.Digest {
 		list(m.identityClaim)
 	}
 	return auth.DigestBytes(approverMappingDigestTag, buffer.Bytes())
-}
-
-// refuseDuplicateJSONKeys walks the document and refuses any object that
-// names a key twice. encoding/json keeps the last of two, so a file could
-// otherwise say one thing to a reviewer and another to this program.
-func refuseDuplicateJSONKeys(raw []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var walk func() error
-	walk = func() error {
-		token, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		delimiter, ok := token.(json.Delim)
-		if !ok {
-			return nil
-		}
-		switch delimiter {
-		case '{':
-			seen := map[string]struct{}{}
-			for decoder.More() {
-				key, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				name, _ := key.(string)
-				if _, duplicate := seen[name]; duplicate {
-					return fmt.Errorf("duplicate key %q", name)
-				}
-				seen[name] = struct{}{}
-				if err := walk(); err != nil {
-					return err
-				}
-			}
-		case '[':
-			for decoder.More() {
-				if err := walk(); err != nil {
-					return err
-				}
-			}
-		}
-		_, err = decoder.Token() // the closing delimiter
-		return err
-	}
-	return walk()
 }
 
 // approverClaimValue resolves a claim path through nested objects. The

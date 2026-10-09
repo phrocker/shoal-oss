@@ -6,7 +6,6 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/phrocker/shoal-oss/internal/strictjson"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -50,8 +50,9 @@ const (
 	labelGrantsDigestTag = "shoal.label-grants/v1-digest"
 )
 
-// labelGrantsFile is the strict on-disk shape. Unknown fields (at any
-// depth), duplicate keys and trailing data are refused.
+// labelGrantsFile is the strict on-disk shape. Unknown fields, duplicate
+// keys and keys matching a field only up to case (at any depth), and
+// trailing data, are refused.
 type labelGrantsFile struct {
 	Version   string                      `json:"version"`
 	Issuer    string                      `json:"issuer"`
@@ -115,18 +116,12 @@ func parseLabelGrants(
 	if !utf8.Valid(raw) {
 		return nil, labelGrantsInvalid("the file is not UTF-8")
 	}
-	if err := refuseDuplicateJSONKeys(raw); err != nil {
-		return nil, labelGrantsInvalid(err.Error())
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
+	// strictjson, not encoding/json: the latter matches field names
+	// case-insensitively, so {"label": "secret", "LABEL": "other"} would be
+	// read as a grant of "other" while a reviewer reads "secret".
 	var file labelGrantsFile
-	if err := decoder.Decode(&file); err != nil {
+	if err := strictjson.Decode(raw, &file); err != nil {
 		return nil, labelGrantsInvalid(err.Error())
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return nil, labelGrantsInvalid("the file must hold one JSON object")
 	}
 	if file.Version != labelGrantsVersion {
 		return nil, labelGrantsInvalid("version must be " + labelGrantsVersion)
