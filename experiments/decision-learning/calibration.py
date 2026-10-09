@@ -40,7 +40,7 @@ def verify(artifact):
     _finite(artifact.get('temperature'), 'temperature', .05, 20.)
     if artifact.get('method') != 'temperature-v1' or artifact.get('optimization_enabled') is not False:
         raise ValueError('unsupported calibration artifact')
-    for key in ('model_id', 'runtime_id', 'validation_scores_digest', 'validation_labels_digest'):
+    for key in ('model_id', 'runtime_id', 'validation_manifest_id', 'validation_scores_digest', 'validation_labels_digest'):
         if not isinstance(artifact.get(key), str) or not artifact[key]:
             raise ValueError('missing calibration ' + key)
     return artifact
@@ -60,7 +60,7 @@ def _loss(scores, labels, temperature):
     return total / len(scores)
 
 
-def fit(scores, labels, *, model_id, runtime_id):
+def fit(scores, labels, *, model_id, runtime_id, validation_manifest_id):
     if not isinstance(scores, dict) or not scores or set(scores) != set(labels):
         raise ValueError('scores and labels must have identical IDs')
     if len(scores) > MAX_ROWS or not isinstance(labels, dict):
@@ -76,12 +76,14 @@ def fit(scores, labels, *, model_id, runtime_id):
         values.append(float(scores[row_id])); targets.append(labels[row_id])
     if len(set(targets)) != 2:
         raise ValueError('calibration needs both classes')
-    if not isinstance(model_id, str) or not model_id or not isinstance(runtime_id, str) or not runtime_id:
+    if (not isinstance(model_id, str) or not model_id or not isinstance(runtime_id, str) or not runtime_id
+            or not isinstance(validation_manifest_id, str) or not validation_manifest_id):
         raise ValueError('model and runtime identities are required')
     candidates = (0.25 + i * 0.01 for i in range(376))
     temperature = min(candidates, key=lambda value: (_loss(values, targets, value), value))
     return seal('calibration_artifact', method='temperature-v1', model_id=model_id,
-                runtime_id=runtime_id, validation_ids=ids, temperature=temperature,
+                runtime_id=runtime_id, validation_manifest_id=validation_manifest_id,
+                validation_ids=ids, temperature=temperature,
                 validation_scores_digest=_digest([[row_id, scores[row_id]] for row_id in ids]),
                 validation_labels_digest=_digest([[row_id, labels[row_id]] for row_id in ids]), optimization_enabled=False,
                 limitation='Validation-only calibration; no promotion or serving mutation.')
