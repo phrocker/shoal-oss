@@ -55,6 +55,24 @@ func TestVerifyLayaArtifactsPinsRevisionAndBytes(t *testing.T) {
 	}
 }
 
+func TestNewVerifiedLayaPredictorChecksBeforeConstruction(t *testing.T) {
+	root := t.TempDir()
+	manifest := artifactTestManifest(t, root)
+	identity := testTypedIdentity()
+	identity.Revision = "rev-1"
+	predictor, err := NewVerifiedLayaPredictor(LayaConfig{BaseURL: "http://worker.invalid", BearerToken: "token", Identity: identity}, root, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if predictor.Identity() != identity {
+		t.Fatalf("identity = %+v, want %+v", predictor.Identity(), identity)
+	}
+	manifest.Artifacts[0].SHA256 = strings.Repeat("a", 64)
+	if _, err := NewVerifiedLayaPredictor(LayaConfig{BaseURL: "http://worker.invalid", BearerToken: "token", Identity: identity}, root, manifest); err == nil {
+		t.Fatal("unverified artifact set accepted")
+	}
+}
+
 func TestLayaArtifactManifestRejectsTraversalAndSymlink(t *testing.T) {
 	bad := LayaArtifactManifest{Revision: "rev", Artifacts: []LayaArtifact{{Path: "../weights", Size: 0, SHA256: strings.Repeat("a", 64)}}}
 	if err := bad.Validate(); err == nil {
