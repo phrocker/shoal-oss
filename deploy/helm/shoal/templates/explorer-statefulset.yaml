@@ -100,7 +100,7 @@ spec:
             - {{ printf "-state-dir=%v" ($explorer.stateDir) | quote }}
             - {{ printf "-listen=0.0.0.0:%v" ($explorer.containerPort) | quote }}
             - {{ printf "-health-address=0.0.0.0:%v" ($explorer.healthPort) | quote }}
-            - {{ printf "-allowed-host=%v" (join "," $explorer.allowedHosts) | quote }}
+            - {{ printf "-allowed-host=%v" (include "shoal.explorerAllowedHosts" .) | quote }}
             {{- if $explorer.disclosure.concealWithholding }}
             - -conceal-withholding
             {{- end }}

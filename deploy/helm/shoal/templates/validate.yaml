@@ -83,8 +83,7 @@
 
 {{- /* An empty allow-list refuses every request with 421, because the resolved
        listen address of a pod is an authority no real client sends. */ -}}
-{{- $allowedHosts := list -}}
-{{- range $explorer.allowedHosts }}{{- if trim . }}{{- $allowedHosts = append $allowedHosts (trim .) }}{{- end }}{{- end -}}
+{{- $allowedHosts := include "shoal.explorerAllowedHosts" . -}}
 {{- if not $allowedHosts -}}
 {{- fail "explorer.allowedHosts needs at least one non-blank value: the workspace binds a non-loopback address in a pod, and with no allow-list every request is refused with 421 Misdirected Request. List the external authority clients actually send (usually the port-less ingress name)" -}}
 {{- end -}}
@@ -282,9 +281,29 @@
 {{- if not $explorer.chat.model -}}
 {{- fail "explorer.chat.model is required when explorer.chat.provider is set" -}}
 {{- end -}}
-{{- if and (not (hasPrefix "http://127.0.0.1" $explorer.chat.baseURL)) (not (hasPrefix "http://localhost" $explorer.chat.baseURL)) -}}
+{{- $chatURL := trim $explorer.chat.baseURL -}}
+{{- if not (include "shoal.urlIsAbsolute" $chatURL) -}}
+{{- fail "explorer.chat.baseURL must be an absolute http(s) URL with a host" -}}
+{{- end -}}
+{{- $chatLoopback := include "shoal.urlIsLoopback" $chatURL -}}
+{{- if and (include "shoal.urlIsPlaintext" $chatURL) (not $chatLoopback) -}}
+{{- fail "explorer.chat.baseURL must use HTTPS unless the host is loopback" -}}
+{{- end -}}
+{{- if not $chatLoopback -}}
 {{- if not $explorer.chat.credentialSecretName -}}
 {{- fail (printf "explorer.chat.credentialSecretName is required for a remote chat base URL (%q): the workspace reads %s at request time, and nothing projects it into the pod without a Secret" $explorer.chat.baseURL $explorer.chat.apiKeyEnv) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if has $explorer.embedding.provider (list "ollama" "openai" "voyage") -}}
+{{- $embeddingURL := trim $explorer.embedding.baseURL -}}
+{{- /* Voyage supplies its own default URL when the value is empty. */ -}}
+{{- if or $embeddingURL (ne $explorer.embedding.provider "voyage") -}}
+{{- if not (include "shoal.urlIsAbsolute" $embeddingURL) -}}
+{{- fail "explorer.embedding.baseURL must be an absolute http(s) URL with a host" -}}
+{{- end -}}
+{{- if and (include "shoal.urlIsPlaintext" $embeddingURL) (not (include "shoal.urlIsLoopback" $embeddingURL)) -}}
+{{- fail "explorer.embedding.baseURL must use HTTPS unless the host is loopback" -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -400,6 +419,12 @@
 {{- /* Two listeners on one port silently means one of them is not serving. */ -}}
 {{- if eq (int $explorer.containerPort) (int $explorer.healthPort) -}}
 {{- fail "explorer.healthPort must differ from explorer.containerPort: they are two listeners and cannot share a port" -}}
+{{- end -}}
+{{- range $field := list "containerPort" "healthPort" -}}
+{{- $port := int (index $explorer $field) -}}
+{{- if lt $port 1024 -}}
+{{- fail (printf "explorer.%s must be 1024 or above (got %d): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $field $port) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -1455,6 +1480,17 @@
 {{- range $key, $value := .Values -}}
 {{- if not (has $key (list "global" "llmProxy")) -}}
 {{- include "shoal.refuseLineBreaks" (dict "path" $key "value" $value "multiline" $lineBreakMultiline "trimmed" $lineBreakTrimmed) -}}
+{{- end -}}
+{{- end -}}
+
+{{- range $role, $fields := dict "writeTier" (list "grpcPort" "metricsPort") "tserver" (list "thriftPort" "metricsPort") "compactor" (list "thriftPort" "metricsPort") -}}
+{{- if eq (include (printf "shoal.%sEnabled" $role) $) "true" -}}
+{{- range $field := $fields -}}
+{{- $port := int (index (index $.Values $role) $field) -}}
+{{- if lt $port 1024 -}}
+{{- fail (printf "%s.%s must be 1024 or above (got %d): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $role $field $port) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 

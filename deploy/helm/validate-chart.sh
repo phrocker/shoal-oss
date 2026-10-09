@@ -479,7 +479,65 @@ renders "withholding concealed"             "${explorer_base[@]}" --set explorer
 renders "ask executor wired"                "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434
 renders "lexical embedding"                 "${explorer_base[@]}" --set explorer.embedding.provider=lexical,explorer.embedding.dimensions=256
 renders "scaled to zero"                    "${explorer_base[@]}" --set explorer.replicas=0
-renders "values around the blanks are trimmed" "${explorer_base[@]}" --set 'explorer.allowedHosts={ shoal.example.test , }'
+assert_renders "every allowed host is trimmed" '^ +- "-allowed-host=shoal\.example\.test,other\.example\.test"$' "${explorer_base[@]}" --set 'explorer.allowedHosts={ shoal.example.test , other.example.test }'
+
+note "== explorer host, bind port, and provider URL guards (#423) =="
+refuses_citing "explorer.allowedHosts contains a blank-after-trim element" "a blank host beside a valid host" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test, }'
+refuses_citing "explorer.allowedHosts contains a blank-after-trim element" "an empty host beside a valid host" "${explorer_base[@]}" --set 'explorer.allowedHosts={,shoal.example.test}'
+for field in containerPort healthPort; do
+  for port in 80 443 1023; do
+    refuses_citing "explorer.$field must be 1024 or above" "explorer $field=$port" "${explorer_base[@]}" --set "explorer.$field=$port"
+  done
+  renders "explorer $field at the unprivileged boundary" "${explorer_base[@]}" --set "explorer.$field=1024"
+done
+renders "a privileged explorer Service port is not a bind port" "${explorer_base[@]}" --set explorer.servicePort=80
+renders "disabled explorer bind ports are ignored" --set explorer.containerPort=80,explorer.healthPort=443
+
+for role in writeTier tserver compactor; do
+  fields=(thriftPort metricsPort)
+  role_base=(-f "$chart/values-accumulo.yaml")
+  if [ "$role" = writeTier ]; then
+    fields=(grpcPort metricsPort)
+    role_base=(--set mode=single)
+  fi
+  for field in "${fields[@]}"; do
+    for port in 80 443 1023; do
+      refuses_citing "$role.$field must be 1024 or above" "$role $field=$port" "${role_base[@]}" --set "$role.$field=$port"
+    done
+    renders "$role $field at the unprivileged boundary" "${role_base[@]}" --set "$role.$field=1024"
+    renders "disabled $role $field is ignored" "${role_base[@]}" --set "$role.enabled=false,$role.$field=80"
+  done
+done
+
+chat_base=("${explorer_base[@]}" --set explorer.chat.provider=ollama,explorer.chat.model=m)
+embedding_base=("${explorer_base[@]}" --set explorer.embedding.provider=ollama,explorer.embedding.model=m,explorer.embedding.dimensions=256)
+for url in http://LOCALHOST:11434 HTTP://LOCALHOST:11434 http://127.0.0.2:11434 http://127.255.255.255:11434 'http://[::1]:11434' 'http://[0:0:0:0:0:0:0:1]:11434'; do
+  renders "loopback chat $url needs no credential" "${chat_base[@]}" --set "explorer.chat.baseURL=$url"
+  renders "loopback embedding $url renders" "${embedding_base[@]}" --set "explorer.embedding.baseURL=$url"
+done
+for url in https://localhost.example https://127.example.test; do
+  refuses_citing "explorer.chat.credentialSecretName is required for a remote chat base URL" "a loopback-looking remote chat host $url" "${chat_base[@]}" --set "explorer.chat.baseURL=$url"
+  renders "remote chat $url with a credential" "${chat_base[@]}" --set "explorer.chat.baseURL=$url,explorer.chat.credentialSecretName=chat"
+done
+for url in http://localhost.example http://127.example.test http://127.0.0.256 http://127.1; do
+  refuses_citing "explorer.chat.baseURL must use HTTPS unless the host is loopback" "remote plaintext chat $url" "${chat_base[@]}" --set "explorer.chat.baseURL=$url,explorer.chat.credentialSecretName=chat"
+  refuses_citing "explorer.embedding.baseURL must use HTTPS unless the host is loopback" "remote plaintext embedding $url" "${embedding_base[@]}" --set "explorer.embedding.baseURL=$url"
+done
+for url in '' https:// http:// /relative ftp://localhost; do
+  refuses_citing "explorer.chat.baseURL must be an absolute http(s) URL with a host" "invalid chat URL $url" "${chat_base[@]}" --set "explorer.chat.baseURL=$url,explorer.chat.credentialSecretName=chat"
+  for provider in ollama openai voyage; do
+    # Only Voyage has a built-in URL default.
+    if [ -z "$url" ] && [ "$provider" = voyage ]; then continue; fi
+    refuses_citing "explorer.embedding.baseURL must be an absolute http(s) URL with a host" "invalid $provider embedding URL $url" "${embedding_base[@]}" --set "explorer.embedding.provider=$provider,explorer.embedding.baseURL=$url,explorer.embedding.credentialSecretName=embedding"
+  done
+done
+for provider in ollama openai voyage; do
+  renders "remote HTTPS $provider embedding with a credential" "${embedding_base[@]}" --set "explorer.embedding.provider=$provider,explorer.embedding.baseURL=https://models.example.test,explorer.embedding.credentialSecretName=embedding"
+done
+renders "Voyage retains its built-in URL default" "${embedding_base[@]}" --set explorer.embedding.provider=voyage,explorer.embedding.baseURL=,explorer.embedding.credentialSecretName=embedding
+renders "fake embedding ignores provider URLs" "${embedding_base[@]}" --set explorer.embedding.provider=fake,explorer.embedding.baseURL=https://
+renders "lexical embedding ignores provider URLs" "${embedding_base[@]}" --set explorer.embedding.provider=lexical,explorer.embedding.baseURL=https://
+renders "disabled providers ignore their URLs" "${explorer_base[@]}" --set explorer.chat.baseURL=https://,explorer.embedding.baseURL=https://
 
 note "== the approver mapping and the stable identity claim (#451, #526) =="
 # The mapping is a document the workspace reads from disk, so it is the one

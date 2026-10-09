@@ -111,7 +111,14 @@ or answer nothing. Authentication is a required decision with one valid value
 (`explorer.auth.mode: oidc`); `-dev-auth` is not offered, because it is refused
 on any non-loopback listener and a pod behind a Service must bind one.
 `explorer.allowedHosts` is required, because an empty allow-list answers every
-request with `421`. `explorer.replicas` above one is refused: the corpus,
+request with `421`. Each authority is trimmed; a blank-after-trim entry is
+refused even beside valid hosts. Explorer chat and network embedding URLs must
+be absolute HTTP(S) URLs with a host; plaintext HTTP is allowed only for
+loopback hosts, not names such as `localhost.example`. Voyage retains its
+built-in URL default when none is supplied. Explorer, embed (`writeTier`),
+tserver and compactor bind ports must be at least 1024, since their containers
+run as uid 65532 with all capabilities dropped; this does not restrict a
+separate Service port. `explorer.replicas` above one is refused: the corpus,
 workspace settings and durable policy catalog share one state root on a
 ReadWriteOnce volume, with no coordination protocol between two processes over
 it. A remote chat or embedding provider without a credential Secret is refused,

@@ -181,6 +181,18 @@ and nothing else; it does not restrict which models may be called.
 {{- join "," $models -}}
 {{- end -}}
 
+{{- define "shoal.explorerAllowedHosts" -}}
+{{- $hosts := list -}}
+{{- range .Values.explorer.allowedHosts -}}
+{{- $host := trim . -}}
+{{- if not $host -}}
+{{- fail "explorer.allowedHosts contains a blank-after-trim element: give every intended host a non-blank authority rather than silently shortening the allow-list" -}}
+{{- end -}}
+{{- $hosts = append $hosts $host -}}
+{{- end -}}
+{{- join "," $hosts -}}
+{{- end -}}
+
 {{- define "shoal.llmGatewayAllowedHosts" -}}
 {{- $hosts := list -}}
 {{- range (default (list) .Values.llmGateway.allowedHosts) -}}
