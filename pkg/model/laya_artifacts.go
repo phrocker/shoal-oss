@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,94 @@ import (
 )
 
 const MaxLayaManifestArtifacts = 256
+const MaxLayaManifestBytes int64 = 1 << 20
+
+// LoadLayaArtifactManifest reads a bounded, strict JSON manifest produced by
+// provisioning. Unknown fields and trailing JSON are rejected so an operator
+// cannot accidentally verify a different schema than the one recorded.
+func LoadLayaArtifactManifest(path string) (LayaArtifactManifest, error) {
+	var manifest LayaArtifactManifest
+	file, err := os.Open(path)
+	if err != nil {
+		return manifest, fmt.Errorf("%w: manifest: %v", ErrUnavailable, err)
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, MaxLayaManifestBytes+1))
+	if err != nil {
+		return manifest, fmt.Errorf("%w: read manifest: %v", ErrUnavailable, err)
+	}
+	if int64(len(raw)) > MaxLayaManifestBytes {
+		return manifest, fmt.Errorf("%w: manifest exceeds bound", ErrOversizedResponse)
+	}
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return manifest, fmt.Errorf("%w: duplicate manifest key: %v", ErrMalformedResponse, err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		return manifest, fmt.Errorf("%w: decode manifest: %v", ErrMalformedResponse, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return manifest, fmt.Errorf("%w: trailing manifest data", ErrMalformedResponse)
+	}
+	if err := manifest.Validate(); err != nil {
+		return manifest, err
+	}
+	return manifest, nil
+}
+
+func rejectDuplicateJSONKeys(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := scanJSONValue(decoder); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("trailing JSON")
+	}
+	return nil
+}
+
+func scanJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' && delim != '[' {
+		return nil
+	}
+	if delim == '[' {
+		for decoder.More() {
+			if err := scanJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err := decoder.Token()
+		return err
+	}
+	seen := map[string]struct{}{}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return fmt.Errorf("object key is not a string")
+		}
+		if _, exists := seen[name]; exists {
+			return fmt.Errorf("%q", name)
+		}
+		seen[name] = struct{}{}
+		if err := scanJSONValue(decoder); err != nil {
+			return err
+		}
+	}
+	_, err = decoder.Token()
+	return err
+}
 
 // NewVerifiedLayaPredictor refuses to construct a serving client until the
 // exact local artifact set matches the predictor's pinned revision. Health is

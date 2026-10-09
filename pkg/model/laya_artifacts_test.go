@@ -3,6 +3,7 @@ package model
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,5 +93,43 @@ func TestLayaArtifactManifestRejectsTraversalAndSymlink(t *testing.T) {
 	identity.Revision = "rev-1"
 	if err := VerifyLayaArtifacts(root, m, identity); err == nil {
 		t.Fatal("symlink artifact accepted")
+	}
+}
+
+func TestLoadLayaArtifactManifestIsStrictAndBounded(t *testing.T) {
+	root := t.TempDir()
+	manifest := artifactTestManifest(t, root)
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "manifest.json")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadLayaArtifactManifest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Revision != manifest.Revision || len(loaded.Artifacts) != 1 {
+		t.Fatalf("loaded = %+v", loaded)
+	}
+	if err := os.WriteFile(path, append(encoded, []byte(`{"extra":true}`)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadLayaArtifactManifest(path); err == nil {
+		t.Fatal("trailing JSON accepted")
+	}
+	if err := os.WriteFile(path, []byte(`{"revision":"rev-1","artifacts":[],"unknown":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadLayaArtifactManifest(path); err == nil {
+		t.Fatal("unknown field accepted")
+	}
+	if err := os.WriteFile(path, []byte(`{"revision":"rev-1","revision":"rev-2","artifacts":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadLayaArtifactManifest(path); err == nil {
+		t.Fatal("duplicate field accepted")
 	}
 }
