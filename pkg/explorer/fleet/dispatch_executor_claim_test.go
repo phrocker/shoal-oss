@@ -138,7 +138,7 @@ func (f *executorClaimFixture) worker(t *testing.T, operations ...auth.Operation
 // principals.
 func TestAnExecutorClaimsWorkItDidNotEnqueue(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.worker(t, auth.OperationExecute)
+	worker := fixture.executorWorker(t)
 
 	// It is visible to the worker at all, which is the half that used to fail
 	// silently. A test that only exercised Claim would pass against a Pull
@@ -285,7 +285,7 @@ func TestTheEnqueuingPrincipalStillClaimsUnderInvoke(t *testing.T) {
 // third-party-writable.
 func TestAForeignClaimDoesNotDetachTheEnqueuer(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.worker(t, auth.OperationExecute)
+	worker := fixture.executorWorker(t)
 
 	if _, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -339,7 +339,7 @@ func TestAForeignClaimDoesNotDetachTheEnqueuer(t *testing.T) {
 // to make resolution fail for a reason that is neither unauthorized nor absent.
 func TestAForeignResolveFailureDoesNotAbortThePage(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.worker(t, auth.OperationExecute)
+	worker := fixture.executorWorker(t)
 
 	// Sanity: the record is visible before anything is broken, or this test
 	// would pass against a page that was empty for an unrelated reason.
@@ -414,7 +414,7 @@ func TestCancelAndStatusStayEnqueuerOnly(t *testing.T) {
 // execute, which is the whole difference.
 func TestAnExecuteHolderCannotProbeForExistence(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.worker(t, auth.OperationExecute)
+	worker := fixture.executorWorker(t)
 	// Unresolvable for a reason that is neither unauthorized nor absent, which
 	// is what produces the bare ErrorUnavailable.
 	fixture.breakExecutor(t)
@@ -507,8 +507,8 @@ func (f *executorClaimFixture) namedWorker(
 // handed someone else's result, which is the one failure mode it cannot detect.
 func TestOneWorkerCannotCompleteAnotherWorkersClaim(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	holder := fixture.namedWorker(t, "holder", auth.OperationExecute)
-	stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+	holder := fixture.namedExecutor(t, "holder")
+	stranger := fixture.namedExecutor(t, "stranger")
 
 	claimed, err := fixture.service.Claim(holder, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -577,8 +577,8 @@ func TestOneWorkerCannotCompleteAnotherWorkersClaim(t *testing.T) {
 // and still leave the first worker able to complete after losing the fence.
 func TestAReclaimMovesWhoMayReport(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	first := fixture.namedWorker(t, "first", auth.OperationExecute)
-	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	first := fixture.namedExecutor(t, "first")
+	second := fixture.namedExecutor(t, "second")
 
 	claimed, err := fixture.service.Claim(first, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -639,8 +639,8 @@ func TestAReclaimMovesWhoMayReport(t *testing.T) {
 // records from the page.
 func TestAStrangerCannotReplayAnotherWorkersClaim(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	holder := fixture.namedWorker(t, "holder", auth.OperationExecute)
-	stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+	holder := fixture.namedExecutor(t, "holder")
+	stranger := fixture.namedExecutor(t, "stranger")
 
 	if _, err := fixture.service.Claim(holder, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -812,14 +812,14 @@ func TestARevokedExecutorCannotCommitItsOutcome(t *testing.T) {
 func TestATerminalActionIsNotVisibleToAStranger(t *testing.T) {
 	t.Run("a stale version", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
-		stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+		stranger := fixture.namedExecutor(t, "stranger")
 		fixture.cancel(t)
 		fixture.assertIndistinguishable(t, stranger, 1)
 	})
 
 	t.Run("a terminal record at its current version", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
-		stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+		stranger := fixture.namedExecutor(t, "stranger")
 		cancelled := fixture.cancel(t)
 		// Pull does not offer it, so this is a record the stranger has no
 		// other way to observe.
@@ -849,7 +849,7 @@ func TestATerminalActionIsNotVisibleToAStranger(t *testing.T) {
 		// refuses both probes identically and so passes without reaching the
 		// branch.
 		fixture.advance(t, 2*time.Hour)
-		stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+		stranger := fixture.namedExecutor(t, "stranger")
 		fixture.assertIndistinguishable(t, stranger, fixture.queued.Version)
 	})
 }
@@ -988,19 +988,51 @@ func TestAnUnauthorizedExecutorCannotCommitItsOutcome(t *testing.T) {
 // ClientID or the whole chain comparison from the production code left this
 // test green. One component at a time is the whole point: a fixture that
 // differs in three ways cannot tell you which of the three is checked.
+//
+// Since #391 a worker is executor-bound and acts as itself, so the execute
+// route cannot carry a delegation chain: the Actor and ClientID variants run
+// through the service with bound workers, and the two chain variants are
+// asserted on sameClaimantPrincipal directly, where the chain is still
+// compared for a delegated invoke-route claimant. Through the service those
+// two would be refused earlier — by the binding on the execute route, and by
+// sameActionPrincipal on the invoke route — so a service-level probe could no
+// longer tell whether the chain comparison is there.
 func TestTheClaimantIsComparedOnItsWholeChain(t *testing.T) {
 	holder := principal{
 		subject: "holder-subject", actor: "holder-actor",
 		request: "holder-request", clientID: "holder-client",
-		onBehalfOf: []shoal.ID{"delegator"},
 	}
 	// Derived from the holder so every field matches unless a case changes it.
 	differing := func(mutate func(*principal)) principal {
 		other := holder
-		other.onBehalfOf = append([]shoal.ID(nil), holder.onBehalfOf...)
 		other.request = "other-request"
 		mutate(&other)
 		return other
+	}
+
+	delegated := holder
+	delegated.onBehalfOf = []shoal.ID{"delegator"}
+	record := ActionRecord{
+		ClaimantSubject: shoal.ID(delegated.subject),
+		ClaimantActor:   shoal.ID(delegated.actor), ClaimantClientID: delegated.clientID,
+		ClaimantOnBehalfOf: delegated.onBehalfOf,
+	}
+	if !sameClaimantPrincipal(dispatchDecisionFor(
+		t, delegated, auth.OperationInvoke, auth.OperationDelegate), record) {
+		t.Fatal("the delegated holder is not its own claimant, so the chain " +
+			"cases below prove nothing")
+	}
+	for component, chain := range map[string][]shoal.ID{
+		"OnBehalfOf (chain emptied)":       nil,
+		"OnBehalfOf (different delegator)": {"other-delegator"},
+	} {
+		other := delegated
+		other.onBehalfOf = chain
+		if sameClaimantPrincipal(dispatchDecisionFor(
+			t, other, auth.OperationInvoke, auth.OperationDelegate), record) {
+			t.Fatalf("a principal differing from the claimant only in %s is "+
+				"its claimant, so that component is not compared", component)
+		}
 	}
 
 	for _, variant := range []struct {
@@ -1009,15 +1041,11 @@ func TestTheClaimantIsComparedOnItsWholeChain(t *testing.T) {
 	}{
 		{"Actor", differing(func(p *principal) { p.actor = "other-actor" })},
 		{"ClientID", differing(func(p *principal) { p.clientID = "other-client" })},
-		{"OnBehalfOf (chain emptied)", differing(func(p *principal) { p.onBehalfOf = nil })},
-		{"OnBehalfOf (different delegator)", differing(func(p *principal) {
-			p.onBehalfOf = []shoal.ID{"other-delegator"}
-		})},
 	} {
 		t.Run(variant.component, func(t *testing.T) {
 			fixture := newExecutorClaimFixture(t)
-			claimant := bindDecision(t, fixture.authority, dispatchDecisionFor(
-				t, holder, auth.OperationExecute, auth.OperationDelegate))
+			claimant := bindDecision(t, fixture.authority,
+				executorDecisionFor(t, holder, "exec"))
 
 			claimed, err := fixture.service.Claim(claimant, ClaimRequest{
 				ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -1028,8 +1056,8 @@ func TestTheClaimantIsComparedOnItsWholeChain(t *testing.T) {
 				t.Fatalf("the holder could not claim: %v", err)
 			}
 
-			other := bindDecision(t, fixture.authority, dispatchDecisionFor(
-				t, variant.who, auth.OperationExecute, auth.OperationDelegate))
+			other := bindDecision(t, fixture.authority,
+				executorDecisionFor(t, variant.who, "exec"))
 			_, err = fixture.service.CompleteClaim(other, CompletionRequest{
 				ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
 				ClaimID: []byte("holder-claim"),
@@ -1076,7 +1104,7 @@ func TestTheClaimantIsComparedOnItsWholeChain(t *testing.T) {
 // which is the pre-#437 encoding and nothing else.
 func TestTheEnqueuerCannotReportOnAWorkersClaim(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	claimed, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -1138,8 +1166,8 @@ func TestTheEnqueuerCannotReportOnAWorkersClaim(t *testing.T) {
 // version 2 and every wrong guess answers not-found.
 func TestALiveClaimIsNotVisibleToAStranger(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	holder := fixture.namedWorker(t, "holder", auth.OperationExecute)
-	stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+	holder := fixture.namedExecutor(t, "holder")
+	stranger := fixture.namedExecutor(t, "stranger")
 
 	claimed, err := fixture.service.Claim(holder, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -1192,8 +1220,8 @@ func TestALiveClaimIsNotVisibleToAStranger(t *testing.T) {
 // version-mismatch branch. That ignored the race.
 func TestTheLoserOfAClaimRaceIsToldNotFound(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	first := fixture.namedWorker(t, "first", auth.OperationExecute)
-	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	first := fixture.namedExecutor(t, "first")
+	second := fixture.namedExecutor(t, "second")
 
 	page, err := fixture.service.Pull(second, PullActionsRequest{
 		Limit: 10, Context: dispatchContext(fixture.now, "second-request"),
@@ -1246,7 +1274,7 @@ func TestTheLoserOfAClaimRaceIsToldNotFound(t *testing.T) {
 	// which is why the concealment keys on what Pull shows rather than on
 	// standing alone. Nothing is concealed that the caller can already pull.
 	fresh := newExecutorClaimFixture(t)
-	stale := fresh.namedWorker(t, "stale", auth.OperationExecute)
+	stale := fresh.namedExecutor(t, "stale")
 	_, err = fresh.service.Claim(stale, ClaimRequest{
 		ID: fresh.queued.ID, ExpectedVersion: fresh.queued.Version + 7,
 		ClaimID: []byte("stale-claim"), Lease: time.Minute,
@@ -1341,7 +1369,7 @@ func (*inProcessExecutor) Execute(
 func TestInvokeCannotExecuteOverAnotherPrincipalsClaim(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
 	fixture.bindExecutor(t, &inProcessExecutor{})
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	claimed, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -1432,7 +1460,7 @@ func TestTheEnqueuerStillInvokesItsOwnWork(t *testing.T) {
 // stranger and a stranger is refused by either.
 func TestAnEnqueuerCannotReplayAnotherPrincipalsClaim(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	if _, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -1477,7 +1505,7 @@ func TestAnEnqueuerCannotReplayAnotherPrincipalsClaim(t *testing.T) {
 func TestAForgedRecordCannotRetrieveAnothersAction(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
 	fixture.bindExecutor(t, &inProcessExecutor{})
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	claimed, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -1556,7 +1584,7 @@ func TestAForgedRecordCannotRetrieveAnothersAction(t *testing.T) {
 func TestARecordNamesTheOperationThatAuthorizedItsTransition(t *testing.T) {
 	t.Run("a claim taken under execute", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
-		worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+		worker := fixture.namedExecutor(t, "worker")
 
 		claimed, err := fixture.service.Claim(worker, ClaimRequest{
 			ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -1696,7 +1724,7 @@ func (f *executorClaimFixture) lapsedClaimant(
 	t *testing.T, name string,
 ) (context.Context, uint64, ActionRecord) {
 	t.Helper()
-	worker := f.namedWorker(t, name, auth.OperationExecute)
+	worker := f.namedExecutor(t, name)
 	claimed, err := f.service.Claim(worker, ClaimRequest{
 		ID: f.queued.ID, ExpectedVersion: f.queued.Version,
 		ClaimID: []byte(name + "-claim"), Lease: time.Nanosecond,
@@ -1726,7 +1754,7 @@ func TestALapsedClaimantRecordsWhatItAttempted(t *testing.T) {
 	// claimant. This is the situation the route exists for, and the one the
 	// issue's own "require a claim_id the record has seen" rule could not
 	// express: the record keeps only the current claim ID.
-	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	second := fixture.namedExecutor(t, "second")
 	reclaimed, err := fixture.service.Claim(second, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
 		ClaimID: []byte("second-claim"), Lease: time.Minute,
@@ -1861,7 +1889,7 @@ func TestOnlyAPrincipalTheRecordHasSeenMayReport(t *testing.T) {
 		{
 			name: "a principal that never claimed",
 			caller: func() context.Context {
-				return fixture.namedWorker(t, "stranger", auth.OperationExecute)
+				return fixture.namedExecutor(t, "stranger")
 			},
 			request: func() AmbiguityRequest {
 				return AmbiguityRequest{
@@ -2037,7 +2065,7 @@ func TestTheClaimHistoryIsBoundedAndDropsTheOldest(t *testing.T) {
 	// concluded the cap dropped the wrong end, when nothing had been dropped.
 	for index := 0; index <= MaxActionClaimHistory+1; index++ {
 		name := fmt.Sprintf("worker-%d", index)
-		worker := fixture.namedWorker(t, name, auth.OperationExecute)
+		worker := fixture.namedExecutor(t, name)
 		claimed, err := fixture.service.Claim(worker, ClaimRequest{
 			ID: fixture.queued.ID, ExpectedVersion: version,
 			ClaimID: []byte(name), Lease: time.Nanosecond,
@@ -2102,7 +2130,7 @@ func TestTheClaimHistoryIsBoundedAndDropsTheOldest(t *testing.T) {
 	}
 
 	// The dropped holder cannot, and is refused the same way a stranger is.
-	dropped := fixture.namedWorker(t, "worker-0", auth.OperationExecute)
+	dropped := fixture.namedExecutor(t, "worker-0")
 	_, err = fixture.service.ReportAmbiguity(dropped, AmbiguityRequest{
 		ID: fixture.queued.ID, ExpectedVersion: current.Version,
 		ClaimFence: firstFence, Outcome: AmbiguityOutcomeUnknown,
@@ -2216,7 +2244,7 @@ func TestALapsedClaimantReportsWithoutKnowingTheVersion(t *testing.T) {
 
 	// Someone else takes the record, moving the version past anything the
 	// first worker saw.
-	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	second := fixture.namedExecutor(t, "second")
 	if _, err := fixture.service.Claim(second, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
 		ClaimID: []byte("second-claim"), Lease: time.Minute,
@@ -2286,7 +2314,7 @@ func TestAReportDoesNotStrandALiveClaimant(t *testing.T) {
 	lapsed, fence, claimedByLapsed := fixture.lapsedClaimant(t, "lapsed")
 
 	// A second worker takes over and holds a live claim.
-	live := fixture.namedWorker(t, "live", auth.OperationExecute)
+	live := fixture.namedExecutor(t, "live")
 	claimedByLive, err := fixture.service.Claim(live, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: claimedByLapsed.Version,
 		ClaimID: []byte("live-claim"), Lease: time.Minute,
@@ -2396,7 +2424,7 @@ func TestAReportDoesNotStrandASynchronousInvoke(t *testing.T) {
 func TestAFencelessCompletionStillComparesTheVersionExactly(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
 	lapsed, fence, claimedByLapsed := fixture.lapsedClaimant(t, "lapsed")
-	live := fixture.namedWorker(t, "live", auth.OperationExecute)
+	live := fixture.namedExecutor(t, "live")
 	claimedByLive, err := fixture.service.Claim(live, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: claimedByLapsed.Version,
 		ClaimID: []byte("live-claim"), Lease: time.Minute,
@@ -2544,7 +2572,7 @@ func TestAnAmbiguityReportAuditsItsOwnPhaseAndOperation(t *testing.T) {
 // completion path.
 func TestARenewalAuditsItsOwnOperationAcrossAnUpgrade(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 	claimed, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
 		ClaimID: []byte("worker-claim"), Lease: time.Minute,
@@ -2610,7 +2638,7 @@ func TestAStaleGenerationCannotCommitOntoALiveOne(t *testing.T) {
 	_ = otherClaim
 
 	// One worker, one reused ClaimID, two generations.
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 	first, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: reported.Version,
 		ClaimID: []byte("reused"), Lease: time.Nanosecond,
@@ -2676,7 +2704,7 @@ func TestAStaleGenerationCannotCommitOntoALiveOne(t *testing.T) {
 // needed no ambiguity report at all, and nothing in the repository covered it.
 func TestAReplayIsNotAnotherGenerationsOutcome(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	first, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -2792,7 +2820,7 @@ func TestTheRetainedHolderCarriesItsOwnClaimID(t *testing.T) {
 	first, _, claimedFirst := fixture.lapsedClaimant(t, "first")
 	_ = first
 
-	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	second := fixture.namedExecutor(t, "second")
 	if _, err := fixture.service.Claim(second, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: claimedFirst.Version,
 		ClaimID: []byte("second-claim"), Lease: time.Minute,
@@ -2864,7 +2892,7 @@ func TestAClaimHolderChainIsBoundedInBytes(t *testing.T) {
 // lease and lose the ability to complete under it.
 func TestARenewalExtendsTheLeaseWithoutMovingTheFence(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	claimed, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -2927,7 +2955,7 @@ func TestARenewalExtendsTheLeaseWithoutMovingTheFence(t *testing.T) {
 // budget is the action's Deadline, which already existed and already clamps.
 func TestARenewalCoversAnOperationLongerThanTheLeaseCeiling(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	// A lease at the ceiling. A larger one is refused, which is what makes
 	// renewal the only way to outlast it.
@@ -2996,7 +3024,7 @@ func TestARenewalCoversAnOperationLongerThanTheLeaseCeiling(t *testing.T) {
 // from "retry the renewal" — the first means it is in the #438 case.
 func TestALeaseIsNotRenewableOnceItHasLapsed(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	claimed, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -3041,8 +3069,8 @@ func TestALeaseIsNotRenewableOnceItHasLapsed(t *testing.T) {
 // require the claimant's principal chain.
 func TestOnlyTheClaimHolderMayRenew(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	holder := fixture.namedWorker(t, "holder", auth.OperationExecute)
-	stranger := fixture.namedWorker(t, "stranger", auth.OperationExecute)
+	holder := fixture.namedExecutor(t, "holder")
+	stranger := fixture.namedExecutor(t, "stranger")
 
 	claimed, err := fixture.service.Claim(holder, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -3120,7 +3148,7 @@ func TestOnlyTheClaimHolderMayRenew(t *testing.T) {
 func TestARenewalIsRefusedWhenItWouldNotMoveTheLeaseForward(t *testing.T) {
 	t.Run("a shorter lease", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
-		worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+		worker := fixture.namedExecutor(t, "worker")
 		claimed, err := fixture.service.Claim(worker, ClaimRequest{
 			ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
 			ClaimID: []byte("worker-claim"), Lease: 2 * time.Minute,
@@ -3144,7 +3172,7 @@ func TestARenewalIsRefusedWhenItWouldNotMoveTheLeaseForward(t *testing.T) {
 
 	t.Run("a lease already clamped to the deadline", func(t *testing.T) {
 		fixture := newExecutorClaimFixture(t)
-		worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+		worker := fixture.namedExecutor(t, "worker")
 		// The action's deadline is an hour out and the ceiling is five
 		// minutes, so claim at the ceiling and advance until the clamp binds.
 		claimed, err := fixture.service.Claim(worker, ClaimRequest{
@@ -3197,7 +3225,7 @@ func TestARenewalIsRefusedWhenItWouldNotMoveTheLeaseForward(t *testing.T) {
 // only one principal can publish is the mixed-identity wedge #480 records.
 func TestARenewalPublishesNoLifecycleEvent(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	claimed, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -3238,7 +3266,7 @@ func TestARenewalPublishesNoLifecycleEvent(t *testing.T) {
 // puts an admission in front of this route.
 func TestAnAdmissionClaimCannotBeRenewed(t *testing.T) {
 	fixture := newExecutorClaimFixture(t)
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 
 	claimed, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
@@ -3304,27 +3332,21 @@ func TestAnAdmissionClaimCannotBeRenewed(t *testing.T) {
 // The second half is what makes the first half mean anything: a chain just
 // inside the bound must still claim, lapse and be re-claimed. Without it this
 // test would pass against a service that refused every delegated claim.
+//
+// Since #391 a delegated claimant can only be the delegated enqueuer on the
+// invoke route — a worker on the execute route is bound and acts as itself —
+// so both halves claim as that enqueuer, and the re-claim is by a bound
+// worker. The bound now also counts the executor ref the holder claimed
+// under.
 func TestAClaimantChainTooLongToRetainIsRefusedAtClaimTime(t *testing.T) {
-	chainOf := func(entries, size int) []shoal.ID {
-		chain := make([]shoal.ID, 0, entries)
-		for index := 0; index < entries; index++ {
-			chain = append(chain, shoal.ID(
-				strings.Repeat(string(rune('a'+index)), size)))
-		}
-		return chain
-	}
-
-	// Legal for a decision — five entries, well under MaxOnBehalfOfEntries,
-	// each well under shoal.MaxIDBytes — and 5120 bytes in aggregate, which no
+	// Legal for a decision — six entries, well under MaxOnBehalfOfEntries,
+	// each well under shoal.MaxIDBytes — and 6144 bytes in aggregate, which no
 	// retained holder may carry.
 	fixture := newExecutorClaimFixture(t)
-	overLong := bindDecision(t, fixture.authority,
-		dispatchDecisionFor(t, principal{
-			subject: "long-subject", actor: "long-actor",
-			request: "long-request", onBehalfOf: chainOf(5, 1024),
-		}, auth.OperationExecute, auth.OperationDelegate))
+	overLong, overLongQueued := fixture.delegatedQueued(
+		t, "long", delegationChainOf(6, 1024))
 	_, err := fixture.service.Claim(overLong, ClaimRequest{
-		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ID: overLongQueued.ID, ExpectedVersion: overLongQueued.Version,
 		ClaimID: []byte("long-claim"), Lease: time.Nanosecond,
 		Context: dispatchContext(fixture.now, "long-request"),
 	})
@@ -3342,14 +3364,10 @@ func TestAClaimantChainTooLongToRetainIsRefusedAtClaimTime(t *testing.T) {
 	// broke: claim, lapse, re-claim by someone else, and the retained holder
 	// is recognisable to the route that needs it.
 	fixture = newExecutorClaimFixture(t)
-	withinBound := chainOf(3, 1024)
-	delegated := bindDecision(t, fixture.authority,
-		dispatchDecisionFor(t, principal{
-			subject: "short-subject", actor: "short-actor",
-			request: "short-request", onBehalfOf: withinBound,
-		}, auth.OperationExecute, auth.OperationDelegate))
+	withinBound := delegationChainOf(3, 1024)
+	delegated, queued := fixture.delegatedQueued(t, "short", withinBound)
 	claimed, err := fixture.service.Claim(delegated, ClaimRequest{
-		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ID: queued.ID, ExpectedVersion: queued.Version,
 		ClaimID: []byte("short-claim"), Lease: time.Nanosecond,
 		Context: dispatchContext(fixture.now, "short-request"),
 	})
@@ -3358,9 +3376,9 @@ func TestAClaimantChainTooLongToRetainIsRefusedAtClaimTime(t *testing.T) {
 			"bound above is refusing ordinary callers: %v", err)
 	}
 	fixture.advance(t, time.Second)
-	second := fixture.namedWorker(t, "second", auth.OperationExecute)
+	second := fixture.namedExecutor(t, "second")
 	if _, err := fixture.service.Claim(second, ClaimRequest{
-		ID: fixture.queued.ID, ExpectedVersion: claimed.Version,
+		ID: queued.ID, ExpectedVersion: claimed.Version,
 		ClaimID: []byte("second-claim"), Lease: time.Minute,
 		Context: dispatchContext(fixture.now, "second-request"),
 	}); err != nil {
@@ -3368,7 +3386,7 @@ func TestAClaimantChainTooLongToRetainIsRefusedAtClaimTime(t *testing.T) {
 	}
 	if _, err := fixture.service.ReportAmbiguity(
 		delegated, AmbiguityRequest{
-			ID: fixture.queued.ID, ClaimFence: claimed.ClaimFence,
+			ID: queued.ID, ClaimFence: claimed.ClaimFence,
 			Outcome: AmbiguityOutcomeUnknown,
 			Context: dispatchContext(fixture.now, "short-request"),
 		}); err != nil {
@@ -3421,7 +3439,7 @@ func TestARecorderFailureLeavesTheRecordUnchanged(t *testing.T) {
 		{
 			phase: "claim_admission",
 			setup: func(t *testing.T, f *executorClaimFixture) (context.Context, ActionRecord) {
-				return f.namedWorker(t, "worker", auth.OperationExecute), f.queued
+				return f.namedExecutor(t, "worker"), f.queued
 			},
 			act: func(_ *testing.T, f *executorClaimFixture, who context.Context, from ActionRecord) error {
 				_, err := f.service.Claim(who, ClaimRequest{
@@ -3449,7 +3467,7 @@ func TestARecorderFailureLeavesTheRecordUnchanged(t *testing.T) {
 		{
 			phase: "claim_extension",
 			setup: func(t *testing.T, f *executorClaimFixture) (context.Context, ActionRecord) {
-				worker := f.namedWorker(t, "worker", auth.OperationExecute)
+				worker := f.namedExecutor(t, "worker")
 				claimed, err := f.service.Claim(worker, ClaimRequest{
 					ID: f.queued.ID, ExpectedVersion: f.queued.Version,
 					ClaimID: []byte("worker-claim"), Lease: time.Minute,
@@ -3488,7 +3506,7 @@ func TestARecorderFailureLeavesTheRecordUnchanged(t *testing.T) {
 			phase:     "effect_outcome",
 			ambiguous: true,
 			setup: func(t *testing.T, f *executorClaimFixture) (context.Context, ActionRecord) {
-				worker := f.namedWorker(t, "worker", auth.OperationExecute)
+				worker := f.namedExecutor(t, "worker")
 				claimed, err := f.service.Claim(worker, ClaimRequest{
 					ID: f.queued.ID, ExpectedVersion: f.queued.Version,
 					ClaimID: []byte("worker-claim"), Lease: time.Minute,
@@ -3581,7 +3599,7 @@ func TestAnExecutorCannotClaimTheServicesAdjudication(t *testing.T) {
 		context.Context, ActionRecord,
 	) {
 		t.Helper()
-		worker := f.namedWorker(t, "worker", auth.OperationExecute)
+		worker := f.namedExecutor(t, "worker")
 		record, err := f.service.Claim(worker, ClaimRequest{
 			ID: f.queued.ID, ExpectedVersion: f.queued.Version,
 			ClaimID: []byte("worker-claim"), Lease: time.Minute,
@@ -3745,7 +3763,7 @@ func TestAGateRefusalNeverPrecedesTheStandingCheck(t *testing.T) {
 
 	// A caller with standing is told the requirement, which is the point of
 	// the distinguishable refusal.
-	worker := fixture.namedWorker(t, "worker", auth.OperationExecute)
+	worker := fixture.namedExecutor(t, "worker")
 	withStanding := fixture.service.claimOnce(t, worker, "worker-request")
 	if !errors.Is(withStanding, ErrApprovalRequired) {
 		t.Fatalf("a caller with standing was not told the requirement: %v",
@@ -3853,7 +3871,7 @@ func TestEffectPossibleAnswersTheQuestionItNames(t *testing.T) {
 	}
 	complete := func(t *testing.T, f *executorClaimFixture) ActionRecord {
 		t.Helper()
-		worker := f.namedWorker(t, "worker", auth.OperationExecute)
+		worker := f.namedExecutor(t, "worker")
 		claimed, err := f.service.Claim(worker, ClaimRequest{
 			ID: f.queued.ID, ExpectedVersion: f.queued.Version,
 			ClaimID: []byte("worker-claim"), Lease: time.Minute,
@@ -4097,10 +4115,14 @@ func TestAClaimDoesNotRecordTheClaimantsDelegationAsTheEnqueues(t *testing.T) {
 
 	// A worker holding execute and acting on someone's behalf. It holds
 	// delegate as well, because a delegated caller without that standing
-	// cannot learn the action exists at all (#539) — so this is the only
-	// shape the defect occurs in, and the decision legitimately carrying
-	// delegate is exactly why the record wrongly absorbed it.
-	worker, err := fixture.authority.Binder().Bind(
+	// cannot learn the action exists at all (#539) — so this was the only
+	// shape the defect occurred in.
+	//
+	// Since #391 that shape cannot claim at all: a worker acts as itself, so
+	// the execute route refuses a delegated caller, as not-found. That closes
+	// the defect at its source, and the bound worker below checks what a
+	// claim does record.
+	delegatedWorker, err := fixture.authority.Binder().Bind(
 		context.Background(),
 		dispatchDecisionFor(t, principal{
 			subject: "worker-subject", actor: "worker-actor",
@@ -4110,14 +4132,22 @@ func TestAClaimDoesNotRecordTheClaimantsDelegationAsTheEnqueues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := fixture.service.Claim(delegatedWorker, ClaimRequest{
+		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
+		ClaimID: []byte("worker-claim"), Lease: time.Minute,
+		Context: dispatchContext(fixture.now, "worker-request"),
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("a delegated worker claimed on the execute route: %v", err)
+	}
 
+	worker := fixture.namedExecutor(t, "worker")
 	claimed, err := fixture.service.Claim(worker, ClaimRequest{
 		ID: fixture.queued.ID, ExpectedVersion: fixture.queued.Version,
 		ClaimID: []byte("worker-claim"), Lease: time.Minute,
 		Context: dispatchContext(fixture.now, "worker-request"),
 	})
 	if err != nil {
-		t.Fatalf("a delegated worker holding execute could not claim: %v", err)
+		t.Fatalf("a bound worker could not claim: %v", err)
 	}
 
 	if containsOperationForTest(

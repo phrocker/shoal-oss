@@ -330,7 +330,7 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 		return ActionRecord{}, shoal.NewError(shoal.ErrorInvalidArgument, "claim version or lease is invalid")
 	}
 	current, claimedAction, executorRef, authorizing, err := s.authorizedClaimant(
-		ctx, decision, request.ID, now)
+		ctx, decision, request.ID, now, executorPhaseClaim, 0)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -442,7 +442,7 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 	next.Version++
 	next, err = applyClaim(
 		next, claimedAction, request.ClaimID, request.Lease,
-		decision, authorizing, now, attestation)
+		decision, authorizing, now, attestation, executorRef)
 	if err != nil {
 		if errors.Is(err, ErrAttestationRequired) {
 			s.auditAttestationRefusal(ctx, current, authorizing, decision)
@@ -492,6 +492,9 @@ func (s *DispatchService) Claim(ctx context.Context, request ClaimRequest) (Acti
 // only under an attestation that outlives its lease, so an attestation cannot
 // expire while its claim is live, and ExecuteClaim refuses a claim whose lease
 // has lapsed. A second gate there would be a second definition to drift.
+//
+// executorRef is the descriptor's executor reference as the claim's caller
+// resolved it, and it becomes the claim's ClaimExecutorRef (#391).
 func applyClaim(
 	record ActionRecord,
 	action Action,
@@ -501,6 +504,7 @@ func applyClaim(
 	authorizing auth.Operation,
 	now time.Time,
 	attestation ExecutorAttestation,
+	executorRef string,
 ) (ActionRecord, error) {
 	leaseUntil := claimLeaseEnd(now, lease, record.Deadline)
 	required := effectiveClaimRequirements(record, action)
@@ -536,7 +540,10 @@ func applyClaim(
 	// that route exists for. A chain that cannot be retained is a chain whose
 	// holder could never be recognised, so refusing the claim is the honest
 	// answer and it arrives before any effect.
-	chainBytes := 0
+	//
+	// The executor reference counts too, because the retained holder will
+	// carry it (#391) and ClaimHolder.validate counts it.
+	chainBytes := len(executorRef)
 	for _, identity := range decision.OnBehalfOf() {
 		chainBytes += len(identity)
 	}
@@ -611,6 +618,10 @@ func applyClaim(
 			// The attestation that holder's claim stood on, so the history
 			// says which statement covered each attempt.
 			AttestationID: record.ClaimAttestationID,
+			// The reference that holder claimed under. A displaced holder's
+			// ambiguity report is judged against it (#391), so dropping it
+			// here would leave that report judged as a legacy claim.
+			ExecutorRef: record.ClaimExecutorRef,
 		})
 	}
 	// Who holds the claim, as distinct from which claim is held. A re-claim
@@ -631,6 +642,10 @@ func applyClaim(
 	if required.Attestation {
 		record.ClaimAttestationID = attestation.ID
 	}
+	// Claim-scoped as well, and set on every claim whichever route admitted
+	// it, so an empty value always means a claim from a build without the
+	// field (#391).
+	record.ClaimExecutorRef = executorRef
 	record.UpdatedAt = now
 	// Actor is deliberately not written here. It names the principal the record
 	// belongs to, which sameActionPrincipal compares, and it is not a
@@ -1011,7 +1026,7 @@ func (s *DispatchService) completeClaim(
 		return ActionRecord{}, err
 	}
 	current, action, _, authorizing, err := s.authorizedClaimant(
-		ctx, decision, request.ID, now)
+		ctx, decision, request.ID, now, executorPhaseComplete, 0)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -1371,7 +1386,13 @@ func (s *DispatchService) applyExecutionResult(
 	//
 	// claimableBy resolves the binding itself, so this is one check rather than
 	// two and cannot disagree with the one Pull and Claim use.
-	stillClaimable, authorizeErr := s.claimableBy(ctx, finalDecision, current, finishNow)
+	//
+	// Under the completion rule, not the claim rule (#391): the record is
+	// already claimed, so what the executor binding must match is the
+	// reference it was claimed under. A rebind between the claim and this
+	// point must not turn a recorded effect into an ambiguous one.
+	stillClaimable, authorizeErr := s.claimableBy(
+		ctx, finalDecision, current, finishNow, executorPhaseComplete)
 	if authorizeErr != nil {
 		return ActionRecord{}, false, errors.Join(ErrExecutionAmbiguous, authorizeErr)
 	}
@@ -1614,7 +1635,7 @@ func (s *DispatchService) ExtendClaim(
 		return ActionRecord{}, err
 	}
 	current, claimedAction, executorRef, authorizing, err := s.authorizedClaimant(
-		ctx, decision, request.ID, now)
+		ctx, decision, request.ID, now, executorPhaseExtend, 0)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -1792,7 +1813,8 @@ func (s *DispatchService) ReportAmbiguity(
 			shoal.ErrorInvalidArgument, "ambiguity reference exceeds its bound")
 	}
 	current, _, _, authorizing, err := s.authorizedClaimant(
-		ctx, decision, request.ID, now)
+		ctx, decision, request.ID, now, executorPhaseAmbiguity,
+		request.ClaimFence)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -2316,7 +2338,8 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 		//
 		// Binding, not execution: a worker has no in-process Execute, so
 		// resolveActionBinding is the right resolver either way.
-		claimable, authorizeErr := s.claimableBy(ctx, decision, record, now)
+		claimable, authorizeErr := s.claimableBy(
+			ctx, decision, record, now, executorPhasePull)
 		if authorizeErr != nil {
 			return ActionPage{}, authorizeErr
 		}
@@ -2514,10 +2537,17 @@ func (s *DispatchService) deadline(ctx context.Context, request RequestContext) 
 //
 // It also returns the descriptor's executor ref, which is what an attestation
 // is keyed by.
+//
+// phase names the route calling, because the execute route is narrowed to the
+// executor reference the caller is bound to and what must match differs by
+// phase (executorBindingPermits). fence is read only for the ambiguity phase,
+// where the reference that matters is the one the named claim was taken under.
 func (s *DispatchService) authorizedClaimant(
 	ctx context.Context, decision auth.Decision, id []byte, now time.Time,
+	phase executorPhase, fence uint64,
 ) (ActionRecord, Action, string, auth.Operation, error) {
-	record, action, ref, err := s.authorizedCurrentBinding(ctx, decision, id, auth.OperationExecute, false, now)
+	record, action, ref, err := s.authorizedCurrentBinding(
+		ctx, decision, id, auth.OperationExecute, false, now, phase, fence)
 	if err == nil {
 		return record, action, ref, auth.OperationExecute, nil
 	}
@@ -2528,7 +2558,8 @@ func (s *DispatchService) authorizedClaimant(
 		!shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 		return ActionRecord{}, Action{}, "", "", err
 	}
-	record, action, ref, err = s.authorizedCurrentBinding(ctx, decision, id, auth.OperationInvoke, true, now)
+	record, action, ref, err = s.authorizedCurrentBinding(
+		ctx, decision, id, auth.OperationInvoke, true, now, phase, fence)
 	return record, action, ref, auth.OperationInvoke, err
 }
 
@@ -2541,13 +2572,19 @@ func (s *DispatchService) authorizedClaimant(
 // identity is what made an out-of-process executor impossible.
 func (s *DispatchService) authorizedCurrent(ctx context.Context, decision auth.Decision, id []byte, operation auth.Operation, requirePrincipal bool, now time.Time) (ActionRecord, Action, error) {
 	record, action, _, err := s.authorizedCurrentBinding(
-		ctx, decision, id, operation, requirePrincipal, now)
+		ctx, decision, id, operation, requirePrincipal, now,
+		executorPhaseNone, 0)
 	return record, action, err
 }
 
 // authorizedCurrentBinding is authorizedCurrent that also returns the bound
 // descriptor's executor ref.
-func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision auth.Decision, id []byte, operation auth.Operation, requirePrincipal bool, now time.Time) (ActionRecord, Action, string, error) {
+//
+// On the execute route it also applies the executor binding for phase
+// (executeRoutePermits), and for a completion or an ambiguity report it
+// tolerates a descriptor whose lease has lapsed since the claim. phase and
+// fence are ignored on every other operation.
+func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision auth.Decision, id []byte, operation auth.Operation, requirePrincipal bool, now time.Time, phase executorPhase, fence uint64) (ActionRecord, Action, string, error) {
 	if err := validateOpaque("action ID", id, false); err != nil {
 		return ActionRecord{}, Action{}, "", err
 	}
@@ -2599,7 +2636,8 @@ func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision
 	// became false the moment execute existed: a worker authorized under
 	// execute was refused by the second call. Handing back the declaration
 	// removes the duplicate gate instead of teaching it the second operation.
-	descriptor, resolved, _, err := s.registry.resolveActionBinding(ctx, decision, current.AgentID, current.AgentGeneration,
+	executeRoute := operation == auth.OperationExecute
+	descriptor, resolved, _, err := s.registry.resolveActionBindingLapsing(ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID, current.ObjectID,
 		operation, now,
 		// Unpinned: this record already exists, so the question is
@@ -2608,6 +2646,7 @@ func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision
 		// heartbeat changes. The requirement itself is checked by
 		// approvalGate and attestationGate. See resolveActionBinding.
 		false,
+		executeRoute && phase.reportsOnClaim(),
 	)
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
@@ -2633,7 +2672,118 @@ func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision
 		}
 		return ActionRecord{}, Action{}, "", err
 	}
+	// The executor binding, on the execute route only (#391). Applied after
+	// the resolution because it needs the descriptor's reference as it is
+	// now, and before every handler branch, so a caller bound to another
+	// reference is told exactly what an absent action is told and never
+	// reaches the attestation store.
+	if executeRoute && !executeRoutePermits(phase, decision,
+		descriptor.ExecutorRef, claimedExecutorRef(current, phase, fence)) {
+		return ActionRecord{}, Action{}, "", auth.ObjectNotFound()
+	}
 	return cloneActionRecord(current), resolved, descriptor.ExecutorRef, nil
+}
+
+// executorPhase names which execute-route operation is asking, because the
+// executor binding asks a different question of each (#391).
+type executorPhase uint8
+
+const (
+	// executorPhaseNone is every route that is not a claimant route. The
+	// binding permits nothing under it, so a future execute-route caller that
+	// forgets to name its phase is refused rather than admitted.
+	executorPhaseNone executorPhase = iota
+	executorPhasePull
+	executorPhaseClaim
+	executorPhaseExtend
+	executorPhaseComplete
+	executorPhaseAmbiguity
+)
+
+// reportsOnClaim reports whether the phase reports on a claim already taken
+// rather than taking or renewing one. Those are judged against the reference
+// the claim was taken under, and tolerate a descriptor lease that lapsed after
+// the claim: a lapse never strands the report of an effect that happened.
+func (p executorPhase) reportsOnClaim() bool {
+	return p == executorPhaseComplete || p == executorPhaseAmbiguity
+}
+
+// executorBindingPermits is the executor binding rule (#391), pure so each
+// row can be tested and mutated on its own.
+//
+// binding is the caller's Decision.ExecutorBinding, currentRef the
+// descriptor's executor reference now, and claimedRef the reference the claim
+// in question was taken under.
+//
+//   - An empty binding permits nothing. A decision may hold execute without a
+//     binding, and before #391 that let it take any descriptor's work in its
+//     scope; it now claims nothing on this route.
+//   - Pull and Claim take new work, so they need the current reference.
+//   - Extend needs the current reference and the claimed one. After a rebind
+//     it is refused, so the claim runs to its lease end and no further.
+//   - Complete and ReportAmbiguity need the claimed reference only, so a
+//     rebind never stops a worker reporting an effect that happened. An empty
+//     claimed reference is a claim taken before the field existed and is
+//     accepted as legacy here, and only here: Extend refuses it.
+func executorBindingPermits(
+	phase executorPhase, binding, currentRef, claimedRef string,
+) bool {
+	if binding == "" {
+		return false
+	}
+	switch phase {
+	case executorPhasePull, executorPhaseClaim:
+		return currentRef == binding
+	case executorPhaseExtend:
+		return currentRef == binding && claimedRef == binding
+	case executorPhaseComplete, executorPhaseAmbiguity:
+		return claimedRef == "" || claimedRef == binding
+	default:
+		return false
+	}
+}
+
+// executeRoutePermits applies executorBindingPermits to a decision, and
+// refuses a delegated caller taking new work.
+//
+// auth already refuses a binding together with an on-behalf-of chain, so a
+// delegated decision has no binding and the rule above refuses it anyway. The
+// fleet refuses it here as well, at Pull and Claim, because a delegated
+// execute claim is what would make #546's subject collision a claim takeover:
+// heldClaimAt compares chains element by element. A worker acts as itself.
+//
+// No test can fail on the chain clause alone, and that is stated rather than
+// hidden: auth cannot mint a bound decision with a chain, so every delegated
+// caller also has an empty binding and is refused by the rule above.
+// Removing both is caught (TestADelegatedExecuteHolderIsRefusedAtPullAndClaim);
+// the clause is kept so the refusal does not rest on auth's validation alone.
+func executeRoutePermits(
+	phase executorPhase, decision auth.Decision, currentRef, claimedRef string,
+) bool {
+	if (phase == executorPhasePull || phase == executorPhaseClaim) &&
+		len(decision.OnBehalfOf()) > 0 {
+		return false
+	}
+	return executorBindingPermits(
+		phase, decision.ExecutorBinding(), currentRef, claimedRef)
+}
+
+// claimedExecutorRef is the reference the claim a phase is about was taken
+// under: the current claim's, or for an ambiguity report the claim at the
+// fence it names, which may be a displaced holder's. A fence the record has
+// not seen yields empty, and heldClaimAt refuses that report regardless.
+func claimedExecutorRef(
+	record ActionRecord, phase executorPhase, fence uint64,
+) string {
+	if phase != executorPhaseAmbiguity || fence == record.ClaimFence {
+		return record.ClaimExecutorRef
+	}
+	for _, holder := range record.ClaimHistory {
+		if holder.ClaimFence == fence {
+			return holder.ExecutorRef
+		}
+	}
+	return ""
 }
 
 // claimableBy reports whether this caller may take this record, by either
@@ -2653,8 +2803,12 @@ func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision
 // That is pre-existing behaviour and this function does not change it. What it
 // does is stop a *foreign* record's fault from aborting a page it has no
 // business aborting, which is a narrower and real guarantee.
+//
+// phase is Pull's or a completion's, and is applied on the execute route as
+// authorizedClaimant applies it (#391).
 func (s *DispatchService) claimableBy(
-	ctx context.Context, decision auth.Decision, record ActionRecord, now time.Time,
+	ctx context.Context, decision auth.Decision, record ActionRecord,
+	now time.Time, phase executorPhase,
 ) (bool, error) {
 	for _, route := range []struct {
 		operation        auth.Operation
@@ -2666,7 +2820,8 @@ func (s *DispatchService) claimableBy(
 		if route.requirePrincipal && !sameActionPrincipal(decision, record) {
 			continue
 		}
-		_, resolved, _, err := s.registry.resolveActionBinding(
+		executeRoute := route.operation == auth.OperationExecute
+		descriptor, resolved, _, err := s.registry.resolveActionBindingLapsing(
 			ctx, decision, record.AgentID, record.AgentGeneration,
 			record.Capability, record.Action, record.SourceID, record.PolicyID,
 			record.ObjectID, route.operation, now,
@@ -2676,7 +2831,15 @@ func (s *DispatchService) claimableBy(
 			// heartbeat changes. The requirement itself is checked by
 			// approvalGate and attestationGate. See resolveActionBinding.
 			false,
+			executeRoute && phase.reportsOnClaim(),
 		)
+		if err == nil && executeRoute && !executeRoutePermits(
+			phase, decision, descriptor.ExecutorRef,
+			claimedExecutorRef(record, phase, 0)) {
+			// Not this worker's reference: a skip, exactly as an
+			// authorization refusal is.
+			continue
+		}
 		if err == nil {
 			// Offering work that cannot be claimed is a listing that lies.
 			// The claim gates are the authority on this; applying the same
@@ -3028,6 +3191,32 @@ func (s *Service) resolveActionBinding(
 	// revocation by s.active regardless of generation.
 	pinned bool,
 ) (Descriptor, Action, any, error) {
+	return s.resolveActionBindingLapsing(ctx, decision, agentID, generation,
+		capabilityName, actionName, sourceID, policyID, objectID, operation,
+		now, pinned, false)
+}
+
+// resolveActionBindingLapsing is resolveActionBinding that, when
+// allowLapsed, still resolves a descriptor whose lease has lapsed.
+//
+// Only an execute-route completion or ambiguity report asks for that (#391):
+// a claim taken while the descriptor was live must still be reportable after
+// its lease lapses, because a worker never heartbeats and cannot keep it live.
+// Revocation still refuses, and so does everything else below. Taking or
+// renewing work never asks, so new claims after a lapse are refused as before.
+func (s *Service) resolveActionBindingLapsing(
+	ctx context.Context,
+	decision auth.Decision,
+	agentID shoal.ID,
+	generation int64,
+	capabilityName, actionName string,
+	sourceID, policyID []byte,
+	objectID shoal.ID,
+	operation auth.Operation,
+	now time.Time,
+	pinned bool,
+	allowLapsed bool,
+) (Descriptor, Action, any, error) {
 	// Caller-only authorization first, before anything is looked up.
 	//
 	// These two checks ask whether *this caller* may act at all: does it hold
@@ -3066,8 +3255,12 @@ func (s *Service) resolveActionBinding(
 		}
 	}
 
-	descriptor, err := s.active(ctx, agentID, now)
-	if err != nil || (pinned && descriptor.Generation != generation) {
+	chain, err := s.activeChainLapsing(ctx, agentID, now, allowLapsed)
+	if err != nil {
+		return Descriptor{}, Action{}, nil, auth.ObjectNotFound()
+	}
+	descriptor := chain[0]
+	if pinned && descriptor.Generation != generation {
 		return Descriptor{}, Action{}, nil, auth.ObjectNotFound()
 	}
 	if !bytes.Equal(descriptor.AuthorizationDomain, decision.AuthorizationDomain()) {

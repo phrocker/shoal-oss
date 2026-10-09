@@ -68,6 +68,13 @@ func TestAttestationPresentation(t *testing.T) {
 			clientID: "alpha-client", onBehalfOf: onBehalfOf,
 		}, operations...))
 	}
+	// bound is a worker since #391: execute only, bound to one executor ref.
+	bound := func(binding string) context.Context {
+		return bindDecision(t, authority, executorDecisionFor(t, principal{
+			subject: "alpha", actor: "alpha-actor", request: "present",
+			clientID: "alpha-client",
+		}, binding))
+	}
 	presentation := AttestationPresentation{
 		ExecutorRef: "exec", IdempotencyKey: []byte("key"), Report: []byte(`{}`),
 	}
@@ -115,7 +122,7 @@ func TestAttestationPresentation(t *testing.T) {
 	})
 	t.Run("accepted, audited first, for the caller only", func(t *testing.T) {
 		service, presenter, recorder := setup()
-		receipt, err := service.Present(caller(nil, auth.OperationExecute), presentation)
+		receipt, err := service.Present(bound("exec"), presentation)
 		if err != nil || receipt.AttestationID == "" {
 			t.Fatalf("present = %+v, %v", receipt, err)
 		}
@@ -131,7 +138,7 @@ func TestAttestationPresentation(t *testing.T) {
 	t.Run("an unrecordable acceptance stores nothing", func(t *testing.T) {
 		service, presenter, recorder := setup()
 		recorder.err = errors.New("down")
-		_, err := service.Present(caller(nil, auth.OperationExecute), presentation)
+		_, err := service.Present(bound("exec"), presentation)
 		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) || len(presenter.recorded) != 0 {
 			t.Fatalf("err = %v, recorded = %d", err, len(presenter.recorded))
 		}
@@ -140,7 +147,7 @@ func TestAttestationPresentation(t *testing.T) {
 		service, presenter, recorder := setup()
 		presenter.verifyErr = &AttestationRefusal{Reason: "signature"}
 		recorder.err = errors.New("down")
-		_, err := service.Present(caller(nil, auth.OperationExecute), presentation)
+		_, err := service.Present(bound("exec"), presentation)
 		refused(t, err)
 		if len(recorder.audits) != 1 || recorder.audits[0].Phase != "attestation_refused" ||
 			recorder.audits[0].Reason != "signature" || len(presenter.recorded) != 0 {
@@ -150,7 +157,7 @@ func TestAttestationPresentation(t *testing.T) {
 	t.Run("a rollback at record time is refused", func(t *testing.T) {
 		service, presenter, recorder := setup()
 		presenter.recordErr = &AttestationRefusal{Reason: "rollback"}
-		_, err := service.Present(caller(nil, auth.OperationExecute), presentation)
+		_, err := service.Present(bound("exec"), presentation)
 		refused(t, err)
 		if last := recorder.audits[len(recorder.audits)-1]; last.Reason != "rollback" {
 			t.Fatalf("audits = %+v", recorder.audits)
@@ -164,10 +171,37 @@ func TestAttestationPresentation(t *testing.T) {
 			t.Fatal("verified a delegated presentation")
 		}
 	})
+	// A worker attests only for the executor it is bound to (#391). Both
+	// refusals are the one opaque refusal, audited with their reason, and
+	// reach no verifier.
+	for _, refusedCaller := range []struct {
+		name string
+		ctx  func() context.Context
+	}{
+		{"an unbound execute-holder is refused", func() context.Context {
+			return caller(nil, auth.OperationExecute)
+		}},
+		{"a worker bound to another executor is refused", func() context.Context {
+			return bound("other-exec")
+		}},
+	} {
+		t.Run(refusedCaller.name, func(t *testing.T) {
+			service, presenter, recorder := setup()
+			_, err := service.Present(refusedCaller.ctx(), presentation)
+			refused(t, err)
+			if len(presenter.verified) != 0 || len(presenter.recorded) != 0 {
+				t.Fatal("verified a presentation for a reference the caller is not bound to")
+			}
+			if len(recorder.audits) != 1 ||
+				recorder.audits[0].Reason != "executor-binding" {
+				t.Fatalf("audits = %+v", recorder.audits)
+			}
+		})
+	}
 	t.Run("a store failure is unavailable", func(t *testing.T) {
 		service, presenter, _ := setup()
 		presenter.recordErr = errors.New("down")
-		_, err := service.Present(caller(nil, auth.OperationExecute), presentation)
+		_, err := service.Present(bound("exec"), presentation)
 		if !errors.Is(err, ErrAttestationUnavailable) || errors.Is(err, ErrAttestationRefused) {
 			t.Fatalf("err = %v", err)
 		}

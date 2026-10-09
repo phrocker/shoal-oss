@@ -130,8 +130,11 @@ var roleOperationCeilings = map[auth.ServiceRole]map[auth.Operation]bool{
 	// AllowedOperations directly never exercises ServiceRole.Allows, which is
 	// how a mutation granting execute to ServiceRoleActionInvocation survived
 	// the dispatch tests entirely.
+	// Resolve so a worker can read its own descriptor, which the fleet
+	// confines to the executor binding (#391). Never heartbeat or register.
 	auth.ServiceRoleActionExecution: operationSet(
 		auth.OperationExecute,
+		auth.OperationAgentResolve,
 		auth.OperationValidate,
 	),
 	// Approve and nothing else. An approver that could also enqueue, invoke

@@ -50,13 +50,14 @@ var (
 		subject: "alice", actor: "alice-gateway", client: "gateway-client",
 		operations: []auth.Operation{auth.OperationDispatch, auth.OperationInvoke},
 	}
+	// Presenters are bound to the executor they attest for (#391).
 	attestedPresenter = principal{
 		subject: "alice", actor: "alice-gateway", client: "gateway-client",
-		operations: []auth.Operation{auth.OperationExecute},
+		operations: []auth.Operation{auth.OperationExecute}, binding: "local",
 	}
 	foreignPresenter = principal{
 		subject: "mallory", actor: "mallory-gateway", client: "mallory-client",
-		operations: []auth.Operation{auth.OperationExecute},
+		operations: []auth.Operation{auth.OperationExecute}, binding: "local",
 	}
 )
 
@@ -465,7 +466,7 @@ func newAttestationPlane(t *testing.T, h *attestationHarness, tokens map[string]
 		if err != nil {
 			return auth.Decision{}, err
 		}
-		decision, err := auth.NewDecision(auth.DecisionConfig{
+		decision, err := auth.NewDecision(who.bindExecutor(auth.DecisionConfig{
 			Subject: who.subject, Actor: who.actor, ClientID: who.client,
 			OnBehalfOf: who.onBehalfOf, AuthorizationDomain: workspaceAuthorizationDomain,
 			AllowedOperations:     who.operations,
@@ -474,7 +475,7 @@ func newAttestationPlane(t *testing.T, h *attestationHarness, tokens map[string]
 			PolicyGeneration:      workspacePolicyGeneration,
 			AuthenticationExpires: h.now().Add(time.Hour),
 			RequestID:             requestID, CorrelationID: correlationID,
-		})
+		}))
 		if err == nil && decision.CorrelationID() == "" {
 			t.Error("the test mint produced no correlation ID")
 		}

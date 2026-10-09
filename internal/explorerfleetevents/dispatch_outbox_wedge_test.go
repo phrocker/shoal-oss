@@ -89,19 +89,9 @@ func TestAStrandedTransitionDoesNotBlockAnotherPrincipalsClaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bind := func(subject, actor, request string, ops ...auth.Operation) context.Context {
+	bindConfig := func(config auth.DecisionConfig) context.Context {
 		t.Helper()
-		decision, err := auth.NewDecision(auth.DecisionConfig{
-			Subject: shoal.ID(subject), Actor: shoal.ID(actor),
-			AuthorizationDomain:   []byte("domain"),
-			AllowedOperations:     ops,
-			PermittedSourceIDs:    [][]byte{[]byte("source")},
-			PermittedPolicyIDs:    [][]byte{[]byte("policy")},
-			PolicyGeneration:      1,
-			AuthenticationExpires: now.Add(2 * time.Hour),
-			RequestID:             shoal.ID(request),
-			CorrelationID:         "correlation",
-		})
+		decision, err := auth.NewDecision(config)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -111,9 +101,32 @@ func TestAStrandedTransitionDoesNotBlockAnotherPrincipalsClaim(t *testing.T) {
 		}
 		return ctx
 	}
+	configFor := func(subject, actor, request string, ops ...auth.Operation) auth.DecisionConfig {
+		return auth.DecisionConfig{
+			Subject: shoal.ID(subject), Actor: shoal.ID(actor),
+			AuthorizationDomain:   []byte("domain"),
+			AllowedOperations:     ops,
+			PermittedSourceIDs:    [][]byte{[]byte("source")},
+			PermittedPolicyIDs:    [][]byte{[]byte("policy")},
+			PolicyGeneration:      1,
+			AuthenticationExpires: now.Add(2 * time.Hour),
+			RequestID:             shoal.ID(request),
+			CorrelationID:         "correlation",
+		}
+	}
+	bind := func(subject, actor, request string, ops ...auth.Operation) context.Context {
+		t.Helper()
+		return bindConfig(configFor(subject, actor, request, ops...))
+	}
 	enqueuer := bind("owner", "actor", "request",
 		auth.OperationAgentRegister, auth.OperationDispatch, auth.OperationInvoke)
-	worker := bind("worker", "worker-actor", "request", auth.OperationExecute)
+	// A worker since #391: bound to the descriptor's executor ref.
+	workerConfig := configFor("worker", "worker-actor", "request",
+		auth.OperationExecute)
+	workerConfig.ServiceRole = auth.ServiceRoleActionExecution
+	workerConfig.ServiceCeilingIdentity = "executor-ceiling"
+	workerConfig.ExecutorBinding = "exec"
+	worker := bindConfig(workerConfig)
 
 	registry, _ := newIntegrationRegistry(
 		t, authority.Resolver(), now,

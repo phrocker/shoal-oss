@@ -514,7 +514,7 @@ func (s *AdmissionService) Request(
 	// invoke, so that is the operation its claim is authorized by.
 	record, err := applyClaim(
 		base, action, request.TokenID, request.Lease,
-		decision, auth.OperationInvoke, now, attestation)
+		decision, auth.OperationInvoke, now, attestation, executorRef)
 	if errors.Is(err, ErrAttestationRequired) {
 		// The existing durable denial, with no reason on the wire, exactly as
 		// approval and the effect ceiling refuse: a caller cannot tell this

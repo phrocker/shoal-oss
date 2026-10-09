@@ -452,6 +452,15 @@ func (s *AttestationService) Present(
 	if principal.ClientID == "" {
 		return refuse("no-client")
 	}
+	// A worker attests only for the executor it is bound to (#391). The claim
+	// it means to take is narrowed to that reference, so an attestation for
+	// any other could never be used by it — and accepting one would let a
+	// worker hold standing statements for executors it may not act for. An
+	// unbound decision has no reference to attest for: it claims nothing on
+	// the execute route.
+	if ref != decision.ExecutorBinding() {
+		return refuse("executor-binding")
+	}
 	verified, err := s.presenter.Verify(principal, presentation, now)
 	if err != nil {
 		return refuse(refusalReason(err))

@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/document"
+	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -55,7 +56,8 @@ const (
 	// Those figures describe what motivated the bound, not what ships. With
 	// the chain bound in place, eight holders carry at most 8 × 4096 = 32 KB
 	// of delegation chain against the 512 KB that 64 maximal entries each
-	// would have reached — a factor of sixteen — and the encoding ceiling is
+	// would have reached — a factor of sixteen (40 KB since the bound also
+	// covers each holder's executor reference) — and the encoding ceiling is
 	// 3 MB (3 × MaxActionPayloadBytes). So "far inside" is now true, and it is
 	// true because of the second bound rather than in spite of its absence.
 	//
@@ -83,7 +85,21 @@ const (
 	// claimed successfully and then the next claim produced a record
 	// ActionRecord.Validate refuses — leaving the action unclaimable by
 	// anyone, forever.
-	MaxClaimHolderChainBytes = 4096
+	//
+	// It also covers the executor reference a holder claimed under (#391),
+	// because a retained holder carries that too: the bound is on what one
+	// holder costs the record, and the reference is part of that cost. It was
+	// raised by executorref.MaxExecutorRefBytes when ClaimHolder gained the
+	// field — the worst case for the one reference each holder carries — so
+	// a holder at the old chain bound is still legal once it also carries a
+	// maximum-length reference. Without the raise, a claimant at the old
+	// bound would claim and then make its successor's record unwritable,
+	// which is the brick described above. Over the whole history that is
+	// MaxActionClaimHistory × MaxExecutorRefBytes (8 KB) more, against an
+	// encoding ceiling of 3 MB.
+	//
+	// TestAMaximalHolderHistoryWithMaximalRefsStillReclaims pins it.
+	MaxClaimHolderChainBytes = 4096 + executorref.MaxExecutorRefBytes
 	// MaxAmbiguityTargetBytes bounds the worker's identifier for the third
 	// party it was talking to, and MaxAmbiguityReferenceBytes the opaque
 	// handle that party returned.
@@ -211,6 +227,13 @@ type ClaimHolder struct {
 	// Empty when the action did not require one. Bounded at
 	// MaxClaimAttestationIDBytes.
 	AttestationID shoal.ID
+	// ExecutorRef is the executor reference that holder's claim was taken
+	// under, carried from ActionRecord.ClaimExecutorRef when it is displaced.
+	// A displaced holder reporting an ambiguity is judged against the
+	// reference it claimed under, not the one the descriptor names now
+	// (#391). Empty for a holder retained by a build without the field. It
+	// counts toward MaxClaimHolderChainBytes.
+	ExecutorRef string
 }
 
 // AmbiguityReport is a worker's account of an effect it may have performed
@@ -266,7 +289,13 @@ func (h ClaimHolder) validate() error {
 	// copy meant a legal claim could produce an illegal record, and then the
 	// refusal landed on whoever claimed next rather than on whoever claimed
 	// too widely.
-	chainBytes := 0
+	if h.ExecutorRef != "" {
+		if err := executorref.ValidExecutorRef(h.ExecutorRef); err != nil {
+			return shoal.NewError(shoal.ErrorInvalidArgument,
+				"claim holder executor reference: "+err.Error())
+		}
+	}
+	chainBytes := len(h.ExecutorRef)
 	for _, identity := range h.OnBehalfOf {
 		if err := shoal.ValidateRequiredID(
 			"claim holder delegation identity", identity); err != nil {
@@ -525,7 +554,19 @@ type ActionRecord struct {
 	// (DispatchService.claimAttestation) and again in Validate. A record
 	// written before the field existed decodes with it empty; gob ignores it
 	// when an earlier build reads a record that carries it.
-	ClaimAttestationID   shoal.ID
+	ClaimAttestationID shoal.ID
+	// ClaimExecutorRef is the descriptor's executor reference at the moment
+	// the current claim was taken (#391). An execute-route completion or
+	// ambiguity report is judged against it rather than against the
+	// descriptor as it is now, so rebinding a descriptor never stops the
+	// worker holding a claim from reporting an effect that happened. An
+	// extension needs both, so a rebound claim runs only to its lease end.
+	//
+	// Claim state, like ClaimAttestationID: applyClaim writes it and a
+	// re-claim moves it, so the store holds it neither immutable nor
+	// monotonic. Empty for a claim taken by a build without the field, which
+	// completion and ambiguity accept as legacy and extension refuses.
+	ClaimExecutorRef     string
 	CancelKey            []byte
 	ExecutorKey          []byte
 	EvidenceSnapshotID   shoal.ID
@@ -1214,6 +1255,16 @@ func (r ActionRecord) Validate() error {
 	if r.ClaimAttestationID != "" && r.ClaimFence == 0 {
 		return shoal.NewError(shoal.ErrorInvalidArgument,
 			"action carries a claim attestation without a claim")
+	}
+	if r.ClaimExecutorRef != "" {
+		if err := executorref.ValidExecutorRef(r.ClaimExecutorRef); err != nil {
+			return shoal.NewError(shoal.ErrorInvalidArgument,
+				"action claim executor reference: "+err.Error())
+		}
+		if r.ClaimFence == 0 {
+			return shoal.NewError(shoal.ErrorInvalidArgument,
+				"action carries a claim executor reference without a claim")
+		}
 	}
 	if len(r.ClaimHistory) > MaxActionClaimHistory {
 		return shoal.NewError(
