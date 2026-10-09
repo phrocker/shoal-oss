@@ -87,6 +87,10 @@ def validate(manifest):
         _digest_text(recipe.get('weights_digest'), 'weights')
         _digest_text(recipe.get('tokenizer_digest'), 'tokenizer')
         _text(recipe.get('license_id'), 'license_id')
+        input_field = recipe.get('input_field', 'text')
+        _text(input_field, 'input_field')
+        if any(term in input_field.lower() for term in FORBIDDEN_FEATURE_TERMS):
+            raise ValueError('recipe input field includes forbidden label or future information')
         if recipe['name'] == 'catboost-structured-v1':
             _text(recipe.get('library_version'), 'CatBoost library version')
             if not isinstance(recipe.get('categorical_features'), list):
@@ -95,6 +99,12 @@ def validate(manifest):
             _text(recipe.get('model_repo'), 'UniXcoder model repo')
             _text(recipe.get('model_revision'), 'UniXcoder model revision')
             _text(recipe.get('tokenizer_revision'), 'UniXcoder tokenizer revision')
+            if recipe['model_repo'] != 'microsoft/unixcoder-base':
+                raise ValueError('UniXcoder recipe must use microsoft/unixcoder-base')
+            for field in ('model_revision', 'tokenizer_revision'):
+                revision = recipe[field]
+                if len(revision) != 40 or any(char not in '0123456789abcdef' for char in revision):
+                    raise ValueError('UniXcoder revision must be an immutable SHA')
             if type(recipe.get('max_context_tokens')) is not int or not 0 < recipe['max_context_tokens'] <= 32768:
                 raise ValueError('invalid UniXcoder context bound')
             if recipe.get('chunking') not in ('reject', 'fixed_nonoverlap'):
