@@ -50,6 +50,12 @@ type DecisionConfig struct {
 	// decision's authority through an operator mapping (#451). It is
 	// additive: a decision without one fingerprints exactly as before.
 	GrantProvenance GrantProvenance
+	// ExecutorBinding names the one executor reference an action-execution
+	// decision may act for (#391). It is required with, and valid only with,
+	// ServiceRoleActionExecution. It is additive: a decision without one
+	// fingerprints exactly as before. A bound decision must carry an empty
+	// OnBehalfOf chain: an executor acts as itself.
+	ExecutorBinding string
 }
 
 // Decision is an immutable trusted authorization decision.
@@ -71,6 +77,7 @@ type Decision struct {
 	serviceCeilingIdentity shoal.ID
 	selectedOntology       ontology.OntologyIdentity
 	grantProvenance        GrantProvenance
+	executorBinding        string
 }
 
 // NewDecision validates, canonicalizes, and defensively owns a trusted
@@ -155,6 +162,11 @@ func NewDecision(config DecisionConfig) (Decision, error) {
 	if err := config.GrantProvenance.Validate(); err != nil {
 		return Decision{}, err
 	}
+	if err := validateExecutorBinding(
+		config.ServiceRole, config.ExecutorBinding, onBehalfOf,
+	); err != nil {
+		return Decision{}, err
+	}
 	if config.ServiceRole == "" {
 		if config.ServiceCeilingIdentity != "" {
 			return Decision{}, shoal.NewError(
@@ -199,6 +211,7 @@ func NewDecision(config DecisionConfig) (Decision, error) {
 		serviceCeilingIdentity: config.ServiceCeilingIdentity,
 		selectedOntology:       config.SelectedOntology,
 		grantProvenance:        config.GrantProvenance.Clone(),
+		executorBinding:        config.ExecutorBinding,
 	}, nil
 }
 
@@ -507,6 +520,7 @@ func (d Decision) cloneValidated() (Decision, error) {
 		ServiceCeilingIdentity: d.serviceCeilingIdentity,
 		SelectedOntology:       d.selectedOntology,
 		GrantProvenance:        d.grantProvenance,
+		ExecutorBinding:        d.executorBinding,
 	})
 }
 

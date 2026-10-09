@@ -358,9 +358,15 @@ refuses_citing "holds a control or line-separator character" "a newline in the a
 refuses_citing "holds a control or line-separator character" "U+0085 in an allowlisted reference" "${explorer_base[@]}" --set-string "explorer.fleet.executorRefs[0]=deploy"$''"- -conceal-withholding=false"
 refuses_citing "holds a control or line-separator character" "U+2028 in an allowlisted reference" "${explorer_base[@]}" --set-string "explorer.fleet.executorRefs[0]=deploy"$' '"- -conceal-withholding=false"
 refuses_citing "holds a control or line-separator character" "U+2029 in an external reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string "explorer.fleet.externalExecutorRefs[0]=deploy"$' '"- -conceal-withholding=false"
-# And a character that is non-ASCII without being a line break must still
-# render, or the widened class would be refusing ordinary values.
-assert_renders "a non-ASCII reference still renders" '^ +- "-fleet-executor-refs=d.ploy"$' "${explorer_base[@]}" --set-string "explorer.fleet.executorRefs[0]=d"$'é'"ploy"
+# A non-ASCII reference used to render here. Since #391 every executor
+# reference is held to one ASCII charset (pkg/executorref), because Unicode
+# look-alikes and invisibles would register, bind and attest as a different
+# executor; the explorer refuses one at startup and the chart refuses it here.
+refuses_citing "entry 1 is outside the executor-reference charset" "a non-ASCII allowlisted reference" "${explorer_base[@]}" --set-string "explorer.fleet.executorRefs[0]=d"$'é'"ploy"
+refuses_citing "entry 1 is outside the executor-reference charset" "a Cyrillic look-alike external reference" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string "explorer.fleet.externalExecutorRefs[0]=depl"$'о'"y"
+refuses_citing "entry 2 is outside the executor-reference charset" "an inner space, at its position" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string 'explorer.fleet.executorRefs[1]=de ploy'
+refuses_citing "entry 1 is outside the executor-reference charset" "a leading dash" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=-deploy'
+assert_renders "every charset punctuation renders" '^ +- "-fleet-executor-refs=a.b_c:d/e@f-g"$' "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=a.b_c:d/e@f-g'
 
 refuses_citing "holds a comma" "a comma inside one allowlisted entry" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy\,restart'
 refuses_citing "holds a comma" "a comma inside one external entry" "${explorer_base[@]}" --set-string 'explorer.fleet.executorRefs[0]=deploy' --set-string 'explorer.fleet.externalExecutorRefs[0]=deploy\,restart'

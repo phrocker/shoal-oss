@@ -377,6 +377,13 @@ func TestProductActionPrivilegeEscalationMutationGuard(t *testing.T) {
 			config.ServiceRole = role
 			config.ServiceCeilingIdentity = "product-action-ceiling"
 			config.AllowedOperations = []auth.Operation{operation}
+			if role == auth.ServiceRoleActionExecution {
+				// The role requires the executor it is bound to, and a bound
+				// decision acts only as itself (#391); the operation ceiling
+				// is what this guard is about.
+				config.ExecutorBinding = "product-action-executor"
+				config.OnBehalfOf = nil
+			}
 			decision, err := auth.NewDecision(config)
 			if roleOperationCeilings[role][operation] {
 				if err != nil {

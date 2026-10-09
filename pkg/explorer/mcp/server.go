@@ -883,6 +883,7 @@ func (s *Server) bindHTTPSessionDecision(
 		ServiceCeilingIdentity: decision.ServiceCeilingIdentity(),
 		SelectedOntology:       selectedOntology,
 		GrantProvenance:        decision.GrantProvenance(),
+		ExecutorBinding:        decision.ExecutorBinding(),
 	})
 	if err != nil {
 		return nil, shoal.NewError(
@@ -945,6 +946,7 @@ func (s *Server) authorizedContext(
 		ServiceCeilingIdentity: template.ServiceCeilingIdentity(),
 		SelectedOntology:       selectedOntology,
 		GrantProvenance:        template.GrantProvenance(),
+		ExecutorBinding:        template.ExecutorBinding(),
 	})
 	if err != nil {
 		return nil, auth.Decision{}, shoal.NewError(

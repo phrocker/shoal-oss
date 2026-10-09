@@ -206,6 +206,7 @@ func (w *oidcApprovalWorld) counterfactual(
 			ServiceCeilingIdentity: decision.ServiceCeilingIdentity(),
 			SelectedOntology:       selected,
 			GrantProvenance:        decision.GrantProvenance(),
+			ExecutorBinding:        decision.ExecutorBinding(),
 		}
 		change(&config)
 		return auth.NewDecision(config)

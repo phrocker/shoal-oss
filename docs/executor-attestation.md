@@ -229,9 +229,44 @@ can never be attested. The row key comes from the authentication
 decision; the body cannot name a principal. Every presentation is audited
 (`attestation_presented`, or `attestation_refused` with the typed reason); an
 accepted one is audited before it is stored, and a refused one stays refused
-if its audit fails. `pkg/attestation/api` (stdlib and `pkg/shoal` only, on the
-import-boundary allowlist) is the wire contract and client;
-`sdk.New(...).Attestation()` returns it.
+if its audit fails. `pkg/attestation/api` (standard library, `pkg/shoal` and
+the standard-library-only `pkg/executorref`, on the import-boundary allowlist)
+is the wire contract and client; `sdk.New(...).Attestation()` returns it.
+
+An executor reference must pass `executorref.ValidExecutorRef`
+(`pkg/executorref`, #391). Every place that accepts one applies this same rule,
+and parity tests hold them all to the same verdict:
+- fleet registration;
+- the ATPL compiler;
+- attestation presentation, on the server and in `pkg/attestation/api`;
+- an action-execution decision's executor binding;
+- the explorer's `-fleet-executor-refs`, `-fleet-external-executor-refs`,
+  `-fleet-external-egress-executor-refs` and `-fleet-ask-executor-ref` flags,
+  the `-fleet-executor-attestation` trust file, and the chart's
+  `explorer.fleet.*ExecutorRef(s)` values.
+
+The rule is a fixed ASCII charset, `^[A-Za-z0-9][A-Za-z0-9._:/@-]*$`, from 1
+to 1024 bytes. A reference starts with a letter or digit and continues with
+letters, digits and `. _ : / @ -`. It contains no spaces and no non-ASCII
+characters. References are compared byte for byte, and inside this charset
+two references that look alike are equal.
+
+**Migration.** The rule tightens *registration*, as #544's floor did.
+- Stored descriptors keep resolving.
+- A descriptor whose reference falls outside the charset is refused with
+  `invalid_argument` at its next `Register`, or at the next ATPL
+  `plan`/`apply` that declares it.
+- A new attestation presentation for such a reference is refused the same way,
+  and no executor binding can name it.
+- Host configuration naming one is refused at startup. The error names the
+  flag and the entry's position.
+
+If this happens to a descriptor that has worked for a long time, the control
+is working: rename the executor reference, and its host binding, into the
+charset and re-register.
+A presentation naming a reference the rule refuses is
+`invalid_argument` before verification, and `attestationapi.NewRequest`
+refuses it on the client.
 
 Note for Path B: an admission caller authenticates under invoke, but presents
 under execute. The same (domain, subject, client) must hold both.

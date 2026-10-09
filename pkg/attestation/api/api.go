@@ -15,8 +15,9 @@
 // code "unauthorized", message "attestation refused". The reason is audited
 // server-side and never returned.
 //
-// This package imports only the standard library and pkg/shoal, so an
-// extension may depend on it (internal/importboundary enforces that).
+// This package imports only the standard library, pkg/shoal and
+// pkg/executorref (itself only the standard library), so an extension may
+// depend on it (internal/importboundary enforces that).
 package api
 
 import (
@@ -32,6 +33,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -43,7 +45,7 @@ const Route = "/api/v1/fleet/executors/attestation"
 // Limits the server applies, mirrored here; a parity test in
 // pkg/explorer/webapi fails if they drift.
 const (
-	MaxExecutorRefBytes    = 1024
+	MaxExecutorRefBytes    = executorref.MaxExecutorRefBytes
 	MaxIdempotencyKeyBytes = 1024
 	MaxReportBytes         = 64 << 10
 	MaxRequestBytes        = 128 << 10
@@ -99,9 +101,8 @@ func Decode(value string) ([]byte, error) {
 
 // NewRequest builds a request, checking it against the limits.
 func NewRequest(executorRef string, idempotencyKey, report []byte) (Request, error) {
-	if executorRef == "" || len(executorRef) > MaxExecutorRefBytes ||
-		strings.TrimSpace(executorRef) != executorRef {
-		return Request{}, errors.New("executor ref is outside its bound")
+	if err := executorref.ValidExecutorRef(executorRef); err != nil {
+		return Request{}, err
 	}
 	if len(idempotencyKey) == 0 || len(idempotencyKey) > MaxIdempotencyKeyBytes {
 		return Request{}, errors.New("idempotency key is outside its bound")
