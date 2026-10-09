@@ -879,6 +879,15 @@ func (s *DispatchService) ExecuteClaim(ctx context.Context, claimed ActionRecord
 		executionDeadline = current.Deadline
 	}
 	executionContext, cancel := context.WithDeadline(ctx, executionDeadline)
+	// Refused before the executor runs, because once it has retrieved there
+	// is nothing to undo: the action's record would carry evidence anchors,
+	// a snapshot pin and node identifiers from outside its own scope (#370).
+	if err := refuseUnconfinedRetrieval(
+		invocationDecision, executor, current, executionNow,
+	); err != nil {
+		cancel()
+		return ActionRecord{}, err
+	}
 	var result ExecutionResult
 	var executionErr error
 	func() {
@@ -3201,4 +3210,100 @@ func actionEventKind(record ActionRecord) string {
 	default:
 		return ""
 	}
+}
+
+// refuseUnconfinedRetrieval refuses an in-process execution whose executor
+// cannot confine retrieval to the action's scope, when the invoking decision
+// permits more than that scope.
+//
+// #370. The descriptor's declared scope is a confinement statement, and the
+// first production executor could not honour it: AskExecutor passes only the
+// question and a top-K to its provider, and ChatService authorizes
+// OperationRetrieve domain-wide — so retrieval spanned every source the
+// principal may read. Nothing was escalated, since the principal reads
+// nothing it could not read directly, but the record ended up a cross-scope
+// index of document, section and span identifiers, and the scope an operator
+// read on the descriptor described none of it.
+//
+// Scoped retrieval is the real fix and is not available here: retrieval.Scope
+// is {DocumentIDs, NodeIDs} and cannot express a (SourceID, PolicyID) bound,
+// and re-minting a decision with narrowed sources would forge authority and
+// change the authorization fingerprint the record pins. So this fails closed
+// where the statement would otherwise be false, and nowhere else.
+//
+// Nowhere else matters as much as the refusal. When the decision permits no
+// more than the action's own scope, the confinement constrains nothing and
+// this returns nil — which is the shipped configuration, where every fleet
+// principal is minted with the same domain, source and policy as the
+// descriptors it registers. The cost falls on multi-source deployments, which
+// are exactly the ones silently widening today.
+func refuseUnconfinedRetrieval(
+	decision auth.Decision,
+	executor Executor,
+	record ActionRecord,
+	now time.Time,
+) error {
+	if confiner, ok := executor.(RetrievalConfiner); ok &&
+		confiner.ConfinesRetrievalToScope() {
+		return nil
+	}
+	// What the principal could retrieve beyond this action's own scope.
+	//
+	// An empty requested set asks for every permitted source, which is the
+	// question: is there more than one, or one that is not this action's?
+	sources, err := decision.IntersectSourceIDs(
+		auth.OperationRetrieve, decision.AuthorizationDomain(), nil, now)
+	if err != nil {
+		// A principal that may not retrieve at all cannot widen retrieval,
+		// so there is nothing to confine and the executor's own retrieval
+		// would be refused anyway. Only an authorization answer is read this
+		// way; any other error is the question failing and is returned.
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			return nil
+		}
+		return err
+	}
+	policies, err := decision.IntersectPolicyIDs(
+		auth.OperationRetrieve, decision.AuthorizationDomain(), nil, now)
+	if err != nil {
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			return nil
+		}
+		return err
+	}
+	if withinScope(sources, record.SourceID) &&
+		withinScope(policies, record.PolicyID) {
+		return nil
+	}
+	// Names no source it does not already hold: the refusal says the
+	// executor cannot confine, which is host configuration, and not which
+	// other sources exist.
+	return shoal.NewError(
+		shoal.ErrorUnauthorized,
+		"the bound executor does not confine retrieval to this action's "+
+			"scope, and the invoking principal may retrieve beyond it; the "+
+			"descriptor's scope would not describe what the record carries")
+}
+
+// withinScope reports whether permitted contains nothing beyond one identity.
+//
+// Empty is within any scope, and that reading was checked rather than
+// assumed: a first version had it the other way, reasoning that an empty set
+// meant "unrestricted". It does not. authorizeResource refuses any non-empty
+// SourceID that is not in the decision's set, so a decision permitting no
+// sources authorizes *nothing* with a source — and IntersectSourceIDs
+// returning empty means either that or every permitted source being hidden.
+// Both are principals that can retrieve nothing, which cannot widen anything.
+//
+// Getting this backwards would have refused exactly the principals with the
+// least reach.
+func withinScope(permitted [][]byte, scope []byte) bool {
+	for _, candidate := range permitted {
+		if !bytes.Equal(candidate, scope) {
+			return false
+		}
+	}
+	return true
 }

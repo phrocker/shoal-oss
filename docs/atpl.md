@@ -91,6 +91,19 @@ is one JSON object:
   the registry's bound (`SkewMargin`) absorb a client clock running ahead of
   the server's: apply computes the lease on the client, the registry checks it
   on the server.
+- **Scopes** bound which actions an agent may be asked to perform, and — for
+  an executor that says so — what one may reach while performing it. The
+  second half is not free: `fleet.Invocation` carries the action's source,
+  policy and object, and an executor is only taken to honour them if it
+  implements `fleet.RetrievalConfiner`. One that does not is refused at
+  invocation when the invoking principal may retrieve beyond the action's
+  scope, rather than run and record evidence from outside it (#370). Where
+  the principal can reach no more than the scope — which is how
+  `cmd/shoal-explore-web` mints fleet principals — the bound constrains
+  nothing and nothing is refused. Scoped retrieval itself is not implemented:
+  `retrieval.Scope` is document and node identifiers and cannot express a
+  source/policy bound, so a scoped reasoning agent currently refuses rather
+  than reaching wider.
 - **Executors** assert what the host binds a reference to. Ceilings and floors
   are host Go objects with no read API (`executorCeiling`, `executorFloor`,
   `cmd/shoal-explore-web/fleet.go`), so the file declares them and compile

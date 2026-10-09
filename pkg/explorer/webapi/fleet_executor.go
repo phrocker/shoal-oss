@@ -132,6 +132,16 @@ type AskExecutorConfig struct {
 }
 
 // AskExecutor implements fleet.ActionExecutor.
+//
+// It does not implement fleet.RetrievalConfiner, and that is accurate rather
+// than an omission: it passes only the question and a top-K to its provider,
+// so the invocation's source, policy and object reach nothing, and
+// ChatService authorizes OperationRetrieve domain-wide. So fleet refuses an
+// invocation whose principal may retrieve beyond the action's own scope,
+// rather than letting the record carry evidence the descriptor's scope does
+// not cover (#370). Implementing the interface is a promise about retrieval;
+// it must not be added before the provider seam can carry a source/policy
+// bound, which retrieval.Scope cannot express today.
 type AskExecutor struct {
 	provider   AskProvider
 	capability string

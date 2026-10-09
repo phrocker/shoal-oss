@@ -4199,3 +4199,234 @@ func containsOperationForTest(
 	}
 	return false
 }
+
+// confiningExecutor declares that it confines retrieval to the invocation's
+// scope, which is the promise #370 requires before an in-process execution
+// may run wider than the action's scope.
+type confiningExecutor struct{ confines bool }
+
+func (confiningExecutor) Execute(
+	context.Context, Invocation,
+) (ExecutionResult, error) {
+	return ExecutionResult{Output: json.RawMessage(`{"ok":true}`)}, nil
+}
+
+func (e confiningExecutor) ConfinesRetrievalToScope() bool { return e.confines }
+
+// TestAnUnconfinedExecutorMayNotRunWiderThanItsScope is #370.
+//
+// A Descriptor declares Scopes as (SourceID, PolicyID) pairs and
+// resolveAction gates every invocation on them, so the scope reads as a bound
+// on what the agent reaches. For an in-process executor that retrieves it was
+// not one: AskExecutor passes only the question and a top-K to its provider,
+// and ChatService authorizes OperationRetrieve domain-wide. Nothing was
+// escalated — the principal reads nothing it could not read directly — but
+// the record became a cross-scope index of document, section and span
+// identifiers, and the scope an operator read on the descriptor described
+// none of it.
+func TestAnUnconfinedExecutorMayNotRunWiderThanItsScope(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	record := ActionRecord{
+		SourceID: []byte("source-a"), PolicyID: []byte("policy-a"),
+	}
+	decisionWith := func(
+		t *testing.T, sources, policies [][]byte, ops ...auth.Operation,
+	) auth.Decision {
+		t.Helper()
+		decision, err := auth.NewDecision(auth.DecisionConfig{
+			Subject: "owner", Actor: "actor",
+			AuthorizationDomain: []byte("domain"),
+			AllowedOperations:   ops,
+			PermittedSourceIDs:  sources, PermittedPolicyIDs: policies,
+			PolicyGeneration:      1,
+			AuthenticationExpires: now.Add(time.Hour),
+			RequestID:             "request", CorrelationID: "correlation",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decision
+	}
+	onlyA := [][]byte{[]byte("source-a")}
+	aAndB := [][]byte{[]byte("source-a"), []byte("source-b")}
+	policyA := [][]byte{[]byte("policy-a")}
+
+	for _, probe := range []struct {
+		name     string
+		decision func(*testing.T) auth.Decision
+		executor Executor
+		refused  bool
+	}{
+		{
+			// The case that was silently widening: more sources than the
+			// action's scope, and an executor that makes no promise.
+			name: "a wider principal and an unconfined executor",
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, aAndB, policyA, auth.OperationRetrieve)
+			},
+			executor: confiningExecutor{},
+			refused:  true,
+		},
+		{
+			// An executor that does not implement the interface at all is
+			// treated the same way, which is the fail-closed half: a promise
+			// nobody made is not a promise.
+			name:     "a wider principal and an executor that cannot answer",
+			executor: &remoteBoundExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, aAndB, policyA, auth.OperationRetrieve)
+			},
+			refused: true,
+		},
+		{
+			// The promise is what lifts the refusal.
+			name:     "a wider principal and a confining executor",
+			executor: confiningExecutor{confines: true},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, aAndB, policyA, auth.OperationRetrieve)
+			},
+		},
+		{
+			// The shipped configuration: the principal is minted with the
+			// same source and policy as the descriptor, so the confinement
+			// constrains nothing and nothing changes. If this refused, every
+			// reasoning action in the demo would stop working.
+			name:     "a principal no wider than the scope",
+			executor: confiningExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, onlyA, policyA, auth.OperationRetrieve)
+			},
+		},
+		{
+			// A principal that may not retrieve cannot widen retrieval, so
+			// there is nothing to confine. Refusing here would stop actions
+			// that reach no corpus at all.
+			name:     "a principal that cannot retrieve",
+			executor: confiningExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, aAndB, policyA, auth.OperationInvoke)
+			},
+		},
+		{
+			// A wider *policy* is the same defect by the other component, and
+			// a check that read only sources would miss it.
+			name:     "a wider policy and an unconfined executor",
+			executor: confiningExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, onlyA, [][]byte{
+					[]byte("policy-a"), []byte("policy-b"),
+				}, auth.OperationRetrieve)
+			},
+			refused: true,
+		},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			err := refuseUnconfinedRetrieval(
+				probe.decision(t), probe.executor, record, now)
+			if probe.refused {
+				if err == nil {
+					t.Fatal("an in-process execution ran wider than its " +
+						"action's scope, so the record will name evidence " +
+						"the descriptor's scope does not cover")
+				}
+				if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+					t.Fatalf("refusal = %v, want unauthorized", err)
+				}
+				// Names no source the caller does not already hold: which
+				// other sources exist is host configuration.
+				if strings.Contains(err.Error(), "source-b") ||
+					strings.Contains(err.Error(), "policy-b") {
+					t.Fatalf("the refusal names another scope: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a confined or already-narrow execution was "+
+					"refused: %v", err)
+			}
+		})
+	}
+}
+
+// TestExecuteClaimAppliesTheRetrievalConfinementCheck pins the call site, not
+// the predicate.
+//
+// Without this, deleting the call from ExecuteClaim leaves every case in
+// TestAnUnconfinedExecutorMayNotRunWiderThanItsScope green — the predicate
+// would be correct and unreached. That is the defect shape this package has
+// produced four times in a row: a mechanism correct in the service and absent
+// from the path that needs it.
+func TestExecuteClaimAppliesTheRetrievalConfinementCheck(t *testing.T) {
+	// A principal that may retrieve from two sources, invoking an action
+	// scoped to one of them.
+	wider := func(t *testing.T, f *executorClaimFixture) context.Context {
+		t.Helper()
+		decision, err := auth.NewDecision(auth.DecisionConfig{
+			Subject: "owner", Actor: "actor",
+			AuthorizationDomain: []byte("domain"),
+			AllowedOperations: []auth.Operation{
+				auth.OperationDispatch, auth.OperationInvoke,
+				auth.OperationRetrieve,
+			},
+			PermittedSourceIDs: [][]byte{
+				[]byte("source"), []byte("other-source"),
+			},
+			PermittedPolicyIDs: [][]byte{[]byte("policy")},
+			PolicyGeneration:   1,
+			AuthenticationExpires: time.Date(
+				2026, 9, 7, 0, 0, 0, 0, time.UTC),
+			RequestID: "request", CorrelationID: "correlation",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bindDecision(t, f.authority, decision)
+	}
+
+	t.Run("refused for an unconfined executor", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		fixture.bindExecutor(t, confiningExecutor{})
+		caller := wider(t, fixture)
+		enqueue := dispatchEnqueue(fixture.now, "request")
+		enqueue.ID = []byte("unconfined-action")
+		enqueue.IdempotencyKey = []byte("unconfined-idempotency")
+		if _, err := fixture.service.Invoke(caller, InvokeRequest{
+			Enqueue: enqueue,
+			ClaimID: []byte("invoke-claim"), Lease: time.Minute,
+		}); err == nil {
+			t.Fatal("an in-process execution ran for a principal that may " +
+				"retrieve beyond the action's scope, against an executor " +
+				"making no confinement promise")
+		}
+		// Refused before the executor ran, so the record is not terminal and
+		// a confining deployment can still run it.
+		stored := fixture.dispatchStore.records["unconfined-action"]
+		if stored.State == DispatchSucceeded || stored.State == DispatchFailed {
+			t.Fatalf("the refused invoke left the record %q", stored.State)
+		}
+	})
+
+	t.Run("allowed for a confining executor", func(t *testing.T) {
+		fixture := newExecutorClaimFixture(t)
+		fixture.bindExecutor(t, confiningExecutor{confines: true})
+		caller := wider(t, fixture)
+		// A distinct action: the fixture already enqueued one in its
+		// constructor, and reusing it conflicts on the idempotency key rather
+		// than reaching the check.
+		enqueue := dispatchEnqueue(fixture.now, "request")
+		enqueue.ID = []byte("confined-action")
+		enqueue.IdempotencyKey = []byte("confined-idempotency")
+		invoked, err := fixture.service.Invoke(caller, InvokeRequest{
+			Enqueue: enqueue,
+			ClaimID: []byte("invoke-claim"), Lease: time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("an executor that confines retrieval was refused: %v", err)
+		}
+		if invoked.State != DispatchSucceeded {
+			t.Fatalf("state = %q, want succeeded: the executor must have "+
+				"actually run, or this passes without reaching the check",
+				invoked.State)
+		}
+	})
+}

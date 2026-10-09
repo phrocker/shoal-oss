@@ -855,3 +855,27 @@ func descriptorDigest(descriptor Descriptor) [sha256.Size]byte {
 	encoded, _ := json.Marshal(descriptor)
 	return sha256.Sum256(encoded)
 }
+
+// RetrievalConfiner is an executor that confines what it retrieves to the
+// scope of the invocation it was handed.
+//
+// A Descriptor declares Scopes as (SourceID, PolicyID) pairs and resolveAction
+// gates every invocation on the action's scope matching one, which makes the
+// scope read as a bound on what the agent can reach. For an in-process
+// executor that retrieves, it was not: Invocation carries SourceID, PolicyID
+// and ObjectID and nothing required an executor to use them, so an action
+// scoped to one source could record evidence anchors, a snapshot pin and node
+// identifiers from every source the *invoking principal* may read (#370).
+//
+// Declaring this is a promise about retrieval, not about authorization. It
+// does not widen anything: the principal already could read what it reads.
+// What it asserts is that the record will name only what the action's own
+// scope covers, which is what an operator reading the descriptor believes.
+//
+// An executor that does not implement this, or returns false, is treated as
+// unable to confine — so fleet refuses the invocation rather than running it,
+// but only where the confinement would otherwise be a lie. See
+// refuseUnconfinedRetrieval.
+type RetrievalConfiner interface {
+	ConfinesRetrievalToScope() bool
+}
