@@ -241,7 +241,7 @@ func migrateLabels(
 	// stderr stays silent unless the migration changed something or left
 	// documents unreadable: a stdio launcher may treat any output as noise.
 	if record.Tightened == 0 && record.HistoricalTightened == 0 &&
-		len(record.Untranslatable) == 0 {
+		len(record.Untranslatable) == 0 && len(record.Drift) == 0 {
 		return nil
 	}
 	fmt.Fprintf(diagnostics,
@@ -257,6 +257,13 @@ func migrateLabels(
 				"source %q label %s: %s\n",
 			entry.DocumentID, entry.RevisionID, entry.SourceURI,
 			entry.EscapedLabel, entry.Reason)
+	}
+	for _, entry := range record.Drift {
+		fmt.Fprintf(diagnostics,
+			"shoal-mcp: corpus revision %s of document %s (source %q) is not "+
+				"registered (catalog has %s); retry its ingest\n",
+			entry.BaseRevisionID, entry.DocumentID, entry.SourceURI,
+			entry.CatalogRevisionID)
 	}
 	return nil
 }

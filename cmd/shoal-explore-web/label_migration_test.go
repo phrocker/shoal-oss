@@ -104,11 +104,19 @@ func TestLabelMigrationFailureRefusesToServe(t *testing.T) {
 func directoryEntries(t *testing.T, dir string) []string {
 	t.Helper()
 	var entries []string
-	if err := filepath.WalkDir(dir, func(path string, _ os.DirEntry, err error) error {
+	if err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		entries = append(entries, path)
+		if entry.IsDir() {
+			entries = append(entries, path+"/")
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, path+" "+string(content))
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -116,8 +124,24 @@ func directoryEntries(t *testing.T, dir string) []string {
 	return entries
 }
 
+// listUnchanged runs the listing and fails unless the policy directory is
+// byte-for-byte what it was before.
+func listUnchanged(t *testing.T, root string, output *bytes.Buffer) error {
+	t.Helper()
+	policy := filepath.Join(root, "policy")
+	before := directoryEntries(t, policy)
+	output.Reset()
+	err := run(context.Background(),
+		[]string{"-list-untranslatable-labels", "-state-dir", root}, output)
+	if after := directoryEntries(t, policy); !reflect.DeepEqual(before, after) {
+		t.Fatalf("the listing changed the policy directory:\n%q\n->\n%q", before, after)
+	}
+	return err
+}
+
 func TestListUntranslatableLabelsFlag(t *testing.T) {
 	root := t.TempDir()
+	policy := filepath.Join(root, "policy")
 	var output bytes.Buffer
 	// No catalog: refused, and none is created.
 	err := run(context.Background(),
@@ -125,43 +149,62 @@ func TestListUntranslatableLabelsFlag(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "no policy catalog") {
 		t.Fatalf("listing without a catalog = %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(root, "policy")); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(policy); !os.IsNotExist(statErr) {
 		t.Fatalf("the listing created a policy catalog: %v", statErr)
 	}
 	// An existing but empty directory: refused, and left empty. The storage
 	// engine would create the catalog table in it.
-	if err := os.Mkdir(filepath.Join(root, "policy"), 0o755); err != nil {
+	if err := os.Mkdir(policy, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	before := directoryEntries(t, filepath.Join(root, "policy"))
-	err = run(context.Background(),
-		[]string{"-list-untranslatable-labels", "-state-dir", root}, &output)
-	if err == nil || !strings.Contains(err.Error(), "no policy catalog") {
+	if err := listUnchanged(t, root, &output); err == nil ||
+		!strings.Contains(err.Error(), "no policy catalog") {
 		t.Fatalf("listing an empty directory = %v", err)
 	}
-	if after := directoryEntries(t, filepath.Join(root, "policy")); !reflect.DeepEqual(before, after) {
-		t.Fatalf("the listing wrote into an empty directory: %v -> %v", before, after)
+	// A bare table directory: the engine would give it a WAL.
+	if err := os.Mkdir(filepath.Join(policy, "_shoal_policy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := listUnchanged(t, root, &output); err == nil ||
+		!strings.Contains(err.Error(), "no committed records") {
+		t.Fatalf("listing a bare table directory = %v", err)
+	}
+	if err := os.Remove(filepath.Join(policy, "_shoal_policy")); err != nil {
+		t.Fatal(err)
 	}
 
-	// A catalog the migration has not completed on.
-	store, err := authorized.OpenDurablePolicyStore(filepath.Join(root, "policy"))
+	// A catalog still open in a "running workspace": its writes are in the
+	// WAL, which opening the engine would replay into a new file.
+	store, err := authorized.OpenDurablePolicyStore(policy)
 	if err != nil {
 		t.Fatal(err)
+	}
+	claim, err := store.CompareAndSwapSourceClaim(
+		context.Background(), "file:///claimed.md", nil, labelMigrationProbeRule(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitSourceClaim(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := listUnchanged(t, root, &output); err == nil ||
+		!strings.Contains(err.Error(), "unflushed writes") {
+		t.Fatalf("listing a catalog with an unflushed WAL = %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	output.Reset()
-	if err := run(context.Background(),
-		[]string{"-list-untranslatable-labels", "-state-dir", root}, &output); err != nil {
+
+	// Cleanly closed, but the migration never ran.
+	if err := listUnchanged(t, root, &output); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(output.String(), "has not completed") {
 		t.Fatalf("listing before the migration = %q", output.String())
 	}
 
-	// A completed migration with an untranslatable document.
-	store, err = authorized.OpenDurablePolicyStore(filepath.Join(root, "policy"))
+	// A completed migration with an untranslatable document and a drift.
+	store, err = authorized.OpenDurablePolicyStore(policy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,25 +214,45 @@ func TestListUntranslatableLabelsFlag(t *testing.T) {
 			DocumentID: "doc-1", RevisionID: "rev-1", SourceURI: "file:///old.md",
 			EscapedLabel: `"top secret!"`, Reason: "document node visibility does not parse",
 		}},
+		Drift: []authorized.RevisionDrift{{
+			DocumentID: "doc-2", SourceURI: "file:///drifted.md",
+			CatalogRevisionID: "rev-a", BaseRevisionID: "rev-b",
+		}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	output.Reset()
-	if err := run(context.Background(),
-		[]string{"-list-untranslatable-labels", "-state-dir", root}, &output); err != nil {
+	if err := listUnchanged(t, root, &output); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
 		"1 untranslatable", "document doc-1 revision rev-1",
 		`source "file:///old.md"`, `label "top secret!"`, "does not parse",
+		`document doc-2 source "file:///drifted.md": catalog revision rev-a, corpus revision rev-b`,
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("listing %q lacks %q", output.String(), want)
 		}
 	}
+}
+
+// labelMigrationProbeRule is any valid rule, for writing a claim.
+func labelMigrationProbeRule(t *testing.T) authorized.AccessRule {
+	t.Helper()
+	policy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: []byte("domain"), SourceID: []byte("source"),
+		GrantPolicyID: []byte("policy"), Epoch: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, err := authorized.NewAccessRule(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rule
 }
 
 // TestLabelMigrationCapabilityMintSites pins that the migration capability is

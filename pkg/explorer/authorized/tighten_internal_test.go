@@ -394,8 +394,9 @@ func TestTightenRuleRefusesWidening(t *testing.T) {
 	})
 }
 
-// TestTightenRulePendingClaim narrows both rules of a pending source claim,
-// so a retry of the interrupted mutation must hold the labels too.
+// TestTightenRulePendingClaim narrows the PreviousRule of a pending source
+// claim, so a retry of the interrupted mutation must hold the labels too,
+// and keeps its Rule, so the retry can still select it.
 func TestTightenRulePendingClaim(t *testing.T) {
 	withTightenStores(t, func(t *testing.T, store PolicyStore, reopen func() PolicyStore) {
 		w := newTightenWorld(t)
@@ -424,9 +425,12 @@ func TestTightenRulePendingClaim(t *testing.T) {
 			if err != nil || !ok || !claim.Pending || claim.PreviousRule == nil {
 				t.Fatalf("pending claim = %+v, %v, %v", claim, ok, err)
 			}
-			if !claim.Rule.equal(w.secret) || !claim.PreviousRule.equal(w.secret) {
-				t.Errorf("pending claim rules = %s / %s, want both %s",
-					claim.Rule, claim.PreviousRule, w.secret)
+			// The retry must still select exactly the in-flight Rule, so it
+			// is kept; the labels go onto PreviousRule, which the retry must
+			// also satisfy.
+			if !claim.Rule.equal(w.bare) || !claim.PreviousRule.equal(w.secret) {
+				t.Errorf("pending claim rules = %s / %s, want %s / %s",
+					claim.Rule, claim.PreviousRule, w.bare, w.secret)
 			}
 		}
 	})

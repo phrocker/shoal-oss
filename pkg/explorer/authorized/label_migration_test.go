@@ -53,9 +53,12 @@ type legacyStore struct {
 	// legacyEdgeKinds registers extracted relations the way a store written
 	// before RegistrationKind decodes them.
 	legacyEdgeKinds bool
-	failTightenAt   int
-	tightenCalls    int
-	tightenChange   int
+	// failPutRevisions fails that many PutRevision calls, leaving the base
+	// one revision ahead of the catalog.
+	failPutRevisions int
+	failTightenAt    int
+	tightenCalls     int
+	tightenChange    int
 }
 
 func (s *legacyStore) setStrip(strip bool) {
@@ -81,7 +84,14 @@ func (s *legacyStore) legacy(rule authorized.AccessRule) authorized.AccessRule {
 func (s *legacyStore) PutRevision(ctx context.Context, registration authorized.RevisionRegistration) error {
 	s.mu.Lock()
 	keep := s.keepRevisions
+	fail := s.failPutRevisions > 0
+	if fail {
+		s.failPutRevisions--
+	}
 	s.mu.Unlock()
+	if fail {
+		return shoal.NewError(shoal.ErrorUnavailable, "injected registration failure")
+	}
 	if !keep {
 		registration.Rule = s.legacy(registration.Rule)
 	}

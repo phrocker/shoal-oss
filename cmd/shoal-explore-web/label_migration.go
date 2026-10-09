@@ -81,6 +81,26 @@ func printLabelMigration(output io.Writer, outcome labelMigrationOutcome) {
 		record.AlreadyTightened, record.Unlabelled, record.Unregistered,
 		record.HistoricalTightened, len(record.Untranslatable))
 	writeUntranslatable(output, record)
+	writeDrift(output, record)
+}
+
+// writeDrift lists documents whose base current revision is not the one the
+// catalog registers: an ingest that committed and then failed to register.
+// Retrying that ingest repairs it.
+func writeDrift(output io.Writer, record authorized.LabelMigrationRecord) {
+	if len(record.Drift) == 0 {
+		return
+	}
+	fmt.Fprintf(output,
+		"%d document(s) have a newer revision in the corpus than in the "+
+			"policy catalog; retry their ingest to register it:\n",
+		len(record.Drift))
+	for _, entry := range record.Drift {
+		fmt.Fprintf(output,
+			"  document %s source %q: catalog revision %s, corpus revision %s\n",
+			entry.DocumentID, entry.SourceURI, entry.CatalogRevisionID,
+			entry.BaseRevisionID)
+	}
 }
 
 func writeUntranslatable(output io.Writer, record authorized.LabelMigrationRecord) {
@@ -128,5 +148,6 @@ func listUntranslatableLabels(
 			"document(s) or revision(s)\n",
 		record.Version, policyDir, len(record.Untranslatable))
 	writeUntranslatable(output, record)
+	writeDrift(output, record)
 	return nil
 }

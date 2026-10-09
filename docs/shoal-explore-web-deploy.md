@@ -300,9 +300,10 @@ On every start, before anything is served, `shoal-explore-web` (and
 `shoal-mcp`, which serves the same authorized store) runs the label migration
 under the catalog's mutation lease:
 
-- For each document it reads `shoal.visibility` from the stored document node,
-  checks it against the revision's own metadata, and narrows the document's
-  rule to the source policy **and** one policy per label. The narrowing
+- For each registered revision of each document it reads `shoal.visibility`
+  from **that revision's own** metadata (and, when the stored document node
+  names the same revision, from the node too, conjoining the two), and narrows
+  the rule to the source policy **and** one policy per label. The narrowing
   (`PolicyStore.TightenRule`) only ever adds conjuncts and refuses anything
   else. It covers every revision of the document (not only the current one),
   the current node and edge projections, the entities and relations extracted
@@ -318,7 +319,18 @@ under the catalog's mutation lease:
   conjoined with the reserved `shoal.label/v1/!untranslatable` policy, which
   no grant can name. It and everything derived from it is readable by
   **nobody**, its ingester included, until relabelled. Its ID, source URI and
-  escaped label are recorded in a report, and the run continues.
+  escaped label are recorded in a report, and the run continues. Only a label
+  translation failure does this.
+- **Drift is not a label failure.** An ingest commits to the corpus before it
+  registers the revision in the policy catalog, so a failed registration (or a
+  crash between the two) leaves the corpus one revision ahead. The migration
+  narrows the registered revision by its own labels, never locks the document
+  or its source claim, and lists the document under "newer revision in the
+  corpus than in the policy catalog" in the log and the report. **Retry that
+  ingest** to repair it; a retry that changes the labels is a relabel and
+  needs the old labels and the new. An interrupted ingest's pending source
+  claim keeps the rule the retry must select and takes the old labels as the
+  rule the retry must also satisfy.
 - The run logs its counts (`Label migration v1: examined N document(s): …`)
   and the untranslatable list. Any catalog or corpus error refuses to start:
   the workspace never serves a corpus it did not finish narrowing.
@@ -347,9 +359,13 @@ Operator steps:
 4. **Review the untranslatable list.** It is in the startup log, and
    `shoal-explore-web -list-untranslatable-labels` (with the same
    `-state-dir`, `-data` or `-policy-dir`) prints the stored report and exits
-   without serving. Run it with the workspace stopped: the catalog takes no
-   cross-process lock. It refuses a directory that holds no policy catalog
-   and never creates one.
+   without serving. It also lists drifted documents to re-ingest. It writes
+   nothing: before opening the storage engine (which would otherwise create a
+   table, give a bare table a WAL, or replay a WAL), it refuses a directory
+   with no policy catalog, a catalog with unflushed writes (a non-empty
+   `wal.log`: the workspace is running, or stopped without a clean shutdown),
+   and a catalog with no committed records. Stop the workspace cleanly and run
+   it then.
 5. **Relabel** each listed document by ingesting its content again under a
    **new source URI**, with labels inside the charset, as a principal holding
    them. The original cannot be relabelled in place: the untranslatable

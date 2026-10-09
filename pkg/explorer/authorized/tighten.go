@@ -404,30 +404,14 @@ func (s *MemoryPolicyStore) tightenRule(
 			if state.held {
 				return tightenChanges{}, catalogConflict()
 			}
-			rule, ruleChanged, err := conjoinDelta(state.claim.Rule, delta)
+			tightened, changed, err := tightenSourceClaim(state.claim, delta)
 			if err != nil {
 				return tightenChanges{}, err
 			}
-			var previous *AccessRule
-			previousChanged := false
-			if state.claim.PreviousRule != nil {
-				narrowed, changed, err := conjoinDelta(
-					*state.claim.PreviousRule, delta)
-				if err != nil {
-					return tightenChanges{}, err
-				}
-				previous, previousChanged = &narrowed, changed
-			}
-			if ruleChanged || previousChanged {
+			if changed {
 				if s.sourceVersion == ^uint64(0) {
 					return tightenChanges{}, catalogUnavailable()
 				}
-				tightened, err := cloneSourcePolicyClaim(state.claim)
-				if err != nil {
-					return tightenChanges{}, catalogUnavailable()
-				}
-				tightened.Rule = rule
-				tightened.PreviousRule = previous
 				claim = &sourceClaimState{claim: tightened}
 				changes.sourceClaim = sourceURI
 			}
@@ -548,6 +532,50 @@ func ruleHasKey(rule AccessRule, key []byte) bool {
 		}
 	}
 	return false
+}
+
+// tightenSourceClaim narrows a source claim. A committed claim's Rule takes
+// the delta. A pending claim is an interrupted mutation whose retry must
+// select exactly its Rule (sourceClaimAllowsMutation), and that Rule was
+// chosen by the ingest itself, under its own labels. So the delta goes onto
+// its PreviousRule, which the retry must ALSO satisfy, and Rule is left
+// alone: the retry stays possible for a principal holding the old and the
+// new labels (the relabel rule), and impossible for a source-only one. A
+// pending claim with no PreviousRule gains one, the narrowed Rule.
+func tightenSourceClaim(
+	claim SourcePolicyClaim,
+	delta []auth.Policy,
+) (SourcePolicyClaim, bool, error) {
+	tightened, err := cloneSourcePolicyClaim(claim)
+	if err != nil {
+		return SourcePolicyClaim{}, false, catalogUnavailable()
+	}
+	if !claim.Pending {
+		rule, changed, err := conjoinDelta(claim.Rule, delta)
+		if err != nil || !changed {
+			return claim, false, err
+		}
+		tightened.Rule = rule
+		return tightened, true, nil
+	}
+	base := claim.Rule
+	if claim.PreviousRule != nil {
+		base = *claim.PreviousRule
+	}
+	previous, changed, err := conjoinDelta(base, delta)
+	if err != nil {
+		return SourcePolicyClaim{}, false, err
+	}
+	if !changed && claim.PreviousRule != nil {
+		return claim, false, nil
+	}
+	if !changed && ruleIncludes(claim.Rule, previous) {
+		// A pending claim with no previous rule whose Rule already carries
+		// the delta needs nothing.
+		return claim, false, nil
+	}
+	tightened.PreviousRule = &previous
+	return tightened, true, nil
 }
 
 // conjoinDelta adds the delta's components to rule through NewAccessRule and

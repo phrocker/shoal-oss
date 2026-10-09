@@ -44,6 +44,15 @@ type persistedLabelMigration struct {
 	AlreadyTightened    int
 	HistoricalTightened int
 	Untranslatable      []persistedUntranslatable
+	Drift               []persistedRevisionDrift
+}
+
+type persistedRevisionDrift struct {
+	DocumentID        string
+	SourceURI         string
+	CatalogRevisionID string
+	BaseRevisionID    string
+	Reason            string
 }
 
 type persistedUntranslatable struct {
@@ -55,20 +64,61 @@ type persistedUntranslatable struct {
 }
 
 // OpenExistingDurablePolicyStore opens a durable policy catalog that already
-// exists, for read-only tooling such as -list-untranslatable-labels. Unlike
-// OpenDurablePolicyStore it never creates anything: a missing directory, or
-// one without the catalog's table, is refused before the storage engine is
-// opened (the engine would create both).
+// exists and was cleanly closed, for read-only tooling such as
+// -list-untranslatable-labels. Opening the storage engine is not read-only in
+// general: it creates a missing table, gives a bare table directory a WAL,
+// and replays an unflushed WAL into a new file (rewriting the file manifest
+// and truncating the WAL). So everything that would make it write is refused
+// BEFORE the engine is opened:
+//
+//   - a missing directory, or one without the catalog's table;
+//   - a table whose tablet holds a non-empty wal.log: the catalog is open in
+//     a running workspace, or one that stopped without flushing;
+//   - a table with no committed file manifest (files.json): a bare or
+//     never-flushed table.
+//
+// What remains is a cleanly closed catalog, which the engine opens without
+// writing.
 func OpenExistingDurablePolicyStore(dir string) (*DurablePolicyStore, error) {
 	info, err := os.Stat(dir)
 	if err != nil || !info.IsDir() {
 		return nil, shoal.NewError(shoal.ErrorNotFound,
 			"no policy catalog at "+dir)
 	}
-	table, err := os.Stat(filepath.Join(dir, policyTable))
+	tableDir := filepath.Join(dir, policyTable)
+	table, err := os.Stat(tableDir)
 	if err != nil || !table.IsDir() {
 		return nil, shoal.NewError(shoal.ErrorNotFound,
 			"no policy catalog at "+dir+": it holds no "+policyTable+" table")
+	}
+	tabletDirs := []string{tableDir}
+	entries, err := os.ReadDir(tableDir)
+	if err != nil {
+		return nil, shoal.WrapError(shoal.ErrorUnavailable,
+			"read policy catalog "+dir, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			tabletDirs = append(tabletDirs, filepath.Join(tableDir, entry.Name()))
+		}
+	}
+	committed := false
+	for _, tabletDir := range tabletDirs {
+		wal, err := os.Stat(filepath.Join(tabletDir, "wal.log"))
+		if err == nil && wal.Size() > 0 {
+			return nil, shoal.NewError(shoal.ErrorUnavailable,
+				"policy catalog "+dir+" has unflushed writes: stop the "+
+					"workspace (a clean shutdown flushes them) and try again")
+		}
+		if _, err := os.Stat(filepath.Join(tabletDir, "files.json")); err == nil {
+			committed = true
+		}
+	}
+	if !committed {
+		return nil, shoal.NewError(shoal.ErrorUnavailable,
+			"policy catalog "+dir+" holds no committed records: start and "+
+				"cleanly stop the workspace so the migration's report is "+
+				"flushed, then try again")
 	}
 	return OpenDurablePolicyStore(dir)
 }
@@ -193,6 +243,15 @@ func (s *DurablePolicyStore) PutLabelMigration(
 				Reason:       entry.Reason,
 			})
 	}
+	for _, entry := range record.Drift {
+		persisted.Drift = append(persisted.Drift, persistedRevisionDrift{
+			DocumentID:        string(entry.DocumentID),
+			SourceURI:         entry.SourceURI,
+			CatalogRevisionID: string(entry.CatalogRevisionID),
+			BaseRevisionID:    string(entry.BaseRevisionID),
+			Reason:            entry.Reason,
+		})
+	}
 	return s.writeRow(
 		[]byte(policyRowLabelMigration), policyKindLabelMigration, persisted)
 }
@@ -221,6 +280,15 @@ func labelMigrationFromPersisted(
 				EscapedLabel: entry.EscapedLabel,
 				Reason:       entry.Reason,
 			})
+	}
+	for _, entry := range record.Drift {
+		migration.Drift = append(migration.Drift, RevisionDrift{
+			DocumentID:        shoal.ID(entry.DocumentID),
+			SourceURI:         entry.SourceURI,
+			CatalogRevisionID: shoal.ID(entry.CatalogRevisionID),
+			BaseRevisionID:    shoal.ID(entry.BaseRevisionID),
+			Reason:            entry.Reason,
+		})
 	}
 	return migration, nil
 }

@@ -24,7 +24,9 @@ together:
   cannot be translated becomes readable by nobody and is listed by
   `shoal-explore-web -list-untranslatable-labels`. It runs on every start, so
   documents labelled by an older binary after a rollback are closed on the
-  next start; any error refuses to start.
+  next start; any error refuses to start. A document whose corpus revision
+  is newer than its registered one (a failed registration) is narrowed by
+  its registered labels and reported for a retried ingest, never locked.
 
 **Upgrade action required.** Write the label grant file before starting the
 new release, then review the untranslatable list and rebuild lexicon bundles.

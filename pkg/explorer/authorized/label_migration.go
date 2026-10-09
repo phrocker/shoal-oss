@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strconv"
 
@@ -63,6 +64,21 @@ type LabelMigrationRecord struct {
 	// labels could not be translated; each was conjoined with the reserved,
 	// never-grantable UntranslatableLabelPolicyID.
 	Untranslatable []UntranslatableLabel
+	// Drift lists documents whose base current revision is not the one the
+	// catalog registers (an ingest that committed to the base and then
+	// failed to register). Each registered revision is still narrowed by its
+	// own labels; the operator retries the ingest to repair it.
+	Drift []RevisionDrift
+}
+
+// RevisionDrift is one base/catalog disagreement about a document's current
+// revision.
+type RevisionDrift struct {
+	DocumentID        shoal.ID
+	SourceURI         string
+	CatalogRevisionID shoal.ID
+	BaseRevisionID    shoal.ID
+	Reason            string
 }
 
 // UntranslatableLabel is one report entry. EscapedLabel is the stored label
@@ -78,6 +94,7 @@ type UntranslatableLabel struct {
 
 func (r LabelMigrationRecord) clone() LabelMigrationRecord {
 	r.Untranslatable = append([]UntranslatableLabel(nil), r.Untranslatable...)
+	r.Drift = append([]RevisionDrift(nil), r.Drift...)
 	return r
 }
 
@@ -237,8 +254,32 @@ func (r migrationRun) document(
 		record.Unregistered++
 		return nil
 	}
+	// Base/catalog drift: an ingest committed a new revision to the base and
+	// then failed to register it, so the catalog's current revision is older
+	// than the base's. That is not a label failure. Each registered revision
+	// is still narrowed by its own labels, and the drift is reported so the
+	// operator can retry the ingest, which repairs it under the ordinary
+	// relabel rule. It must never lock the document or its claim.
+	if summary.Revision.ID != current.RevisionID {
+		record.Drift = append(record.Drift, RevisionDrift{
+			DocumentID:        documentID,
+			SourceURI:         summary.SourceURI,
+			CatalogRevisionID: current.RevisionID,
+			BaseRevisionID:    summary.Revision.ID,
+			Reason: "the base's current revision is not the registered one; " +
+				"retry the ingest of this source",
+		})
+	}
 	labels, raw, reason, err := c.currentRevisionLabels(
 		ctx, documentID, current.RevisionID)
+	if errors.Is(err, errRevisionNotServed) {
+		if summary.Revision.ID == current.RevisionID {
+			return inconsistentBase()
+		}
+		// The registered revision is not served, so it cannot be read or
+		// labelled; the drift entry above already names the document.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -415,23 +456,38 @@ func splitLabelledRule(rule AccessRule) (AccessRule, auth.Policy, int, error) {
 	return bare, sources[0], len(sources), nil
 }
 
-// currentRevisionLabels reads the labels of the current revision from the
-// stored document node, where parse.go put them, and requires the revision's
-// own metadata to declare the same set. Anything that prevents a confident
-// reading is returned as a reason (the document becomes untranslatable), with
-// the raw value for the report; only a base failure is an error.
+// errRevisionNotServed reports that the base does not serve a revision the
+// catalog registers: drift, never a label failure.
+var errRevisionNotServed = shoal.NewError(
+	shoal.ErrorNotFound, "the base does not serve the registered revision")
+
+// currentRevisionLabels reads the labels of one registered revision from
+// that revision's OWN metadata, the declaration parse.go copied onto its
+// nodes. When the stored document node names this same revision, its labels
+// are read too and conjoined (a disagreement only narrows); when it names
+// another revision, the base has moved past the catalog (an ingest whose
+// registration failed), which is drift and is ignored here.
+//
+// Only a label that does not parse is returned as a reason (the document then
+// becomes untranslatable). A revision the base does not serve returns
+// errRevisionNotServed; any other base failure is an error.
 func (c *Client) currentRevisionLabels(
 	ctx context.Context,
 	documentID, revisionID shoal.ID,
 ) (labels []string, raw string, reason string, err error) {
 	view, err := c.base.Document(ctx, documentID, revisionID)
 	if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		return nil, "", "the base does not serve the registered current revision", nil
+		return nil, "", "", errRevisionNotServed
 	}
 	if err != nil {
 		return nil, "", "", err
 	}
 	declared := view.Document.Metadata[interaction.PropertyVisibility]
+	labels, parseErr := interaction.ParseVisibility(declared)
+	if parseErr != nil {
+		return nil, declared, "revision visibility does not parse: " +
+			parseErr.Error(), nil
+	}
 	if declared == "" {
 		// parse.go derives the nodes' labels from this metadata alone, so an
 		// unlabelled revision has unlabelled nodes: skip the graph read.
@@ -443,39 +499,28 @@ func (c *Client) currentRevisionLabels(
 		EdgeTypes: []string{"contains"},
 	})
 	if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-		return nil, declared, "the stored document node is missing", nil
+		return labels, declared, "", nil
 	}
 	if err != nil {
 		return nil, "", "", err
 	}
 	for _, node := range neighborhood.Nodes {
-		if node.ID != documentID {
+		if node.ID != documentID ||
+			node.Properties["revision_id"] != string(revisionID) {
 			continue
 		}
-		raw = node.Properties[interaction.PropertyVisibility]
-		if raw == "" {
-			raw = declared
-		}
-		if node.Properties["revision_id"] != string(revisionID) {
-			return nil, raw, "the stored document node names another revision", nil
-		}
-		labels, parseErr := interaction.NodeVisibility(node)
+		nodeLabels, parseErr := interaction.NodeVisibility(node)
 		if parseErr != nil {
-			return nil, raw, "document node visibility does not parse: " +
-				parseErr.Error(), nil
+			return nil, node.Properties[interaction.PropertyVisibility],
+				"document node visibility does not parse: " + parseErr.Error(), nil
 		}
-		declaredLabels, parseErr := interaction.ParseVisibility(declared)
-		if parseErr != nil {
-			return nil, declared, "revision visibility does not parse: " +
-				parseErr.Error(), nil
+		union, err := interaction.Conjoin(labels, nodeLabels)
+		if err != nil {
+			return nil, declared, "visibility does not parse: " + err.Error(), nil
 		}
-		if interaction.Expression(labels) != interaction.Expression(declaredLabels) {
-			return nil, raw, "the document node and the revision metadata " +
-				"declare different labels", nil
-		}
-		return labels, raw, "", nil
+		return union, declared, "", nil
 	}
-	return nil, declared, "the stored document node is missing", nil
+	return labels, declared, "", nil
 }
 
 func escapeLabel(raw string) string {
