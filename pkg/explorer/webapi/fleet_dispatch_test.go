@@ -646,6 +646,122 @@ func TestTheCompletionRouteCarriesTheClaimFence(t *testing.T) {
 	}
 }
 
+// TestTheCompletionRouteCarriesTheEffectedVolume is #427 on this route, and
+// it exists for the reason the claim-fence test above exists.
+//
+// applyExecutionResult validates ExecutionResult.Effected, and this is the
+// route the effects gateway completes through — the component that performs
+// real external effects, so the one most likely to fail after a partial one.
+// A field the service validates with no surface able to set it is #435's
+// shape: decodeRequest refuses unknown fields, so the only client that could
+// use it would get a 400.
+//
+// Driven as raw JSON rather than through the wire struct, so the field has to
+// be accepted *by name*. Marshalling the struct would pass whatever the tag
+// says, including a tag nothing sends.
+func TestTheCompletionRouteCarriesTheEffectedVolume(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationInvoke},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy")}, PolicyGeneration: 1,
+		AuthenticationExpires: now.Add(time.Hour), RequestID: "request",
+		CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewAuthenticatedHandler(&stubWorkspaceService{},
+		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		authority.Binder(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &stubDispatchProvider{resolver: authority.Resolver()}
+	if err := handler.MountFleetDispatch(provider); err != nil {
+		t.Fatal(err)
+	}
+
+	actionID := []byte{'a', 0, 255}
+	route := "http://example.test/api/v1/fleet/actions/" +
+		base64.RawURLEncoding.EncodeToString(actionID) + "/complete"
+	contextWire := fleetRequestContextWire{
+		RequestID: encodeFleetID("request"), ReasonCode: "operator_request",
+		CorrelationID: encodeFleetID("correlation"),
+		Deadline:      now.Add(time.Minute),
+	}
+	post := func(t *testing.T, effected string) {
+		t.Helper()
+		raw := `{"context":` + mustJSON(t, contextWire) + `,` +
+			`"expected_version":7,"claim_fence":3,"failed":true,` +
+			`"error_code":"response_truncated","claim_id":"` +
+			base64.RawURLEncoding.EncodeToString([]byte("claim")) + `"` +
+			effected + `}`
+		request := httptest.NewRequest(
+			http.MethodPost, route, bytes.NewReader([]byte(raw)))
+		request.Host = "example.test"
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("a body naming effected was refused (status=%d): %s; "+
+				"a worker that reports how much escaped then cannot complete "+
+				"at all", response.Code, response.Body.String())
+		}
+	}
+
+	post(t, `,"effected":{"bytes":2097152,"chunks":64}`)
+	if got := provider.completion.Result.Effected; got !=
+		(fleet.EffectedVolume{Bytes: 2097152, Chunks: 64}) {
+		t.Fatalf("the route dropped the effected volume (got %#v): the "+
+			"service validates this field and nothing could set it", got)
+	}
+
+	// Absent means nothing left, which is what a worker written before this
+	// field existed sends. It must still complete, and must not acquire a
+	// volume it did not report.
+	post(t, "")
+	if got := provider.completion.Result.Effected; !got.Zero() {
+		t.Fatalf("a completion with no effected field got %#v", got)
+	}
+
+	// And the record comes back carrying it, so a worker that lost its
+	// response reads what was recorded rather than re-deriving it — which it
+	// cannot, since the field is write-once and its own retry is compared
+	// against the stored value.
+	encoded := encodeFleetAction(fleet.ActionRecord{
+		ID: actionID, State: fleet.DispatchFailed,
+		ErrorCode: "response_truncated",
+		Effected:  fleet.EffectedVolume{Bytes: 50},
+	})
+	body, err := json.Marshal(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"effected":{"bytes":50}`)) {
+		t.Fatalf("a failed record's volume is not returned: %s", body)
+	}
+	// Omitted when nothing left, so an unaffected record's bytes are
+	// unchanged from before this field existed.
+	clean, err := json.Marshal(encodeFleetAction(fleet.ActionRecord{
+		ID: actionID, State: fleet.DispatchSucceeded,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(clean, []byte("effected")) {
+		t.Fatalf("a record with no volume names the field anyway: %s", clean)
+	}
+}
+
 func mustJSON(t *testing.T, value any) string {
 	t.Helper()
 	encoded, err := json.Marshal(value)

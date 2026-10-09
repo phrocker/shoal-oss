@@ -1287,7 +1287,35 @@ func (s *DispatchService) applyExecutionResult(
 		next.ErrorCodeOrigin = ErrorCodeOriginService
 	}
 
+	// How much left before the failure. Validated here so the dispatch
+	// completion path cannot record what the admission path refuses, and
+	// written only on a failure — a success's volume is not what this field
+	// answers, and allowing it there would make it a second, unvalidated way
+	// to describe a completed egress (#427).
+	//
+	// A refusal has to be adjudicated rather than returned, because by this
+	// point the effect has happened: the service assigns its own code and
+	// drops the unusable number, exactly as it does for an output or evidence
+	// the schema refuses.
+	if !result.Effected.Zero() {
+		switch {
+		case result.Effected.validate() != nil,
+			!action.Effects.contains(EffectEgressesContent):
+			if executionErr == nil {
+				executionErr = shoal.NewError(
+					shoal.ErrorInvalidArgument,
+					"reported effected volume is not usable")
+				result.ErrorCode = "invalid_executor_effected"
+				next.ErrorCodeOrigin = ErrorCodeOriginService
+			}
+		default:
+			next.Effected = result.Effected
+		}
+	}
 	if executionErr == nil && result.ErrorCode == "" {
+		// A success carries no volume, so a caller that reported one on work
+		// that then succeeded does not get it recorded.
+		next.Effected = EffectedVolume{}
 		next.State = DispatchSucceeded
 	} else {
 		next.State = DispatchFailed

@@ -287,10 +287,21 @@ func decodeAdmissionReport(w admissionapi.Report) (fleet.AdmissionReport, error)
 	if err != nil {
 		return fleet.AdmissionReport{}, err
 	}
+	// Absent means nothing left, which is the same thing a caller written
+	// before this field existed says by omitting it. A present object with
+	// zero bytes is also nothing left; the service refuses it on a success
+	// and bounds it on a failure, so neither spelling needs a decision here.
+	var effected fleet.EffectedVolume
+	if w.Effected != nil {
+		effected = fleet.EffectedVolume{
+			Bytes: w.Effected.Bytes, Chunks: w.Effected.Chunks,
+		}
+	}
 	return fleet.AdmissionReport{
 		Token:   token,
 		Outcome: append(json.RawMessage(nil), w.Outcome...),
-		Failed:  w.Failed, ErrorCode: w.ErrorCode, Context: contextValue,
+		Failed:  w.Failed, ErrorCode: w.ErrorCode, Effected: effected,
+		Context: contextValue,
 	}, nil
 }
 

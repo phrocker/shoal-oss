@@ -4508,6 +4508,28 @@ next dispatch.error.executor_error.next
   Reconcile with the target if the action reached any external system before requesting the work again.
   record=action:act-1
 
+== failed code=invalid_executor_effected origin=omitted
+reason dispatch.error.invalid_executor_effected.either
+  The failure was recorded as invalid_executor_effected, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the volume given for a partial disclosure was unusable, so how much escaped is unknown.
+  record=action:act-1 principal=worker-1 claim=claim-1
+gap dispatch.gap.effect_may
+  An external effect may have occurred; reconcile with the target.
+  record=action:act-1
+next dispatch.error.invalid_executor_effected.next
+  Reconcile with the target before requesting the work again, treating the disclosure as unbounded because the record cannot say how much left, then fix the executor’s volume reporting.
+  record=action:act-1
+
+== failed code=invalid_executor_effected origin=omitted effect_possible=false
+reason dispatch.error.invalid_executor_effected.either
+  The failure was recorded as invalid_executor_effected, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the volume given for a partial disclosure was unusable, so how much escaped is unknown.
+  record=action:act-1 principal=worker-1 claim=claim-1
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
+  record=action:act-1
+next dispatch.error.invalid_executor_effected.next
+  Reconcile with the target if the action reached any external system before requesting the work again, treating any disclosure as unbounded because the record cannot say how much left, then fix the executor’s volume reporting.
+  record=action:act-1
+
 == failed code=invalid_executor_error origin=omitted
 reason dispatch.error.invalid_executor_error.either
   The failure was recorded as invalid_executor_error, which either the executor reported or Shoal assigned; the record does not say which. If accurate, it means the executor’s own error code was refused as malformed.
@@ -9120,6 +9142,28 @@ next dispatch.error.executor_error.next
   Reconcile with the target if the action reached any external system before requesting the work again.
   record=action:act-1
 
+== failed code=invalid_executor_effected origin=executor
+reason dispatch.error.invalid_executor_effected.executor
+  The failure was reported as invalid_executor_effected, which, if accurate, means the volume given for a partial disclosure was unusable. How much escaped is therefore unknown.
+  record=action:act-1 principal=worker-1 claim=claim-1
+gap dispatch.gap.effect_may
+  An external effect may have occurred; reconcile with the target.
+  record=action:act-1
+next dispatch.error.invalid_executor_effected.next
+  Reconcile with the target before requesting the work again, treating the disclosure as unbounded because the record cannot say how much left, then fix the executor’s volume reporting.
+  record=action:act-1
+
+== failed code=invalid_executor_effected origin=executor effect_possible=false
+reason dispatch.error.invalid_executor_effected.executor
+  The failure was reported as invalid_executor_effected, which, if accurate, means the volume given for a partial disclosure was unusable. How much escaped is therefore unknown.
+  record=action:act-1 principal=worker-1 claim=claim-1
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
+  record=action:act-1
+next dispatch.error.invalid_executor_effected.next
+  Reconcile with the target if the action reached any external system before requesting the work again, treating any disclosure as unbounded because the record cannot say how much left, then fix the executor’s volume reporting.
+  record=action:act-1
+
 == failed code=invalid_executor_error origin=executor
 reason dispatch.error.invalid_executor_error.executor
   The failure was reported as invalid_executor_error, which, if accurate, means the executor’s own error code was refused as malformed.
@@ -13730,6 +13774,28 @@ reason dispatch.effect.declared_none_unsure
   record=action:act-1
 next dispatch.error.executor_error.next
   Reconcile with the target if the action reached any external system before requesting the work again.
+  record=action:act-1
+
+== failed code=invalid_executor_effected origin=service
+reason dispatch.error.invalid_executor_effected.service
+  Shoal recorded the failure as invalid_executor_effected, which means the volume given for a partial disclosure was unusable — outside its bounds, or attached to an action that declares it sends nothing outside the platform. How much escaped is therefore unknown.
+  record=action:act-1 principal=worker-1 claim=claim-1
+gap dispatch.gap.effect_may
+  An external effect may have occurred; reconcile with the target.
+  record=action:act-1
+next dispatch.error.invalid_executor_effected.next
+  Reconcile with the target before requesting the work again, treating the disclosure as unbounded because the record cannot say how much left, then fix the executor’s volume reporting.
+  record=action:act-1
+
+== failed code=invalid_executor_effected origin=service effect_possible=false
+reason dispatch.error.invalid_executor_effected.service
+  Shoal recorded the failure as invalid_executor_effected, which means the volume given for a partial disclosure was unusable — outside its bounds, or attached to an action that declares it sends nothing outside the platform. How much escaped is therefore unknown.
+  record=action:act-1 principal=worker-1 claim=claim-1
+reason dispatch.effect.declared_none_unsure
+  This action declares no external or egress effect, but a declaration does not establish what the action did, so it cannot show that the failure left nothing to reconcile outside this record.
+  record=action:act-1
+next dispatch.error.invalid_executor_effected.next
+  Reconcile with the target if the action reached any external system before requesting the work again, treating any disclosure as unbounded because the record cannot say how much left, then fix the executor’s volume reporting.
   record=action:act-1
 
 == failed code=invalid_executor_error origin=service

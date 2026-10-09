@@ -215,7 +215,83 @@ type AdmissionReport struct {
 	// carries the reason and is required when Failed is set.
 	Failed    bool
 	ErrorCode string
-	Context   RequestContext
+	// Effected is how much of an irreversible egress happened before the
+	// failure, for the one boundary where a failure follows a partial effect
+	// (#427).
+	//
+	// A streamed completion that breaks halfway has already put bytes in
+	// front of the caller and they cannot be recalled. Volume is then the
+	// only thing left to report about an egress that could not be prevented,
+	// and without it three different events arrived identically as
+	// response_truncated: nothing left, fifty bytes left, two megabytes
+	// left. The first is a non-event and the third is a near-complete
+	// disclosure, and #389 consumes these reports to shape the next
+	// decision.
+	//
+	// Valid only on a failure, and only for an action that declares it may
+	// egress. Both are refused rather than recorded, so the field cannot
+	// become a free-form side channel on an action that egresses nothing.
+	Effected EffectedVolume
+	Context  RequestContext
+}
+
+// EffectedVolume is how much left, in units the plane already understands.
+//
+// An UPPER BOUND on what may have left, never a receipt. It counts bytes
+// handed to the transport, which is the most any sender can know: kernel
+// buffers and intermediate proxies sit between the write and the reader, so
+// "N bytes were received" is not a statement a gateway can make. Read it as
+// "at most N bytes may have reached the caller".
+//
+// That is also why it is never refined. Both gateways know the final count
+// at the moment they report — the LLM gateway after its response handler has
+// returned, when the bytes passed to the ResponseWriter can no longer grow;
+// the effects gateway when its send completes or fails, with any partial
+// write counted by the dialer's wrapped conn — so the first report is the
+// whole report, which is what lets the field be write-once.
+
+// Fixed integers rather than a unit/value pair, deliberately. A label would
+// be caller-controlled text on a durable record, and this record's byte
+// accounting is adjacent to the claim-holder chain whose bound has already
+// bricked actions once. Tokens are derived from bytes by a gateway that has a
+// tokenizer; that is the gateway's observation for #389 and not something the
+// plane carries.
+type EffectedVolume struct {
+	Bytes  int64 `json:"bytes,omitempty"`
+	Chunks int64 `json:"chunks,omitempty"`
+}
+
+// Zero reports whether nothing left.
+func (v EffectedVolume) Zero() bool { return v.Bytes == 0 && v.Chunks == 0 }
+
+// MaxEffectedBytes and MaxEffectedChunks bound a reported volume. They are
+// ceilings on what is representable, not on what may egress: a report above
+// them is a report this plane cannot store, and is refused rather than
+// clamped, because a clamped number read as exact would understate a
+// disclosure.
+const (
+	MaxEffectedBytes  int64 = 1 << 40
+	MaxEffectedChunks int64 = 1 << 24
+)
+
+func (v EffectedVolume) validate() error {
+	if v.Bytes < 0 || v.Chunks < 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "effected volume is negative")
+	}
+	if v.Bytes > MaxEffectedBytes || v.Chunks > MaxEffectedChunks {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "effected volume exceeds its bound")
+	}
+	// Chunks with no bytes is a contradiction: a chunk that left carried
+	// something. Bytes with no chunk count is fine — a caller that does not
+	// frame its egress still knows how much of it there was.
+	if v.Chunks > 0 && v.Bytes == 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"effected volume counts chunks but no bytes")
+	}
+	return nil
 }
 
 // OutstandingAdmission is an admission that was granted and never reported.
@@ -986,6 +1062,20 @@ func (s *AdmissionService) Report(
 			shoal.ErrorInvalidArgument,
 			"a failed admission report carries no outcome")
 	}
+	// Effected is the quantity on a failure, so it is meaningless on a
+	// success and refused there. The exclusivity above is what keeps the
+	// replay comparison well defined, and this field does not weaken it:
+	// unlike the outcome it was refused for, Effected is committed and
+	// compared, so two failures that differ in how much escaped are
+	// different reports (#427).
+	if !report.Failed && !report.Effected.Zero() {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"a successful admission report carries no effected volume")
+	}
+	if err := report.Effected.validate(); err != nil {
+		return ActionRecord{}, err
+	}
 	// Validated here rather than left to the completion path. That path is
 	// written for an executor which has already performed the work, so a
 	// malformed result has to be recorded as something: it commits
@@ -1052,6 +1142,23 @@ func (s *AdmissionService) Report(
 	// and spend the token, and answering "spent" to a malformed report would
 	// tell a caller its report was well formed and merely late. A malformed
 	// report is malformed whether or not the token is still live.
+	// Effected is only meaningful for an action the host declared may send
+	// content outside Shoal. Refused rather than recorded on any other
+	// action, so a volume cannot be attached to work that egresses nothing —
+	// which would make the field a free-form channel on the durable record
+	// rather than a measurement of a disclosure (#427).
+	//
+	// Checked against the declaration resolved above rather than against the
+	// record, because the declaration is what the host asserted and the
+	// record carries only whether an effect was possible.
+	if !report.Effected.Zero() &&
+		!action.Effects.contains(EffectEgressesContent) {
+		return ActionRecord{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"an action that does not declare "+
+				string(EffectEgressesContent)+
+				" reports no effected volume")
+	}
 	output, err := reportedOutput(action, report)
 	if err != nil {
 		return ActionRecord{}, err
@@ -1073,7 +1180,10 @@ func (s *AdmissionService) Report(
 	record, err := dispatch.completeClaim(ctx, CompletionRequest{
 		ID: report.Token.ActionID, ExpectedVersion: report.Token.Version,
 		ClaimID: report.Token.TokenID, Failed: report.Failed,
-		Result:  ExecutionResult{Output: report.Outcome, ErrorCode: report.ErrorCode},
+		Result: ExecutionResult{
+			Output: report.Outcome, ErrorCode: report.ErrorCode,
+			Effected: report.Effected,
+		},
 		Context: report.Context,
 	}, false)
 	if err == nil {
@@ -1129,8 +1239,18 @@ func sameReportedOutcome(
 		return false
 	}
 	if report.Failed {
+		// Effected is part of the comparison, which is the whole reason it
+		// may exist on a failure at all. The exclusivity rule above refused
+		// an outcome on a failure because the completion path discarded it,
+		// so two failures with the same error code compared equal and a
+		// caller could replace what it reported and be told the second was
+		// recorded. A field that is committed and compared has none of that:
+		// two failures reporting different volumes are different reports
+		// (#427).
 		return current.State == DispatchFailed &&
-			current.ErrorCode == report.ErrorCode && len(current.Output) == 0
+			current.ErrorCode == report.ErrorCode &&
+			current.Effected == report.Effected &&
+			len(current.Output) == 0
 	}
 	return current.State == DispatchSucceeded &&
 		current.ErrorCode == "" && bytes.Equal(current.Output, output)

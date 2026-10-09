@@ -192,6 +192,38 @@ type Report struct {
 	Outcome   json.RawMessage `json:"outcome,omitempty"`
 	Failed    bool            `json:"failed,omitempty"`
 	ErrorCode string          `json:"error_code,omitempty"`
+	// Effected is how much of an irreversible egress happened before the
+	// failure (#427). Valid only with Failed, and only for an action that
+	// declares it may egress content.
+	//
+	// Omitted when nothing left, so a caller that has nothing to report
+	// sends the same bytes it sent before this field existed.
+	Effected *Effected `json:"effected,omitempty"`
+}
+
+// Effected is the volume of a partial egress, in units the plane already
+// understands.
+//
+// An UPPER BOUND on what may have left, never a receipt. It counts bytes
+// handed to the transport, which is the most any sender can know: kernel
+// buffers and intermediate proxies sit between the write and the reader, so
+// "N bytes were received" is not a statement a gateway can make. Read it as
+// "at most N bytes may have reached the caller".
+//
+// That is also why it is never refined. Both gateways know the final count
+// at the moment they report — the LLM gateway after its response handler has
+// returned, when the bytes passed to the ResponseWriter can no longer grow;
+// the effects gateway when its send completes or fails, with any partial
+// write counted by the dialer's wrapped conn — so the first report is the
+// whole report, which is what lets the field be write-once.
+
+// Fixed integers, not a unit/value pair: a unit label would be
+// caller-controlled text on a durable record. A gateway with a tokenizer
+// derives tokens from bytes itself; that is its own observation and not
+// something the plane carries.
+type Effected struct {
+	Bytes  int64 `json:"bytes"`
+	Chunks int64 `json:"chunks,omitempty"`
 }
 
 // Receipt acknowledges a Report.

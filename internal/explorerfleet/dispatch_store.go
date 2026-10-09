@@ -845,6 +845,29 @@ func refuseRewrittenIdentity(current, next fleet.ActionRecord) error {
 			shoal.ErrorInternal,
 			"fleet action possible effect may not be withdrawn")
 	}
+
+	// Write-once, a third class alongside immutable and monotonic.
+	//
+	// Effected is how much of an irreversible egress happened before a
+	// failure (#427). It is zero before the terminal transition, written
+	// exactly once by it, and immutable after — so it is neither immutable
+	// from creation (the terminal transition must be able to set it) nor
+	// monotonic (a larger number is not more valid; a *different* number is a
+	// rewrite of what was reported).
+	//
+	// Filing it as mutable would have been the easy answer and the wrong one.
+	// The field exists so an operator reconciling a failed external call can
+	// tell "nothing left" from "two megabytes left", and a value a later
+	// transition may overwrite cannot carry that: the number an operator
+	// reads would not be the number the worker reported. The replay
+	// comparison in sameReportedOutcome also includes it, so a rewrite here
+	// would let a caller's second report disagree with its first and still be
+	// answered as the same report.
+	if !current.Effected.Zero() && current.Effected != next.Effected {
+		return shoal.NewError(
+			shoal.ErrorInternal,
+			"fleet action effected volume is written once")
+	}
 	return nil
 }
 

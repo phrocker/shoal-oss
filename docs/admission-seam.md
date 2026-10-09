@@ -450,16 +450,60 @@ caller was never told about and leave it unable to report the outcome it
 actually has. Nothing about the underlying call is known from a malformed
 report, so it is refused with no durable transition and the token stays usable.
 
-**Reporting a failure is a successful report.** The completion path is built
-for an executor, where a failed outcome is the executor's error and is returned
-alongside the committed record; here the failure is the news, not an error in
-delivering it. So a committed record that matches the report is a receipt.
-Propagating the completion path's error instead would make the first response
-to a reported failure an error and the identical retry a receipt, so what the
-caller saw would depend on whether its own report had committed — the exact
-confusion the one-shot token exists to remove. The conversion is guarded by the
-replay comparison itself: an outcome the service cannot confirm it wrote stays
-an error.
+**Reporting a failure is a successful report.** The failure is the news, not an
+error in delivering it: a committed record that matches the report is a
+receipt. If the first response to a reported failure were an error and the
+identical retry a receipt, what the caller saw would depend on whether its own
+report had committed — the exact confusion the one-shot token exists to remove.
+
+This surface used to convert that itself, because the completion path answered
+a durably recorded failure with an error. It no longer does (#492): the
+completion path returns the committed record with no error, since recording
+the report is what the operation was asked to do and the outcome lives in the
+record's `state` and `error_code`. So the conversion here was removed rather
+than kept as belt-and-braces — a check nothing can reach implies a guarantee
+that is no longer held at that point.
+
+### How much escaped
+
+A failure may carry `effected`, a bounded volume saying how much of an
+irreversible egress happened before it (#427):
+
+```json
+{"failed": true, "error_code": "response_truncated",
+ "effected": {"bytes": 2097152, "chunks": 64}}
+```
+
+This exists for one boundary. A streamed completion that breaks halfway has
+already put bytes in front of the caller and cannot recall them, so volume is
+the only thing left to report about an egress that could not be prevented.
+Without it, nothing left, fifty bytes left and two megabytes left all arrived
+as `response_truncated`, and the loop that consumes these reports could not
+tell a non-event from a near-complete disclosure.
+
+**It is an upper bound, never a receipt.** It counts bytes handed to the
+transport, which is the most any sender can know — kernel buffers and
+intermediate proxies sit between the write and the reader. Read it as *"at
+most N bytes may have reached the caller"*, not *"N bytes were received"*.
+
+It does not weaken the either-or rule above. The outcome was refused on a
+failure because the completion path *discarded* it; `effected` is committed
+and **part of the replay comparison**, so two failures reporting different
+volumes are different reports and a second one is `conflict` rather than an
+accepted correction. That also makes it write-once: the number a caller
+reports first is the number the record keeps, which both gateways can satisfy
+because each knows its final count when it reports.
+
+Refused rather than recorded in four ways, so it cannot become a free-form
+field on a durable record: on a success, on an action that does not declare
+`egresses-content`, outside its bounds, and for chunks with no bytes — a chunk
+that left carried something. On the dispatch completion route a refusal is
+adjudicated as `invalid_executor_effected` instead, because by then the effect
+has happened; that code means *the volume is unknown*, not zero.
+
+The same object is accepted and returned on
+`POST /api/v1/fleet/actions/{action}/complete`, which is the route a gateway
+performing external effects completes through.
 
 ## Outstanding
 
