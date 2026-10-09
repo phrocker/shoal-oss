@@ -14,6 +14,21 @@ import (
 
 const MaxLayaManifestArtifacts = 256
 
+// NewVerifiedLayaPredictor refuses to construct a serving client until the
+// exact local artifact set matches the predictor's pinned revision. Health is
+// checked separately with CheckHealth because construction must remain free of
+// network side effects.
+func NewVerifiedLayaPredictor(cfg LayaConfig, root string, manifest LayaArtifactManifest) (*LayaPredictor, error) {
+	predictor, err := NewLayaPredictor(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := VerifyLayaArtifacts(root, manifest, predictor.Identity()); err != nil {
+		return nil, err
+	}
+	return predictor, nil
+}
+
 // LayaArtifact identifies one immutable file used by a local worker. Paths
 // are relative to the provisioned artifact root and digests are SHA-256.
 type LayaArtifact struct {
