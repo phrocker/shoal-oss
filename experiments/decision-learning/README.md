@@ -87,7 +87,7 @@ is a targeting heuristic, not calibrated uncertainty.
 
 The sealed `influence.py` primitive measures leave-one-out score deltas and
 decision flips between two explicitly identified artifacts on the same test
-IDs. It is a structural sensitivity report only: it makes no truth, quality,
+IDs, with canonical digests for both score maps. It is a structural sensitivity report only: it makes no truth, quality,
 causal, or machine-unlearning claim, and cannot change a serving or promotion
 pointer.
 
