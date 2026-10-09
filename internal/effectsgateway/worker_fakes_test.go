@@ -146,6 +146,8 @@ type fakeExplorer struct {
 	// error is the call's answer. It is how a test makes a call block until
 	// its context ends.
 	gate func(ctx context.Context, op string) error
+	// loseExtendAnswer applies an extension and then answers it as lost.
+	loseExtendAnswer bool
 	// reportAt is the clock reading at each ambiguity report's start.
 	reportAt []time.Time
 	// Hooks answer instead of the default when they return handled.
@@ -331,6 +333,9 @@ func (e *fakeExplorer) Extend(ctx context.Context, id []byte, request ExtendRequ
 	record.leaseUntil = lease
 	record.action.ClaimLeaseUntil, record.action.UpdatedAt = lease.UTC(), now.UTC()
 	record.action.Version++
+	if e.loseExtendAnswer {
+		return Action{}, &DispatchError{Op: "extend", Kind: DispatchIndeterminate}
+	}
 	return record.action, nil
 }
 

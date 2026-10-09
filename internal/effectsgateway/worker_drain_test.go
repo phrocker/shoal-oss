@@ -300,3 +300,71 @@ func TestTheWorstShutdownPathFitsTheDrainBound(t *testing.T) {
 		t.Fatalf("SIGTERM to the last write took %s; the path did not block as intended", took)
 	}
 }
+
+// TestTheSettleWaitCoversAnExtensionOfUnknownOutcome: the renewal at L/2 is
+// in flight when the completion comes back indeterminate. Stopping the
+// renewal cancels it — and the explorer has applied it anyway, moving the
+// lease to 30s + L = 90s, though the worker never reads that answer. The
+// fallback report must wait until no renewal the worker sent can still hold
+// the claim: not the old anchored end (60s), but the latest end the
+// cancelled extension could have granted, sent + planeTimeout + L = 95s.
+func TestTheSettleWaitCoversAnExtensionOfUnknownOutcome(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	h.explorer.loseExtendAnswer = true
+	h.explorer.setGate(func(ctx context.Context, op string) error {
+		switch op {
+		case "extend":
+			<-ctx.Done() // applied when the worker gives up on it
+		case "complete":
+			return &DispatchError{Op: "complete", Kind: DispatchIndeterminate}
+		}
+		return nil
+	})
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.startGated()
+	h.clock.Advance(30 * time.Second)
+	settle()
+	h.release()
+	eventually(t, "the cancelled extension to apply", func() bool {
+		return h.explorer.record("a1").ClaimLeaseUntil.Equal(workerEpoch.Add(90 * time.Second))
+	})
+	settle()
+	for _, at := range []time.Duration{61, 90, 94} {
+		h.clock.Advance(at*time.Second - h.clock.Now().Sub(workerEpoch))
+		settle()
+		if reports := h.explorer.reportTimes(); len(reports) != 0 {
+			t.Fatalf("reported at %ds, before the possibly extended end (95s)", at)
+		}
+	}
+	h.clock.Advance(time.Second) // 95s
+	eventually(t, "the report", func() bool { return len(h.explorer.reportTimes()) == 1 })
+	if at := h.explorer.reportTimes()[0].Sub(workerEpoch); at != 95*time.Second {
+		t.Fatalf("reported at %s", at)
+	}
+	if h.logs.has("dispatch_error") {
+		// Under fence 1, the completion's own indeterminate answer is the
+		// only one (a re-claim after the lapse has its own fence).
+		count := 0
+		for _, line := range h.logs.lines() {
+			if line["event"] == "dispatch_error" && line["fence"] == float64(1) {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("%d dispatch_error events; the cancelled renewal logged one:\n%s", count, h.logs)
+		}
+	}
+}
+
+// TestPossibleLeaseEnd: Anchor's rule from the late side.
+func TestPossibleLeaseEnd(t *testing.T) {
+	sent := workerEpoch.Add(30 * time.Second)
+	anchored := Anchored{LeaseLocal: workerEpoch.Add(60 * time.Second), DeadlineLocal: workerEpoch.Add(time.Hour)}
+	if got := PossibleLeaseEnd(sent, 5*time.Second, time.Minute, anchored); !got.Equal(workerEpoch.Add(95 * time.Second)) {
+		t.Fatalf("unclamped = %s", got.Sub(workerEpoch))
+	}
+	anchored.DeadlineLocal = workerEpoch.Add(70 * time.Second)
+	if got := PossibleLeaseEnd(sent, 5*time.Second, time.Minute, anchored); !got.Equal(workerEpoch.Add(75 * time.Second)) {
+		t.Fatalf("clamped = %s", got.Sub(workerEpoch))
+	}
+}

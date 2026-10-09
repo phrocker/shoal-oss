@@ -103,6 +103,30 @@ func Anchor(sent time.Time, claim ClaimTimes) (Anchored, error) {
 	}, nil
 }
 
+// PossibleLeaseEnd is the latest local instant a renewal whose answer the
+// worker never read — cancelled, timed out, lost, or answered indeterminate —
+// could have moved the lease to.
+//
+// It is Anchor's rule read from the late side. Anchor places the server's
+// grant on the local clock from the earliest instant the server could have
+// applied it, the send; the latest is the end of the call's bound, sent +
+// callBound, since the request carries a deadline no later than that and the
+// explorer refuses work past it. The server grants min(applied + L,
+// deadline), so the lease can end no later than
+//
+//	min(sent + callBound + L, deadlineLocal + callBound)
+//
+// where the second term allows for deadlineLocal being Anchor's early
+// estimate, short of the true local deadline by at most the claim's own
+// round trip, itself bounded by callBound.
+func PossibleLeaseEnd(sent time.Time, callBound, lease time.Duration, anchored Anchored) time.Time {
+	end := sent.Add(callBound + lease)
+	if latest := anchored.DeadlineLocal.Add(callBound); end.After(latest) {
+		end = latest
+	}
+	return end
+}
+
 // RetentionCovers is the PRECHECK retention rule for a key route:
 //
 //	deadline − created_at ≤ retention

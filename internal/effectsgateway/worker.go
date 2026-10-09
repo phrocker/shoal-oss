@@ -371,6 +371,17 @@ func (w *Worker) withTimeout(parent context.Context, d time.Duration) (context.C
 	return ctx, cancel
 }
 
+// extensionMayHaveApplied: an Extend answered by anything but a definite
+// refusal may have moved the lease.
+func extensionMayHaveApplied(err error) bool {
+	switch DispatchKind(err) {
+	case DispatchFenceLost, DispatchInvalid, DispatchUnauthorized,
+		DispatchRefusedLocal, DispatchNoCredential:
+		return false
+	}
+	return true
+}
+
 // ErrDrainAbandoned says the grace period ended with runs unfinished. Each
 // one whose request may have reached the target is in the unrecorded log.
 var ErrDrainAbandoned = errors.New("the drain ended with work unfinished")
@@ -822,10 +833,13 @@ type claimRun struct {
 	mu       sync.Mutex
 	anchored Anchored
 	anchorAt time.Time
-	lost     bool
-	lostCh   chan struct{}
-	inFlight bool
-	reported bool
+	// possibleEnd is the latest end a renewal whose outcome is unknown may
+	// have granted (PossibleLeaseEnd); zero when every renewal was answered.
+	possibleEnd time.Time
+	lost        bool
+	lostCh      chan struct{}
+	inFlight    bool
+	reported    bool
 	// attempted: a request was handed to the target client, so the effect
 	// may have happened. settled: the outcome is on the record or in the
 	// unrecorded log. abandoned: the drain gave up on this run.
@@ -865,6 +879,19 @@ func (r *claimRun) unrecorded(target string, outcome fleet.AmbiguityOutcome, ref
 		Target: target, Reference: ref, CorrelationID: r.action.CorrelationID,
 		Status: dispatchStatus(err), DispatchError: DispatchKind(err),
 	}
+}
+
+// settleAt is when whatever this claim had in flight has settled: the end of
+// the lease as anchored, or later, the end a renewal of unknown outcome may
+// have granted. The explorer cannot have anything of this claim's in flight
+// past it.
+func (r *claimRun) settleAt() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.possibleEnd.After(r.anchored.LeaseLocal) {
+		return r.possibleEnd
+	}
+	return r.anchored.LeaseLocal
 }
 
 func (r *claimRun) isLost() bool {
@@ -1002,6 +1029,10 @@ func (w *Worker) renew(run *claimRun) {
 			w.log.Log(record)
 			run.markLost()
 			return
+		case run.renewCtx.Err() != nil:
+			// Stopped: the extension's outcome is recorded (possibleEnd);
+			// the cancellation itself is not a dispatch failure.
+			return
 		default:
 			// Indeterminate or unreachable: keep the lease end already held
 			// and try again shortly; the local lease end still bounds it.
@@ -1027,6 +1058,13 @@ func (w *Worker) extend(run *claimRun) (Action, error) {
 	})
 	cancel()
 	if err != nil {
+		if extensionMayHaveApplied(err) {
+			run.mu.Lock()
+			if end := PossibleLeaseEnd(sent, w.cfg.PlaneTimeout, w.cfg.ClaimLease, run.anchored); end.After(run.possibleEnd) {
+				run.possibleEnd = end
+			}
+			run.mu.Unlock()
+		}
 		return Action{}, err
 	}
 	// The explorer's end, clamped to the deadline — never sent + L.
@@ -1316,8 +1354,7 @@ func (w *Worker) complete(run *claimRun, class Classification, result sendResult
 		// report through the ambiguity route. While draining, the grace
 		// period does not wait for the lease.
 		stopRenewal()
-		anchored, _ := run.anchor()
-		if delay := anchored.LeaseLocal.Sub(w.clock.Now()); delay > 0 {
+		if delay := run.settleAt().Sub(w.clock.Now()); delay > 0 {
 			select {
 			case <-w.clock.After(delay):
 			case <-w.drainCh:

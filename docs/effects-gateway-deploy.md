@@ -521,7 +521,12 @@ held and is retried after the plane timeout.
 The same report follows a completion the explorer refused (404, 409, …). A
 completion whose answer may have committed (`indeterminate`, #506) stops
 renewing, waits out the lease, and then reports through the ambiguity route,
-which appends at `expected_version` 0. Each fence gets at most one report.
+which appends at `expected_version` 0. "The lease" there is the latest end any
+renewal could have granted: an extension whose answer was never read
+(cancelled, timed out, lost) may still have applied, so the wait runs to
+`PossibleLeaseEnd` — `min(sent + planeTimeout + L, deadlineLocal + planeTimeout)`,
+Anchor's rule from the late side — when that is later than the anchored end.
+Each fence gets at most one report.
 
 **Shutdown** (context cancelled): stop pulling and go not-ready (`draining`).
 A claim with nothing sent reports `request_not_sent` and lapses. A request in
