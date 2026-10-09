@@ -123,12 +123,17 @@ type labelledDelivery struct {
 
 // newLabelledDelivery runs a real dispatch through the real fleetevents
 // service and the real event backend: the action is enqueued, claimed and
-// executed by "owner", whose executor records both references. The owner —
-// the publisher of every lifecycle event — holds neither label.
+// executed by "owner", whose executor records both references (or exactly
+// evidence, when given). The owner — the publisher of every lifecycle event —
+// holds neither label.
 func newLabelledDelivery(
 	t *testing.T, visibility func(auth.Resolver) evidencelabels.Visibility,
+	evidence ...fleet.EvidenceRef,
 ) labelledDelivery {
 	t.Helper()
+	if len(evidence) == 0 {
+		evidence = []fleet.EvidenceRef{openEvidence, secretEvidence}
+	}
 	now := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
 	config := runtimeConfig(t.TempDir())
 	config = explorerfleet.ConfigureRuntime(config)
@@ -148,7 +153,7 @@ func newLabelledDelivery(
 	executor := &integrationExecutor{result: fleet.ExecutionResult{
 		Output:             json.RawMessage(`{"ok":true}`),
 		EvidenceSnapshotID: "snapshot", EvidenceSnapshotAsOf: now,
-		Evidence: []fleet.EvidenceRef{openEvidence, secretEvidence},
+		Evidence: evidence,
 	}}
 	registry, _ := newIntegrationRegistry(t, authority.Resolver(), now, executor)
 	backend, err := New(runtime, config.Domain)
@@ -198,10 +203,10 @@ func newLabelledDelivery(
 	if err != nil || completed.State != fleet.DispatchSucceeded {
 		t.Fatalf("complete = %#v, %v", completed, err)
 	}
-	if len(completed.Evidence) != 2 {
-		t.Fatalf("the action recorded %d evidence references, want 2: "+
+	if len(completed.Evidence) != len(evidence) {
+		t.Fatalf("the action recorded %d evidence references, want %d: "+
 			"this probe cannot check what was never recorded",
-			len(completed.Evidence))
+			len(completed.Evidence), len(evidence))
 	}
 	return labelledDelivery{
 		authority: authority, events: events, backend: backend, now: now,
@@ -570,6 +575,18 @@ func withoutSecret(t *testing.T, stored fleetevents.Event) fleetevents.Event {
 		consumed = append(consumed, reference)
 		visibility = append(visibility, want.ConsumedEvidenceVisibility[i])
 	}
+	// With the only labelled reference gone, the group has no labelled
+	// entry left, and an event that never had one carries nil. Anything else
+	// — even [][]string{nil} — marks that something was withheld (#398).
+	labelled := false
+	for _, entry := range visibility {
+		if len(entry) > 0 {
+			labelled = true
+		}
+	}
+	if !labelled {
+		visibility = nil
+	}
 	want.ConsumedEvidence, want.ConsumedEvidenceVisibility = consumed, visibility
 	var join []fleetevents.Evidence
 	for _, item := range want.Evidence {
@@ -580,4 +597,57 @@ func withoutSecret(t *testing.T, stored fleetevents.Event) fleetevents.Event {
 	}
 	want.Evidence = join
 	return want
+}
+
+// TestAnOutsiderCannotTellEvidenceWasWithheld is #398 applied to #562's
+// envelope: what a subscriber lacking B's labels receives must be
+// indistinguishable from the same transition published with only the
+// unlabelled reference. Deep equality on the delivered events catches any
+// marker of a withheld reference — a count, a placeholder, or the shape of
+// a visibility group that once held a label — not only one this test names.
+func TestAnOutsiderCannotTellEvidenceWasWithheld(t *testing.T) {
+	evaluator := func(resolver auth.Resolver) evidencelabels.Visibility {
+		return subjectLabels{resolver: resolver, holds: map[shoal.ID][]string{
+			"holder": {"project-x", "secret"},
+		}}
+	}
+	withheld := newLabelledDelivery(t, evaluator)
+	neverLabelled := newLabelledDelivery(t, evaluator, openEvidence)
+	for _, path := range deliveryPaths {
+		t.Run(path.name, func(t *testing.T) {
+			ctx, subscription := withheld.subscribe(t, "outsider")
+			got, gotBytes := path.read(t, withheld, ctx, subscription)
+			ctx, subscription = neverLabelled.subscribe(t, "outsider")
+			want, wantBytes := path.read(t, neverLabelled, ctx, subscription)
+			if !got.found || !want.found {
+				t.Fatal("the completion was not delivered")
+			}
+			if !reflect.DeepEqual(got.event, want.event) {
+				t.Fatalf("%s: an outsider can tell evidence was withheld:\n"+
+					"%#v\nwant, as if it had never been recorded,\n%#v",
+					path.name, got.event, want.event)
+			}
+			if path.name == "HTTP pull" {
+				// The cursor is sealed with a fresh nonce, so compare the
+				// body without it.
+				if !bytes.Equal(withoutCursor(t, gotBytes), withoutCursor(t, wantBytes)) {
+					t.Fatalf("HTTP bodies differ:\n%s\n%s", gotBytes, wantBytes)
+				}
+			}
+		})
+	}
+}
+
+func withoutCursor(t *testing.T, body []byte) []byte {
+	t.Helper()
+	var page map[string]json.RawMessage
+	if err := json.Unmarshal(body, &page); err != nil {
+		t.Fatal(err)
+	}
+	delete(page, "next_cursor")
+	encoded, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }

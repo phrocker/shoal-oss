@@ -845,17 +845,17 @@ func (s *Service) readableEvidenceGroup(
 		return nil, nil, true, nil
 	}
 	keptReferences := make([]interaction.EvidenceReference, len(kept))
-	var keptVisibility [][]string
-	if len(visibility) != 0 {
-		keptVisibility = make([][]string, len(kept))
-	}
+	keptVisibility := make([][]string, len(kept))
 	for i, value := range kept {
 		keptReferences[i] = value.reference
-		if keptVisibility != nil {
-			keptVisibility[i] = value.visibility
-		}
+		keptVisibility[i] = value.visibility
 	}
-	return keptReferences, keptVisibility, true, nil
+	// The visibility group's shape must not outlive what it described. A
+	// group whose every remaining entry is empty is returned as nil — the
+	// exact shape of an event that never carried labelled evidence —
+	// because a non-nil array of empty entries would itself say "a labelled
+	// reference was here and was withheld" (#398).
+	return keptReferences, canonicalVisibilityGroup(keptVisibility), true, nil
 }
 
 func containsReference(
