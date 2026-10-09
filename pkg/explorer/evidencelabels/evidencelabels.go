@@ -36,7 +36,11 @@
 // import it, and neither imports the other for it.
 package evidencelabels
 
-import "context"
+import (
+	"context"
+
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
 
 // Visibility answers whether the current reader holds the labels an evidence
 // reference carries.
@@ -50,6 +54,30 @@ type Visibility interface {
 	// question failing, and the caller returns it rather than silently
 	// withholding.
 	VisibleToReader(ctx context.Context, visibility []string) (bool, error)
+}
+
+// Translator rewrites, at record time, the visibility an evidence reference
+// carries into the terms Visibility can decide.
+//
+// An executor reports the visibility of the nodes it retrieved as their
+// shoal.visibility property: free-form ingest labels such as "secret". No
+// decision holds such a label, so a reference stored with one is withheld
+// from every reader, holders included. Since #570 each such label is enforced
+// as a structured policy per (source, label) conjoined into the node's
+// AccessRule, and that policy's grant labels (d:, s:, g:) are what a reader
+// can be shown to hold. Translator replaces each free-form term with them.
+//
+// Implemented by the host that owns the policy catalog
+// (authorized.LabelTranslator). A term it cannot translate exactly is kept as
+// it was, so the reference stays withheld rather than opened.
+type Translator interface {
+	// StructuredVisibility returns visibility with every free-form term
+	// replaced by the structured terms of the label policies that enforce it
+	// on nodeIDs and the endpoints of edgeIDs. An error is the catalog read
+	// failing, never a refusal.
+	StructuredVisibility(
+		ctx context.Context, nodeIDs, edgeIDs []shoal.ID, visibility []string,
+	) ([]string, error)
 }
 
 // Filter returns the values the reader behind ctx may see, in order, and

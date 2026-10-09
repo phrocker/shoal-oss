@@ -21,6 +21,7 @@ package authorized
 
 import (
 	"context"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -38,14 +39,43 @@ func (c *Client) FoldInteractions(
 	if err != nil {
 		return explorer.FoldResult{}, err
 	}
-	decision, guard, _, err := c.begin(ctx, auth.OperationConnect)
+	decision, guard, now, err := c.begin(ctx, auth.OperationConnect)
 	if err != nil {
 		return explorer.FoldResult{}, err
 	}
+	pending := interaction.Fold{
+		Members: make([]interaction.FoldMember, 0, len(request.SessionIDs)),
+	}
 	for _, sessionID := range request.SessionIDs {
-		if _, err := c.Interaction(ctx, sessionID); err != nil {
+		record, err := c.InteractionRecord(ctx, sessionID)
+		if err != nil {
 			return explorer.FoldResult{}, err
 		}
+		if record.Summary.Deleted || record.Session.ID == "" {
+			return explorer.FoldResult{}, auth.ObjectNotFound()
+		}
+		// The member as the store will fold it, from the trusted record
+		// rather than the reader's view, whose expression may be cleared.
+		stored, err := c.interactionSource.InteractionRecord(ctx, sessionID)
+		if err != nil {
+			return explorer.FoldResult{}, directBaseError(err)
+		}
+		pending.Members = append(pending.Members, interaction.FoldMember{
+			SessionID:        sessionID,
+			RetrievedNodeIDs: stored.TouchedNodeIDs,
+			TouchedEdgeIDs:   stored.TouchedEdgeIDs,
+			Visibility:       auth.SplitVisibilityConjunction(stored.Summary.Visibility),
+		})
+	}
+	// A fold is shown only to a reader who may see its own visibility, so a
+	// caller who could not see the result is refused before it is written
+	// rather than after.
+	permitted, err := c.foldLabelsPermitted(ctx, decision, now, pending)
+	if err != nil {
+		return explorer.FoldResult{}, err
+	}
+	if !permitted {
+		return explorer.FoldResult{}, auth.ObjectNotFound()
 	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.FoldResult{}, err
@@ -63,8 +93,7 @@ func (c *Client) FoldInteractions(
 	}
 	// The durable winner is authoritative for retries. Reauthorize every one
 	// of its canonical members rather than only the caller-supplied request.
-	allowed, recorders, err := c.foldMembersVisible(
-		ctx, fold, readerFingerprint(decision))
+	allowed, err := c.foldVisible(ctx, decision, c.clock(), fold)
 	if err != nil {
 		return committedFoldFailure(err)
 	}
@@ -73,9 +102,6 @@ func (c *Client) FoldInteractions(
 	}
 	if err := guard.Check(ctx); err != nil {
 		return committedFoldFailure(err)
-	}
-	if !recorders.all {
-		result.Visibility = ""
 	}
 	return result, nil
 }
@@ -151,11 +177,10 @@ func (c *Client) Folds(ctx context.Context) ([]explorer.FoldSummary, error) {
 	if err != nil {
 		return nil, err
 	}
-	decision, guard, _, err := c.begin(ctx, auth.OperationRead)
+	decision, guard, now, err := c.begin(ctx, auth.OperationRead)
 	if err != nil {
 		return nil, err
 	}
-	reader := readerFingerprint(decision)
 	values, err := store.Folds(ctx)
 	if err != nil {
 		return nil, directBaseError(err)
@@ -171,16 +196,12 @@ func (c *Client) Folds(ctx context.Context) ([]explorer.FoldSummary, error) {
 			}
 			return nil, directBaseError(readErr)
 		}
-		allowed, recorders, authorizationErr := c.foldMembersVisible(
-			ctx, fold, reader)
+		allowed, authorizationErr := c.foldVisible(ctx, decision, now, fold)
 		if authorizationErr != nil {
 			return nil, authorizationErr
 		}
 		if !allowed {
 			continue
-		}
-		if !recorders.all {
-			value.Visibility = ""
 		}
 		visible = append(visible, value)
 	}
@@ -229,7 +250,7 @@ func (c *Client) RehydrateFold(
 	if err != nil {
 		return interaction.Fold{}, err
 	}
-	decision, guard, _, err := c.begin(ctx, auth.OperationRead)
+	decision, guard, now, err := c.begin(ctx, auth.OperationRead)
 	if err != nil {
 		return interaction.Fold{}, err
 	}
@@ -242,8 +263,7 @@ func (c *Client) RehydrateFold(
 		}
 		return interaction.Fold{}, directBaseError(err)
 	}
-	allowed, recorders, err := c.foldMembersVisible(
-		ctx, fold, readerFingerprint(decision))
+	allowed, err := c.foldVisible(ctx, decision, now, fold)
 	if err != nil {
 		return interaction.Fold{}, err
 	}
@@ -253,33 +273,41 @@ func (c *Client) RehydrateFold(
 	if err := guard.Check(ctx); err != nil {
 		return interaction.Fold{}, err
 	}
-	return withholdFoldLabels(fold, recorders), nil
+	return fold, nil
 }
 
-// foldMembersVisible reauthorizes every member session of a fold for the
-// current caller and reports which of them the caller recorded (see
-// label_withholding.go). A fold spans several recorders, so its own conjoined
-// label expression is shown only when the caller recorded all of them.
-func (c *Client) foldMembersVisible(
-	ctx context.Context, fold interaction.Fold, reader shoal.ID,
-) (bool, foldRecorders, error) {
-	recorders := foldRecorders{
-		members: make([]bool, len(fold.Members)),
-		all:     len(fold.Members) > 0,
-	}
-	for index, member := range fold.Members {
-		session, err := c.Interaction(ctx, member.SessionID)
-		if err != nil {
+// foldVisible reauthorizes every member session of a fold for the current
+// caller, each through the interaction read's own label check, and then
+// requires the caller to see the fold's own visibility (#568). A fold cannot
+// be partially unfolded, because its summary digest covers every member, so
+// one member or one label the caller may not see hides the whole fold.
+func (c *Client) foldVisible(
+	ctx context.Context, decision auth.Decision, now time.Time,
+	fold interaction.Fold,
+) (bool, error) {
+	for _, member := range fold.Members {
+		if _, err := c.Interaction(ctx, member.SessionID); err != nil {
 			if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-				return false, foldRecorders{}, nil
+				return false, nil
 			}
-			return false, foldRecorders{}, err
+			return false, err
 		}
-		recorders.members[index] = readerRecorded(
-			session.AuthorizationFingerprint, reader)
-		recorders.all = recorders.all && recorders.members[index]
 	}
-	return true, recorders, nil
+	return c.foldLabelsPermitted(ctx, decision, now, fold)
+}
+
+// foldLabelsPermitted evaluates a fold's own visibility, translated over its
+// members' touched provenance.
+func (c *Client) foldLabelsPermitted(
+	ctx context.Context, decision auth.Decision, now time.Time,
+	fold interaction.Fold,
+) (bool, error) {
+	labels, nodeIDs, edgeIDs := foldVisibility(fold)
+	translated, err := c.structuredLabels(ctx, labels, nodeIDs, edgeIDs)
+	if err != nil {
+		return false, err
+	}
+	return c.labelVisibility.permits(ctx, decision, translated, now)
 }
 
 func (c *Client) foldStore() (FoldStore, error) {

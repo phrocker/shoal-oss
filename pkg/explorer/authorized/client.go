@@ -120,6 +120,10 @@ type Config struct {
 	// and a positive Window, so an enabled-but-unbacked control fails closed at
 	// construction.
 	Mosaic MosaicBudget
+	// CeilingResolver resolves a trusted service's configured ceiling for
+	// the reader label evaluator (#564). Nil means no service account has
+	// one, so every trusted service is refused labelled data.
+	CeilingResolver CeilingResolver
 }
 
 // Client enforces trusted-context authorization around an Explorer client.
@@ -141,6 +145,7 @@ type Client struct {
 	clock               func() time.Time
 	mosaic              MosaicBudget
 	accumulator         *Accumulator[[]string]
+	labelVisibility     *LabelVisibility
 	mutationMu          sync.Mutex
 	vectorMu            sync.Mutex
 	vectorAvailability  authorizedVectorAvailabilityCache
@@ -204,6 +209,13 @@ func NewClient(config Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	labelVisibility, err := NewLabelVisibility(LabelVisibilityConfig{
+		Resolver: config.Resolver, Ceilings: config.CeilingResolver,
+		Clock: config.Clock,
+	})
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
 		base:                config.Base,
 		vectorScorer:        config.VectorScorer,
@@ -222,6 +234,7 @@ func NewClient(config Config) (*Client, error) {
 		clock:               config.Clock,
 		mosaic:              config.Mosaic,
 		accumulator:         accumulator,
+		labelVisibility:     labelVisibility,
 	}, nil
 }
 

@@ -32,6 +32,7 @@ type DispatchService struct {
 	// attestations is consulted only for actions that require attestation.
 	attestations       ExecutorAttestations
 	evidenceVisibility EvidenceVisibility
+	evidenceLabels     evidencelabels.Translator
 }
 
 func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
@@ -50,6 +51,7 @@ func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
 		recorder: config.Recorder, events: config.Events, clock: config.Clock,
 		outbox: outbox, attestations: config.Attestations,
 		evidenceVisibility: config.EvidenceVisibility,
+		evidenceLabels:     config.EvidenceLabels,
 	}
 	return service, nil
 }
@@ -1312,7 +1314,11 @@ func (s *DispatchService) applyExecutionResult(
 			next.ErrorCodeOrigin = ErrorCodeOriginService
 		}
 	} else {
-		next.Evidence = result.Evidence
+		evidence, err := s.structuredEvidence(ctx, result.Evidence)
+		if err != nil {
+			return ActionRecord{}, false, err
+		}
+		next.Evidence = evidence
 		next.EvidenceSnapshotID = result.EvidenceSnapshotID
 		next.EvidenceSnapshotAsOf = result.EvidenceSnapshotAsOf.UTC()
 	}
@@ -3599,6 +3605,39 @@ func withinScope(permitted [][]byte, scope []byte) bool {
 		}
 	}
 	return true
+}
+
+// structuredEvidence is the record-time half of the label rule: each
+// reference's visibility is stored as the structured label-policy terms a
+// reader can be shown to hold, translated from the free-form labels the
+// executor reported (#564). A translation failure is a catalog read failing,
+// so the completion is not recorded and the claim stands; recording the
+// untranslated labels instead would withhold the evidence from every reader
+// for good.
+func (s *DispatchService) structuredEvidence(
+	ctx context.Context, evidence []EvidenceRef,
+) ([]EvidenceRef, error) {
+	if s.evidenceLabels == nil || len(evidence) == 0 {
+		return evidence, nil
+	}
+	translated := make([]EvidenceRef, len(evidence))
+	for index, reference := range evidence {
+		translated[index] = reference
+		if len(reference.Visibility) == 0 {
+			continue
+		}
+		visibility, err := s.evidenceLabels.StructuredVisibility(
+			ctx, reference.NodeIDs, reference.EdgeIDs, reference.Visibility)
+		if err != nil {
+			return nil, err
+		}
+		canonical, err := interaction.Conjoin(visibility)
+		if err != nil {
+			return nil, err
+		}
+		translated[index].Visibility = canonical
+	}
+	return translated, nil
 }
 
 // readableRecord returns the record as this reader may see it, with evidence

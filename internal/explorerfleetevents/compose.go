@@ -26,6 +26,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
+	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -89,11 +90,14 @@ func ComposeWithPublisher(
 		return nil, nil, err
 	}
 	return composeWithPublisher(
-		backend, resolver, generations, auditor, leases, cursorKey, clock)
+		backend, resolver, generations, auditor, leases, cursorKey, clock, nil)
 }
 
 // ComposeWithPublisherAndReader constructs the production event service with
 // authoritative interaction-receipt reconciliation for exact retries.
+// evidenceVisibility is the reader label evaluator applied to every
+// delivered envelope's evidence (#562, #564); nil withholds labelled evidence
+// from every subscriber.
 func ComposeWithPublisherAndReader(
 	runtime *explorercoord.Runtime,
 	domain coordination.DomainID,
@@ -105,6 +109,7 @@ func ComposeWithPublisherAndReader(
 	leases fleetevents.LeaseValidator,
 	cursorKey []byte,
 	clock func() time.Time,
+	evidenceVisibility evidencelabels.Visibility,
 ) (*fleetevents.Service, *ActionEventPublisher, error) {
 	backend, err := New(runtime, domain)
 	if err != nil {
@@ -116,7 +121,8 @@ func ComposeWithPublisherAndReader(
 		return nil, nil, err
 	}
 	return composeWithPublisher(
-		backend, resolver, generations, auditor, leases, cursorKey, clock)
+		backend, resolver, generations, auditor, leases, cursorKey, clock,
+		evidenceVisibility)
 }
 
 func composeWithPublisher(
@@ -127,12 +133,13 @@ func composeWithPublisher(
 	leases fleetevents.LeaseValidator,
 	cursorKey []byte,
 	clock func() time.Time,
+	evidenceVisibility evidencelabels.Visibility,
 ) (*fleetevents.Service, *ActionEventPublisher, error) {
 	capability := explorerfleetcap.New()
 	service, err := fleetevents.NewWithLifecycleCapability(fleetevents.Config{
 		Backend: backend, Resolver: resolver, GenerationReader: generations,
 		LeaseValidator: leases, Auditor: auditor, CursorKey: cursorKey,
-		Clock: clock,
+		Clock: clock, EvidenceVisibility: evidenceVisibility,
 	}, capability)
 	if err != nil {
 		return nil, nil, err

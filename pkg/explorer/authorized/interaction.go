@@ -311,6 +311,22 @@ func (c *Client) recordInteractionWithEvidenceOperation(
 	); err != nil {
 		return interaction.Session{}, err
 	}
+	// The stored output restriction is what reads evaluate (#564, #567), so
+	// it must hold terms a reader can hold. A producer derives it from the
+	// shoal.visibility of the nodes it touched, which is free-form ("secret")
+	// and held by nobody; each such term is replaced by the grant labels of
+	// the label policy enforcing it on those nodes (#570). Translated before
+	// the retry comparison, so an exact retry compares like with like.
+	canonical.RequiredVisibility, err = c.structuredLabels(
+		ctx, canonical.RequiredVisibility,
+		canonical.TouchedNodeIDs(), canonical.TouchedEdgeIDs())
+	if err != nil {
+		return interaction.Session{}, err
+	}
+	canonical, err = canonical.Canonical()
+	if err != nil {
+		return interaction.Session{}, err
+	}
 	reader, err := c.interactionReader()
 	if err != nil {
 		return interaction.Session{}, err
@@ -582,11 +598,17 @@ func (c *Client) InteractionRecords(
 	if err != nil {
 		return nil, err
 	}
-	fingerprint := readerFingerprint(decision)
 	visible := make([]explorer.InteractionRecord, 0, len(records))
 	for index, record := range records {
-		if allowed[index] {
-			visible = append(visible, withholdInteractionLabels(record, fingerprint))
+		if !allowed[index] {
+			continue
+		}
+		readable, ok, err := c.readableInteraction(ctx, decision, now, record)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			visible = append(visible, readable)
 		}
 	}
 	if err := guard.Check(ctx); err != nil {
@@ -793,10 +815,17 @@ func (c *Client) InteractionRecord(
 		}
 		return explorer.InteractionRecord{}, err
 	}
+	readable, ok, err := c.readableInteraction(ctx, decision, now, record)
+	if err != nil {
+		return explorer.InteractionRecord{}, err
+	}
+	if !ok {
+		return explorer.InteractionRecord{}, auth.ObjectNotFound()
+	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.InteractionRecord{}, err
 	}
-	return withholdInteractionLabels(record, readerFingerprint(decision)), nil
+	return readable, nil
 }
 
 // Interaction returns one authorized typed interaction. It is an explicit
@@ -843,12 +872,14 @@ func (c *Client) InteractionSubgraph(
 		if readErr != nil {
 			return explorer.Neighborhood{}, directBaseError(readErr)
 		}
+		permitted, err := c.subgraphLabelsPermitted(ctx, decision, now, record)
+		if err != nil {
+			return explorer.Neighborhood{}, err
+		}
 		if err := guard.Check(ctx); err != nil {
 			return explorer.Neighborhood{}, err
 		}
-		return withholdSubgraphLabels(
-			subgraph, record.Summary.AuthorizationFingerprint,
-			readerFingerprint(decision)), nil
+		return withholdSubgraphLabels(subgraph, permitted), nil
 	}
 	if len(record.TouchedNodeIDs) == 0 &&
 		!summaryFingerprintMatchesDecision(record.Summary, decision) {
@@ -875,12 +906,33 @@ func (c *Client) InteractionSubgraph(
 		!summaryFingerprintMatchesDecision(record.Summary, decision) {
 		return explorer.Neighborhood{}, auth.ObjectNotFound()
 	}
+	permitted, err := c.subgraphLabelsPermitted(ctx, decision, now, record)
+	if err != nil {
+		return explorer.Neighborhood{}, err
+	}
 	if err := guard.Check(ctx); err != nil {
 		return explorer.Neighborhood{}, err
 	}
-	return withholdSubgraphLabels(
-		subgraph, record.Summary.AuthorizationFingerprint,
-		readerFingerprint(decision)), nil
+	return withholdSubgraphLabels(subgraph, permitted), nil
+}
+
+// subgraphLabelsPermitted applies the record read's label rule to the derived
+// graph: a record the reader may not see is ObjectNotFound, and its stamped
+// expression is shown only when the reader may see every term of it.
+func (c *Client) subgraphLabelsPermitted(
+	ctx context.Context,
+	decision auth.Decision,
+	now time.Time,
+	record explorer.InteractionRecord,
+) (bool, error) {
+	readable, ok, err := c.readableInteraction(ctx, decision, now, record)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, auth.ObjectNotFound()
+	}
+	return readable.Summary.Visibility == record.Summary.Visibility, nil
 }
 
 func interactionSubgraphIsTombstone(subgraph explorer.Neighborhood) bool {

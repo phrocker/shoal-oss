@@ -1142,6 +1142,14 @@ type DispatchConfig struct {
 	// a label must not hand out identifiers the label exists to protect
 	// (#369).
 	EvidenceVisibility EvidenceVisibility
+	// EvidenceLabels translates, when an executor's evidence is recorded,
+	// the free-form ingest labels on each reference into the structured
+	// label-policy terms EvidenceVisibility can decide (#564, #570).
+	//
+	// Optional. Nil records the executor's visibility as reported, and a
+	// reference stored with a free-form label is then withheld from every
+	// reader, holders included: fail closed, never open.
+	EvidenceLabels evidencelabels.Translator
 }
 
 // EvidenceVisibility answers whether the current reader holds the labels an
