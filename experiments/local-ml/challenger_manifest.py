@@ -87,6 +87,10 @@ def validate(manifest):
         _digest_text(recipe.get('weights_digest'), 'weights')
         _digest_text(recipe.get('tokenizer_digest'), 'tokenizer')
         _text(recipe.get('license_id'), 'license_id')
+        input_field = recipe.get('input_field', 'text')
+        _text(input_field, 'input_field')
+        if any(term in input_field.lower() for term in FORBIDDEN_FEATURE_TERMS):
+            raise ValueError('recipe input field includes forbidden label or future information')
         if recipe['name'] == 'catboost-structured-v1':
             _text(recipe.get('library_version'), 'CatBoost library version')
             if not isinstance(recipe.get('categorical_features'), list):
