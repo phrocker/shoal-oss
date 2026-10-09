@@ -206,7 +206,9 @@ type Worker struct {
 	kill   context.CancelFunc
 	killed atomic.Bool
 
-	attestMu     sync.Mutex
+	// attestSem serializes presentations; a waiter gives up when its
+	// context ends, so a cancelled renewal never queues behind one.
+	attestSem    chan struct{}
 	attestExpiry time.Time
 
 	serverMu     sync.Mutex
@@ -279,7 +281,7 @@ func NewWorker(cfg WorkerConfig) (*Worker, error) {
 		},
 		slots: make(chan struct{}, cfg.MaxInFlight), notReady: NotReadyStarting,
 		drainCh: make(chan struct{}), skipped: map[string]uint64{},
-		runs: map[*claimRun]struct{}{},
+		runs: map[*claimRun]struct{}{}, attestSem: make(chan struct{}, 1),
 	}
 	w.hard, w.kill = context.WithCancel(context.Background())
 	return w, nil
@@ -351,6 +353,24 @@ func (w *Worker) Run(ctx context.Context) error {
 	return nil
 }
 
+// withTimeout is context.WithTimeout on the worker's clock, so every bound
+// the worker spends is measured by the same clock GracePeriod is budgeted on.
+func (w *Worker) withTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if _, system := w.clock.(systemClock); system {
+		return context.WithTimeout(parent, d)
+	}
+	ctx, cancel := context.WithCancel(parent)
+	expired := w.clock.After(d)
+	go func() {
+		select {
+		case <-expired:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
 // ErrDrainAbandoned says the grace period ended with runs unfinished. Each
 // one whose request may have reached the target is in the unrecorded log.
 var ErrDrainAbandoned = errors.New("the drain ended with work unfinished")
@@ -380,9 +400,10 @@ func (w *Worker) drain() int {
 	abandoned := 0
 	select {
 	case <-done:
-	case <-w.clock.After(GracePeriod(w.cfg.OperationTimeout, w.cfg.PlaneTimeout)):
-		// The kubelet's SIGKILL follows. Nothing that may have happened is
-		// left only in memory.
+	case <-w.clock.After(DrainBound(w.cfg.OperationTimeout, w.cfg.PlaneTimeout)):
+		// The grace period's exit margin is all that is left before the
+		// kubelet's SIGKILL, and it belongs to this: nothing that may have
+		// happened is left only in memory.
 		abandoned = w.abandon()
 	case <-w.hard.Done():
 	}
@@ -401,18 +422,25 @@ func (w *Worker) abandon() int {
 		runs = append(runs, run)
 	}
 	w.runsMu.Unlock()
+	var written []*claimRun
+	var entries []UnrecordedEntry
 	for _, run := range runs {
 		run.mu.Lock()
 		write := run.attempted && !run.settled
 		run.abandoned, run.reported = true, true
 		run.mu.Unlock()
-		if !write {
-			continue
+		if write {
+			written = append(written, run)
+			entries = append(entries, run.unrecorded(w.cfg.SurfaceName,
+				fleet.AmbiguityOutcomeUnknown, "", nil))
 		}
+	}
+	// One durable rewrite for all of them: the exit margin is short.
+	err := w.cfg.Unrecorded.AppendAll(entries)
+	for _, run := range written {
 		record := w.record(run, EventUnrecorded)
 		record.Ambiguity = fleet.AmbiguityOutcomeUnknown
-		if err := w.cfg.Unrecorded.Append(run.unrecorded(w.cfg.SurfaceName,
-			fleet.AmbiguityOutcomeUnknown, "", nil)); err != nil {
+		if err != nil {
 			record.Event = EventDispatch
 		}
 		record.Unrecorded = w.cfg.Unrecorded.Len()
@@ -437,7 +465,7 @@ func (w *Worker) RetryUnrecorded(ctx context.Context) {
 		if err != nil {
 			return
 		}
-		callCtx, cancel := context.WithTimeout(ctx, w.cfg.PlaneTimeout)
+		callCtx, cancel := w.withTimeout(ctx, w.cfg.PlaneTimeout)
 		_, err = w.cfg.Dispatch.ReportAmbiguity(callCtx, entry.ActionID, entry.Report(request))
 		cancel()
 		record := LogRecord{ActionID: entry.ActionID, Fence: entry.Fence,
@@ -615,7 +643,7 @@ func (w *Worker) pullOnce(ctx context.Context, held *ticket, cursor string) (boo
 	if err != nil {
 		return false, "", err
 	}
-	callCtx, cancel := context.WithTimeout(ctx, w.cfg.PlaneTimeout)
+	callCtx, cancel := w.withTimeout(ctx, w.cfg.PlaneTimeout)
 	page, err := w.cfg.Dispatch.Pull(callCtx, request, cursor, w.cfg.PullLimit)
 	cancel()
 	if err != nil {
@@ -736,8 +764,12 @@ func (w *Worker) serverNow() (time.Time, error) {
 // ensureAttestation presents the attestation unless the one in hand
 // outlives the explorer's now + L + ReportWindow.
 func (w *Worker) ensureAttestation(ctx context.Context, force bool) error {
-	w.attestMu.Lock()
-	defer w.attestMu.Unlock()
+	select {
+	case w.attestSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-w.attestSem }()
 	now, err := w.serverNow()
 	if err != nil {
 		return err
@@ -746,7 +778,7 @@ func (w *Worker) ensureAttestation(ctx context.Context, force bool) error {
 	if !force && !w.attestExpiry.IsZero() && !w.attestExpiry.Before(needed) {
 		return nil
 	}
-	callCtx, cancel := context.WithTimeout(ctx, w.cfg.PlaneTimeout)
+	callCtx, cancel := w.withTimeout(ctx, w.cfg.PlaneTimeout)
 	expires, err := w.cfg.Dispatch.PresentAttestation(callCtx,
 		w.cfg.AttestationStatementFile, w.cfg.AttestationKeyFile)
 	cancel()
@@ -763,9 +795,9 @@ func (w *Worker) ensureAttestation(ctx context.Context, force bool) error {
 }
 
 func (w *Worker) forgetAttestation() {
-	w.attestMu.Lock()
+	w.attestSem <- struct{}{}
 	w.attestExpiry = time.Time{}
-	w.attestMu.Unlock()
+	<-w.attestSem
 }
 
 func (w *Worker) requestContext(reason string) (RequestContext, error) {
@@ -802,6 +834,10 @@ type claimRun struct {
 	abandoned bool
 	stopRenew chan struct{}
 	renewDone chan struct{}
+	// renewCtx bounds every call the renewal makes; stopping the renewal
+	// cancels it first, so the stop never waits on a call in flight.
+	renewCtx    context.Context
+	renewCancel context.CancelFunc
 }
 
 func (r *claimRun) markLost() {
@@ -853,7 +889,7 @@ func (w *Worker) claim(ctx context.Context, offered Action, route *Route) (*clai
 		return nil, err
 	}
 	sent := w.clock.Now()
-	callCtx, cancel := context.WithTimeout(ctx, w.cfg.PlaneTimeout)
+	callCtx, cancel := w.withTimeout(ctx, w.cfg.PlaneTimeout)
 	claimed, err := w.cfg.Dispatch.Claim(callCtx, offered.ID, ClaimRequest{
 		Context: offered.Correlate(request), ExpectedVersion: offered.Version,
 		ClaimID: claimID, Lease: w.cfg.ClaimLease,
@@ -873,6 +909,7 @@ func (w *Worker) claim(ctx context.Context, offered Action, route *Route) (*clai
 		lostCh: make(chan struct{}), stopRenew: make(chan struct{}),
 		renewDone: make(chan struct{}),
 	}
+	run.renewCtx, run.renewCancel = context.WithCancel(w.hard)
 	if len(run.action.CorrelationID) == 0 {
 		run.action.CorrelationID = append([]byte(nil), offered.CorrelationID...)
 	}
@@ -923,7 +960,7 @@ func (w *Worker) renew(run *claimRun) {
 			case <-w.clock.After(delay):
 			case <-run.stopRenew:
 				return
-			case <-w.hard.Done():
+			case <-run.renewCtx.Done():
 				return
 			}
 		}
@@ -945,7 +982,7 @@ func (w *Worker) renew(run *claimRun) {
 		if w.cfg.RequiresAttestation(run.action.Action) {
 			// Best effort: a refused presentation shows up as the
 			// extension's own 409.
-			_ = w.ensureAttestation(w.hard, false)
+			_ = w.ensureAttestation(run.renewCtx, false)
 		}
 		_, err := w.extend(run)
 		switch {
@@ -956,7 +993,7 @@ func (w *Worker) renew(run *claimRun) {
 			if dispatchStatus(err) == http.StatusConflict &&
 				w.cfg.RequiresAttestation(run.action.Action) && !attestRetried {
 				attestRetried = true
-				_ = w.ensureAttestation(w.hard, true)
+				_ = w.ensureAttestation(run.renewCtx, true)
 				retryAt = w.clock.Now()
 				continue
 			}
@@ -983,7 +1020,7 @@ func (w *Worker) extend(run *claimRun) (Action, error) {
 		return Action{}, err
 	}
 	sent := w.clock.Now()
-	callCtx, cancel := context.WithTimeout(w.hard, w.cfg.PlaneTimeout)
+	callCtx, cancel := w.withTimeout(run.renewCtx, w.cfg.PlaneTimeout)
 	extended, err := w.cfg.Dispatch.Extend(callCtx, run.action.ID, ExtendRequest{
 		Context: run.action.Correlate(request), ClaimID: run.claimID,
 		ClaimFence: run.action.ClaimFence, Lease: w.cfg.ClaimLease,
@@ -1035,7 +1072,10 @@ func (w *Worker) handle(run *claimRun) {
 		w.runsMu.Unlock()
 	}()
 	go w.renew(run)
+	// Cancel, then wait: a renewal call in flight ends at once rather than
+	// at its own timeout, which GracePeriod does not budget for.
 	stopRenewal := func() {
+		run.renewCancel()
 		select {
 		case <-run.stopRenew:
 		default:
@@ -1186,7 +1226,7 @@ func (w *Worker) attempt(run *claimRun, bound BoundRequest, header, credential s
 	Observation, int64, int64, time.Duration,
 ) {
 	var written atomic.Bool
-	ctx, cancel := context.WithTimeout(w.hard, w.cfg.OperationTimeout)
+	ctx, cancel := w.withTimeout(w.hard, w.cfg.OperationTimeout)
 	defer cancel()
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		GotConn: func(httptrace.GotConnInfo) { written.Store(true) },
@@ -1249,7 +1289,7 @@ func (w *Worker) complete(run *claimRun, class Classification, result sendResult
 		completion.Effected = w.effected(run.route, result)
 	}
 	// CompletionBudget is the same figure GracePeriod reserves for it.
-	callCtx, cancel := context.WithTimeout(w.hard, CompletionBudget(w.cfg.PlaneTimeout))
+	callCtx, cancel := w.withTimeout(w.hard, CompletionBudget(w.cfg.PlaneTimeout))
 	_, err = w.cfg.Dispatch.Complete(callCtx, run.action.ID, completion)
 	cancel()
 	record := w.record(run, EventCompleted)
@@ -1338,7 +1378,7 @@ func (w *Worker) report(run *claimRun, outcome fleet.AmbiguityOutcome, ref strin
 			break
 		}
 		report.Context = run.action.Correlate(request)
-		callCtx, cancel := context.WithTimeout(w.hard, ReportWindow)
+		callCtx, cancel := w.withTimeout(w.hard, ReportWindow)
 		_, err = w.cfg.Dispatch.ReportAmbiguity(callCtx, run.action.ID, report)
 		cancel()
 		if err == nil || errors.Is(err, ErrAmbiguityUnrecorded) || w.killed.Load() {

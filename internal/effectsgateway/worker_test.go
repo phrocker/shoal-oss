@@ -283,31 +283,49 @@ func (h *workerHarness) release() {
 }
 
 // TestWorkerExtendsToTheExplorersClampedEnd: the extension at L/2 is granted
-// only to the action's deadline, and the worker's lease ends there — not at
-// the extension's send time plus the lease it asked for. The request in
-// flight at that end finishes and is reported effect_observed, never
-// completed.
+// only to the action's deadline (75s), and the worker's lease ends there —
+// not at the extension's send time plus the lease it asked for (90s). The
+// claim is held with nothing sent yet, so the lost fence is reported
+// request_not_sent and nothing is sent or completed.
 func TestWorkerExtendsToTheExplorersClampedEnd(t *testing.T) {
+	hold, entered := make(chan struct{}), make(chan struct{}, 1)
 	h := newWorkerHarness(t, nil)
-	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(70*time.Second))
-	h.startGated()
+	first := true
+	h.credential = func() {
+		if first {
+			first = false
+			entered <- struct{}{}
+			<-hold
+		}
+	}
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(75*time.Second))
+	h.start()
+	<-entered
+	settle()
 	h.clock.Advance(30 * time.Second)
 	eventually(t, "the extension", func() bool { _, _, n, _, _ := h.explorer.counts(); return n == 1 })
 	settle()
-	if got := h.explorer.record("a1").ClaimLeaseUntil; !got.Equal(workerEpoch.Add(70 * time.Second)) {
+	if got := h.explorer.record("a1").ClaimLeaseUntil; !got.Equal(workerEpoch.Add(75 * time.Second)) {
 		t.Fatalf("granted %v", got)
 	}
-	h.clock.Advance(31 * time.Second) // 61s: past sent+L/2 of the extension
+	h.clock.Advance(44 * time.Second) // 74s
 	settle()
-	h.clock.Advance(10 * time.Second) // 71s: past the clamped end
-	eventually(t, "the fence to be lost", func() bool { return h.logs.has("fence_lost") })
-	h.release()
+	if h.logs.has("fence_lost") {
+		t.Fatal("the lease ended before the explorer's end")
+	}
+	h.clock.Advance(2 * time.Second) // 76s: past the clamped end, well before 90s
+	eventually(t, "the fence to be lost at the clamped end", func() bool { return h.logs.has("fence_lost") })
+	if _, _, extends, _, _ := h.explorer.counts(); extends != 1 {
+		t.Fatalf("%d extensions of a lease clamped to the deadline", extends)
+	}
+	close(hold)
 	eventually(t, "the report", func() bool { return len(h.reportsMade()) == 1 })
 	settle()
-	report := h.reportsMade()[0]
-	if report.Outcome != fleet.AmbiguityEffectObserved || report.Reference != "ch_1" ||
-		report.Target != testSurface || report.ClaimFence != 1 {
+	if report := h.reportsMade()[0]; report.Outcome != fleet.AmbiguityRequestNotSent || report.ClaimFence != 1 {
 		t.Fatalf("report = %+v", report)
+	}
+	if _, requests, _ := h.target.stats(); requests != 0 {
+		t.Fatal("sent after the lease ended")
 	}
 	if _, _, _, completions, _ := h.explorer.counts(); completions != 0 {
 		t.Fatalf("%d completions after the lease ended", completions)

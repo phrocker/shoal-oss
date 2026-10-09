@@ -277,25 +277,11 @@ func TestGracePeriod(t *testing.T) {
 	}
 }
 
-// TestGracePeriodCoversTheWorstShutdownPath: the worst path a drain can take
-// — the request in flight for T, the completion for its whole budget, then
-// every fallback report for its whole window — computed from the constants
-// the worker spends, plus the exit margin, fits the grace period. The old
-// formula (T + 2×ReportWindow + 5s) did not once 3×planeTimeout exceeded the
-// report window.
-func TestGracePeriodCoversTheWorstShutdownPath(t *testing.T) {
-	for _, operation := range []time.Duration{time.Second, 3 * time.Minute, 10 * time.Minute} {
-		for _, plane := range []time.Duration{time.Second, 5 * time.Second, 10 * time.Second, 75 * time.Second} {
-			worst := operation + CompletionBudget(plane) +
-				time.Duration(FallbackReportAttempts)*ReportWindow
-			if GracePeriod(operation, plane) < worst+exitMargin {
-				t.Errorf("T=%s P=%s: grace %s does not cover the worst path %s plus exit",
-					operation, plane, GracePeriod(operation, plane), worst)
-			}
-			if plane*3 > ReportWindow && worst+exitMargin <= operation+2*ReportWindow+5*time.Second {
-				t.Errorf("T=%s P=%s: the case the old formula missed is not exercised", operation, plane)
-			}
-		}
+// TestDrainBoundLeavesTheExitMargin: the drain gives up before the grace
+// period ends, by the margin the abandonment and the exit need.
+func TestDrainBoundLeavesTheExitMargin(t *testing.T) {
+	if DrainBound(time.Minute, time.Second) != GracePeriod(time.Minute, time.Second)-exitMargin {
+		t.Fatal("the drain bound does not leave the exit margin")
 	}
 	if CompletionBudget(time.Second) != ReportWindow || CompletionBudget(10*time.Second) != 30*time.Second {
 		t.Fatal("completion budget is not max(ReportWindow, 3×planeTimeout)")

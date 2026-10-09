@@ -142,6 +142,12 @@ type fakeExplorer struct {
 	calls       []string
 
 	attestValidity time.Duration
+	// gate, when set, runs first on every call, outside the lock; a non-nil
+	// error is the call's answer. It is how a test makes a call block until
+	// its context ends.
+	gate func(ctx context.Context, op string) error
+	// reportAt is the clock reading at each ambiguity report's start.
+	reportAt []time.Time
 	// Hooks answer instead of the default when they return handled.
 	onClaim     func(n int, id []byte, request ClaimRequest) (Action, error, bool)
 	onExtend    func(n int, id []byte, request ExtendRequest) (Action, error, bool)
@@ -184,6 +190,24 @@ func (e *fakeExplorer) enqueueFor(id, agent, capability, action, input string, d
 	e.order = append(e.order, id)
 }
 
+func (e *fakeExplorer) gateFn() func(context.Context, string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.gate
+}
+
+func (e *fakeExplorer) setGate(gate func(context.Context, string) error) {
+	e.mu.Lock()
+	e.gate = gate
+	e.mu.Unlock()
+}
+
+func (e *fakeExplorer) reportTimes() []time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]time.Time(nil), e.reportAt...)
+}
+
 func (e *fakeExplorer) note(call string) {
 	e.calls = append(e.calls, call)
 }
@@ -206,7 +230,12 @@ func (e *fakeExplorer) counts() (pulls, claims, extends, completions, reports in
 	return e.pulls, len(e.claims), len(e.extends), len(e.completions), len(e.reports)
 }
 
-func (e *fakeExplorer) Pull(_ context.Context, request RequestContext, after string, limit int) (PullPage, error) {
+func (e *fakeExplorer) Pull(ctx context.Context, request RequestContext, after string, limit int) (PullPage, error) {
+	if gate := e.gateFn(); gate != nil {
+		if err := gate(ctx, "pull"); err != nil {
+			return PullPage{}, err
+		}
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pulls++
@@ -235,7 +264,12 @@ func conflict(op string, status int) error {
 	return &DispatchError{Op: op, Kind: kind, Status: status}
 }
 
-func (e *fakeExplorer) Claim(_ context.Context, id []byte, request ClaimRequest) (Action, error) {
+func (e *fakeExplorer) Claim(ctx context.Context, id []byte, request ClaimRequest) (Action, error) {
+	if gate := e.gateFn(); gate != nil {
+		if err := gate(ctx, "claim"); err != nil {
+			return Action{}, err
+		}
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.claims = append(e.claims, request)
@@ -269,7 +303,12 @@ func (e *fakeExplorer) Claim(_ context.Context, id []byte, request ClaimRequest)
 	return claimed, nil
 }
 
-func (e *fakeExplorer) Extend(_ context.Context, id []byte, request ExtendRequest) (Action, error) {
+func (e *fakeExplorer) Extend(ctx context.Context, id []byte, request ExtendRequest) (Action, error) {
+	if gate := e.gateFn(); gate != nil {
+		if err := gate(ctx, "extend"); err != nil {
+			return Action{}, err
+		}
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.extends = append(e.extends, request)
@@ -295,7 +334,12 @@ func (e *fakeExplorer) Extend(_ context.Context, id []byte, request ExtendReques
 	return record.action, nil
 }
 
-func (e *fakeExplorer) Complete(_ context.Context, id []byte, completion Completion) (Action, error) {
+func (e *fakeExplorer) Complete(ctx context.Context, id []byte, completion Completion) (Action, error) {
+	if gate := e.gateFn(); gate != nil {
+		if err := gate(ctx, "complete"); err != nil {
+			return Action{}, err
+		}
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.completions = append(e.completions, completion)
@@ -320,7 +364,17 @@ func (e *fakeExplorer) Complete(_ context.Context, id []byte, completion Complet
 	return record.action, nil
 }
 
-func (e *fakeExplorer) ReportAmbiguity(_ context.Context, id []byte, report AmbiguityReport) (Action, error) {
+func (e *fakeExplorer) ReportAmbiguity(ctx context.Context, id []byte, report AmbiguityReport) (Action, error) {
+	{
+		e.mu.Lock()
+		e.reportAt = append(e.reportAt, e.clock.Now())
+		e.mu.Unlock()
+	}
+	if gate := e.gateFn(); gate != nil {
+		if err := gate(ctx, "ambiguity"); err != nil {
+			return Action{}, err
+		}
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.reports = append(e.reports, report)
@@ -343,7 +397,12 @@ func (e *fakeExplorer) ReportAmbiguity(_ context.Context, id []byte, report Ambi
 	return record.action, nil
 }
 
-func (e *fakeExplorer) PresentAttestation(context.Context, string, string) (time.Time, error) {
+func (e *fakeExplorer) PresentAttestation(ctx context.Context, _, _ string) (time.Time, error) {
+	if gate := e.gateFn(); gate != nil {
+		if err := gate(ctx, "attest"); err != nil {
+			return time.Time{}, err
+		}
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.attests++
@@ -549,7 +608,7 @@ func (h *workerHarness) build(mutate func(*WorkerConfig)) {
 		},
 		AgentID: []byte(testAgent), Capability: testCapability, SurfaceName: testSurface,
 		Pod: "gw-0", IdempotencyRetention: 24 * time.Hour,
-		ClaimLease: 60 * time.Second, OperationTimeout: 20 * time.Second,
+		ClaimLease: 60 * time.Second, OperationTimeout: 64 * time.Second, Renew: true,
 		PlaneTimeout: 5 * time.Second, MaxResponseBytes: 64 << 10, PullLimit: 32,
 		PullInterval: time.Second, Unrecorded: h.log,
 		Logger: NewLogger(h.logs, h.clock.Now), Clock: h.clock,

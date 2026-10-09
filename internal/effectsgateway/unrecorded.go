@@ -527,6 +527,60 @@ func (l *UnrecordedLog) recordAttempts(updates []UnrecordedEntry) error {
 	return nil
 }
 
+// AppendAll appends several entries with one durable rewrite. Each is
+// treated as Append treats it.
+func (l *UnrecordedLog) AppendAll(entries []UnrecordedEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	for _, entry := range entries {
+		if err := entry.check(); err != nil {
+			return err
+		}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return errors.New("unrecorded log is closed")
+	}
+	previousEntries := append([]UnrecordedEntry(nil), l.entries...)
+	previousLines := append([][]byte(nil), l.lines...)
+	previousSize := l.size
+	restore := func() { l.entries, l.lines, l.size = previousEntries, previousLines, previousSize }
+	now := l.now().UTC()
+	for _, entry := range entries {
+		if entry.LastAt.IsZero() {
+			entry.LastAt = now
+		}
+		if entry.FirstAt.IsZero() {
+			entry.FirstAt = entry.LastAt
+		}
+		if entry.Attempts == 0 {
+			entry.Attempts = 1
+		}
+		if index := l.find(entry.ActionID, entry.Fence); index >= 0 {
+			entry.FirstAt = l.entries[index].FirstAt
+			entry.Attempts += l.entries[index].Attempts
+		} else if len(l.entries)+1 > UnrecordedMaxEntries {
+			restore()
+			return ErrUnrecordedFull
+		}
+		if err := l.add(entry); err != nil {
+			restore()
+			return err
+		}
+	}
+	if l.size > UnrecordedMaxBytes {
+		restore()
+		return ErrUnrecordedFull
+	}
+	if err := l.persist(); err != nil {
+		restore()
+		return err
+	}
+	return nil
+}
+
 // Ack removes the entry for an action and fence: the operator has reconciled
 // it. It is the explicit clearing API (`shoal-gateway unrecorded ack`), and
 // reports whether an entry was removed.

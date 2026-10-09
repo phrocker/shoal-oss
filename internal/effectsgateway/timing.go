@@ -255,6 +255,15 @@ func GracePeriod(operationTimeout, planeTimeout time.Duration) time.Duration {
 		FallbackReportAttempts*ReportWindow + exitMargin
 }
 
+// DrainBound is how long a drain waits for work in hand before abandoning
+// it: the grace period less the exit margin, which belongs to the
+// abandonment's one durable write and the process's exit. The kubelet's clock
+// starts before SIGTERM is delivered, so waiting the whole grace period would
+// put the abandonment at or after SIGKILL.
+func DrainBound(operationTimeout, planeTimeout time.Duration) time.Duration {
+	return GracePeriod(operationTimeout, planeTimeout) - exitMargin
+}
+
 // GracePeriodSeconds rounds GracePeriod up to whole seconds, which is the unit
 // Kubernetes takes. Rounding down would shave the margin the formula exists
 // to provide.

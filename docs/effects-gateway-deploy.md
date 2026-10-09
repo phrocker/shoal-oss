@@ -527,11 +527,18 @@ which appends at `expected_version` 0. Each fence gets at most one report.
 A claim with nothing sent reports `request_not_sent` and lapses. A request in
 flight finishes and completes, falling back to the report and then to the
 unrecorded log. The start-up retry of held reports also stops on SIGTERM;
-what it did not reach stays on disk. The drain is bounded by
-`GracePeriod(T, planeTimeout)`. If that runs out, every unfinished run whose
-request may have reached the target is written to the unrecorded log as
-`outcome_unknown` before it is abandoned, an `abandoned` event carries the
-count, and `Run` returns `ErrDrainAbandoned`. `Kill` abandons
+what it did not reach stays on disk. The drain waits at most
+`DrainBound` — the grace period less its five-second exit margin, because the
+kubelet's clock starts before SIGTERM arrives. If that runs out, every
+unfinished run whose request may have reached the target is written to the
+unrecorded log as `outcome_unknown`, all of them in one durable rewrite,
+before it is abandoned; an `abandoned` event carries the count, and `Run`
+returns `ErrDrainAbandoned`. Every bound the worker spends — the operation,
+each plane call, the completion budget, each report window — is measured on
+the worker's own clock, and stopping a renewal cancels its call in flight
+rather than waiting for it, so the honest worst path (request, completion,
+both fallback reports) fits inside the drain bound; a test drives it with
+every call blocking to its timeout and measures it. `Kill` abandons
 everything, as SIGKILL would; the next instance re-claims after the lapse and
 resends under the same `ExecutorKey`.
 
