@@ -228,6 +228,48 @@ one compact vertex that can later be unfolded back into what it replaced.
 - Folding is an operator action, not part of serving an inference, so it never
   sits on the request latency path.
 
+### Output-label exposure (interim, #567 and #568)
+
+An interaction record and a fold store the output-policy label expression they
+require of a reader, for example `project-x&secret`. That is the session's
+`RequiredVisibility`, its conjoined `Visibility`, the `shoal.visibility`
+property on its derived nodes and edges, a fold's `Visibility`, and each fold
+member's `Visibility`. No read checks that expression against the reader yet,
+because an authorization decision carries no label set; the per-reader
+evaluator is #564. Records stay readable to any principal authorized on every
+source they touched, since team overview and provenance exist to show other
+principals' sessions.
+
+Until #564 lands, the expression itself is shown **only to the principal that
+recorded it**:
+
+- The authorized client withholds it on every interaction and fold read:
+  `InteractionRecord(s)`, `InteractionRecordsPage`, `Interaction(s)`,
+  `InteractionSubgraph`, `Folds`, `FoldsPage`, `RehydrateFold`, and the
+  result of `FoldInteractions`. Team overview, the HTTP provenance API
+  (`output_visibility`), and the MCP `shoal.provenance.*` tools all read
+  through these calls, so they inherit it.
+- "Recorded it" means the reader's authorization fingerprint equals the one
+  pinned into the record, the same identity that already gates tombstones,
+  zero-hit records and exact-retry replay. A recorder whose grants have since
+  changed counts as another reader.
+- A fold spans several recorders. Its own expression is shown only to a reader
+  that recorded every member; each member's label set is shown only to that
+  member's recorder.
+- A withheld field is set exactly as a record with no labels stores it (empty
+  string, nil list, absent property, including the visibility digest and
+  count that stand in for an over-long expression). A withheld record is
+  therefore indistinguishable from an unlabelled one, and no response carries
+  a per-record or per-response "filtered" marker. An empty `output_visibility`
+  does not mean public; the web UI shows nothing rather than "public".
+- Storage is unchanged, and the recorder still sees its labels.
+
+**Residual.** Session, fold, node and edge IDs, digests, counts, and model and
+prompt provenance remain visible to every reader authorized on the touched
+sources, as does the existence of a session recorded under a stricter output
+policy. Only the label expression, the one part legible without other access,
+is withheld. Per-reader enforcement of the labels themselves is #564.
+
 ### Cross-session provenance traversal
 
 - `InteractionsTouching` lists every session and fold that retrieved or cited a
