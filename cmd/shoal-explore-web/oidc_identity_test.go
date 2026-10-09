@@ -272,10 +272,12 @@ func TestIdentitySchemeDigestNamesIssuerPathAndFormat(t *testing.T) {
 		}
 		seen[got.digest] = name
 	}
-	family := []string{
-		oidcIdentityPrefix + issuer.server.URL + "#",
-		oidcStableIdentityPrefix + issuer.server.URL + "#",
-		legacyEntraPrefix,
+	// Issuer-agnostic, and without the executor prefix (#391).
+	family := []string{oidcIdentityPrefix, oidcStableIdentityPrefix, legacyEntraPrefix}
+	for _, namespace := range humanIdentityFamily {
+		if strings.HasPrefix("oidcexec:runner", namespace) {
+			t.Fatalf("the executor prefix oidcexec: is in the human family via %q", namespace)
+		}
 	}
 	sameFamily := func(got []string) bool {
 		if len(got) != len(family) {

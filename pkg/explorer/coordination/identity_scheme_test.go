@@ -28,11 +28,11 @@ import (
 // TestIdentitySchemeRowGoldenAndRoundTrip pins the identity-scheme row key
 // (#526) to checked-in bytes, as every other coordination row is: a replica
 // that encoded the key differently would read no row, write its own, and
-// start beside a replica naming the same human differently.
+// start beside a replica naming the same human differently. The key is the
+// domain alone, so an issuer change cannot find an empty row either.
 func TestIdentitySchemeRowGoldenAndRoundTrip(t *testing.T) {
 	domain := DomainID{0, 0xff, 'd'}
-	issuer := []byte("https://login.example/tenant/v2.0")
-	row, err := IdentitySchemeRow(domain, issuer)
+	row, err := IdentitySchemeRow(domain)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,8 +41,7 @@ func TestIdentitySchemeRowGoldenAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := IdentitySchemeKey{Domain: domain, Issuer: issuer}
-	if !reflect.DeepEqual(decoded, want) {
+	if want := (IdentitySchemeKey{Domain: domain}); !reflect.DeepEqual(decoded, want) {
 		t.Fatalf("row round trip differs:\ngot  %#v\nwant %#v", decoded, want)
 	}
 	if _, err := ParseIdentitySchemeRow(append(append([]byte(nil), row...), 0)); err == nil {
@@ -53,14 +52,14 @@ func TestIdentitySchemeRowGoldenAndRoundTrip(t *testing.T) {
 	if _, err := ParseIdentitySchemeRow(corrupt); err == nil {
 		t.Fatal("partition band mismatch accepted")
 	}
-	// One row per issuer: two issuers never share a row, and the row is not
-	// the policy generation's.
-	other, err := IdentitySchemeRow(domain, []byte("https://login.example/other/v2.0"))
+	// One row per domain, whatever the issuer: an issuer change finds the
+	// row the previous issuer wrote. Distinct from the policy generation's.
+	other, err := IdentitySchemeRow(DomainID("another-domain"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Equal(row, other) {
-		t.Fatal("two issuers share an identity-scheme row")
+		t.Fatal("two domains share an identity-scheme row")
 	}
 	generation, err := PolicyGenerationRow(domain, 1)
 	if err != nil {
@@ -69,8 +68,8 @@ func TestIdentitySchemeRowGoldenAndRoundTrip(t *testing.T) {
 	if bytes.HasPrefix(generation, row[:2]) {
 		t.Fatal("the identity-scheme row shares the policy generation's row kind")
 	}
-	if _, err := IdentitySchemeRow(domain, nil); err == nil {
-		t.Fatal("an empty issuer was accepted")
+	if _, err := IdentitySchemeRow(nil); err == nil {
+		t.Fatal("an empty domain was accepted")
 	}
 }
 

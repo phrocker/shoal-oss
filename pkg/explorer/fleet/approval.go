@@ -547,13 +547,16 @@ type IdentityScheme struct {
 	// Prefix is the namespace in force: it begins every identity the scheme
 	// in force mints. It must itself begin with one of Family.
 	Prefix string
-	// Family are the namespaces (identity prefixes) this host's
-	// authenticator can mint under any of its schemes, for this issuer. An
-	// identity in the family but outside Prefix was minted under another
-	// scheme, and is refused wherever it is involved in an approval.
-	// Identities outside the family — other issuers, service and development
-	// principals, MCP — are not this rule's business. Empty, with an empty
-	// Prefix and a zero Digest, configures no rule.
+	// Family are the identity prefixes this host's authenticator can mint
+	// human principals under, under any scheme and any issuer it has ever
+	// been configured with: a deployment has exactly one human OIDC issuer,
+	// so an identity of another issuer is one minted before the issuer
+	// changed, not an unrelated principal. An identity in the family but
+	// outside Prefix was minted under another scheme, and is refused
+	// wherever it is involved in an approval. Identities outside the family
+	// — service, development, executor and MCP principals — are not this
+	// rule's business. Empty, with an empty Prefix and a zero Digest,
+	// configures no rule.
 	Family []string
 }
 
@@ -605,13 +608,26 @@ func (s IdentityScheme) foreignNamespace(identities []shoal.ID) string {
 		if strings.HasPrefix(string(identity), s.Prefix) {
 			continue
 		}
-		for _, namespace := range s.Family {
-			if strings.HasPrefix(string(identity), namespace) {
-				return namespace
+		for _, family := range s.Family {
+			if strings.HasPrefix(string(identity), family) {
+				return namespaceOf(string(identity), family)
 			}
 		}
 	}
 	return ""
+}
+
+// namespaceOf names the namespace of a family identity for a refusal: the
+// family prefix and everything up to and including the first '#' after it,
+// which for a minted identity is the issuer (oidc:<iss>#, oidcid:<iss>#)
+// and never the value. An issuer cannot contain '#' (it may not carry a
+// fragment). Without a '#' the family prefix alone is named.
+func namespaceOf(identity, family string) string {
+	rest := identity[len(family):]
+	if index := strings.IndexByte(rest, '#'); index >= 0 {
+		return family + rest[:index+1]
+	}
+	return family
 }
 
 func cloneIdentityScheme(s IdentityScheme) IdentityScheme {

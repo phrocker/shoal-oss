@@ -107,3 +107,53 @@ func TestIdentitySchemeMigrateFlagShape(t *testing.T) {
 		}
 	}
 }
+
+// TestIdentitySchemeRowIsPerDomainSoAnIssuerChangeIsASwitch: the row is keyed
+// by the domain alone and the digest covers the issuer, so a new issuer (Entra
+// v1 to v2, a hostname move) finds the previous issuer's record and needs the
+// one-shot migrate like any other scheme change. A record whose digest is this
+// scheme's but whose issuer is another's is inconsistent and refused.
+func TestIdentitySchemeRowIsPerDomainSoAnIssuerChangeIsASwitch(t *testing.T) {
+	runtime, err := explorercoord.Open(explorercoord.Config{
+		Directory: t.TempDir(), Domain: workspacePublicationDomain,
+		Owner: workspaceRuntimeOwner,
+		Authority: transaction.Authority{
+			Generation: 1, Fence: 1, Holder: workspaceRuntimeOwner,
+			Mode:                coordination.WriterModeEmbeddedPrimary,
+			RetentionGeneration: 1, HistoryFloor: 1,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	engine := runtime.EmbeddedEngine()
+	const v1 = "https://sts.windows.net/tenant/"
+	const v2 = "https://login.microsoftonline.com/tenant/v2.0"
+	start := func(issuer, name string, from coordination.Digest) error {
+		return stampIdentityScheme(context.Background(), engine, "",
+			&identitySchemeConfig{scheme: oidcIdentityScheme{
+				issuer: issuer, digest: auth.DigestBytes("scheme", []byte(name)),
+			}, migrateFrom: from})
+	}
+	recorded := coordination.Digest(auth.DigestBytes("scheme", []byte("v1-oid")))
+	if err := start(v1, "v1-oid", coordination.Digest{}); err != nil {
+		t.Fatal(err)
+	}
+	err = start(v2, "v2-oid", coordination.Digest{})
+	if !errors.Is(err, errIdentitySchemeMismatch) ||
+		!strings.Contains(err.Error(), "changing the issuer is a scheme change") {
+		t.Fatalf("a new issuer without migrate = %v, want the switch refusal", err)
+	}
+	// Same digest under another issuer: no replica writes that.
+	if err := start(v2, "v1-oid", coordination.Digest{}); err == nil ||
+		!strings.Contains(err.Error(), "inconsistent") {
+		t.Fatalf("a record naming another issuer under this digest = %v", err)
+	}
+	if err := start(v2, "v2-oid", recorded); err != nil {
+		t.Fatalf("the issuer switch with migrate: %v", err)
+	}
+	if err := start(v1, "v1-oid", coordination.Digest{}); !errors.Is(err, errIdentitySchemeMismatch) {
+		t.Fatalf("the previous issuer after the switch = %v", err)
+	}
+}

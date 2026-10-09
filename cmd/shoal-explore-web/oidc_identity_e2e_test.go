@@ -553,11 +553,35 @@ func TestStableIdentityLegacyRegistrationBlocksApproval(t *testing.T) {
 	w.mustDecide(bob, w.mustHold(alice, h.held("stable-agent-request"), "stable-agent"))
 
 	// Outside the family: a service principal's registration ("owner" /
-	// "operator", not an OIDC identity) is not this rule's business.
+	// "operator", not an OIDC identity) is not this rule's business, and
+	// neither is an executor identity (#391's oidcexec: — not human, and
+	// deliberately not in the family although it begins with "oidc").
 	if _, err := h.register("service-agent", "service-registration", 0, true, ""); err != nil {
 		t.Fatal(err)
 	}
 	w.mustDecide(bob, w.mustHold(alice, h.held("service-agent-request"), "service-agent"))
+	executor := principal{
+		subject: shoal.ID("oidcexec:" + w.issuer.server.URL + "#runner-1"),
+		actor:   shoal.ID("oidcexec:" + w.issuer.server.URL + "#runner-1"),
+		operations: []auth.Operation{
+			auth.OperationAgentRegister, auth.OperationDelegate,
+		},
+	}
+	if _, err := h.opened.fleetRegistry.Register(h.as(executor), fleet.RegisterRequest{
+		Context:         h.context(h.now().Add(time.Minute)),
+		RegistrationKey: "executor-registration",
+		Spec: fleet.Spec{
+			ID: "executor-agent", AuthorizationDomain: workspaceAuthorizationDomain,
+			Scopes: []fleet.Scope{
+				{SourceID: workspaceSourceID, PolicyID: workspaceGrantPolicyID},
+			},
+			ExecutorRef: "local", Capabilities: approvalActions(true),
+			LeaseExpiresAt: h.now().Add(20 * time.Hour),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w.mustDecide(bob, w.mustHold(alice, h.held("executor-agent-request"), "executor-agent"))
 }
 
 // TestStableIdentityStableToStableSwitchIsRefused is review finding (a):
@@ -664,4 +688,57 @@ func TestStableIdentityMixedRolloutFailsClosed(t *testing.T) {
 			authn: newReplica}, w.mustHold(call{
 			token: w.fleetToken("alice-ws", both("alice")), authn: oldReplica},
 			h.held("mixed-stamp"), "bobs-old-agent")))
+}
+
+// TestStableIdentityIssuerChangeIsASchemeSwitch is review round 2: changing
+// -oidc-issuer (Entra v1 to v2, a Keycloak hostname move) keeps oid or the
+// user id but renames every human. The new issuer finds the previous one's
+// record and refuses to start without the one-shot migrate; after the switch,
+// a registrant under the old issuer approving under the new one is refused,
+// naming the old issuer's namespace and never the identity — under the
+// default scheme and under a stable claim alike.
+func TestStableIdentityIssuerChangeIsASchemeSwitch(t *testing.T) {
+	for _, probe := range []struct {
+		name  string
+		claim []string
+	}{
+		{"sub-derived", nil},
+		{"stable oid", []string{"oid"}},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			var w *oidcApprovalWorld
+			if probe.claim == nil {
+				w = newOIDCApprovalWorld(t, nil, oid("oid-owner"))
+			} else {
+				w = newStableWorld(t, probe.claim, oid("oid-owner"))
+			}
+			h := w.h
+			w.register(w.fleetToken("bob", oid("oid-bob")), "bobs-agent", "")
+			previous := w.issuer.server.URL
+			family := oidcIdentityPrefix
+			if probe.claim != nil {
+				family = oidcStableIdentityPrefix
+			}
+
+			// The new issuer: same humans, same oid and sub values.
+			w.issuer = newFakeOIDCIssuer(t)
+			if err := w.switchScheme(probe.claim, false); !errors.Is(err, errIdentitySchemeMismatch) ||
+				!strings.Contains(err.Error(), "changing the issuer is a scheme change") {
+				t.Fatalf("a new issuer started without migrate: %v", err)
+			}
+			if err := w.switchScheme(probe.claim, true); err != nil {
+				t.Fatalf("the issuer switch with migrate: %v", err)
+			}
+
+			alice := call{token: w.fleetToken("alice", oid("oid-alice"))}
+			bob := call{token: w.approverTokenWith("bob", oid("oid-bob"))}
+			receipt := w.mustHold(alice, h.held("issuer-change"), "bobs-agent")
+			assertForeignNamespace(t, "self-approval across an issuer change",
+				w.decide(bob, receipt), family+previous+"#", "#bob")
+
+			// Control: an agent registered under the new issuer.
+			w.register(w.fleetToken("carol", oid("oid-carol")), "carols-agent", "")
+			w.mustDecide(bob, w.mustHold(alice, h.held("issuer-control"), "carols-agent"))
+		})
+	}
 }

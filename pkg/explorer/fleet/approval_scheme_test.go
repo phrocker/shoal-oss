@@ -13,7 +13,7 @@ import (
 const testIssuerFamily = "https://issuer.example#"
 
 func testFamily() []string {
-	return []string{"oidc:" + testIssuerFamily, "oidcid:" + testIssuerFamily, "entra:"}
+	return []string{"oidc:", "oidcid:", "entra:"}
 }
 
 // TestIdentitySchemeShape (#526): the zero scheme configures no rule; a
@@ -60,9 +60,9 @@ func TestIdentitySchemeShape(t *testing.T) {
 
 // TestIdentitySchemeOnlyTheNamespaceInForceIsComparable: within the family,
 // every namespace but the one in force is foreign — under a stable scheme
-// and under the default one alike, with no list of previous schemes — and
-// identities outside the family (development, service and MCP principals,
-// another issuer's) are never refused.
+// and under the default one alike, with no list of previous schemes, and
+// whatever issuer minted it — and identities outside the family
+// (development, service, executor and MCP principals) are never refused.
 func TestIdentitySchemeOnlyTheNamespaceInForceIsComparable(t *testing.T) {
 	oid := IdentityScheme{
 		Digest: auth.DigestBytes("scheme", []byte("oid")),
@@ -77,8 +77,8 @@ func TestIdentitySchemeOnlyTheNamespaceInForceIsComparable(t *testing.T) {
 	subDerived := IdentityScheme{Prefix: "oidc:" + testIssuerFamily, Family: testFamily()}
 	outside := []shoal.ID{
 		"alice", "dev-principal", "mcp:client-7", "service:indexer",
-		"oidc:https://other.example#bob", "oidcid:https://other.example#x#bob",
-		"gateway",
+		"oidcexec:https://issuer.example#runner-1", "oidcexec:bob", "gateway",
+		"shoal-explore-web-oidc",
 	}
 	for name, probe := range map[string]struct {
 		scheme  IdentityScheme
@@ -90,6 +90,13 @@ func TestIdentitySchemeOnlyTheNamespaceInForceIsComparable(t *testing.T) {
 		"entra under a stable scheme":                {oid, "entra:bob", "entra:"},
 		"stable identity under the default scheme":   {subDerived, shoal.ID(oid.Prefix + "bob"), "oidcid:" + testIssuerFamily},
 		"entra under the default scheme":             {subDerived, "entra:bob", "entra:"},
+		"another issuer's sub under the default scheme": {subDerived,
+			"oidc:https://old-issuer.example#bob", "oidc:https://old-issuer.example#"},
+		"another issuer's stable identity under a stable scheme": {oid,
+			"oidcid:https://old-issuer.example#0123456789abcdef#bob",
+			"oidcid:https://old-issuer.example#"},
+		"another issuer's sub under a stable scheme": {oid,
+			"oidc:https://sts.windows.net/tenant/#bob", "oidc:https://sts.windows.net/tenant/#"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			current := shoal.ID(probe.scheme.Prefix + "carol")

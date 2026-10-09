@@ -20,36 +20,36 @@
 package coordination
 
 // The identity-scheme row (#526) records which identity scheme a
-// deployment's OIDC principals are named under, per issuer: a digest of the
-// issuer, the claim path the identity is read from, and the format the
-// identity is written in. It sits beside the policy generation in the
-// coordination table because it is the same kind of fact — one every replica
-// must agree on before it serves. A replica that would name the same human
-// differently refuses to start, so one human cannot request on one replica
-// and approve their own request on another.
+// deployment's human principals are named under: a digest of the issuer, the
+// claim path the identity is read from, and the format it is written in. It
+// sits beside the policy generation in the coordination table because it is
+// the same kind of fact — one every replica must agree on before it serves. A
+// replica that would name the same human differently refuses to start, so
+// one human cannot request on one replica and approve their own request on
+// another.
+//
+// There is one row per domain, not per issuer. A deployment has one human
+// issuer, and changing it (Entra v1 to v2, a hostname move) renames every
+// human exactly as changing the claim does, so it must be seen as a scheme
+// change. A row per issuer would let a new issuer find no row and record
+// itself unchallenged.
 //
 // The value is a digest, never the configuration: the row says whether two
 // replicas agree, not what either is configured with.
 
-// IdentitySchemeKey identifies the identity-scheme row of one issuer.
+// IdentitySchemeKey identifies the identity-scheme row of one domain.
 type IdentitySchemeKey struct {
 	Domain DomainID
-	Issuer []byte
 }
 
-// IdentitySchemeRow is the row holding the identity scheme in force for an
-// issuer.
-func IdentitySchemeRow(domain DomainID, issuer []byte) ([]byte, error) {
+// IdentitySchemeRow is the row holding the identity scheme in force for a
+// domain.
+func IdentitySchemeRow(domain DomainID) ([]byte, error) {
 	if err := domain.Validate(); err != nil {
 		return nil, err
 	}
-	if err := validateOpaque(
-		"identity scheme issuer", issuer, MaxOpaqueIDBytes, true); err != nil {
-		return nil, err
-	}
-	row := rowPrefix(RowKind('I'), B8('I', domain, issuer))
-	row = append(row, E(domain)...)
-	return append(row, E(issuer)...), nil
+	row := rowPrefix(RowKind('I'), B8('I', domain))
+	return append(row, E(domain)...), nil
 }
 
 // ParseIdentitySchemeRow is the inverse of IdentitySchemeRow.
@@ -58,24 +58,18 @@ func ParseIdentitySchemeRow(row []byte) (IdentitySchemeKey, error) {
 	if err != nil {
 		return IdentitySchemeKey{}, err
 	}
-	issuer, used, err := DecodeE(row[offset:])
-	if err != nil {
-		return IdentitySchemeKey{}, err
-	}
-	if err := validateOpaque(
-		"identity scheme issuer", issuer, MaxOpaqueIDBytes, true); err != nil {
-		return IdentitySchemeKey{}, err
-	}
-	if offset+used != len(row) || row[2] != B8('I', domain, issuer) {
+	if offset != len(row) || row[2] != B8('I', domain) {
 		return IdentitySchemeKey{}, invalid(
 			"identity-scheme row has malformed or trailing components")
 	}
-	return IdentitySchemeKey{Domain: domain, Issuer: issuer}, nil
+	return IdentitySchemeKey{Domain: domain}, nil
 }
 
-// IdentitySchemeV1 is the value of an identity-scheme row: the issuer it is
-// for, restated so a value cannot be read under another issuer's row, and
-// the digest of the scheme in force.
+// IdentitySchemeV1 is the value of an identity-scheme row: the issuer the
+// recorded scheme is for, and the digest of the scheme, which covers that
+// issuer. The issuer is restated so a refusal can say an issuer changed, and
+// so a value whose issuer disagrees with a matching digest is recognised as
+// corrupt rather than accepted.
 type IdentitySchemeV1 struct {
 	Issuer []byte
 	Scheme Digest

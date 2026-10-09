@@ -19,7 +19,9 @@ import (
 )
 
 // The identity-scheme row (#526) is written by the first replica to start
-// for an issuer and checked by every one after. Separation of duty compares
+// and checked by every one after. There is one row per domain, whatever the
+// issuer, and the digest covers the issuer, so changing -oidc-issuer is a
+// scheme change like changing the claim. Separation of duty compares
 // identities, so it holds across replicas only while they all name a human
 // the same way: a replica on the stable scheme beside one on sub would let
 // one human request through one and approve through the other. A replica
@@ -92,7 +94,7 @@ func (c *identitySchemeConfig) approvals() fleet.IdentityScheme {
 	return c.scheme.approvals
 }
 
-// stampIdentityScheme records the scheme for its issuer, or checks it
+// stampIdentityScheme records the scheme in the domain's one row, or checks it
 // against the one recorded. Nil config records nothing.
 func stampIdentityScheme(
 	ctx context.Context, eng *engine.Engine, table string,
@@ -113,7 +115,9 @@ func stampIdentityScheme(
 		return err
 	}
 	issuer := []byte(config.scheme.issuer)
-	row, err := coordination.IdentitySchemeRow(workspacePublicationDomain, issuer)
+	// One row per domain: an issuer change finds the previous issuer's
+	// record and is a scheme change like any other.
+	row, err := coordination.IdentitySchemeRow(workspacePublicationDomain)
 	if err != nil {
 		return err
 	}
@@ -155,24 +159,37 @@ func stampIdentityScheme(
 				return fmt.Errorf("refusing to start: the recorded identity "+
 					"scheme cannot be read: %w", err)
 			}
-			if !bytes.Equal(stored.Issuer, issuer) {
-				return fmt.Errorf("refusing to start: the recorded identity " +
-					"scheme names another issuer")
-			}
+			issuerChanged := !bytes.Equal(stored.Issuer, issuer)
 			if stored.Scheme == configured {
+				// The digest covers the issuer, so a record whose digest is
+				// this scheme's but whose issuer is not was not written by
+				// any replica: refuse it rather than trust either half.
+				if issuerChanged {
+					return fmt.Errorf("refusing to start for issuer %s: the "+
+						"recorded identity scheme has this scheme's digest but "+
+						"names issuer %q; the record is inconsistent",
+						config.scheme.issuer, stored.Issuer)
+				}
 				return nil
 			}
 			if config.migrateFrom != stored.Scheme {
+				changed := ""
+				if issuerChanged {
+					// An issuer change renames every human as a claim
+					// change does: Entra v1 to v2, or a hostname move.
+					changed = fmt.Sprintf("; the recorded scheme is for issuer "+
+						"%q, and changing the issuer is a scheme change", stored.Issuer)
+				}
 				return fmt.Errorf(
 					"refusing to start for issuer %s: %w (recorded %s, "+
-						"configured %s); another replica, or this one before a "+
+						"configured %s%s); another replica, or this one before a "+
 						"restart, names principals differently, so one human "+
 						"could request through one and approve through the "+
 						"other. Configure every replica identically, or, to "+
 						"switch, pass -oidc-identity-scheme-migrate=%s for "+
 						"this rollout",
 					config.scheme.issuer, errIdentitySchemeMismatch,
-					stored.Scheme, configured, stored.Scheme)
+					stored.Scheme, configured, changed, stored.Scheme)
 			}
 			mutation.Conditions = []allocator.Condition{{
 				Coordinate: coordinate, Value: cells[0].Value,

@@ -244,16 +244,24 @@ type oidcIdentityScheme struct {
 	approvals fleet.IdentityScheme
 }
 
-// identityFamily is every namespace this authenticator could mint into for
-// its issuer under any scheme: sub-derived (oidc:<iss>#), any stable claim
-// path (oidcid:<iss>#), and legacy Entra (entra:, which is not issuer-scoped
-// but is only ever minted for the one configured Entra issuer).
+// humanIdentityFamily are the prefixes of every identity this command mints
+// for a human, under any scheme and any issuer: sub-derived (oidc:), stable
+// (oidcid:) and legacy Entra (entra:). It is deliberately issuer-agnostic. A
+// deployment has exactly one human OIDC issuer, so an identity under another
+// issuer was minted before the issuer changed (Entra v1 sts.windows.net to
+// v2 login.microsoftonline.com, a Keycloak hostname move), and the same human
+// may hold it; scoping the family to the issuer in force would make it an
+// unrelated principal. The executor identities of #391 (oidcexec:) are not
+// human and are not in the family: "oidcexec:" begins with neither "oidc:"
+// nor "oidcid:", and must never be added here.
+var humanIdentityFamily = []string{
+	oidcIdentityPrefix, oidcStableIdentityPrefix, legacyEntraPrefix,
+}
+
+// identityFamily is the family, plus the namespace in force should it lie
+// outside it (a custom identity prefix).
 func (a *oidcAuthenticator) identityFamily(current string) []string {
-	family := []string{
-		oidcIdentityPrefix + a.expectedIssuer + "#",
-		oidcStableIdentityPrefix + a.expectedIssuer + "#",
-		legacyEntraPrefix,
-	}
+	family := append([]string(nil), humanIdentityFamily...)
 	for _, namespace := range family {
 		if strings.HasPrefix(current, namespace) {
 			return family

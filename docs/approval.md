@@ -157,10 +157,10 @@ asked as an approver:
 - The same identity scheme (#526). The approver must be named under the
   scheme the request was stamped with; a request made under another scheme
   cannot be decided (`identity_scheme_moved`). And under every OIDC scheme,
-  the default one included, every involved identity in the issuer's OIDC
-  family (`oidc:<iss>#`, `oidcid:<iss>#`, `entra:`) must be in the namespace
-  in force; the refusal names the namespace. Identities outside the family
-  are not affected. See "Switching an issuer's identity scheme".
+  the default one included, every involved identity in the human OIDC
+  family (`oidc:`, `oidcid:`, `entra:`, under any issuer) must be in the
+  namespace in force; the refusal names the namespace. Identities outside
+  the family are not affected. See "Switching an issuer's identity scheme".
 - No delegation. A decision carrying `OnBehalfOf` is refused.
 - The approver must **fail** `dispatch`, `invoke` and `execute` on the scope.
   Under shared scopes, which every OIDC-minted principal has, holding approve
@@ -367,7 +367,13 @@ which the same human would carry an `entra:` identity as a requester and an
 Changing how principals are named changes every identity, and an identity
 under one scheme cannot be compared with one under another: the same human
 can hold one of each. That is as true of a switch from one stable claim to
-another, or back to `sub`, as of the first switch to a stable claim.
+another, or back to `sub`, as of the first switch to a stable claim — and of
+**changing `-oidc-issuer`**. The issuer is part of every identity, so moving
+from Entra's v1 issuer (`https://sts.windows.net/<tenant>/`) to its v2 issuer
+(`https://login.microsoftonline.com/<tenant>/v2.0`), or moving a Keycloak
+realm to a new hostname, renames every human although `oid` or the user ID
+is unchanged. An issuer change is a scheme switch, with the same rules and
+the same rollout as any other.
 Independence has to hold across every switch, and through the rollout that
 makes it, and three things make it hold.
 
@@ -375,12 +381,16 @@ makes it, and three things make it hold.
   the default sub-derived one included, `eligibility` refuses an approval
   when any involved identity — the requester's subject, actor and delegation
   chain, the agent, its registrant, any ancestor's ID or registrant, and the
-  approver itself — is in the issuer's OIDC family (`oidc:<iss>#`,
-  `oidcid:<iss>#`, or `entra:`) but not in the namespace in force
+  approver itself — is in the human OIDC family (`oidc:`, `oidcid:` or
+  `entra:`, under **any** issuer) but not in the namespace in force
   (`oidc:<iss>#` under `sub`, `oidcid:<iss>#<tag>#` under a stable claim,
-  `entra:` under legacy Entra). There is no list of previous schemes to keep
-  complete: any identity minted under another scheme is refused, whatever the
-  switch history. Otherwise someone who registered an agent as
+  `entra:` under legacy Entra). The family is not scoped to the issuer in
+  force: a deployment has one human issuer, so an identity under another
+  issuer was minted before the issuer changed and may be the same human.
+  There is no list of previous schemes or issuers to keep complete: any
+  identity minted under another scheme is refused, whatever the switch
+  history. Executor identities (#391, `oidcexec:`) are not human and are not
+  in the family. Otherwise someone who registered an agent as
   `oidc:<iss>#<sub>` could approve work on it as `oidcid:`, and someone who
   registered under one stable claim could approve under another. Identities
   outside the family — other issuers, development, service and MCP
@@ -404,8 +414,9 @@ makes it, and three things make it hold.
   requester makes a new request under their new identity.
 - **The scheme is recorded, and switched once.** Every OIDC deployment
   writes a digest of its identity scheme — the issuer, the claim path and the
-  identity format — to the `identity-scheme` row for its issuer in the
-  coordination store, beside the policy generation, the first time it starts,
+  identity format — to the domain's one `identity-scheme` row in the
+  coordination store (one row, not one per issuer, so a new issuer finds the
+  previous issuer's record rather than an empty row), beside the policy generation, the first time it starts,
   and checks it on every start after; startup prints it. A replica whose
   scheme differs refuses to start, and the refusal prints the recorded
   digest. To switch, start the new configuration with
