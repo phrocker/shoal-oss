@@ -6,10 +6,10 @@ package evidencelabels
 
 import (
 	"context"
-	"time"
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"

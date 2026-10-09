@@ -81,6 +81,11 @@ type planeOptions struct {
 	wrapGate func(evidencelabels.NodeGate) evidencelabels.NodeGate
 	// refused is set when the completion is expected to be refused.
 	refused bool
+	// now fixes the plane's clock; zero uses a minute from now.
+	now time.Time
+	// evidence selects what the executor reports: "" both references,
+	// "labelled" only the labelled one, "none" nothing at all.
+	evidence string
 }
 
 func newLabelPlaneWith(t *testing.T, options planeOptions) labelPlane {
@@ -88,6 +93,9 @@ func newLabelPlaneWith(t *testing.T, options planeOptions) labelPlane {
 	choose, wireEvents := options.choose, options.wireEvents
 	// A minute ahead, so corpus snapshots taken in real time precede it.
 	now := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
+	if !options.now.IsZero() {
+		now = options.now
+	}
 	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
@@ -138,11 +146,19 @@ func newLabelPlaneWith(t *testing.T, options planeOptions) labelPlane {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close() })
-	executor := &integrationExecutor{result: fleet.ExecutionResult{
+	result := fleet.ExecutionResult{
 		Output:             json.RawMessage(`{"ok":true}`),
 		EvidenceSnapshotID: "snapshot", EvidenceSnapshotAsOf: now,
 		Evidence: []fleet.EvidenceRef{open, reported},
-	}}
+	}
+	switch options.evidence {
+	case "labelled":
+		result.Evidence = []fleet.EvidenceRef{reported}
+	case "none":
+		result.Evidence = nil
+		result.EvidenceSnapshotID, result.EvidenceSnapshotAsOf = "", time.Time{}
+	}
+	executor := &integrationExecutor{result: result}
 	registry, _ := newIntegrationRegistry(t, authority.Resolver(), now, executor)
 	backend, err := New(runtime, config.Domain)
 	if err != nil {

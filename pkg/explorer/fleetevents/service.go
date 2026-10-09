@@ -832,7 +832,7 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 	result := make([]Event, len(events))
 	offset := 0
 	take := func(references []interaction.EvidenceReference, visibility [][]string) (
-		[]interaction.EvidenceReference, [][]string, bool,
+		[]interaction.EvidenceReference, [][]string, bool, error,
 	) {
 		count := len(references)
 		group := labelled[offset : offset+count]
@@ -841,10 +841,16 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 		return readableEvidenceGroup(references, visibility, group, decided)
 	}
 	for index, event := range events {
-		consumed, consumedVisibility, consumedWithheld := take(
+		consumed, consumedVisibility, consumedWithheld, err := take(
 			event.ConsumedEvidence, event.ConsumedEvidenceVisibility)
-		cited, citedVisibility, citedWithheld := take(
+		if err != nil {
+			return nil, err
+		}
+		cited, citedVisibility, citedWithheld, err := take(
 			event.CitedEvidence, event.CitedEvidenceVisibility)
+		if err != nil {
+			return nil, err
+		}
 		if !consumedWithheld && !citedWithheld {
 			result[index] = event
 			continue
@@ -877,17 +883,22 @@ type labelledReference struct {
 	visibility []string
 }
 
-// readableEvidenceGroup applies one group's verdicts.
+// readableEvidenceGroup applies one group's verdicts. Verdicts that do not
+// align with the group are the question failing, and fail the delivery
+// rather than delivering the group unfiltered.
 func readableEvidenceGroup(
 	references []interaction.EvidenceReference, visibility [][]string,
 	labelled []labelledReference, verdicts []bool,
-) ([]interaction.EvidenceReference, [][]string, bool) {
+) ([]interaction.EvidenceReference, [][]string, bool, error) {
 	kept, withheld, err := evidencelabels.Apply(labelled, verdicts)
-	if err != nil || !withheld {
-		return references, visibility, false
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !withheld {
+		return references, visibility, false, nil
 	}
 	if len(kept) == 0 {
-		return nil, nil, true
+		return nil, nil, true, nil
 	}
 	keptReferences := make([]interaction.EvidenceReference, len(kept))
 	keptVisibility := make([][]string, len(kept))
@@ -900,7 +911,7 @@ func readableEvidenceGroup(
 	// exact shape of an event that never carried labelled evidence) because
 	// a non-nil array of empty entries would itself say "a labelled
 	// reference was here and was withheld" (#398).
-	return keptReferences, canonicalVisibilityGroup(keptVisibility), true
+	return keptReferences, canonicalVisibilityGroup(keptVisibility), true, nil
 }
 
 func containsReference(

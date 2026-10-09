@@ -254,18 +254,25 @@ func (p labelPlane) recordSession(t *testing.T, id shoal.ID) {
 // same readers, against an expected verdict table for each plane, so that
 // neither can drift from the other silently.
 //
-// They disagree in two pinned places.
+// Both planes follow one rule over two kinds of object: a reference is no
+// more visible than the object it cites is readable now. A document
+// reference cites a revision; a graph reference cites nodes and edges. The
+// table pins where that rule and the interaction plane's current behaviour
+// meet differently:
 //
 //   - After a tightening the base explorer refuses an interaction record to
 //     every reader, holders of the new labels included, until it is
-//     re-recorded (staleDerivedVisibilityError: the record's stored
-//     visibility no longer covers its sources). Dispatch decides a reference
-//     by the current rules, so a holder of the new labels sees it.
+//     re-recorded (staleDerivedVisibilityError). Dispatch decides by the
+//     current rules, so a holder of the new labels sees the reference.
 //   - After loosening to unlabelled, the interaction record is visible to
 //     every reader, since its touched nodes are now public. The dispatch
-//     reference cites the revision that was labelled secret, and a document
-//     reference also requires its cited revision's own rule, so it stays
-//     closed to readers without secret.
+//     reference cites the revision that was labelled secret, and that
+//     revision is still readable only with secret, so the reference is too.
+//
+// This test is what showed the cited revision mattered: a gate that checked
+// only current node rules would have made the loosened dispatch row all
+// true, and a labelled historical revision readable through an unlabelled
+// current one.
 func TestDispatchAndInteractionReadsAgreeAcrossARelabel(t *testing.T) {
 	plane := newLabelPlaneWith(t, planeOptions{
 		choose: fullLabels, wireEvents: true, label: "secret",

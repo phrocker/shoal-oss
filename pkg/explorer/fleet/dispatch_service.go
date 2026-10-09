@@ -3784,7 +3784,14 @@ func (s *DispatchService) readableRecords(
 		}
 		redacted := cloneActionRecord(record)
 		if len(readable) == 0 {
-			redacted.Evidence = nil
+			// Exactly a record that never had evidence: Validate refuses a
+			// snapshot pin without evidence, and the wire emits the pin, so a
+			// pin left behind would itself say evidence was withheld (#398).
+			// cloneActionEvidence's empty value is how a read returns a
+			// record stored without evidence.
+			redacted.Evidence = cloneActionEvidence(nil)
+			redacted.EvidenceSnapshotID = ""
+			redacted.EvidenceSnapshotAsOf = time.Time{}
 		} else {
 			redacted.Evidence = readable
 		}
@@ -3795,7 +3802,15 @@ func (s *DispatchService) readableRecords(
 
 // evidenceGraph is what a reference names in the corpus. Every assertion is on
 // one of its EdgeIDs (interaction.EvidenceReference.Validate), so the edges
-// cover them; a document reference also names the revision it cites.
+// cover them; a document reference also names the revision it cites. One
+// rule over both kinds: a reference is no more visible than the object it
+// cites is readable now. A document reference cites a revision, so the
+// revision's own rule decides it with its nodes'; a graph reference cites
+// nodes and edges.
+//
+// The AnchorID stays on the protected side with the rest of the reference.
+// It is content-derived (it hashes the document ID, titles and quoted text),
+// so a reader who can guess the content could use it to confirm the guess.
 func evidenceGraph(reference EvidenceRef) evidencelabels.Graph {
 	graph := evidencelabels.Graph{NodeIDs: reference.NodeIDs, EdgeIDs: reference.EdgeIDs}
 	if reference.Kind == interaction.EvidenceDocument {

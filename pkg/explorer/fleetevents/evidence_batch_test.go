@@ -82,3 +82,16 @@ func TestAPageOfEventsAsksTheGateOnce(t *testing.T) {
 		}
 	}
 }
+
+// TestMisalignedVerdictsFailClosed: verdicts that do not align with their
+// group are the question failing. The group is never delivered unfiltered.
+func TestMisalignedVerdictsFailClosed(t *testing.T) {
+	references := []interaction.EvidenceReference{{AnchorID: "a"}, {AnchorID: "b"}}
+	labelled := []labelledReference{{reference: references[0]}, {reference: references[1]}}
+	kept, visibility, withheld, err := readableEvidenceGroup(
+		references, nil, labelled, []bool{true})
+	if err == nil || kept != nil || visibility != nil || withheld {
+		t.Fatalf("misaligned verdicts returned %v, %v, %v, %v; want an error and nothing",
+			kept, visibility, withheld, err)
+	}
+}

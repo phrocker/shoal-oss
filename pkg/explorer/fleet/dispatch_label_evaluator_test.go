@@ -594,6 +594,10 @@ func approvalReplay(
 	action.ExecutionPolicyGeneration = 1
 	action.ExecutionExpiresAt = action.Deadline
 	action.Evidence = evidence
+	if len(evidence) > 0 {
+		action.EvidenceSnapshotID = "evidence-snapshot"
+		action.EvidenceSnapshotAsOf = now
+	}
 	ctx := bindDecision(t, authority, ownerUntil(t, now.Add(time.Hour), holds, auth.OperationInvoke))
 	replayed, err := service.replayMaterialized(ctx, action, approval)
 	if err != nil {
@@ -785,5 +789,99 @@ func TestADispatchPageAsksTheGateOnce(t *testing.T) {
 	}
 	if gate.calls != 1 {
 		t.Fatalf("a page of 10 records and 20 references asked the gate %d times, want 1", gate.calls)
+	}
+}
+
+// withSnapshot pins evidence to a snapshot, as a completion with evidence
+// does, or clears the pin with the evidence, as a record without any has.
+func withSnapshot(fixture *executorClaimFixture, evidence ...EvidenceRef) {
+	stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
+	stored.Evidence = evidence
+	if len(evidence) > 0 {
+		stored.EvidenceSnapshotID = "evidence-snapshot"
+		stored.EvidenceSnapshotAsOf = fixture.now
+	} else {
+		stored.EvidenceSnapshotID = ""
+		stored.EvidenceSnapshotAsOf = time.Time{}
+	}
+	fixture.dispatchStore.records[string(fixture.queued.ID)] = stored
+}
+
+// TestAnOutsiderOfOnlyLabelledEvidenceSeesARecordThatNeverHadAny: when every
+// reference is withheld, the record must be exactly one that never had
+// evidence, snapshot pin included; a pin left behind says evidence was
+// withheld (#398). Status, Pull, TeamActions and the three replays.
+func TestAnOutsiderOfOnlyLabelledEvidenceSeesARecordThatNeverHadAny(t *testing.T) {
+	labelled, _ := structuredEvidence(t)
+	reads := func(evidence ...EvidenceRef) dispatchReads {
+		fixture := labelledFixture(t)
+		withSnapshot(fixture, evidence...)
+		overseer := bindDecision(t, fixture.authority, dispatchDecision(
+			t, "owner", "actor", "request", auth.OperationTeamOverviewRead))
+		return readDispatch(t, fixture, fixture.enqueuer, overseer)
+	}
+	got, want := reads(labelled), reads()
+	if want.status.EvidenceSnapshotID != "" {
+		t.Fatal("the never-had-evidence record carries a snapshot pin")
+	}
+	assertReadsEqual(t, "an outsider", got, want)
+
+	replay := func(name string, evidence ...EvidenceRef) ActionRecord {
+		fixture := labelledFixture(t)
+		completedByAnotherPrincipal(t, fixture)
+		withSnapshot(fixture, evidence...)
+		switch name {
+		case "enqueue":
+			record, err := fixture.service.Enqueue(fixture.enqueuer, enqueueOf(fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return record
+		default:
+			record, err := fixture.service.Invoke(fixture.enqueuer, InvokeRequest{
+				Enqueue: enqueueOf(fixture), ClaimID: []byte("invoke-claim"), Lease: time.Minute,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return record
+		}
+	}
+	for _, name := range []string{"enqueue", "invoke"} {
+		if got, want := replay(name, labelled), replay(name); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s replay to an outsider:\n%#v\nwant, as if it never had evidence,\n%#v",
+				name, got, want)
+		}
+	}
+
+	approval := func(evidence ...EvidenceRef) ActionRecord {
+		noop := func(*testing.T, *catalogGate) {}
+		record := approvalReplay(t, false, noop, evidence...)
+		return record
+	}
+	if got, want := approval(labelled), approval(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("approval replay to an outsider:\n%#v\nwant\n%#v", got, want)
+	}
+}
+
+// TestRedactionNeverChangesTheRequestDigest pins that redaction touches only
+// completion-time fields (evidence and its snapshot pin): the approval
+// request digest of what a reader is shown equals the stored record's. No
+// digest covers evidence, so redaction never has to recompute one per viewer.
+func TestRedactionNeverChangesTheRequestDigest(t *testing.T) {
+	labelled, _ := structuredEvidence(t)
+	fixture := labelledFixture(t)
+	completedByAnotherPrincipal(t, fixture)
+	withSnapshot(fixture, labelled)
+	stored := cloneActionRecord(fixture.dispatchStore.records[string(fixture.queued.ID)])
+	redacted, err := fixture.service.readableRecord(fixture.enqueuer, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(redacted.Evidence) != 0 || redacted.EvidenceSnapshotID != "" {
+		t.Fatalf("the outsider was not redacted; the probe is vacuous: %#v", redacted.Evidence)
+	}
+	if string(ApprovalRequestDigest(redacted)) != string(ApprovalRequestDigest(stored)) {
+		t.Fatal("redaction changed the approval request digest")
 	}
 }
