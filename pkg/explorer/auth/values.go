@@ -225,6 +225,16 @@ func (r ServiceRole) Allows(operation Operation) bool {
 		// to; the fleet confines it to that descriptor (#391). Never
 		// heartbeat: a worker cannot truthfully assert a descriptor's
 		// liveness.
+		//
+		// Not retrieve, and adding it is not free. The fleet's
+		// refuseUnconfinedRetrieval (#561) asks the invoking decision what
+		// it may retrieve, and today this role's answer is unauthorized,
+		// which it reads as "cannot widen" and lets through. With
+		// OperationRetrieve here the check becomes live for worker
+		// credentials: any worker whose permitted sources or policies are
+		// wider than an action's scope would be refused at invoke unless
+		// its executor confines retrieval. Whoever adds retrieve must handle
+		// that first.
 		return operation == OperationExecute ||
 			operation == OperationAgentResolve ||
 			operation == OperationValidate
