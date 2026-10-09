@@ -45,5 +45,18 @@ class ChallengerManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'identity'):
             c.validate(value)
 
+    def test_resealed_malformed_recipe_and_metric_metadata_rejected(self):
+        value = manifest()
+        for mutation in (
+                lambda item: item.update(feature_names=['reachability', 'freshness', 'operation_kind']),
+                lambda item: item.update(primary_metrics=['']),
+                lambda item: item['recipes'][0].update(categorical_features=['operation_kind', 'operation_kind']),
+                lambda item: item['recipes'][0].update(categorical_features=[1])):
+            bad = manifest()
+            mutation(bad)
+            bad['id'] = c._digest({key: item for key, item in bad.items() if key != 'id'})
+            with self.assertRaises(ValueError):
+                c.validate(bad)
+
 
 if __name__ == '__main__': unittest.main()
