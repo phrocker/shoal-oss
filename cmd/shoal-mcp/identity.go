@@ -89,7 +89,26 @@ type processIdentity struct {
 	clock  func() time.Time
 }
 
+// configureIdentity builds the process identity and refuses, for both the
+// explicit -identity-policy and the -dev-auth identity, a policy identity in
+// the label namespace: label grants come only from the operator's label grant
+// file, never from a process identity, and the identity policy doubles as the
+// static ingest source policy, which must never be a label policy.
 func configureIdentity(options identityOptions) (identityConfig, error) {
+	config, err := configureIdentityFields(options)
+	if err != nil {
+		return identityConfig{}, err
+	}
+	if auth.IsLabelPolicyID(config.policyID) {
+		return identityConfig{}, fmt.Errorf(
+			"identity policy %q is in the label namespace %q; label grants come "+
+				"only from the label grant file",
+			config.policyID, auth.LabelPolicyNamespace)
+	}
+	return config, nil
+}
+
+func configureIdentityFields(options identityOptions) (identityConfig, error) {
 	var zero identityConfig
 	if options.policyGeneration <= 0 {
 		return zero, fmt.Errorf("identity generation must be positive")

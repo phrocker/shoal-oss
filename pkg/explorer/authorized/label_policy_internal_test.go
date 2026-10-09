@@ -114,7 +114,7 @@ func TestLabelPolicyIDProbeTable(t *testing.T) {
 // past it, for one- and two-digit source lengths.
 func TestLabelPolicyIDLengthLimit(t *testing.T) {
 	for _, source := range []string{"s", strings.Repeat("s", 10), "1/2/3/4/5/"} {
-		overhead := len(LabelPolicyIDPrefix) + len(strconv.Itoa(len(source))) + 1 +
+		overhead := len(auth.LabelPolicyIDPrefix) + len(strconv.Itoa(len(source))) + 1 +
 			len(source) + 1
 		limit := auth.MaxPolicyComponentBytes - overhead
 		atLimit := strings.Repeat("L", limit)
@@ -214,7 +214,7 @@ func TestLabelPolicyIDPropertyDistinctAndRoundTrip(t *testing.T) {
 		t.Helper()
 		id, err := LabelPolicyID([]byte(source), label)
 		if err != nil {
-			if len(LabelPolicyIDPrefix)+len(strconv.Itoa(len(source)))+
+			if len(auth.LabelPolicyIDPrefix)+len(strconv.Itoa(len(source)))+
 				len(source)+len(label)+2 <= auth.MaxPolicyComponentBytes {
 				t.Fatalf("LabelPolicyID(%q, %q) refused within bounds: %v", source, label, err)
 			}
@@ -486,7 +486,7 @@ func TestLabelRuleDeduplicatesAndCaps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LabelRule(%d distinct, duplicated) = %v", MaxLabelsPerRule, err)
 	}
-	if len(full.components()) != auth.MaxPolicyTerms {
+	if len(full.components()) != MaxLabelsPerRule+1 {
 		t.Fatalf("full rule has %d components", len(full.components()))
 	}
 	if _, err := LabelRule(source, append(labels, "one-more")); err == nil {
@@ -497,6 +497,116 @@ func TestLabelRuleDeduplicatesAndCaps(t *testing.T) {
 	}
 	if _, err := LabelRule(auth.Policy{}, nil); err == nil {
 		t.Fatal("LabelRule accepted a zero source policy")
+	}
+}
+
+func distinctLabels(count int) []string {
+	labels := make([]string, 0, count)
+	for index := 0; index < count; index++ {
+		labels = append(labels, "l"+strconv.Itoa(index))
+	}
+	return labels
+}
+
+func requireRefusalNaming(t *testing.T, err error, bound string) {
+	t.Helper()
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("error = %v, want invalid_argument naming %s", err, bound)
+	}
+	if !strings.Contains(err.Error(), bound) {
+		t.Fatalf("error %q does not name %s", err, bound)
+	}
+}
+
+// TestLabelRuleFlattenedTermBound: one source flattens to d:, s: and g: plus
+// one g: per label, so 61 labels give exactly auth.MaxPolicyTerms terms and
+// 62 are refused. A service-role source carries a fourth term, so there the
+// term bound itself is what refuses 61 labels.
+func TestLabelRuleFlattenedTermBound(t *testing.T) {
+	if MaxLabelsPerRule != auth.MaxPolicyTerms-3 {
+		t.Fatalf("MaxLabelsPerRule = %d", MaxLabelsPerRule)
+	}
+	source := labelTestPolicy(t, "domain", "source", "policy", 1)
+	rule, err := LabelRule(source, distinctLabels(61))
+	if err != nil {
+		t.Fatalf("LabelRule(61 labels) = %v", err)
+	}
+	expression, err := auth.ConjoinPolicies(rule.components()...)
+	if err != nil {
+		t.Fatalf("ConjoinPolicies(61-label rule) = %v", err)
+	}
+	if terms := len(bytes.Split(expression, []byte{'&'})); terms != auth.MaxPolicyTerms {
+		t.Fatalf("61-label rule flattens to %d terms, want %d", terms, auth.MaxPolicyTerms)
+	}
+	_, err = LabelRule(source, distinctLabels(62))
+	requireRefusalNaming(t, err, "MaxLabelsPerRule")
+
+	service := servicePolicyForTest(t, source, auth.ServiceRoleDataWrite)
+	if _, err := LabelRule(service, distinctLabels(60)); err != nil {
+		t.Fatalf("LabelRule(service source, 60 labels) = %v", err)
+	}
+	_, err = LabelRule(service, distinctLabels(61))
+	requireRefusalNaming(t, err, "MaxPolicyTerms")
+}
+
+// TestLabelRuleFlattenedByteBound: with a long source every label term is
+// about 200 bytes, so the 4 KiB expression bound binds long before the term
+// bound. The last accepted rule must flatten; the next label is refused.
+func TestLabelRuleFlattenedByteBound(t *testing.T) {
+	source := labelTestPolicy(t, "domain", strings.Repeat("s", 100), "policy", 1)
+	accepted := -1
+	for count := 1; count <= MaxLabelsPerRule; count++ {
+		rule, err := LabelRule(source, distinctLabels(count))
+		if err != nil {
+			requireRefusalNaming(t, err, "MaxPolicyExpressionBytes")
+			break
+		}
+		expression, err := auth.ConjoinPolicies(rule.components()...)
+		if err != nil {
+			t.Fatalf("LabelRule accepted %d labels that do not flatten: %v", count, err)
+		}
+		if len(expression) > auth.MaxPolicyExpressionBytes {
+			t.Fatalf("flattened %d-label rule is %d bytes", count, len(expression))
+		}
+		accepted = count
+	}
+	if accepted < 1 || accepted >= MaxLabelsPerRule {
+		t.Fatalf("byte bound never refused; last accepted = %d", accepted)
+	}
+	// The refusal sits at the bound: the accepted rule is within one label
+	// term of it.
+	rule, err := LabelRule(source, distinctLabels(accepted))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expression, err := auth.ConjoinPolicies(rule.components()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labelTerm := len("g:") + (auth.MaxPolicyComponentBytes*8+4)/5 + len(":e:1") + 1
+	if len(expression)+labelTerm <= auth.MaxPolicyExpressionBytes {
+		t.Fatalf("refused %d labels at %d bytes, well below the bound",
+			accepted+1, len(expression))
+	}
+}
+
+// TestStaticPolicySelectorRefusesLabelNamespace: a source policy must never
+// be a label policy, so a static selector cannot be configured with one, in
+// any version of the namespace or in its reserved part.
+func TestStaticPolicySelectorRefusesLabelNamespace(t *testing.T) {
+	for _, grant := range []string{
+		string(mustLabelPolicyID(t, "source", "secret")),
+		UntranslatableLabelPolicyID,
+		"shoal.label/v2/anything",
+		"shoal.label/",
+	} {
+		if _, err := NewStaticPolicySelector([]byte("source"), []byte(grant)); !shoal.IsErrorCode(
+			err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("NewStaticPolicySelector(%q) = %v, want refusal", grant, err)
+		}
+	}
+	if _, err := NewStaticPolicySelector([]byte("source"), []byte("shoal.labels")); err != nil {
+		t.Fatalf("NewStaticPolicySelector(outside the namespace) = %v", err)
 	}
 }
 
@@ -557,6 +667,20 @@ func TestLabelRuleAuthorizeRequiresTheLabelOnThatSource(t *testing.T) {
 		decide(mustLabelPolicyID(t, "A", "secret")), auth.OperationRead, now,
 	); err == nil {
 		t.Fatal("untranslatable rule was authorized")
+	}
+	// Nor can any decision hold the reserved ID that would open it.
+	if _, err := auth.NewDecision(auth.DecisionConfig{
+		Subject:               "subject",
+		Actor:                 "actor",
+		AuthorizationDomain:   []byte("domain"),
+		AllowedOperations:     []auth.Operation{auth.OperationRead},
+		PermittedSourceIDs:    [][]byte{[]byte("A")},
+		PermittedPolicyIDs:    [][]byte{[]byte("policy"), []byte(UntranslatableLabelPolicyID)},
+		PolicyGeneration:      1,
+		AuthenticationExpires: now.Add(time.Hour),
+		RequestID:             "request",
+	}); err == nil {
+		t.Fatal("a decision was minted holding the untranslatable policy")
 	}
 }
 

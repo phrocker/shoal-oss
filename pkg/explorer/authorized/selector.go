@@ -25,6 +25,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // PolicySelector is trusted host configuration that derives exactly one
@@ -79,6 +80,15 @@ type StaticPolicySelector struct {
 func NewStaticPolicySelector(
 	sourceID, grantPolicyID []byte,
 ) (*StaticPolicySelector, error) {
+	// A source policy must never be a label policy: label policies are only
+	// derived from a source policy (LabelRule), never selected as one.
+	if auth.IsLabelPolicyID(grantPolicyID) {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"static selector grant policy identity is in the label namespace "+
+				auth.LabelPolicyNamespace,
+		)
+	}
 	if _, err := auth.NewPolicy(auth.PolicyConfig{
 		AuthorizationDomain: []byte("static-selector-validation"),
 		SourceID:            sourceID,

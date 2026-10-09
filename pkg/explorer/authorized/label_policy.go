@@ -39,26 +39,23 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
+// The namespace prefixes (auth.LabelPolicyIDPrefix and
+// auth.ReservedLabelPolicyIDPrefix) live in package auth so that NewDecision
+// and the ingest selectors can refuse them.
 const (
-	// LabelPolicyIDPrefix opens every grant-policy identity in the label
-	// namespace.
-	LabelPolicyIDPrefix = "shoal.label/v1/"
-
-	// labelPolicyReservedPrefix opens the reserved part of the label
-	// namespace. A canonical label policy ID carries a decimal length right
-	// after LabelPolicyIDPrefix, so no canonical ID has '!' there; '!' is
-	// also outside the label charset.
-	labelPolicyReservedPrefix = LabelPolicyIDPrefix + "!"
-
 	// UntranslatableLabelPolicyID is the reserved, never-grantable grant
 	// policy identity conjoined onto a document whose labels cannot be
-	// translated. Nothing may grant it, so such a document is readable by
-	// nobody until it is relabelled.
-	UntranslatableLabelPolicyID = labelPolicyReservedPrefix + "untranslatable"
+	// translated. auth.NewDecision refuses it as a grant, so such a document
+	// is readable by nobody until it is relabelled.
+	UntranslatableLabelPolicyID = auth.ReservedLabelPolicyIDPrefix + "untranslatable"
 
-	// MaxLabelsPerRule bounds the distinct labels one rule may carry: the
-	// source policy takes one of the auth.MaxPolicyTerms conjuncts.
-	MaxLabelsPerRule = auth.MaxPolicyTerms - 1
+	// MaxLabelsPerRule bounds the distinct labels one rule may carry, counted
+	// in flattened visibility terms. A rule over one source flattens to the
+	// source policy's d:, s: and g: terms plus one g: term per label, so
+	// 3+n terms must fit in auth.MaxPolicyTerms. The flattened expression
+	// must also fit in auth.MaxPolicyExpressionBytes, which LabelRule checks
+	// separately and which binds earlier when sources or labels are long.
+	MaxLabelsPerRule = auth.MaxPolicyTerms - 3
 )
 
 // LabelPolicyID returns the grant-policy identity for one free-form label on
@@ -89,7 +86,7 @@ func LabelPolicyID(sourceID []byte, label string) ([]byte, error) {
 		return nil, err
 	}
 	length := strconv.Itoa(len(sourceID))
-	size := len(LabelPolicyIDPrefix) + len(length) + 1 + len(sourceID) + 1 + len(label)
+	size := len(auth.LabelPolicyIDPrefix) + len(length) + 1 + len(sourceID) + 1 + len(label)
 	if size > auth.MaxPolicyComponentBytes {
 		return nil, shoal.NewError(
 			shoal.ErrorInvalidArgument,
@@ -97,7 +94,7 @@ func LabelPolicyID(sourceID []byte, label string) ([]byte, error) {
 		)
 	}
 	id := make([]byte, 0, size)
-	id = append(id, LabelPolicyIDPrefix...)
+	id = append(id, auth.LabelPolicyIDPrefix...)
 	id = append(id, length...)
 	id = append(id, '/')
 	id = append(id, sourceID...)
@@ -115,10 +112,10 @@ func ParseLabelPolicyID(id []byte) (sourceID []byte, label string, err error) {
 			shoal.ErrorInvalidArgument, "label policy identity is not canonical")
 	}
 	if len(id) > auth.MaxPolicyComponentBytes ||
-		!bytes.HasPrefix(id, []byte(LabelPolicyIDPrefix)) {
+		!bytes.HasPrefix(id, []byte(auth.LabelPolicyIDPrefix)) {
 		return invalid()
 	}
-	rest := id[len(LabelPolicyIDPrefix):]
+	rest := id[len(auth.LabelPolicyIDPrefix):]
 	end := bytes.IndexByte(rest, '/')
 	if end <= 0 {
 		return invalid()
@@ -148,15 +145,10 @@ func ParseLabelPolicyID(id []byte) (sourceID []byte, label string, err error) {
 
 // IsReservedLabelPolicyID reports whether id lies in the reserved part of the
 // label namespace, which includes UntranslatableLabelPolicyID. A grant loader
-// must refuse any such ID: it can never be granted.
+// must refuse any such ID: it can never be granted. auth.NewDecision already
+// refuses it as a permitted policy identity.
 func IsReservedLabelPolicyID(id []byte) bool {
-	return bytes.HasPrefix(id, []byte(labelPolicyReservedPrefix))
-}
-
-// isLabelPolicyID reports whether id lies anywhere in the label namespace,
-// whether canonical, reserved or malformed.
-func isLabelPolicyID(id []byte) bool {
-	return bytes.HasPrefix(id, []byte(LabelPolicyIDPrefix))
+	return auth.IsReservedLabelPolicyID(id)
 }
 
 // newLabelPolicy derives the structured policy for one label on the source
@@ -186,8 +178,14 @@ func UntranslatablePolicy(sourcePolicy auth.Policy) (auth.Policy, error) {
 // LabelRule returns the AccessRule for a document on sourcePolicy's source
 // that carries labels: the conjunction of the source policy and one label
 // policy per distinct label, built only through NewAccessRule. Duplicate
-// labels collapse; more than MaxLabelsPerRule distinct labels are refused. An
-// empty label set yields exactly NewAccessRule(sourcePolicy).
+// labels collapse. An empty label set yields exactly
+// NewAccessRule(sourcePolicy).
+//
+// The rule must stay flattenable into one canonical visibility
+// (auth.ConjoinPolicies), so it is refused, never truncated, when it has more
+// than MaxLabelsPerRule distinct labels, more than auth.MaxPolicyTerms
+// flattened terms, or more than auth.MaxPolicyExpressionBytes flattened bytes.
+// Each refusal names the bound it hit.
 func LabelRule(sourcePolicy auth.Policy, labels []string) (AccessRule, error) {
 	if err := validateLabelSourcePolicy(sourcePolicy); err != nil {
 		return AccessRule{}, err
@@ -202,7 +200,8 @@ func LabelRule(sourcePolicy auth.Policy, labels []string) (AccessRule, error) {
 		if len(seen) == MaxLabelsPerRule {
 			return AccessRule{}, shoal.NewError(
 				shoal.ErrorInvalidArgument,
-				"document visibility labels exceed the per-rule bound",
+				"document visibility labels exceed MaxLabelsPerRule ("+
+					strconv.Itoa(MaxLabelsPerRule)+" distinct labels)",
 			)
 		}
 		seen[label] = struct{}{}
@@ -212,7 +211,56 @@ func LabelRule(sourcePolicy auth.Policy, labels []string) (AccessRule, error) {
 		}
 		policies = append(policies, policy)
 	}
-	return NewAccessRule(policies...)
+	rule, err := NewAccessRule(policies...)
+	if err != nil {
+		return AccessRule{}, err
+	}
+	if err := checkFlattenable(rule.policies); err != nil {
+		return AccessRule{}, err
+	}
+	return rule, nil
+}
+
+// checkFlattenable refuses a conjunction that auth.ConjoinPolicies cannot
+// render as one visibility, naming the bound it exceeds. It measures the
+// flattened terms itself so the refusal can say which bound was hit, then
+// defers to ConjoinPolicies as the authority.
+func checkFlattenable(policies []auth.Policy) error {
+	terms := make(map[string]struct{}, len(policies)*3)
+	expressionBytes := -1
+	for _, policy := range policies {
+		encoded, err := policy.Encode()
+		if err != nil {
+			return err
+		}
+		for _, term := range bytes.Split(encoded, []byte{'&'}) {
+			if _, duplicate := terms[string(term)]; duplicate {
+				continue
+			}
+			terms[string(term)] = struct{}{}
+			expressionBytes += len(term) + 1
+		}
+	}
+	if len(terms) > auth.MaxPolicyTerms {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"document visibility labels exceed auth.MaxPolicyTerms ("+
+				strconv.Itoa(auth.MaxPolicyTerms)+" flattened terms, rule needs "+
+				strconv.Itoa(len(terms))+")",
+		)
+	}
+	if expressionBytes > auth.MaxPolicyExpressionBytes {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"document visibility labels exceed auth.MaxPolicyExpressionBytes ("+
+				strconv.Itoa(auth.MaxPolicyExpressionBytes)+" flattened bytes, rule needs "+
+				strconv.Itoa(expressionBytes)+")",
+		)
+	}
+	if _, err := auth.ConjoinPolicies(policies...); err != nil {
+		return err
+	}
+	return nil
 }
 
 // validateLabelSourcePolicy refuses a source policy that cannot anchor label
@@ -221,7 +269,7 @@ func validateLabelSourcePolicy(sourcePolicy auth.Policy) error {
 	if err := sourcePolicy.Validate(); err != nil {
 		return err
 	}
-	if isLabelPolicyID(sourcePolicy.GrantPolicyID()) {
+	if auth.IsLabelPolicyID(sourcePolicy.GrantPolicyID()) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"a label policy cannot anchor further label policies",
