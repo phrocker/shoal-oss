@@ -146,8 +146,13 @@ type fakeExplorer struct {
 	// error is the call's answer. It is how a test makes a call block until
 	// its context ends.
 	gate func(ctx context.Context, op string) error
-	// loseExtendAnswer applies an extension and then answers it as lost.
+	// loseExtendAnswer applies an extension and then answers it as lost;
+	// with extendApplyDelay the application happens that long after the
+	// answer, as a write already under way when the caller gave up would.
 	loseExtendAnswer bool
+	extendApplyDelay time.Duration
+	// skew puts the explorer's clock this far behind the worker's.
+	skew time.Duration
 	// reportAt is the clock reading at each ambiguity report's start.
 	reportAt []time.Time
 	// Hooks answer instead of the default when they return handled.
@@ -180,7 +185,7 @@ func (e *fakeExplorer) enqueue(id, action string, input string, deadline time.Ti
 func (e *fakeExplorer) enqueueFor(id, agent, capability, action, input string, deadline time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	now := e.clock.Now()
+	now := e.serverNow()
 	e.records[id] = &fakeRecord{
 		action: Action{
 			ID: []byte(id), Version: 1, State: fleet.DispatchQueued, AgentID: []byte(agent),
@@ -191,6 +196,8 @@ func (e *fakeExplorer) enqueueFor(id, agent, capability, action, input string, d
 	}
 	e.order = append(e.order, id)
 }
+
+func (e *fakeExplorer) serverNow() time.Time { return e.clock.Now().Add(-e.skew) }
 
 func (e *fakeExplorer) gateFn() func(context.Context, string) error {
 	e.mu.Lock()
@@ -242,7 +249,7 @@ func (e *fakeExplorer) Pull(ctx context.Context, request RequestContext, after s
 	defer e.mu.Unlock()
 	e.pulls++
 	e.note("pull")
-	now := e.clock.Now()
+	now := e.serverNow()
 	page := PullPage{Header: http.Header{}, ReceivedAt: now}
 	page.Header.Set("Date", now.UTC().Format(http.TimeFormat))
 	for _, id := range e.order {
@@ -282,7 +289,7 @@ func (e *fakeExplorer) Claim(ctx context.Context, id []byte, request ClaimReques
 		}
 	}
 	record, ok := e.records[string(id)]
-	now := e.clock.Now()
+	now := e.serverNow()
 	if !ok || record.action.Version != request.ExpectedVersion {
 		return Action{}, conflict("claim", http.StatusConflict)
 	}
@@ -321,18 +328,31 @@ func (e *fakeExplorer) Extend(ctx context.Context, id []byte, request ExtendRequ
 		}
 	}
 	record := e.records[string(id)]
-	now := e.clock.Now()
+	now := e.serverNow()
 	if record == nil || record.action.ClaimFence != request.ClaimFence ||
 		record.action.State != fleet.DispatchClaimed || !now.Before(record.leaseUntil) {
 		return Action{}, &DispatchError{Op: "extend", Kind: DispatchFenceLost, Status: http.StatusConflict}
 	}
-	lease := now.Add(request.Lease)
-	if lease.After(record.action.Deadline) {
-		lease = record.action.Deadline
+	apply := func(now time.Time) {
+		lease := now.Add(request.Lease)
+		if lease.After(record.action.Deadline) {
+			lease = record.action.Deadline
+		}
+		record.leaseUntil = lease
+		record.action.ClaimLeaseUntil, record.action.UpdatedAt = lease.UTC(), now.UTC()
+		record.action.Version++
 	}
-	record.leaseUntil = lease
-	record.action.ClaimLeaseUntil, record.action.UpdatedAt = lease.UTC(), now.UTC()
-	record.action.Version++
+	if e.loseExtendAnswer && e.extendApplyDelay > 0 {
+		later := e.clock.After(e.extendApplyDelay)
+		go func() {
+			at := <-later
+			e.mu.Lock()
+			apply(at.Add(-e.skew))
+			e.mu.Unlock()
+		}()
+		return Action{}, &DispatchError{Op: "extend", Kind: DispatchIndeterminate}
+	}
+	apply(now)
 	if e.loseExtendAnswer {
 		return Action{}, &DispatchError{Op: "extend", Kind: DispatchIndeterminate}
 	}
@@ -412,7 +432,7 @@ func (e *fakeExplorer) PresentAttestation(ctx context.Context, _, _ string) (tim
 	defer e.mu.Unlock()
 	e.attests++
 	e.note("attest")
-	return e.clock.Now().Add(e.attestValidity), nil
+	return e.serverNow().Add(e.attestValidity), nil
 }
 
 // fakeTarget is a payment-style API: a request under a new idempotency key

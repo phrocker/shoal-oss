@@ -58,6 +58,12 @@ type ClaimTimes struct {
 type Anchored struct {
 	LeaseLocal    time.Time
 	DeadlineLocal time.Time
+	// DeadlineLocalLatest is DeadlineLocal's late-side counterpart: no
+	// earlier than the true local instant of the action's deadline, and so no
+	// earlier than the end of any lease the explorer can ever grant on this
+	// claim, which it clamps to the deadline. Set by AnchorAnswer; zero from
+	// Anchor alone.
+	DeadlineLocalLatest time.Time
 }
 
 // Anchor places a claim's bounds on the local clock.
@@ -103,28 +109,28 @@ func Anchor(sent time.Time, claim ClaimTimes) (Anchored, error) {
 	}, nil
 }
 
-// PossibleLeaseEnd is the latest local instant a renewal whose answer the
-// worker never read — cancelled, timed out, lost, or answered indeterminate —
-// could have moved the lease to.
+// AnchorAnswer is Anchor plus the late side of the deadline, from the local
+// monotonic instant the answer that was read arrived:
 //
-// It is Anchor's rule read from the late side. Anchor places the server's
-// grant on the local clock from the earliest instant the server could have
-// applied it, the send; the latest is the end of the call's bound, sent +
-// callBound, since the request carries a deadline no later than that and the
-// explorer refuses work past it. The server grants min(applied + L,
-// deadline), so the lease can end no later than
+//	deadlineLocalLatest = received + (deadline − updated_at)
 //
-//	min(sent + callBound + L, deadlineLocal + callBound)
-//
-// where the second term allows for deadlineLocal being Anchor's early
-// estimate, short of the true local deadline by at most the claim's own
-// round trip, itself bounded by callBound.
-func PossibleLeaseEnd(sent time.Time, callBound, lease time.Duration, anchored Anchored) time.Time {
-	end := sent.Add(callBound + lease)
-	if latest := anchored.DeadlineLocal.Add(callBound); end.After(latest) {
-		end = latest
+// The explorer applied the claim or renewal at updated_at, before its answer
+// arrived, so the true local deadline is no later than this. As with Anchor
+// the difference is server minus server and the instant is local monotonic:
+// only the server clock's rate matters, never its offset, and no local wall
+// reading is compared with a server timestamp. A later received only makes
+// the bound later, so the instant read after a call that resent its request
+// still bounds the answer that was used.
+func AnchorAnswer(sent, received time.Time, claim ClaimTimes) (Anchored, error) {
+	anchored, err := Anchor(sent, claim)
+	if err != nil {
+		return Anchored{}, err
 	}
-	return end
+	if received.Before(sent) {
+		return Anchored{}, errors.New("an answer cannot arrive before its request was sent")
+	}
+	anchored.DeadlineLocalLatest = received.Add(claim.Deadline.Sub(claim.UpdatedAt))
+	return anchored, nil
 }
 
 // RetentionCovers is the PRECHECK retention rule for a key route:

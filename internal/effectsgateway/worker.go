@@ -833,13 +833,13 @@ type claimRun struct {
 	mu       sync.Mutex
 	anchored Anchored
 	anchorAt time.Time
-	// possibleEnd is the latest end a renewal whose outcome is unknown may
-	// have granted (PossibleLeaseEnd); zero when every renewal was answered.
-	possibleEnd time.Time
-	lost        bool
-	lostCh      chan struct{}
-	inFlight    bool
-	reported    bool
+	// extensionUnknown: some renewal's outcome was never read, so the
+	// explorer may hold a lease end the worker never saw.
+	extensionUnknown bool
+	lost             bool
+	lostCh           chan struct{}
+	inFlight         bool
+	reported         bool
 	// attempted: a request was handed to the target client, so the effect
 	// may have happened. settled: the outcome is on the record or in the
 	// unrecorded log. abandoned: the drain gave up on this run.
@@ -882,14 +882,17 @@ func (r *claimRun) unrecorded(target string, outcome fleet.AmbiguityOutcome, ref
 }
 
 // settleAt is when whatever this claim had in flight has settled: the end of
-// the lease as anchored, or later, the end a renewal of unknown outcome may
-// have granted. The explorer cannot have anything of this claim's in flight
-// past it.
+// the lease as anchored — or, when a renewal's outcome was never read, the
+// latest local instant of the action's deadline (DeadlineLocalLatest), since
+// that renewal may have granted any end up to the deadline and nothing on the
+// worker's side bounds when the explorer applied it. A request deadline is
+// not such a bound: it is a local wall reading the explorer compares with its
+// own clock, and a write already under way can commit after it.
 func (r *claimRun) settleAt() time.Time {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.possibleEnd.After(r.anchored.LeaseLocal) {
-		return r.possibleEnd
+	if r.extensionUnknown && r.anchored.DeadlineLocalLatest.After(r.anchored.LeaseLocal) {
+		return r.anchored.DeadlineLocalLatest
 	}
 	return r.anchored.LeaseLocal
 }
@@ -940,7 +943,7 @@ func (w *Worker) claim(ctx context.Context, offered Action, route *Route) (*clai
 	if len(run.action.CorrelationID) == 0 {
 		run.action.CorrelationID = append([]byte(nil), offered.CorrelationID...)
 	}
-	anchored, err := Anchor(sent, claimed.ClaimTimes())
+	anchored, err := AnchorAnswer(sent, w.clock.Now(), claimed.ClaimTimes())
 	if err != nil {
 		// A claim whose bounds cannot be placed on the local clock is held
 		// for an unknown time: treat it as already lost.
@@ -1030,7 +1033,7 @@ func (w *Worker) renew(run *claimRun) {
 			run.markLost()
 			return
 		case run.renewCtx.Err() != nil:
-			// Stopped: the extension's outcome is recorded (possibleEnd);
+			// Stopped: the extension's outcome is recorded (extensionUnknown);
 			// the cancellation itself is not a dispatch failure.
 			return
 		default:
@@ -1060,15 +1063,13 @@ func (w *Worker) extend(run *claimRun) (Action, error) {
 	if err != nil {
 		if extensionMayHaveApplied(err) {
 			run.mu.Lock()
-			if end := PossibleLeaseEnd(sent, w.cfg.PlaneTimeout, w.cfg.ClaimLease, run.anchored); end.After(run.possibleEnd) {
-				run.possibleEnd = end
-			}
+			run.extensionUnknown = true
 			run.mu.Unlock()
 		}
 		return Action{}, err
 	}
 	// The explorer's end, clamped to the deadline — never sent + L.
-	anchored, anchorErr := Anchor(sent, extended.ClaimTimes())
+	anchored, anchorErr := AnchorAnswer(sent, w.clock.Now(), extended.ClaimTimes())
 	if anchorErr != nil {
 		return Action{}, &DispatchError{Op: "extend", Kind: DispatchProtocol,
 			reason: "extend response cannot be anchored"}
@@ -1076,6 +1077,12 @@ func (w *Worker) extend(run *claimRun) (Action, error) {
 	// Adopted as granted, even if it ends earlier than the end already held:
 	// the explorer's answer is the lease.
 	run.mu.Lock()
+	// Every answer gives a valid late bound on the deadline; keep the
+	// tightest.
+	if previous := run.anchored.DeadlineLocalLatest; !previous.IsZero() &&
+		previous.Before(anchored.DeadlineLocalLatest) {
+		anchored.DeadlineLocalLatest = previous
+	}
 	run.anchored = anchored
 	run.anchorAt = sent
 	if extended.Version > run.action.Version {

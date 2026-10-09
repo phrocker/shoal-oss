@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -301,70 +302,141 @@ func TestTheWorstShutdownPathFitsTheDrainBound(t *testing.T) {
 	}
 }
 
-// TestTheSettleWaitCoversAnExtensionOfUnknownOutcome: the renewal at L/2 is
-// in flight when the completion comes back indeterminate. Stopping the
-// renewal cancels it — and the explorer has applied it anyway, moving the
-// lease to 30s + L = 90s, though the worker never reads that answer. The
-// fallback report must wait until no renewal the worker sent can still hold
-// the claim: not the old anchored end (60s), but the latest end the
-// cancelled extension could have granted, sent + planeTimeout + L = 95s.
-func TestTheSettleWaitCoversAnExtensionOfUnknownOutcome(t *testing.T) {
+// settleScenario runs a claim whose renewal at 30s is in flight, blocked
+// until the worker gives up on it, when the completion comes back
+// indeterminate. The explorer applies the renewal anyway, delay after the
+// worker gives up, and never answers it. The claim's own answer takes
+// claimDelay to arrive. Re-pulls are refused, so only this claim reports.
+func settleScenario(t *testing.T, skew, claimDelay, delay, deadline time.Duration) *workerHarness {
+	t.Helper()
 	h := newWorkerHarness(t, nil)
-	h.explorer.loseExtendAnswer = true
+	h.explorer.skew = skew
+	h.explorer.loseExtendAnswer, h.explorer.extendApplyDelay = true, delay
+	var claimed atomic.Bool
+	claiming := make(chan struct{}, 1)
 	h.explorer.setGate(func(ctx context.Context, op string) error {
 		switch op {
+		case "pull":
+			if claimed.Load() {
+				return &DispatchError{Op: "pull", Kind: DispatchUnavailable}
+			}
+		case "claim":
+			claimed.Store(true)
+			if claimDelay > 0 {
+				claiming <- struct{}{}
+				<-h.clock.After(claimDelay)
+			}
 		case "extend":
-			<-ctx.Done() // applied when the worker gives up on it
+			<-ctx.Done()
 		case "complete":
 			return &DispatchError{Op: "complete", Kind: DispatchIndeterminate}
 		}
 		return nil
 	})
-	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
-	h.startGated()
-	h.clock.Advance(30 * time.Second)
+	// The deadline is the explorer's timestamp, on the explorer's clock.
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(-skew).Add(deadline))
+	h.target.gate = make(chan struct{})
+	t.Cleanup(h.release)
+	h.start()
+	if claimDelay > 0 {
+		<-claiming
+		settle()
+		h.clock.Advance(claimDelay)
+	}
+	select {
+	case <-h.target.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the target saw no request")
+	}
+	settle()
+	h.clock.Advance(30*time.Second - h.clock.Now().Sub(workerEpoch))
 	settle()
 	h.release()
-	eventually(t, "the cancelled extension to apply", func() bool {
-		return h.explorer.record("a1").ClaimLeaseUntil.Equal(workerEpoch.Add(90 * time.Second))
-	})
-	settle()
-	for _, at := range []time.Duration{61, 90, 94} {
-		h.clock.Advance(at*time.Second - h.clock.Now().Sub(workerEpoch))
+	return h
+}
+
+// assertNoReportUntil steps the clock to each instant (from the epoch) and
+// checks no report has been made.
+func (h *workerHarness) assertNoReportUntil(instants ...time.Duration) {
+	h.t.Helper()
+	for _, at := range instants {
+		if step := at - h.clock.Now().Sub(workerEpoch); step > 0 {
+			h.clock.Advance(step)
+		}
 		settle()
 		if reports := h.explorer.reportTimes(); len(reports) != 0 {
-			t.Fatalf("reported at %ds, before the possibly extended end (95s)", at)
-		}
-	}
-	h.clock.Advance(time.Second) // 95s
-	eventually(t, "the report", func() bool { return len(h.explorer.reportTimes()) == 1 })
-	if at := h.explorer.reportTimes()[0].Sub(workerEpoch); at != 95*time.Second {
-		t.Fatalf("reported at %s", at)
-	}
-	if h.logs.has("dispatch_error") {
-		// Under fence 1, the completion's own indeterminate answer is the
-		// only one (a re-claim after the lapse has its own fence).
-		count := 0
-		for _, line := range h.logs.lines() {
-			if line["event"] == "dispatch_error" && line["fence"] == float64(1) {
-				count++
-			}
-		}
-		if count != 1 {
-			t.Fatalf("%d dispatch_error events; the cancelled renewal logged one:\n%s", count, h.logs)
+			h.t.Fatalf("reported at %s", reports[0].Sub(workerEpoch))
 		}
 	}
 }
 
-// TestPossibleLeaseEnd: Anchor's rule from the late side.
-func TestPossibleLeaseEnd(t *testing.T) {
-	sent := workerEpoch.Add(30 * time.Second)
-	anchored := Anchored{LeaseLocal: workerEpoch.Add(60 * time.Second), DeadlineLocal: workerEpoch.Add(time.Hour)}
-	if got := PossibleLeaseEnd(sent, 5*time.Second, time.Minute, anchored); !got.Equal(workerEpoch.Add(95 * time.Second)) {
-		t.Fatalf("unclamped = %s", got.Sub(workerEpoch))
+// TestTheSettleWaitCoversAnExtensionOfUnknownOutcome: stopping the renewal
+// cancels it, and the explorer applies it anyway (lease to 90s); the worker
+// never reads that. Nothing on the worker's side bounds when the explorer
+// applied it, so the fallback report waits for the latest local instant of
+// the action's deadline (120s), not the old anchored end (60s).
+func TestTheSettleWaitCoversAnExtensionOfUnknownOutcome(t *testing.T) {
+	h := settleScenario(t, 0, 0, 0, 120*time.Second)
+	eventually(t, "the cancelled extension to apply", func() bool {
+		return h.explorer.record("a1").ClaimLeaseUntil.Equal(workerEpoch.Add(90 * time.Second))
+	})
+	h.assertNoReportUntil(61*time.Second, 90*time.Second, 119*time.Second)
+	h.clock.Advance(time.Second) // 120s
+	eventually(t, "the report", func() bool { return len(h.explorer.reportTimes()) == 1 })
+	if at := h.explorer.reportTimes()[0].Sub(workerEpoch); at != 120*time.Second {
+		t.Fatalf("reported at %s, want the deadline's latest local instant (120s)", at)
 	}
-	anchored.DeadlineLocal = workerEpoch.Add(70 * time.Second)
-	if got := PossibleLeaseEnd(sent, 5*time.Second, time.Minute, anchored); !got.Equal(workerEpoch.Add(75 * time.Second)) {
-		t.Fatalf("clamped = %s", got.Sub(workerEpoch))
+	count := 0
+	for _, line := range h.logs.lines() {
+		if line["event"] == "dispatch_error" && line["fence"] == float64(1) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("%d dispatch_error events for the claim; only the completion's is expected:\n%s", count, h.logs)
+	}
+}
+
+// TestTheSettleWaitHoldsUnderSkew: the explorer's clock runs 30s behind the
+// worker's, the claim's answer takes 2s to arrive, and the renewal the worker
+// gave up on at 35s (its own timeout) is applied 40s after that — as an
+// explorer that judged the request's deadline on its own clock, or had the
+// write already under way, would. That renewal is clamped to the action's
+// deadline, so the lease really ends at the deadline: 130s on the worker's
+// clock. DeadlineLocal, the early estimate, says 128s; only the late side,
+// DeadlineLocalLatest, is safe. No report may precede 130s; it comes then.
+func TestTheSettleWaitHoldsUnderSkew(t *testing.T) {
+	h := settleScenario(t, 30*time.Second, 2*time.Second, 40*time.Second, 130*time.Second)
+	h.assertNoReportUntil(35*time.Second, 76*time.Second)
+	explorerEpoch := workerEpoch.Add(-30 * time.Second)
+	if got := h.explorer.record("a1").ClaimLeaseUntil.Sub(explorerEpoch); got != 130*time.Second {
+		t.Fatalf("the late renewal granted %s (explorer time), want the deadline", got)
+	}
+	h.assertNoReportUntil(96*time.Second, 115*time.Second, 128*time.Second, 129*time.Second)
+	h.clock.Advance(time.Second) // 130s
+	eventually(t, "the report", func() bool { return len(h.explorer.reportTimes()) == 1 })
+	if at := h.explorer.reportTimes()[0].Sub(workerEpoch); at != 130*time.Second {
+		t.Fatalf("reported at %s, want 130s", at)
+	}
+}
+
+// TestAnchorAnswer: the late side of the deadline is the answer's arrival
+// plus the server's own deadline − updated_at, whatever the server's offset.
+func TestAnchorAnswer(t *testing.T) {
+	server := workerEpoch.Add(-time.Hour) // any offset
+	claim := ClaimTimes{UpdatedAt: server, ClaimLeaseUntil: server.Add(time.Minute),
+		Deadline: server.Add(10 * time.Minute)}
+	sent, received := workerEpoch, workerEpoch.Add(3*time.Second)
+	anchored, err := AnchorAnswer(sent, received, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !anchored.DeadlineLocal.Equal(sent.Add(10*time.Minute)) ||
+		!anchored.DeadlineLocalLatest.Equal(received.Add(10*time.Minute)) ||
+		!anchored.LeaseLocal.Equal(sent.Add(time.Minute)) {
+		t.Fatalf("anchored = %+v", anchored)
+	}
+	if _, err := AnchorAnswer(received, sent, claim); err == nil {
+		t.Fatal("an answer before its request")
 	}
 }

@@ -463,6 +463,9 @@ instant; no local wall-clock reading is compared with a server timestamp.
 - **Anchoring**, from the claim response: `leaseLocal = t₀ + (claim_lease_until
   − updated_at)` and `deadlineLocal = t₀ + (deadline − updated_at)`, with `t₀`
   the local instant the claim ID was *first* sent. Both err early.
+  `deadlineLocalLatest = t₁ + (deadline − updated_at)`, with `t₁` the local
+  instant the answer that was read arrived, errs late; it bounds every lease
+  the explorer can grant on the claim.
 - **Send gate**, before every attempt: not draining,
   `deadlineLocal − now ≥ T + 5s`, and `leaseLocal − now ≥ T + 5s` (or
   `≥ L/2` with `-renew`).
@@ -522,10 +525,16 @@ The same report follows a completion the explorer refused (404, 409, …). A
 completion whose answer may have committed (`indeterminate`, #506) stops
 renewing, waits out the lease, and then reports through the ambiguity route,
 which appends at `expected_version` 0. "The lease" there is the latest end any
-renewal could have granted: an extension whose answer was never read
-(cancelled, timed out, lost) may still have applied, so the wait runs to
-`PossibleLeaseEnd` — `min(sent + planeTimeout + L, deadlineLocal + planeTimeout)`,
-Anchor's rule from the late side — when that is later than the anchored end.
+renewal could have granted. When an extension's answer was never read
+(cancelled, timed out, lost), it may still have applied — at any time: the
+request's deadline is a local wall reading the explorer judges on its own
+clock, and a write already under way can commit after it — so the wait runs
+to the action's deadline on its late side, `DeadlineLocalLatest =
+answerReceived + (deadline − updated_at)`. The explorer clamps every lease to
+the deadline and applied the claim before its answer arrived, so this is
+skew-free: server minus server, on the local monotonic clock. The cost is
+waiting to the deadline in the rare case of an indeterminate completion
+behind an unknown renewal.
 Each fence gets at most one report.
 
 **Shutdown** (context cancelled): stop pulling and go not-ready (`draining`).
