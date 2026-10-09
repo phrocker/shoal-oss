@@ -921,6 +921,12 @@ func TestReportRefusesAFailureCarryingAnOutcome(t *testing.T) {
 // it here made the first response an error and the identical retry a receipt,
 // so what a caller saw depended on whether its own report had committed — the
 // exact confusion the one-shot token exists to remove.
+//
+// The guarantee has since moved to where it belongs: completeClaim answers a
+// recorded failure with the record and no error (#492), so this surface no
+// longer converts anything and this test now proves the service's contract
+// rather than a local correction of it. It still fails if that contract
+// regresses, which is why it stayed here when the conversion was removed.
 func TestReportingAFailureIsASuccessfulReport(t *testing.T) {
 	harness := newAdmissionHarness(t, nil)
 	grant, err := harness.service.Request(

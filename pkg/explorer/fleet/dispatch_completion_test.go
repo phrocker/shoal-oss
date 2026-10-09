@@ -182,8 +182,12 @@ func TestCompleteClaimRecordsAReportedFailure(t *testing.T) {
 	request.Failed = true
 	request.Result = ExecutionResult{ErrorCode: "gateway_refused"}
 	completed, err := fixture.service.CompleteClaim(fixture.ctx, request)
-	if err == nil {
-		t.Fatal("a reported failure returned no error")
+	// Recording the report is what this operation does, and it did it. The
+	// failure is the work's outcome, carried in State and ErrorCode below —
+	// answering with an error instead told a worker that had just performed an
+	// irreversible effect that its report was refused (#492).
+	if err != nil {
+		t.Fatalf("a durably recorded failure was answered as a refusal: %v", err)
 	}
 	if completed.State != DispatchFailed || completed.ErrorCode != "gateway_refused" {
 		t.Fatalf("failure record = %#v", completed)
@@ -246,8 +250,13 @@ func TestCompleteClaimValidatesOutputAsTheInProcessPathDoes(t *testing.T) {
 	// else.
 	request.Result.Output = json.RawMessage(`{"ok":"yes","extra":1}`)
 	completed, err := fixture.service.CompleteClaim(fixture.ctx, request)
-	if err == nil {
-		t.Fatal("schema-violating output was accepted")
+	// Not "accepted": the action is terminally failed, which the record says.
+	// The worker reads its own rejection off ErrorCode rather than off a
+	// status that also means its request never happened (#492).
+	if err != nil {
+		t.Fatalf("a committed invalid_executor_output was answered as a "+
+			"refusal, so the worker cannot tell it from a rejected report: %v",
+			err)
 	}
 	if completed.State != DispatchFailed || completed.ErrorCode != "invalid_executor_output" {
 		t.Fatalf("invalid output record = %#v", completed)
@@ -271,8 +280,10 @@ func TestCompleteClaimValidatesEvidenceAsTheInProcessPathDoes(t *testing.T) {
 	// was read against, so it cannot be verified later.
 	request.Result.Evidence = []EvidenceRef{{Kind: "document"}}
 	completed, err := fixture.service.CompleteClaim(fixture.ctx, request)
-	if err == nil {
-		t.Fatal("unpinned evidence was accepted")
+	// As above: committed as failed, not refused (#492).
+	if err != nil {
+		t.Fatalf("a committed invalid_executor_evidence was answered as a "+
+			"refusal: %v", err)
 	}
 	if completed.State != DispatchFailed || completed.ErrorCode != "invalid_executor_evidence" {
 		t.Fatalf("invalid evidence record = %#v", completed)

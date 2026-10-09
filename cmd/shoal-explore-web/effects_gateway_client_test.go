@@ -461,22 +461,27 @@ func TestEffectsGatewayClientAgainstTheRealDispatchHandler(t *testing.T) {
 	}
 }
 
-// TestEffectsGatewayClientRecordsAFailureDespiteTheWire500 drives a failed
+// TestEffectsGatewayClientRecordsAFailureInOneRequest drives a failed
 // completion through the real handler.
 //
-// CURRENT behaviour, not desired: on main a durably recorded failure is
-// answered with HTTP 500, because the /complete handler discards the
-// committed record CompleteClaim returns alongside its error (#492). The raw
-// assertion below pins that so it flips visibly when #492 lands — at which
-// point it should expect 2xx with the record, and the client's 400/500 resend
-// trigger should be removed. The client-level assertions hold either way.
-func TestEffectsGatewayClientRecordsAFailureDespiteTheWire500(t *testing.T) {
+// This test used to pin the opposite, under the name
+// ...RecordsAFailureDespiteTheWire500: a durably recorded failure was
+// answered HTTP 500, because the /complete handler discarded the committed
+// record CompleteClaim returned alongside its error. Its own comment said to
+// flip it to 2xx when #492 landed, which is what this is.
+//
+// The flip matters beyond a status code. The worker could not tell "committed
+// as failed" from "your report was rejected, nothing happened", and the only
+// way to find out was to resend the identical body and read the replay — an
+// extra request on the path a gateway takes immediately after an irreversible
+// external effect, which is where an extra request is least welcome.
+func TestEffectsGatewayClientRecordsAFailureInOneRequest(t *testing.T) {
 	h := newGatewayHarness(t)
 	client := h.client()
 	ctx := context.Background()
 	const input = `{"path":{"account":"a"},"body":{"amount":1}}`
 
-	// The raw wire, first. CURRENT behaviour (#492): a recorded failure is a 500.
+	// The raw wire, first: one request, 200, and the record.
 	h.enqueue("action-raw", input)
 	offered, _ := pulled(t, client, "action-raw")
 	rawClaim, _, _ := effectsgateway.NewClaimID("pod-0", nil)
@@ -498,15 +503,28 @@ func TestEffectsGatewayClientRecordsAFailureDespiteTheWire500(t *testing.T) {
 	})
 	path := "/api/v1/fleet/actions/" + base64.RawURLEncoding.EncodeToString(claimed.ID) + "/complete"
 	first := h.rawPost(path, failure)
-	if first.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("a recorded failure answered %d (%s); if #492 has landed, "+
-			"expect 2xx here and remove the client's 400/500 resend trigger",
-			first.StatusCode, readAll(first))
-	}
+	firstBody := readAll(first)
 	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("a recorded failure answered %d (%s): the write landed and "+
+			"the worker was told it was refused",
+			first.StatusCode, firstBody)
+	}
+	// The status alone would be worse than the error it replaced if the body
+	// said nothing — the worker would learn neither outcome.
+	if !strings.Contains(firstBody, `"state":"failed"`) ||
+		!strings.Contains(firstBody, `"error_code":"target_rejected_422"`) {
+		t.Fatalf("the first answer carries no outcome: %s", firstBody)
+	}
+	// The replay still agrees, which is what makes the single request safe to
+	// rely on: a worker that loses the response can still ask again.
 	second := h.rawPost(path, failure)
-	if second.StatusCode != http.StatusOK || !strings.Contains(readAll(second), `"state":"failed"`) {
-		t.Fatal("the replay did not return the recorded failure")
+	secondBody := readAll(second)
+	second.Body.Close()
+	if second.StatusCode != http.StatusOK ||
+		!strings.Contains(secondBody, `"state":"failed"`) {
+		t.Fatalf("the replay did not return the recorded failure: %d %s",
+			second.StatusCode, secondBody)
 	}
 
 	// The client hides that: one call, the recorded record.
@@ -573,9 +591,12 @@ func TestEffectsGatewayClientRecordsAFailureDespiteTheWire500(t *testing.T) {
 // a refusal that wrote nothing — the record is terminal — and must not report
 // it as the success it sent.
 //
-// CURRENT behaviour (#492): main answers this 400 and the client recovers the
-// record by resending. After #492 the handler answers 2xx with the record;
-// recorded_otherwise is the permanent part and this test should keep passing.
+// Before #492 the handler answered this 400 and the client recovered the
+// record by resending. The handler now answers 2xx with the record, and
+// recorded_otherwise is the permanent part — which is why this test reads
+// identically on both sides of that change. The client still has a 400/500
+// resend path; it is no longer reached against a server with #492, and is
+// kept for one talking to a server without it.
 func TestEffectsGatewayClientSurfacesAnOutcomeRecordedOtherwise(t *testing.T) {
 	h := newGatewayHarness(t, fleet.Action{
 		Name:        "strict",
