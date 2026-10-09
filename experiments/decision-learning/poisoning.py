@@ -87,7 +87,9 @@ def run():
         evaluation = l.evaluate(base['ledger'], base['data'], base['evaluation_policy'], base['candidate'], predictions)
         artifact = l.seal('candidate_artifact', candidate_id=base['candidate']['id'], evaluation_id=evaluation['id'],
                           dataset_id=base['data']['id'], model_digest='model', runtime_digest='runtime')
-        l.promote_candidate(base['candidate'], evaluation, artifact, base['approval'])
+        approval = l.seal('promotion_approval', candidate_id=base['candidate']['id'], evaluation_id=evaluation['id'],
+                          owner='owner', approved=True)
+        l.promote_candidate(base['candidate'], evaluation, artifact, approval)
 
     def artifact_substitution():
         artifact = l.seal('candidate_artifact', candidate_id=base['candidate']['id'], evaluation_id=base['evaluation']['id'],
