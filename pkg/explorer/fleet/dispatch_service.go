@@ -2750,6 +2750,12 @@ func executorBindingPermits(
 // fleet refuses it here as well, at Pull and Claim, because a delegated
 // execute claim is what would make #546's subject collision a claim takeover:
 // heldClaimAt compares chains element by element. A worker acts as itself.
+//
+// No test can fail on the chain clause alone, and that is stated rather than
+// hidden: auth cannot mint a bound decision with a chain, so every delegated
+// caller also has an empty binding and is refused by the rule above.
+// Removing both is caught (TestADelegatedExecuteHolderIsRefusedAtPullAndClaim);
+// the clause is kept so the refusal does not rest on auth's validation alone.
 func executeRoutePermits(
 	phase executorPhase, decision auth.Decision, currentRef, claimedRef string,
 ) bool {
