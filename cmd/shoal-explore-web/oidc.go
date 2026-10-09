@@ -278,6 +278,14 @@ type oidcConfig struct {
 	// segments naming a stable identity claim. Empty means identities are
 	// derived from the subject claim, as before.
 	identityClaim string
+	// labelGrantsFile names the operator label grant file (#570). Empty
+	// means no labels: no token holds a label policy, so labelled content is
+	// visible to nobody.
+	labelGrantsFile string
+	// labelGrantSources is the set of source IDs a label grant may name. Nil
+	// means this command's one configured source, workspaceSourceID; only a
+	// test sets it, to name a second source the server does not ingest into.
+	labelGrantSources [][]byte
 
 	// httpClient and clock are injected by tests; production leaves them nil.
 	httpClient *http.Client
@@ -298,7 +306,7 @@ func (c oidcConfig) configured() bool {
 		c.browserClientID != "" ||
 		c.browserScope != "" || c.authorizationEndpoint != "" ||
 		c.tokenEndpoint != "" || c.approverMappingFile != "" ||
-		c.identityClaim != ""
+		c.identityClaim != "" || c.labelGrantsFile != ""
 }
 
 // oidcAuthenticator validates bearer tokens against the issuer's JWKS
@@ -339,6 +347,10 @@ type oidcAuthenticator struct {
 	// set, every principal on both branches is oidcid:<iss>#<tag>#<value>, derived
 	// by stableIdentity and by nothing else.
 	identityClaim []string
+	// labelGrants is the operator label grant file (#570), or nil. Only the
+	// workspace branch reads it, and only for a token a role mapping has
+	// already granted.
+	labelGrants *labelGrants
 }
 
 func newOIDCAuthenticator(
@@ -455,6 +467,17 @@ func newOIDCAuthenticator(
 					"it cannot be combined with the legacy Entra identity mode")
 		}
 	}
+	var grants *labelGrants
+	if path := strings.TrimSpace(config.labelGrantsFile); path != "" {
+		sources := config.labelGrantSources
+		if sources == nil {
+			sources = [][]byte{workspaceSourceID}
+		}
+		grants, err = loadLabelGrants(path, issuer, sources)
+		if err != nil {
+			return nil, err
+		}
+	}
 	workspaceAudiences := make(map[string]struct{}, len(audiences))
 	for _, audience := range audiences {
 		workspaceAudiences[audience] = struct{}{}
@@ -547,6 +570,7 @@ func newOIDCAuthenticator(
 		approver:                   approver,
 		workspaceAudiences:         workspaceAudiences,
 		identityClaim:              identityClaim,
+		labelGrants:                grants,
 	}, nil
 }
 
@@ -932,7 +956,11 @@ func (a *oidcAuthenticator) mintWorkspace(
 			return auth.Decision{}, errMalformedClaim
 		}
 	}
-	operations, sources, policies, mapped := a.authority(authorizationValues)
+	operations, sources, policies, mapped, err := a.authority(
+		authorizationValues, claims)
+	if err != nil {
+		return auth.Decision{}, err
+	}
 	if !mapped {
 		return auth.Decision{}, errUnmappedAuthorization
 	}
@@ -1017,9 +1045,14 @@ func (a *oidcAuthenticator) workspaceSubject(claims jwt.MapClaims) (shoal.ID, er
 // authority maps configured claim values to operations and corpus grants. It
 // is fail-closed: only an explicitly configured contributor or reader value
 // grants visibility. An unmapped value produces no decision.
+//
+// Label grants (#570) are appended here and only here, and only to a token a
+// role mapping has already granted the workspace source: they add policy
+// IDs, never an operation or a source, and a token that holds no role gets
+// none — including the legacy unmapped-list branch below.
 func (a *oidcAuthenticator) authority(
-	values []string,
-) ([]auth.Operation, [][]byte, [][]byte, bool) {
+	values []string, claims jwt.MapClaims,
+) ([]auth.Operation, [][]byte, [][]byte, bool, error) {
 	if a.trimAuthorizationValues {
 		trimmed := make([]string, 0, len(values))
 		for _, value := range values {
@@ -1045,15 +1078,22 @@ func (a *oidcAuthenticator) authority(
 			operations, operationSet, oidcReaderOperations)
 	}
 	if len(operations) > 0 {
+		labels, err := a.labelGrants.policies(claims)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+		policies := make([][]byte, 0, 1+len(labels))
+		policies = append(policies, workspaceGrantPolicyID)
+		policies = append(policies, labels...)
 		return operations,
 			[][]byte{workspaceSourceID},
-			[][]byte{workspaceGrantPolicyID},
-			true
+			policies,
+			true, nil
 	}
 	if a.allowUnmappedAuthorization {
-		return []auth.Operation{auth.OperationList}, nil, nil, true
+		return []auth.Operation{auth.OperationList}, nil, nil, true, nil
 	}
-	return nil, nil, nil, false
+	return nil, nil, nil, false, nil
 }
 
 func appendUniqueOperations(

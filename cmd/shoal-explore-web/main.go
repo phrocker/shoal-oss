@@ -231,6 +231,15 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Authenticate every request as a fixed development principal; "+
 			"refused unless the resolved listen address is loopback-only",
 	)
+	developmentLabels := flags.String(
+		"dev-auth-labels", "",
+		"Comma-separated label grants for the -dev-auth principal, each "+
+			"<source>=<label> with the source exactly as configured ("+
+			string(workspaceSourceID)+"), for example "+
+			string(workspaceSourceID)+"=secret. Without it the development "+
+			"principal holds no label and can neither ingest nor read "+
+			"labelled content (#570). Requires -dev-auth",
+	)
 	mosaicBudget := flags.Uint(
 		"mosaic-budget", 0,
 		"Sensitivity-domain co-occurrence budget defending against the mosaic "+
@@ -345,6 +354,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"oidcid:<iss>#<tag>#<value> on both branches; the approver mapping must "+
 			"restate it as identity_claim. Environment fallback "+
 			"SHOAL_OIDC_IDENTITY_CLAIM")
+	oidcLabelGrantsFile := flags.String(
+		"oidc-label-grants-file", "",
+		"Operator file (shoal.label-grants/v1) granting free-form visibility "+
+			"labels, per source, to OIDC claim values (#570). A grant adds "+
+			"visibility to a token a role mapping already grants, never an "+
+			"operation; without it no token holds any label, and labelled "+
+			"content is visible to nobody. Environment fallback "+
+			"SHOAL_OIDC_LABEL_GRANTS_FILE")
 	oidcIdentitySchemeMigrate := flags.String(
 		"oidc-identity-scheme-migrate", "",
 		"One-shot identity scheme switch: the digest (64 hex digits, as the "+
@@ -483,6 +500,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			os.Getenv("SHOAL_OIDC_APPROVER_MAPPING_FILE")),
 		identityClaim: firstNonEmpty(
 			*oidcIdentityClaim, os.Getenv("SHOAL_OIDC_IDENTITY_CLAIM")),
+		labelGrantsFile: firstNonEmpty(
+			*oidcLabelGrantsFile, os.Getenv("SHOAL_OIDC_LABEL_GRANTS_FILE")),
 	}, legacyEntraConfig{
 		tenantID: firstNonEmpty(
 			*entraTenant, os.Getenv("SHOAL_ENTRA_TENANT")),
@@ -527,7 +546,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// bound, so an address the workspace may not serve never opens a socket
 	// and never prompts an operator to approve exposure the program has
 	// already decided against.
-	if _, err := selectAuthenticator(*developmentAuth, oidc, *listen, time.Now); err != nil {
+	if _, err := selectAuthenticator(
+		*developmentAuth, *developmentLabels, oidc, *listen, time.Now); err != nil {
 		return err
 	}
 	listener, err := listenTCP("tcp", *listen)
@@ -539,7 +559,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// Identity is decided from it, and a refusal closes the listener here,
 	// before the corpus is opened and before any request can be served.
 	authenticator, err := selectAuthenticator(
-		*developmentAuth, oidc, listener.Addr().String(), time.Now)
+		*developmentAuth, *developmentLabels, oidc,
+		listener.Addr().String(), time.Now)
 	if err != nil {
 		listener.Close()
 		return err
@@ -551,6 +572,10 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// The identity scheme the OIDC authenticator mints under (#526); nil
 	// for any other authenticator.
 	var identityScheme *identitySchemeConfig
+	// The label grant file in force (#570): its digest and grant count.
+	// Zero when none is configured.
+	var labelGrantsDigest auth.Digest
+	var labelGrantCount int
 	if oidcAuthenticator, ok := authenticator.(*oidcAuthenticator); ok {
 		// An approver mapping needs an issuer that states public subject
 		// identifiers only, unless a stable identity claim is configured;
@@ -567,6 +592,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 				listener.Addr(), err)
 		}
 		approverMapping = oidcAuthenticator.approverMappingDigest()
+		labelGrantsDigest, labelGrantCount = oidcAuthenticator.labelGrantsDigest()
 		migrateFrom, err := parseIdentitySchemeMigrate(
 			strings.TrimSpace(*oidcIdentitySchemeMigrate))
 		if err != nil {
@@ -853,6 +879,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"Authenticating every request as development principal %s\n",
 			developmentSubject,
 		)
+		if *developmentLabels != "" {
+			fmt.Fprintf(output,
+				"The development principal holds the label grants %s\n",
+				*developmentLabels)
+		}
 	}
 	if oidc.configured() {
 		fmt.Fprintf(
@@ -865,6 +896,16 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			fmt.Fprintf(output,
 				"OIDC approver mapping is in force (%s); approvals are "+
 					"pinned to it\n", approverMapping)
+		}
+		if labelGrantsDigest != (auth.Digest{}) {
+			fmt.Fprintf(output,
+				"OIDC label grants are in force (%s): %d grant(s); a label "+
+					"no grant names is visible to nobody\n",
+				labelGrantsDigest, labelGrantCount)
+		} else {
+			fmt.Fprintf(output,
+				"No OIDC label grants are configured: labelled content is "+
+					"visible to nobody\n")
 		}
 	}
 	if *backend == "embedded" {

@@ -644,8 +644,11 @@ func (a *oidcAuthenticator) mintApprover(
 		AuthorizationDomain: workspaceAuthorizationDomain,
 		AllowedOperations:   oidcApproverOperations,
 		PermittedSourceIDs:  [][]byte{workspaceSourceID},
-		PermittedPolicyIDs:  [][]byte{workspaceGrantPolicyID},
-		PolicyGeneration:    workspacePolicyGeneration,
+		// No label grants (#570), whatever the token's claims say: an
+		// approver reads nothing, so a label would be clearance with no use
+		// but to widen what a future approver operation could see.
+		PermittedPolicyIDs: [][]byte{workspaceGrantPolicyID},
+		PolicyGeneration:   workspacePolicyGeneration,
 		AuthenticationExpires: expiration.Time.UTC().Add(
 			a.authenticationLeeway),
 		RequestID: requestID,

@@ -76,11 +76,22 @@ For an explicitly configured process identity, omit `-dev-auth` and provide:
 | `-identity-generation` | `SHOAL_MCP_IDENTITY_GENERATION` |
 | `-identity-lifetime` | `SHOAL_MCP_IDENTITY_LIFETIME` |
 | `-identity-audit-purpose` | `SHOAL_MCP_IDENTITY_AUDIT_PURPOSE` |
+| `-identity-labels` | `SHOAL_MCP_IDENTITY_LABELS` |
 
 Subject, actor, domain, source, and policy are required. The default explicit
 operation set is read-only:
 `list,read,neighborhood,retrieve,validation`. Generation defaults to `1`, and
 each decision lifetime defaults to `15m`.
+
+`-identity-labels` grants the process identity free-form visibility labels
+(#570): a comma-separated list of `<source>=<label>`, where the source must be
+the identity's own source exactly (with `-dev-auth`,
+`shoal-explore-web/workspace`). A labelled document is readable only by a
+principal holding every one of its labels on its source, so without this flag
+the identity can neither read nor ingest labelled content. The labels add
+policy grants only; operations are unchanged. A label policy can never be
+named through `-identity-policy`, which refuses the whole `shoal.label/`
+namespace.
 
 Generic interaction evidence is reauthorized with the legacy `retrieve`
 operation. An explicit identity therefore needs `retrieve` for tools whose

@@ -1383,7 +1383,7 @@ func TestSelectAuthenticatorOIDCAllowsNonLoopbackAndRejectsConflict(t *testing.T
 		readerClaimValues:  []string{"reader"},
 	}
 	for _, address := range []string{"0.0.0.0:8080", "10.0.0.5:8080", "[::]:8080"} {
-		authenticator, err := selectAuthenticator(false, config, address, time.Now)
+		authenticator, err := selectAuthenticator(false, "", config, address, time.Now)
 		if err != nil {
 			t.Fatalf("OIDC authenticator refused on %s: %v", address, err)
 		}
@@ -1392,7 +1392,7 @@ func TestSelectAuthenticatorOIDCAllowsNonLoopbackAndRejectsConflict(t *testing.T
 		}
 	}
 	if authenticator, err := selectAuthenticator(
-		true, config, "127.0.0.1:8080", time.Now,
+		true, "", config, "127.0.0.1:8080", time.Now,
 	); err == nil || authenticator != nil {
 		t.Fatal("-dev-auth and OIDC were not rejected as mutually exclusive")
 	}
@@ -1406,7 +1406,7 @@ func TestOIDCAuthenticatorNeverGetsDevelopmentBackfill(t *testing.T) {
 		readerClaimValues:  []string{"reader"},
 	}
 	authenticator, err := selectAuthenticator(
-		false, config, "0.0.0.0:8080", time.Now)
+		false, "", config, "0.0.0.0:8080", time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}

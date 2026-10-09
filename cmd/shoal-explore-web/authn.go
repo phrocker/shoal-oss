@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/webapi"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -107,17 +108,37 @@ var workspaceOperations = []auth.Operation{
 type developmentAuthenticator struct {
 	clock    func() time.Time
 	lifetime time.Duration
+	// labels are the label policy IDs -dev-auth-labels grants (#570). They
+	// add visibility and nothing else: the operations and the source are the
+	// fixed development ones whatever is listed here.
+	labels [][]byte
 }
 
 func newDevelopmentAuthenticator(
 	clock func() time.Time,
 ) (*developmentAuthenticator, error) {
+	return newDevelopmentAuthenticatorWithLabels(clock, "")
+}
+
+// newDevelopmentAuthenticatorWithLabels parses -dev-auth-labels: a
+// comma-separated list of <source>=<label>, where the source must be the
+// workspace source exactly as configured. '=' is the separator because the
+// label charset excludes it and includes ':'; see
+// authorized.LabelGrantSeparator.
+func newDevelopmentAuthenticatorWithLabels(
+	clock func() time.Time, labels string,
+) (*developmentAuthenticator, error) {
 	if clock == nil {
 		return nil, shoal.NewError(shoal.ErrorInvalidArgument, "clock is required")
+	}
+	ids, err := authorized.ParseLabelGrantList(labels, [][]byte{workspaceSourceID})
+	if err != nil {
+		return nil, fmt.Errorf("-dev-auth-labels: %w", err)
 	}
 	return &developmentAuthenticator{
 		clock:    clock,
 		lifetime: developmentSessionLifetime,
+		labels:   ids,
 	}, nil
 }
 
@@ -145,13 +166,14 @@ func (a *developmentAuthenticator) mint(
 	if err != nil {
 		return auth.Decision{}, err
 	}
+	policies := append([][]byte{workspaceGrantPolicyID}, a.labels...)
 	return auth.NewDecision(auth.DecisionConfig{
 		Subject:               developmentSubject,
 		Actor:                 developmentActor,
 		AuthorizationDomain:   workspaceAuthorizationDomain,
 		AllowedOperations:     workspaceOperations,
 		PermittedSourceIDs:    [][]byte{workspaceSourceID},
-		PermittedPolicyIDs:    [][]byte{workspaceGrantPolicyID},
+		PermittedPolicyIDs:    policies,
 		PolicyGeneration:      workspacePolicyGeneration,
 		AuthenticationExpires: a.clock().Add(a.lifetime),
 		RequestID:             requestID,
@@ -328,10 +350,18 @@ func listenAddressIsLoopback(address string) bool {
 // silent preference of one over the other.
 func selectAuthenticator(
 	developmentAuth bool,
+	developmentLabels string,
 	oidc oidcConfig,
 	address string,
 	clock func() time.Time,
 ) (webapi.Authenticator, error) {
+	if developmentLabels != "" && !developmentAuth {
+		return nil, fmt.Errorf(
+			"refusing to serve %s: -dev-auth-labels grants labels to the "+
+				"-dev-auth principal and means nothing without -dev-auth; "+
+				"OIDC label grants come from -oidc-label-grants-file",
+			address)
+	}
 	oidcConfigured := oidc.configured()
 	if developmentAuth && oidcConfigured {
 		return nil, fmt.Errorf(
@@ -373,5 +403,5 @@ func selectAuthenticator(
 			address, developmentSubject,
 		)
 	}
-	return newDevelopmentAuthenticator(clock)
+	return newDevelopmentAuthenticatorWithLabels(clock, developmentLabels)
 }

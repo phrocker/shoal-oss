@@ -170,6 +170,7 @@ closed. Authentication never falls back to anonymous or development authority.
 | `-oidc-fleet-values` / `SHOAL_OIDC_FLEET_VALUES` | Comma-separated claim values granting Fleet control-plane access: agent register/heartbeat/revoke, delegation for child-agent registration, dispatch/invoke, subscription create/delete/deliver, and event publication. |
 | `-oidc-approver-mapping-file` / `SHOAL_OIDC_APPROVER_MAPPING_FILE` | Operator file (`shoal.approvers/v1`) mapping OIDC humans on a dedicated approver audience to `action_approve` and nothing else. Without it no token may approve. Requires access tokens that carry `azp`, and either an issuer whose discovery states `subject_types_supported: ["public"]` only (expected: Auth0; Okta with a custom `azp` claim) or `-oidc-identity-claim` (Entra, Keycloak); startup and minting enforce both, so a non-qualifying issuer is refused. See `docs/approval.md`, "The OIDC approver mapping". |
 | `-oidc-identity-claim` / `SHOAL_OIDC_IDENTITY_CLAIM` | A stable identity claim (#526), as a JSON array of path segments such as `'["oid"]'`. Requesters and approvers are then named `oidcid:<issuer>#<tag>#<value>` (the tag is a digest of the claim path) on both branches, read by one derivation (present, a string of 1–256 bytes, no control characters, never trimmed), and the approver mapping's public-subjects check is waived. The approver mapping must restate it as `identity_claim`. Refused: `["sub"]`; a last segment that does not name one human stably — editable and profile fields (`email`, `preferred_username`, `upn`, `unique_name`, `name`, `nickname`, `given_name`, `family_name`, `locale`, `picture`, `website`, `zoneinfo`), per-session or per-token claims (`sid`, `session_state`, `jti`, `nonce`, `at_hash`, `c_hash`, `auth_time`, `iat`, `exp`, `nbf`, `acr`, `amr`) and per-client claims (`azp`, `client_id`, `cid`); never choose a path under a user-editable parent either; an issuer containing `#`; combination with a non-default `-oidc-subject-claim`, legacy Entra mode, `-oidc-actor-claim` or `-oidc-delegation-claim`; an issuer path naming `common`, `organizations` or `{tenantid}`. Use `oid` on Entra's tenant issuer, or a Keycloak User Property `id` mapper on a client scope shared by both clients. See `docs/approval.md`, "Supported issuers". |
+| `-oidc-label-grants-file` / `SHOAL_OIDC_LABEL_GRANTS_FILE` | Operator file (`shoal.label-grants/v1`) granting free-form visibility labels, one source at a time, to claim values. A grant adds visibility to a token a reader, contributor or Fleet mapping already grants, and nothing else. Without it no token holds any label, so labelled content is visible to nobody. See "Granting visibility labels" below. |
 | `-oidc-identity-scheme-migrate` | One-shot identity scheme switch: the digest (64 lowercase hex digits) of the scheme recorded for `-oidc-issuer` that this rollout replaces, as the startup refusal prints it. Every OIDC replica records its scheme (issuer, claim path, identity format) in the coordination store and refuses to start when it differs from the recorded one; with this flag a replica starts only if the recorded scheme is the one named (it then records its own) or already its own. Remove it after the rollout. Changing `-oidc-issuer` (Entra v1 to v2, a hostname move) is a scheme switch too and needs this flag. Upgrade every replica to this build on the current scheme before switching, and never roll back to a build before #553 across a switch. A request made under the previous scheme can then only expire. See `docs/approval.md`, "Switching an issuer's identity scheme". |
 
 At least one reader, contributor, or Fleet value is required. A missing,
@@ -197,6 +198,91 @@ one human's value and another human's `sub` the same identity. For a stable,
 cross-client identity use `-oidc-identity-claim` instead, which has a
 namespace of its own (`oidcid:`) and cannot be combined with a non-default
 subject claim.
+
+### Granting visibility labels
+
+A document ingested with free-form visibility labels (`metadata["shoal.visibility"]`,
+for example `secret` or `secret&pii`) is registered under its source's policy
+**and** one policy per label, on that source (#570). Holding the source is no
+longer enough to read it: a reader needs every label as well. Labels are
+granted only by the operator, in a file; never by ATPL, so a registrant cannot
+grant itself clearance, and never by the workspace role mappings.
+
+```json
+{
+  "version": "shoal.label-grants/v1",
+  "issuer": "https://issuer.example.com/",
+  "claim": ["groups"],
+  "max_values": 64,
+  "grants": {
+    "secret-readers": [
+      {"source": "shoal-explore-web/workspace", "label": "secret"}
+    ],
+    "privacy-office": [
+      {"source": "shoal-explore-web/workspace", "label": "secret"},
+      {"source": "shoal-explore-web/workspace", "label": "pii"}
+    ]
+  }
+}
+```
+
+- **What a grant gives.** A token whose `claim` holds a value listed under
+  `grants` is given the label policies listed for that value, added to its
+  `PermittedPolicyIDs`. That is all it gives. It adds no operation (a reader
+  holding `secret` still cannot ingest), no source, and does nothing for a
+  token no reader, contributor or Fleet value maps: such a token is denied as
+  before, label or not. Approver tokens get no labels, whatever their claims
+  say: the approver branch mints `action_approve` and nothing else, and approve
+  reads nothing. Executor-bound decisions (#391) are not minted by this
+  authenticator and get none either.
+- **Per source.** A grant is a (source, label) pair, and a label policy names
+  its source. A grant for (A, `secret`) does not open `secret` content in
+  source B, even to a principal that also holds B. In this workspace every
+  grant names `shoal-explore-web/workspace`, the one source it configures; any
+  other source is refused at startup.
+- **Fail closed.** A label no grant names is visible to nobody. That includes
+  the principal that ingested it: ingest is refused unless the ingester holds
+  every label it writes, and so is any later relabel, which needs both the
+  old labels and the new. The file is read once, at startup; after a
+  restart without a grant, its principals stop seeing the content on their
+  next request.
+- **Matching.** `claim` is a path of literal object keys, as in the approver
+  mapping (`["realm_access", "roles"]` is the nested claim, never a key
+  containing a dot). The claim may be a string or an array of at most
+  `max_values` strings; values are compared byte for byte, never trimmed or
+  case-folded. An absent, null or empty claim grants no labels. Any other
+  shape, or more than `max_values` values, refuses the token.
+- **Refused at startup.** Unknown fields at any depth, duplicate keys,
+  trailing data, a file over 256 KiB, a version other than
+  `shoal.label-grants/v1`, an `issuer` that is not `-oidc-issuer` byte for
+  byte, a source that is not configured, a label outside the label charset
+  (`A-Z a-z 0-9 _ . : -`, at most 256 bytes, never folded: `secret` and
+  `Secret` are different labels), a label policy ID over 128 bytes, a pair
+  listed twice for one value, more than 256 claim values, and more than 1024
+  grants in all. A grant can never name the reserved label namespace
+  (`shoal.label/v1/!…`), which is how untranslatable labels are kept from
+  everyone.
+- **Digest.** Startup prints `OIDC label grants are in force (<digest>)`.
+  The digest identifies the file's meaning (it ignores ordering), so operators
+  can confirm every replica serves the same grants. It is provenance only: it
+  is not part of the policy generation or of any decision's fingerprint. A
+  grant change already changes the `PermittedPolicyIDs`, and therefore the
+  authorization fingerprint, of exactly the principals whose grants changed;
+  folding the file's digest into every decision would instead invalidate every
+  pinned decision on any edit.
+
+For local development, `-dev-auth-labels` grants labels to the `-dev-auth`
+principal: a comma-separated list of `<source>=<label>`, with the source
+exactly as configured, for example
+`-dev-auth-labels shoal-explore-web/workspace=secret`. `=` separates source
+from label because the label charset excludes it (and includes `:`, which
+therefore cannot). Without it the development principal holds no label and
+can neither ingest nor read labelled content. `shoal-mcp` takes the same form
+in `-identity-labels` (`docs/mcp-stdio.md`).
+
+Neither the browser upload route nor the MCP ingest tool lets a caller attach
+a visibility label today; labelled content arrives through programmatic
+ingest (`authorized.Client.Ingest`) or is already in the corpus.
 
 ### Discovery, keys, and validation options
 
@@ -520,6 +606,7 @@ The refusals:
 | one of `readerValues` / `contributorValues` / `fleetValues` | A claim mapped to nothing denies every authenticated caller, which is fail-closed but indistinguishable from an outage. |
 | `explorer.replicas` above 1 | The corpus, workspace settings and policy catalog share one state root on a `ReadWriteOnce` volume, with no coordination protocol between two processes over it. |
 | a remote chat or embedding provider without a credential Secret | The credential is read at request time and nothing projects it into the pod. |
+| `explorer.auth.oidc.labelGrants` that is not a map, with a version other than `shoal.label-grants/v1`, an `issuer` other than `explorer.auth.oidc.issuer`, no grants, a grant on a source other than `shoal-explore-web/workspace`, or a label outside the label charset | The workspace refuses each of these at startup. |
 | any value still containing `REPLACE_ME` | A placeholder is not configuration. |
 
 Two chart choices follow from this document rather than from Kubernetes
@@ -542,6 +629,12 @@ must restate it as `identity_claim`. `explorer.auth.oidc.identitySchemeMigrateFr
 renders `-oidc-identity-scheme-migrate` with the digest of the recorded scheme
 being replaced; it can move the record only once, so unset it after the
 rollout (`docs/approval.md`).
+
+The label grants follow the same pattern. `explorer.auth.oidc.labelGrants`
+holds the `shoal.label-grants/v1` document as a map; the chart renders it as
+JSON into a ConfigMap it owns (`<release>-label-grants`), mounts it read-only
+at `/etc/shoal/label-grants`, passes `-oidc-label-grants-file`, and puts its
+checksum on the pod template so a changed grant rolls the pod.
 
 Probes address the health port below, never the workspace port.
 
