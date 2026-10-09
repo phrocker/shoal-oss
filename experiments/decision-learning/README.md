@@ -85,6 +85,12 @@ The audit plan is a replay demonstration (12 random plus 12 targeted), not a
 claim that it selected the already collected labels. Inference margin distance
 is a targeting heuristic, not calibrated uncertainty.
 
+The sealed `influence.py` primitive measures leave-one-out score deltas and
+decision flips between two explicitly identified artifacts on the same test
+IDs. It is a structural sensitivity report only: it makes no truth, quality,
+causal, or machine-unlearning claim, and cannot change a serving or promotion
+pointer.
+
 ```sh
 python3 -m unittest discover -s experiments/decision-learning -v
 python3 experiments/decision-learning/learning.py dataset \
