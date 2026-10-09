@@ -424,8 +424,20 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"read-only at /api/v1/ontology; environment fallback "+
 			"SHOAL_ONTOLOGY_FILE",
 	)
+	listUntranslatable := flags.Bool(
+		"list-untranslatable-labels", false,
+		"Print the startup label migration's report of documents whose "+
+			"visibility labels could not be translated into label policies "+
+			"(and so are readable by nobody), from the policy catalog that "+
+			"-state-dir, -data and -policy-dir select, then exit without "+
+			"serving. Run it with the workspace stopped (#570)",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *listUntranslatable {
+		_, policyDir := resolveWorkspacePaths(*stateDir, *data, *policyDirFlag)
+		return listUntranslatableLabels(ctx, output, policyDir)
 	}
 	executors, err := newConfiguredFleetExecutors(
 		splitCommaList(*fleetExecutorRefs))
@@ -909,6 +921,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		}
 	}
 	if *backend == "embedded" {
+		printLabelMigration(output, opened.labelMigration)
 		if activeOntology != nil {
 			fmt.Fprintf(
 				output,
@@ -1121,7 +1134,9 @@ type openedService struct {
 	teamOverview  webapi.TeamOverviewProvider
 	client        *authorized.Client
 	backfilled    int
-	close         func()
+	// labelMigration is what the startup label migration did (#570).
+	labelMigration labelMigrationOutcome
+	close          func()
 }
 
 var (
@@ -1218,6 +1233,16 @@ func openService(
 		client, err := authorizedClient(
 			corpus, store, config.resolver, generationReader,
 			config.clock, config.mosaic)
+		if err != nil {
+			store.Close()
+			embedded.Close()
+			return closed, err
+		}
+		// Documents labelled before labels were enforced still carry the
+		// bare source rule, readable by every holder of the source, until
+		// this narrows them (#570). It runs before anything is served, and
+		// any failure refuses to start.
+		labelMigration, err := runLabelMigration(ctx, client)
 		if err != nil {
 			store.Close()
 			embedded.Close()
@@ -1493,17 +1518,18 @@ func openService(
 			return closed, err
 		}
 		return openedService{
-			service:       service,
-			settings:      settingsProvider,
-			fleetRegistry: boundFleetRegistry,
-			fleetDispatch: boundFleetDispatch,
-			fleetEvents:   fleetEvents,
-			admission:     boundAdmissionService,
-			approvals:     boundApprovalService,
-			attestation:   optionalAttestation(attestationService),
-			teamOverview:  teamOverview,
-			client:        client,
-			backfilled:    backfilled,
+			service:        service,
+			settings:       settingsProvider,
+			fleetRegistry:  boundFleetRegistry,
+			fleetDispatch:  boundFleetDispatch,
+			fleetEvents:    fleetEvents,
+			admission:      boundAdmissionService,
+			approvals:      boundApprovalService,
+			attestation:    optionalAttestation(attestationService),
+			teamOverview:   teamOverview,
+			client:         client,
+			backfilled:     backfilled,
+			labelMigration: labelMigration,
 			close: func() {
 				settingsStore.Close()
 				store.Close()

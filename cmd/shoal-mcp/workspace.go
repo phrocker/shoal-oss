@@ -21,8 +21,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/labelmigration"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
@@ -169,6 +171,12 @@ func openWorkspace(
 	if err != nil {
 		return nil, nil, noClose, errors.Join(err, closeWorkspace())
 	}
+	// Documents labelled before labels were enforced carry the bare source
+	// rule until this narrows them (#570). It runs before the first tool
+	// call is served, and any failure refuses to start.
+	if err := migrateLabels(ctx, client, config.diagnostics); err != nil {
+		return nil, nil, noClose, errors.Join(err, closeWorkspace())
+	}
 	service, err := webapi.NewEmbeddedService(client)
 	if err != nil {
 		return nil, nil, noClose, errors.Join(err, closeWorkspace())
@@ -208,4 +216,56 @@ func stringsBlank(value string) bool {
 		}
 	}
 	return true
+}
+
+// migrateLabels runs the startup label migration (#570) and reports its
+// counts and untranslatable documents on diagnostics. It fails closed.
+func migrateLabels(
+	ctx context.Context,
+	client *authorized.Client,
+	diagnostics io.Writer,
+) error {
+	if diagnostics == nil {
+		diagnostics = io.Discard
+	}
+	// One of the two mint sites; see TestLabelMigrationCapabilityMintSites
+	// in cmd/shoal-explore-web.
+	record, ran, err := client.MigrateLabelledDocuments(
+		ctx, labelmigration.NewCapability())
+	if err != nil {
+		return fmt.Errorf(
+			"refusing to serve: the startup label migration (#570) failed, so "+
+				"documents labelled before labels were enforced could still be "+
+				"readable by every holder of their source: %w", err)
+	}
+	// stderr stays silent unless the migration changed something or left
+	// documents unreadable: a stdio launcher may treat any output as noise.
+	if !ran {
+		if len(record.Untranslatable) > 0 {
+			fmt.Fprintf(diagnostics,
+				"shoal-mcp: label migration v%d already applied; %d "+
+					"document(s) are unreadable until relabelled\n",
+				record.Version, len(record.Untranslatable))
+		}
+		return nil
+	}
+	if record.Tightened == 0 && record.HistoricalTightened == 0 &&
+		len(record.Untranslatable) == 0 {
+		return nil
+	}
+	fmt.Fprintf(diagnostics,
+		"shoal-mcp: label migration v%d: %d document(s), %d tightened, %d "+
+			"already labelled, %d historical revision(s) narrowed, %d "+
+			"untranslatable\n",
+		record.Version, record.Documents, record.Tightened,
+		record.AlreadyTightened, record.HistoricalTightened,
+		len(record.Untranslatable))
+	for _, entry := range record.Untranslatable {
+		fmt.Fprintf(diagnostics,
+			"shoal-mcp: unreadable until relabelled: document %s revision %s "+
+				"source %q label %s: %s\n",
+			entry.DocumentID, entry.RevisionID, entry.SourceURI,
+			entry.EscapedLabel, entry.Reason)
+	}
+	return nil
 }
