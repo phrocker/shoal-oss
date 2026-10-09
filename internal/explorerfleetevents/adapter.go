@@ -222,7 +222,12 @@ type eventWire struct {
 	Evidence                      []evidenceWire
 	ConsumedEvidence              []evidenceReferenceWire
 	CitedEvidence                 []evidenceReferenceWire
-	OccurredAt                    time.Time
+	// Visibility expressions for the exact evidence groups, index for index
+	// (#562). Absent on an event written before the field existed, which
+	// decodes as an all-unlabelled group.
+	ConsumedEvidenceVisibility [][]string `json:",omitempty"`
+	CitedEvidenceVisibility    [][]string `json:",omitempty"`
+	OccurredAt                 time.Time
 }
 
 func subscriptionToWire(value fleetevents.Subscription) subscriptionWire {
@@ -271,8 +276,25 @@ func eventToWire(value fleetevents.Event) eventWire {
 		Evidence:         evidence,
 		ConsumedEvidence: evidenceReferencesToWire(value.ConsumedEvidence),
 		CitedEvidence:    evidenceReferencesToWire(value.CitedEvidence),
-		OccurredAt:       value.OccurredAt,
+		ConsumedEvidenceVisibility: visibilityGroupCopy(
+			value.ConsumedEvidenceVisibility),
+		CitedEvidenceVisibility: visibilityGroupCopy(
+			value.CitedEvidenceVisibility),
+		OccurredAt: value.OccurredAt,
 	}
+}
+
+func visibilityGroupCopy(values [][]string) [][]string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([][]string, len(values))
+	for i, value := range values {
+		if len(value) > 0 {
+			result[i] = append([]string(nil), value...)
+		}
+	}
+	return result
 }
 
 func (value eventWire) domain() fleetevents.Event {
@@ -299,7 +321,11 @@ func (value eventWire) domain() fleetevents.Event {
 		Evidence:         evidence,
 		ConsumedEvidence: evidenceReferencesFromWire(value.ConsumedEvidence),
 		CitedEvidence:    evidenceReferencesFromWire(value.CitedEvidence),
-		OccurredAt:       value.OccurredAt,
+		ConsumedEvidenceVisibility: visibilityGroupCopy(
+			value.ConsumedEvidenceVisibility),
+		CitedEvidenceVisibility: visibilityGroupCopy(
+			value.CitedEvidenceVisibility),
+		OccurredAt: value.OccurredAt,
 	}
 }
 

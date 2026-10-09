@@ -409,7 +409,12 @@ carry the producer generation and an opaque hashed transition identity.
 Lifecycle publication reauthorizes the original exact `dispatch` or `invoke`
 operation and retains complete representable evidence. Subscription delivery
 uses the dedicated `subscription_deliver` operation and rechecks the shared
-policy-generation authority during long polls.
+policy-generation authority during long polls. Delivery also drops, per
+subscriber, every evidence reference whose visibility labels that subscriber
+does not hold, whole and with no count (#562, under #398's rule); the stored
+event keeps them. The host supplies the label evaluator through
+`fleetevents.Config.EvidenceVisibility`; until it does, labelled evidence is
+withheld from every subscriber, exactly as on the dispatch read paths (#369).
 
 Fleet event cursors are AES-GCM-protected, restart-stable, and scoped to the
 subscription and authorization identity. Event and subscription storage use

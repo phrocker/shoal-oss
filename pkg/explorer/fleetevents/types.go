@@ -98,7 +98,21 @@ type Event struct {
 	Evidence           []Evidence
 	ConsumedEvidence   []interaction.EvidenceReference
 	CitedEvidence      []interaction.EvidenceReference
-	OccurredAt         time.Time
+	// ConsumedEvidenceVisibility and CitedEvidenceVisibility carry, index for
+	// index, the visibility expression each exact evidence reference was
+	// recorded under. Empty means every reference in the group is
+	// unlabelled; otherwise the length equals the group's, and an empty
+	// entry marks one unlabelled reference.
+	//
+	// They are on the durable event so the delivery-time check can ask each
+	// *subscriber* whether it holds a reference's labels (#562). The event
+	// is the durable record of the transition and stays complete; delivery
+	// drops, per subscriber, every reference whose labels the subscriber does
+	// not hold, together with its expression here and any authorization join
+	// entry that points at it.
+	ConsumedEvidenceVisibility [][]string
+	CitedEvidenceVisibility    [][]string
+	OccurredAt                 time.Time
 }
 
 // PublishRequest contains the immutable event, an idempotency token, and the
@@ -254,6 +268,23 @@ func cloneEvent(event Event) Event {
 	result.Evidence = cloneEvidence(event.Evidence)
 	result.ConsumedEvidence = cloneEvidenceReferences(event.ConsumedEvidence)
 	result.CitedEvidence = cloneEvidenceReferences(event.CitedEvidence)
+	result.ConsumedEvidenceVisibility = cloneVisibilityGroup(
+		event.ConsumedEvidenceVisibility)
+	result.CitedEvidenceVisibility = cloneVisibilityGroup(
+		event.CitedEvidenceVisibility)
+	return result
+}
+
+func cloneVisibilityGroup(values [][]string) [][]string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([][]string, len(values))
+	for i, value := range values {
+		if len(value) > 0 {
+			result[i] = append([]string(nil), value...)
+		}
+	}
 	return result
 }
 
@@ -395,6 +426,18 @@ func normalizeEvent(event Event, requireSequence bool) (Event, error) {
 		return Event{}, err
 	}
 	result.ConsumedEvidence, result.CitedEvidence = consumed, cited
+	for _, group := range []struct {
+		references []interaction.EvidenceReference
+		visibility [][]string
+	}{
+		{consumed, result.ConsumedEvidenceVisibility},
+		{cited, result.CitedEvidenceVisibility},
+	} {
+		if err := validateEvidenceVisibility(
+			group.references, group.visibility); err != nil {
+			return Event{}, err
+		}
+	}
 	if err := validateAuthorizationReferences(
 		result.Evidence, consumed, cited); err != nil {
 		return Event{}, err
@@ -407,6 +450,37 @@ func normalizeEvent(event Event, requireSequence bool) (Event, error) {
 		return Event{}, shoal.NewError(shoal.ErrorInvalidArgument, "event occurrence time must be UTC")
 	}
 	return result, nil
+}
+
+// validateEvidenceVisibility checks that a group's visibility expressions
+// align with its references and are each canonical, the same rule
+// fleet.validateEvidence applies to an action's evidence.
+func validateEvidenceVisibility(
+	references []interaction.EvidenceReference, visibility [][]string,
+) error {
+	if len(visibility) == 0 {
+		return nil
+	}
+	if len(visibility) != len(references) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"event evidence visibility does not align with its references")
+	}
+	for _, expression := range visibility {
+		if len(expression) == 0 {
+			continue
+		}
+		normalized, err := interaction.Conjoin(expression)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(normalized, expression) {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"event evidence visibility must be canonical")
+		}
+	}
+	return nil
 }
 
 func compareEvidence(left, right Evidence) int {
