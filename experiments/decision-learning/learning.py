@@ -195,6 +195,59 @@ def evaluate(ledger, data, policy, candidate, predictions):
                 limitation='Relevance assessments are not defect truth. No quality-parity or exclusion authorization.')
 
 
+def promote_candidate(candidate, evaluation, artifact, approval, predecessor_release=None):
+    """Create an explicit active release after a clean shadow evaluation.
+
+    This is an append-only record constructor. It does not mutate a serving
+    pointer or authenticate the approval; an authorized service must perform
+    those operations around this structural check.
+    """
+    verify(candidate, 'candidate')
+    verify(evaluation, 'promotion_record')
+    verify(artifact, 'candidate_artifact')
+    verify(approval, 'promotion_approval')
+    if evaluation['candidate_id'] != candidate['id'] or artifact['candidate_id'] != candidate['id']:
+        raise ValueError('candidate lineage mismatch')
+    if artifact['evaluation_id'] != evaluation['id'] or artifact['dataset_id'] != candidate['dataset_id']:
+        raise ValueError('artifact evaluation lineage mismatch')
+    if not artifact.get('runtime_digest') or not artifact.get('model_digest') or artifact['model_digest'] != candidate.get('model_digest'):
+        raise ValueError('artifact model mismatch')
+    if evaluation['disposition'] != 'shadow_candidate' or evaluation.get('reasons'):
+        raise ValueError('candidate did not pass shadow evaluation')
+    if approval.get('approved') is not True or not approval.get('owner') or approval.get('candidate_id') != candidate['id'] or approval.get('evaluation_id') != evaluation['id']:
+        raise ValueError('promotion approval is not bound')
+    predecessor_release_id = None
+    if predecessor_release is not None:
+        verify(predecessor_release, 'model_release')
+        if predecessor_release['state'] != 'active' or any(predecessor_release[field] != candidate[field] for field in ('dataset_id', 'evaluation_policy_id')) or predecessor_release['ledger_id'] != evaluation['ledger_id']:
+            raise ValueError('invalid predecessor release')
+        predecessor_release_id = predecessor_release['id']
+    return seal('model_release', state='active', candidate_id=candidate['id'], artifact_id=artifact['id'],
+                evaluation_id=evaluation['id'], dataset_id=candidate['dataset_id'],
+                evaluation_policy_id=candidate['evaluation_policy_id'], ledger_id=evaluation['ledger_id'],
+                predecessor_release_id=predecessor_release_id, rollback_of=None,
+                approval_id=approval['id'], limitation='Structural release record; serving pointer mutation is external.')
+
+
+def rollback_release(active_release, prior_release, approval):
+    """Emit an immutable rollback release; never overwrite the active record."""
+    verify(active_release, 'model_release')
+    verify(prior_release, 'model_release')
+    verify(approval, 'rollback_approval')
+    if active_release['state'] != 'active' or prior_release['state'] != 'active':
+        raise ValueError('rollback requires active releases')
+    for field in ('dataset_id', 'evaluation_policy_id', 'ledger_id'):
+        if active_release[field] != prior_release[field]:
+            raise ValueError('rollback lineage mismatch')
+    if approval.get('approved') is not True or not approval.get('owner') or approval.get('active_release_id') != active_release['id'] or approval.get('prior_release_id') != prior_release['id']:
+        raise ValueError('rollback approval is not bound')
+    return seal('model_release', state='active', candidate_id=prior_release['candidate_id'], artifact_id=prior_release['artifact_id'],
+                evaluation_id=prior_release['evaluation_id'], dataset_id=prior_release['dataset_id'],
+                evaluation_policy_id=prior_release['evaluation_policy_id'], ledger_id=prior_release['ledger_id'],
+                predecessor_release_id=active_release['id'], rollback_of=active_release['id'],
+                approval_id=approval['id'], limitation='Structural rollback record; serving pointer mutation is external.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['dataset', 'audit', 'evaluate'])
