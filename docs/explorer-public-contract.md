@@ -228,47 +228,78 @@ one compact vertex that can later be unfolded back into what it replaced.
 - Folding is an operator action, not part of serving an inference, so it never
   sits on the request latency path.
 
-### Output-label exposure (interim, #567 and #568)
+### Output labels on interaction and fold reads (#564, #567, #568)
 
-An interaction record and a fold store the output-policy label expression they
-require of a reader, for example `project-x&secret`. That is the session's
-`RequiredVisibility`, its conjoined `Visibility`, the `shoal.visibility`
-property on its derived nodes and edges, a fold's `Visibility`, and each fold
-member's `Visibility`. No read checks that expression against the reader yet,
-because an authorization decision carries no label set; the per-reader
-evaluator is #564. Records stay readable to any principal authorized on every
-source they touched, since team overview and provenance exist to show other
-principals' sessions.
+An interaction record and a fold store the output-policy label set they
+require of a reader. That is the session's `RequiredVisibility`, its conjoined
+`Visibility` expression, the `shoal.visibility` property on its derived nodes
+and edges, a fold's `Visibility`, and each fold member's `Visibility`. Every
+interaction and fold read of the authorized client evaluates it against the
+reader with the reader label evaluator (`authorized.LabelVisibility`):
+`InteractionRecord(s)`, `InteractionRecordsPage`, `Interaction(s)`,
+`InteractionSubgraph`, `Folds`, `FoldsPage`, `RehydrateFold`, and
+`FoldInteractions`. Team overview, the HTTP provenance API
+(`output_visibility`) and the MCP `shoal.provenance.*` tools all read through
+these calls, so they inherit it.
 
-Until #564 lands, the expression itself is shown **only to the principal that
-recorded it**:
+- **The evaluator.** A stored label set is a conjunction of structured grant
+  labels: `d:<domain>`, `s:<source>`, `g:<policy>:e:<epoch>`, `svc:<role>`.
+  A user decision may see it when its grants cover every term
+  (`auth.VisibilityPermittedForUser`; a grant at any epoch passes). A trusted
+  service additionally needs every term inside its configured ceiling
+  (`auth.VisibilityPermittedForService`, exact epochs), resolved per request
+  by a `CeilingResolver`; a service with no ceiling configured is refused
+  every labelled set. A free-form or malformed term is held by nobody and is
+  false. A resolver or ceiling-resolver failure is an error. There is no
+  cross-request cache and no change to `auth.Decision` or its fingerprint.
+- **Which labels.** A free-form ingest label such as `secret` is enforced as a
+  structured policy per (source, label) conjoined into the document's
+  AccessRule (#570). A producer derives a session's output restriction from
+  the `shoal.visibility` of the nodes it touched, which carries the free-form
+  form, so the authorized recorder replaces each free-form term with the grant
+  labels of the label policy that enforces it in the touched nodes' rules
+  before the record is written. A term no touched rule enforces is kept as it
+  is, which no reader holds.
+- **Records written before translation** carry free-form terms. Their touched
+  nodes are known, so a read translates them through the same mapping over
+  the nodes' current rules; that is exact, because those rules are what the
+  touched-source check already requires of the reader. A label no current
+  rule enforces (an untranslatable document, or a record whose producer named
+  a label no touched node carries) stays unsatisfiable: withheld from
+  everyone.
+- **Interactions.** A record whose output restriction the reader may not see
+  is `ObjectNotFound` on a point read and absent from every list. Records are
+  never partly withheld: one conjunction is stamped on every derived node and
+  edge, and turns carry no labels of their own.
+- **The expression.** It is returned exactly when the reader may see every
+  term it names. A reader who may see the record but not its whole expression
+  (a trusted service whose ceiling lacks a touched node's label, or a record
+  whose producer kept an output label off its restriction) receives the
+  expression cleared exactly as an unlabelled record stores it: empty string,
+  absent property, including the visibility digest and count. This replaces
+  the interim recorder-only rule of #574.
+- **Folds.** A fold is visible only when every member session is and the
+  reader may see the fold's own visibility, which conjoins every member's. A
+  fold cannot be partly unfolded, because its summary digest covers every
+  member, so a visible fold is returned unchanged. `FoldInteractions` refuses,
+  before writing, a fold its caller could not then read.
+- **No marker.** What a reader without the labels receives is byte-for-byte
+  what it would receive had the record never been written. No response
+  carries a per-record or per-response "filtered" marker or count (#398).
 
-- The authorized client withholds it on every interaction and fold read:
-  `InteractionRecord(s)`, `InteractionRecordsPage`, `Interaction(s)`,
-  `InteractionSubgraph`, `Folds`, `FoldsPage`, `RehydrateFold`, and the
-  result of `FoldInteractions`. Team overview, the HTTP provenance API
-  (`output_visibility`), and the MCP `shoal.provenance.*` tools all read
-  through these calls, so they inherit it.
-- "Recorded it" means the reader's authorization fingerprint equals the one
-  pinned into the record, the same identity that already gates tombstones,
-  zero-hit records and exact-retry replay. A recorder whose grants have since
-  changed counts as another reader.
-- A fold spans several recorders. Its own expression is shown only to a reader
-  that recorded every member; each member's label set is shown only to that
-  member's recorder.
-- A withheld field is set exactly as a record with no labels stores it (empty
-  string, nil list, absent property, including the visibility digest and
-  count that stand in for an over-long expression). A withheld record is
-  therefore indistinguishable from an unlabelled one, and no response carries
-  a per-record or per-response "filtered" marker. An empty `output_visibility`
-  does not mean public; the web UI shows nothing rather than "public".
-- Storage is unchanged, and the recorder still sees its labels.
+**Residuals.**
 
-**Residual.** Session, fold, node and edge IDs, digests, counts, and model and
-prompt provenance remain visible to every reader authorized on the touched
-sources, as does the existence of a session recorded under a stricter output
-policy. Only the label expression, the one part legible without other access,
-is withheld. Per-reader enforcement of the labels themselves is #564.
+- A reader holding the labels sees the record whoever recorded it; the
+  recorder sees it only while it still holds them.
+- The free-form form of a label stays in the expression, as provenance,
+  next to the structured terms, and is shown to readers permitted the whole
+  expression.
+- A trusted service whose role requires service visibility (every role but
+  `data_read` and `data_write`) sees a labelled set only when it also carries
+  that role's `svc:<role>` term, as at the tablet. No record does, so such a
+  service, an executor worker included, sees no labelled stored record.
+  `shoal-explore-web` mints no trusted-service decision and configures no
+  ceiling.
 
 ### Cross-session provenance traversal
 

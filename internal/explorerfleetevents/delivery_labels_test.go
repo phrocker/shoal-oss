@@ -21,6 +21,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/document"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
@@ -29,39 +30,60 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// subjectLabels is a test evaluator implementing the one visibility seam.
-// It answers from the real auth.Decision bound to ctx, so it can only answer
-// for whoever is asking at the moment it is asked — which is what makes
-// publish-time evaluation (the publisher asking) distinguishable from
-// delivery-time evaluation (each subscriber asking).
-type subjectLabels struct {
-	resolver auth.Resolver
-	holds    map[shoal.ID][]string
+// realLabels is the production reader label evaluator (#564). It answers
+// from the real auth.Decision bound to ctx, so it can only answer for whoever
+// is asking at the moment it is asked — which is what makes publish-time
+// evaluation (the publisher asking) distinguishable from delivery-time
+// evaluation (each subscriber asking).
+func realLabels(now time.Time) func(auth.Resolver) evidencelabels.Visibility {
+	return func(resolver auth.Resolver) evidencelabels.Visibility {
+		evaluator, err := authorized.NewLabelVisibility(authorized.LabelVisibilityConfig{
+			Resolver: resolver, Clock: func() time.Time { return now },
+		})
+		if err != nil {
+			panic(err)
+		}
+		return evaluator
+	}
 }
 
-var _ evidencelabels.Visibility = subjectLabels{}
+var deliveryNow = time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
 
-func (s subjectLabels) VisibleToReader(
-	ctx context.Context, visibility []string,
-) (bool, error) {
-	decision, err := s.resolver.Resolve(ctx)
+// sourceB is the source of the labelled document, and its two free-form
+// labels are enforced as (source, label) policies (#570).
+var sourceB = []byte("source-b")
+
+func sourceBLabelPolicy(label string) []byte {
+	id, err := authorized.LabelPolicyID(sourceB, label)
 	if err != nil {
-		return false, err
+		panic(err)
 	}
-	held := s.holds[decision.Subject()]
-	for _, label := range visibility {
-		found := false
-		for _, candidate := range held {
-			if candidate == label {
-				found = true
-				break
-			}
+	return id
+}
+
+// secretVisibility is what the reference to B is recorded with: the grant
+// labels of B's secret and project-x label policies.
+func secretVisibility() []string {
+	var terms []string
+	for _, label := range []string{"secret", "project-x"} {
+		policy, err := auth.NewPolicy(auth.PolicyConfig{
+			AuthorizationDomain: []byte("domain"), SourceID: sourceB,
+			GrantPolicyID: sourceBLabelPolicy(label), Epoch: 1,
+		})
+		if err != nil {
+			panic(err)
 		}
-		if !found {
-			return false, nil
+		policyTerms, err := policy.VisibilityTerms()
+		if err != nil {
+			panic(err)
 		}
+		terms = append(terms, policyTerms...)
 	}
-	return true, nil
+	labels, err := interaction.Conjoin(terms)
+	if err != nil {
+		panic(err)
+	}
+	return labels
 }
 
 // The two references the executor records. The open one is from the action's
@@ -92,7 +114,7 @@ var (
 		},
 		NodeIDs: []shoal.ID{
 			"doc-b-hidden", "section-b-hidden", "span-b-hidden"},
-		Visibility: []string{"project-x", "secret"},
+		Visibility: secretVisibility(),
 	}
 )
 
@@ -105,7 +127,7 @@ func secretMarkers() []string {
 		"section-b-hidden", "span-b-hidden",
 		"project-x", "secret", "4711", "4799",
 	}
-	markers := append([]string(nil), raw...)
+	markers := append(append([]string(nil), raw...), secretVisibility()...)
 	for _, value := range raw[:5] {
 		markers = append(markers,
 			base64.RawURLEncoding.EncodeToString([]byte(value)),
@@ -134,7 +156,7 @@ func newLabelledDelivery(
 	if len(evidence) == 0 {
 		evidence = []fleet.EvidenceRef{openEvidence, secretEvidence}
 	}
-	now := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
+	now := deliveryNow
 	config := runtimeConfig(t.TempDir())
 	config = explorerfleet.ConfigureRuntime(config)
 	ConfigureRuntime(&config)
@@ -218,16 +240,23 @@ func bindSubject(
 	subject shoal.ID, operations ...auth.Operation,
 ) context.Context {
 	t.Helper()
+	// Authorized on the action's own source. The (domain, source, policy,
+	// object) check does not ask about labels — which is the whole of #562.
+	// Only "holder" is also granted B and its two label policies.
+	sources := [][]byte{[]byte("source")}
+	policies := [][]byte{[]byte("policy")}
+	if subject == "holder" {
+		sources = append(sources, sourceB)
+		policies = append(policies,
+			sourceBLabelPolicy("secret"), sourceBLabelPolicy("project-x"))
+	}
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: subject, Actor: "actor", ClientID: "client",
 		AuthorizationDomain: []byte("domain"),
 		AllowedOperations:   operations,
-		// Authorized on the action's own source only. Nothing here grants
-		// source B, and the (domain, source, policy, object) check does not
-		// ask about labels — which is the whole of #562.
-		PermittedSourceIDs: [][]byte{[]byte("source")},
-		PermittedPolicyIDs: [][]byte{[]byte("policy")},
-		PolicyGeneration:   1, AuthenticationExpires: now.Add(2 * time.Hour),
+		PermittedSourceIDs:  sources,
+		PermittedPolicyIDs:  policies,
+		PolicyGeneration:    1, AuthenticationExpires: now.Add(2 * time.Hour),
 		RequestID: "request", CorrelationID: "correlation",
 	})
 	if err != nil {
@@ -423,14 +452,10 @@ func assertNoSecretBytes(t *testing.T, path string, delivered []byte) {
 // identifiers, offsets, node IDs and anchors for a document in source B
 // labelled secret&project-x.
 func TestASubscriberReceivesOnlyEvidenceItsLabelsCover(t *testing.T) {
-	delivery := newLabelledDelivery(t, func(resolver auth.Resolver) evidencelabels.Visibility {
-		return subjectLabels{resolver: resolver, holds: map[shoal.ID][]string{
-			// The owner publishes every lifecycle event and holds neither
-			// label, so a filter applied at publish — under the publisher's
-			// identity — would withhold the reference from "holder" too.
-			"holder": {"project-x", "secret"},
-		}}
-	})
+	// The owner publishes every lifecycle event and holds neither label, so
+	// a filter applied at publish — under the publisher's identity — would
+	// withhold the reference from "holder" too.
+	delivery := newLabelledDelivery(t, realLabels(deliveryNow))
 
 	stored := storedCompletion(t, delivery)
 
@@ -503,7 +528,7 @@ func TestASubscriberReceivesOnlyEvidenceItsLabelsCover(t *testing.T) {
 			t.Fatalf("the durable event carries %v, want both references", got)
 		}
 		if !reflect.DeepEqual(after.ConsumedEvidenceVisibility,
-			[][]string{nil, {"project-x", "secret"}}) {
+			[][]string{nil, secretVisibility()}) {
 			t.Fatalf("the durable event's visibility = %#v",
 				after.ConsumedEvidenceVisibility)
 		}
@@ -606,11 +631,7 @@ func withoutSecret(t *testing.T, stored fleetevents.Event) fleetevents.Event {
 // marker of a withheld reference — a count, a placeholder, or the shape of
 // a visibility group that once held a label — not only one this test names.
 func TestAnOutsiderCannotTellEvidenceWasWithheld(t *testing.T) {
-	evaluator := func(resolver auth.Resolver) evidencelabels.Visibility {
-		return subjectLabels{resolver: resolver, holds: map[shoal.ID][]string{
-			"holder": {"project-x", "secret"},
-		}}
-	}
+	evaluator := realLabels(deliveryNow)
 	withheld := newLabelledDelivery(t, evaluator)
 	neverLabelled := newLabelledDelivery(t, evaluator, openEvidence)
 	for _, path := range deliveryPaths {

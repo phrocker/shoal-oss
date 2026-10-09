@@ -45,9 +45,11 @@ import (
 // Visibility answers whether the current reader holds the labels an evidence
 // reference carries.
 //
-// Implemented by the host, because the reader's authorizations are
-// established where the request is authenticated and are not carried on an
-// auth.Decision.
+// Implemented by the host that owns the request's decision:
+// authorized.LabelVisibility (#564) decides structured grant labels against
+// the reader's own auth.Decision and, for a trusted service, its configured
+// ceiling. A free-form label is held by nobody, which is why Translator
+// exists.
 type Visibility interface {
 	// VisibleToReader reports whether the reader behind ctx holds the labels
 	// in a visibility expression. An error is not a false answer: it is the

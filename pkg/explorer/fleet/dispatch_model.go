@@ -1158,9 +1158,8 @@ type DispatchConfig struct {
 // An alias, not a definition: the one definition lives in the leaf package
 // evidencelabels, which the event plane also uses for lifecycle delivery
 // (#562), so there is exactly one notion of "may this reader see this label"
-// for stored evidence. Implemented by the host, because the reader's
-// authorizations are established where the request is authenticated and are
-// not carried on an auth.Decision.
+// for stored evidence. Implemented by the host (authorized.LabelVisibility,
+// #564), which decides it from the reader's own decision.
 type EvidenceVisibility = evidencelabels.Visibility
 
 func (r ActionRecord) Validate() error {

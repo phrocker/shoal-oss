@@ -100,8 +100,13 @@ context at delivery, holds each reference's labels. That seam is
 `evidencelabels.Filter` rule the dispatch read paths use for #369
 (`fleet.DispatchConfig.EvidenceVisibility` is an alias of it). A reference the
 subscriber may not see is dropped whole — anchor, citation, node and edge IDs,
-offsets, label expression, and the authorization join entry naming it. Nil
-means no subscriber may see labelled evidence; unlabelled references are
+offsets, label expression, and the authorization join entry naming it. The
+host implementation is `authorized.LabelVisibility` (#564), which decides
+structured grant labels against the subscriber's own decision (and, for a
+trusted service, its configured ceiling); dispatch records each reference's
+labels as the structured terms of the (source, label) policies enforcing
+them (#570), so a subscriber holding them receives the reference unchanged.
+Nil means no subscriber may see labelled evidence; unlabelled references are
 delivered unchanged; an evaluator error fails the pull rather than reading as
 a redaction. The rule is evaluated at delivery, never at publish: the
 publisher is the wrong identity to ask, and the durable event — like the

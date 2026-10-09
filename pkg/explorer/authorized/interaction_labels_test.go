@@ -425,6 +425,36 @@ func TestTheExpressionIsShownOnlyToAReaderPermittedEveryTerm(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertSameBytes(t, "holder", own, stored)
+
+	// A fold conjoins its members' expressions and cannot be partly
+	// unfolded, so the fold of this session is the holder's alone even
+	// though its member session is not (#568). The outsider may not create
+	// it either.
+	_, err = f.Client.FoldInteractions(outsider, explorer.FoldRequest{
+		SessionIDs: []shoal.ID{wide}})
+	_, never := f.Client.FoldInteractions(outsider, explorer.FoldRequest{
+		SessionIDs: []shoal.ID{neverSession}})
+	assertSameRefusal(t, "an outsider's fold of the session", err, never)
+	fold := f.Fold(t, authorizedtest.HolderSubject, wide)
+	storedFold, err := f.Corpus.RehydrateFold(ctx, fold.FoldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotFold, err := f.Client.RehydrateFold(holder, fold.FoldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSameBytes(t, "holder unfold", gotFold, storedFold)
+	_, err = f.Client.RehydrateFold(outsider, fold.FoldID)
+	_, never = f.Client.RehydrateFold(outsider, neverFold)
+	assertSameRefusal(t, "an outsider's unfold", err, never)
+	folds, err := f.Client.Folds(outsider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folds) != 0 {
+		t.Fatalf("an outsider listed %+v", folds)
+	}
 }
 
 // assertSamePropertyKeys compares derived nodes and edges by property key set;
