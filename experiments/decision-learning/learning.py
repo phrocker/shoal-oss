@@ -84,8 +84,7 @@ def dataset(ledger, policy):
     for eid, e in sorted(examples.items()):
         labels = {a['label'] for a in assessments.get(eid, [])}
         reason = None
-        if (not assessments.get(eid) and all_assessments.get(eid)
-                and not any(a['assessor'] in policy['assessors'] for a in all_assessments[eid])):
+        if any(a['assessor'] not in policy['assessors'] for a in all_assessments.get(eid, [])):
             reason = 'unauthorized_assessment'
         elif not labels or 'unknown' in labels:
             reason = 'missing_or_unknown_label'
