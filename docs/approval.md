@@ -314,12 +314,24 @@ guarantees:
   path as `IdentityClaimPath`, appended to the authorization fingerprint only
   when present, so every existing fingerprint is unchanged.
 - **Refused at startup:** `["sub"]` (that is the subject the claim replaces);
-  a path ending in `email`, `preferred_username`, `upn`, `unique_name` or
-  `name`, in any case; and the flag together with a non-default
+  a path whose last segment, in any case, is a claim that does not name one
+  human stably — an editable identifier or profile field (`email`,
+  `preferred_username`, `upn`, `unique_name`, `name`, `nickname`,
+  `given_name`, `family_name`, `locale`, `picture`, `website`, `zoneinfo`),
+  a per-session or per-token claim (`sid`, `session_state`, `jti`, `nonce`,
+  `at_hash`, `c_hash`, `auth_time`, `iat`, `exp`, `nbf`, `acr`, `amr`), or a
+  per-client one (`azp`, `client_id`, `cid`); an issuer containing `#`
+  anywhere (it separates the issuer from the value in every identity); and
+  the flag together with a non-default
   `-oidc-subject-claim`, legacy Entra mode, `-oidc-actor-claim` or
   `-oidc-delegation-claim`. Each of those would put a second, possibly
   per-client identity into the decision, and the approval service counts
   every identity a request carries as involved.
+
+  The list checks the claim's own name, and cannot be complete. **Never
+  choose a path under a parent the user can edit** — for example a claim
+  inside a user-attributes object an account console exposes — whatever the
+  last segment is called: whoever can edit the parent can choose the value.
 - **The mapping restates it.** The approver mapping file's `identity_claim`
   must equal the flag segment for segment, byte for byte, whenever either is
   set, and it is part of the mapping digest (only when present, so a mapping

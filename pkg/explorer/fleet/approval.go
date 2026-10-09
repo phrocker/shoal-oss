@@ -620,8 +620,9 @@ func (s IdentityScheme) foreignNamespace(identities []shoal.ID) string {
 // namespaceOf names the namespace of a family identity for a refusal: the
 // family prefix and everything up to and including the first '#' after it,
 // which for a minted identity is the issuer (oidc:<iss>#, oidcid:<iss>#)
-// and never the value. An issuer cannot contain '#' (it may not carry a
-// fragment). Without a '#' the family prefix alone is named.
+// and never the value. The host refuses an issuer containing '#' anywhere,
+// an empty fragment included, so the first '#' ends the issuer. Without a
+// '#' the family prefix alone is named.
 func namespaceOf(identity, family string) string {
 	rest := identity[len(family):]
 	if index := strings.IndexByte(rest, '#'); index >= 0 {

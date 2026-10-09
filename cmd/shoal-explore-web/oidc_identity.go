@@ -51,14 +51,35 @@ const (
 	identityClaimPathTag = "shoal-explore-web/identity-claim-path/v1"
 )
 
-// mutableIdentityClaims are claims an issuer lets a human, or an
-// administrator in the ordinary course, change. A changed value would be a
-// new identity for the same human — and a reused one would be an old
-// identity for a new human. They are refused as the last segment of the
-// path, compared without regard to case.
+// mutableIdentityClaims are claims that do not name one human stably, and
+// are refused as the last segment of the path, compared without regard to
+// case:
+//
+//   - claims a human, or an administrator in the ordinary course, can
+//     change, including the OIDC profile fields. A changed value would be a
+//     new identity for the same human, and a reused one an old identity for
+//     a new human;
+//   - per-session and per-token claims (sid, session_state, jti, nonce, the
+//     hashes and the times). They name a login or a token, so one human
+//     would be a new identity every time, and the value is not theirs;
+//   - per-client claims (azp, client_id, cid). They name the application,
+//     so every human using one client would be one identity, and one human
+//     on two clients two.
+//
+// The list cannot be complete: a custom claim can be any of these. Choosing
+// the claim is the operator's assertion (docs/approval.md), and that
+// includes never choosing a path under a parent the user can edit.
 var mutableIdentityClaims = map[string]struct{}{
+	// Editable identifiers and profile fields.
 	"email": {}, "preferred_username": {}, "upn": {}, "unique_name": {},
-	"name": {},
+	"name": {}, "nickname": {}, "given_name": {}, "family_name": {},
+	"locale": {}, "picture": {}, "website": {}, "zoneinfo": {},
+	// Per session and per token.
+	"sid": {}, "jti": {}, "session_state": {}, "nonce": {}, "at_hash": {},
+	"c_hash": {}, "auth_time": {}, "iat": {}, "exp": {}, "nbf": {},
+	"acr": {}, "amr": {},
+	// Per client.
+	"azp": {}, "client_id": {}, "cid": {},
 }
 
 // entraMultiTenantSegments are the issuer path segments of an Entra
@@ -108,8 +129,9 @@ func parseIdentityClaimFlag(raw string) ([]string, error) {
 	last := strings.ToLower(segments[len(segments)-1])
 	if _, mutable := mutableIdentityClaims[last]; mutable {
 		return nil, identityClaimInvalid(
-			"it names a claim a human or administrator can change (" +
-				segments[len(segments)-1] + "); choose an immutable identifier")
+			"it names a claim that does not name one human stably (" +
+				segments[len(segments)-1] + ": editable, per-session, per-token " +
+				"or per-client); choose an immutable per-user identifier")
 	}
 	return segments, nil
 }

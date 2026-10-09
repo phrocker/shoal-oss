@@ -666,6 +666,15 @@ func validateOIDCEndpoint(name, raw string, allowLoopbackHTTP bool) error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "issuer must not contain a query")
 	}
+	// Not even an empty fragment: url.Parse reports "https://x/#" with an
+	// empty Fragment, and the issuer is embedded in every identity as
+	// oidc:<iss>#<value>, where '#' is the separator. An issuer containing
+	// one would let identities of two issuers, or an issuer and a value,
+	// run into each other.
+	if name == "issuer" && strings.Contains(raw, "#") {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "issuer must not contain '#'")
+	}
 	if !validOIDCEndpointHost(parsed) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, name+" must use a valid IP or DNS host")
