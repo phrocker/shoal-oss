@@ -596,3 +596,51 @@ func entityDisplayName(entity extraction.Entity) string {
 	}
 	return entity.Key
 }
+
+// ExtractionRecord is the provenance of one published extraction: the
+// document revision that asserted it and the graph nodes and edges it
+// published. The label migration (#570) uses it to find relations a document
+// asserted that the policy catalog cannot attribute to it.
+type ExtractionRecord struct {
+	ID         shoal.ID
+	DocumentID shoal.ID
+	RevisionID shoal.ID
+	NodeIDs    []shoal.ID
+	EdgeIDs    []shoal.ID
+}
+
+// ExtractionRecords returns every stored extraction record, ordered by ID.
+func (e *Explorer) ExtractionRecords(ctx context.Context) ([]ExtractionRecord, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if err := e.requireOpen(); err != nil {
+		return nil, err
+	}
+	records := make([]ExtractionRecord, 0, len(e.extractions))
+	for _, stored := range e.extractions {
+		if stored == nil {
+			continue
+		}
+		record := ExtractionRecord{
+			ID:         stored.ID,
+			DocumentID: stored.DocumentID,
+			RevisionID: stored.RevisionID,
+			NodeIDs:    make([]shoal.ID, 0, len(stored.Nodes)),
+			EdgeIDs:    make([]shoal.ID, 0, len(stored.Edges)),
+		}
+		for _, node := range stored.Nodes {
+			record.NodeIDs = append(record.NodeIDs, node.ID)
+		}
+		for _, edge := range stored.Edges {
+			record.EdgeIDs = append(record.EdgeIDs, edge.ID)
+		}
+		records = append(records, record)
+	}
+	sort.Slice(records, func(left, right int) bool {
+		return shoal.CompareID(records[left].ID, records[right].ID) < 0
+	})
+	return records, nil
+}

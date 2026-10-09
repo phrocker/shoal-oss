@@ -284,6 +284,123 @@ Neither the browser upload route nor the MCP ingest tool lets a caller attach
 a visibility label today; labelled content arrives through programmatic
 ingest (`authorized.Client.Ingest`) or is already in the corpus.
 
+### Upgrading: labelled documents are tightened at startup
+
+Before this release a label was stored on the document's nodes
+(`shoal.visibility`) but its catalog rule was the bare source rule, so every
+holder of the source could read it. That data is already in the corpus, so the
+upgrade cannot wait for the next write: **refusing at the next write**, the
+model #544 used for registration rules, would leave every existing labelled
+document readable until someone happened to re-ingest it. Unlike #544, which
+tightened what may be *registered* and left stored records resolving, this
+migration rewrites stored authorization so the control is on before the first
+request is served.
+
+On every start, before anything is served, `shoal-explore-web` (and
+`shoal-mcp`, which serves the same authorized store) runs the label migration
+under the catalog's mutation lease:
+
+- For each registered revision of each document it reads `shoal.visibility`
+  from **that revision's own** metadata (and, when the stored document node
+  names the same revision, from the node too, conjoining the two), and narrows
+  the rule to the source policy **and** one policy per label. The narrowing
+  (`PolicyStore.TightenRule`) only ever adds conjuncts and refuses anything
+  else. It covers every revision of the document (not only the current one),
+  the current node and edge projections, the entities and relations extracted
+  from it, the relations the corpus's extraction records say it asserted
+  (see the residuals for why that matters), application edges touching its
+  entities, and the source claim, so a source holder without the labels can
+  neither read the document nor re-ingest it unlabelled.
+- A historical revision is also narrowed by its own labels, which may differ
+  from the current revision's.
+- A document whose labels cannot be translated (they do not parse, fall
+  outside the label charset, exceed 256 bytes, exceed 61 labels or the
+  flattened term or byte bounds, or make a label policy ID over 128 bytes) is
+  conjoined with the reserved `shoal.label/v1/!untranslatable` policy, which
+  no grant can name. It and everything derived from it is readable by
+  **nobody**, its ingester included, until relabelled. Its ID, source URI and
+  escaped label are recorded in a report, and the run continues. Only a label
+  translation failure does this.
+- **Drift is not a label failure.** An ingest commits to the corpus before it
+  registers the revision in the policy catalog, so a failed registration (or a
+  crash between the two) leaves the corpus one revision ahead. The migration
+  narrows the registered revision by its own labels, never locks the document
+  or its source claim, and lists the document under "newer revision in the
+  corpus than in the policy catalog" in the log and the report. **Retry that
+  ingest** to repair it; a retry that changes the labels is a relabel and
+  needs the old labels and the new. An interrupted ingest's pending source
+  claim keeps the rule the retry must select and takes the old labels as the
+  rule the retry must also satisfy.
+- The run logs its counts (`Label migration v1: examined N document(s): …`)
+  and the untranslatable list. Any catalog or corpus error refuses to start:
+  the workspace never serves a corpus it did not finish narrowing.
+- It runs on **every** start, not once. A rollback to a release before this
+  one, followed by a re-upgrade, can leave labelled documents ingested by the
+  older binary under the bare source rule; the next start closes them. Every
+  step is idempotent, so a run that is interrupted (a crash, a failed write)
+  is simply completed by the next start, and a start with nothing to narrow
+  only confirms it. The run builds one index of the catalog and then visits
+  each document's own registrations: on a catalog of 1M entities and 1M
+  relations, about 0.7 s for the index plus 3.6 ms per labelled document the
+  first time and 0.1 ms per document afterwards.
+- Its report is written to the policy catalog after the last document, for
+  `-list-untranslatable-labels`. It is a report, not a gate.
+
+Operator steps:
+
+1. **Upgrade** the image. Keep the corpus and policy directories (one
+   `-state-dir` mount).
+2. **Write the label grant file** (`-oidc-label-grants-file`, or
+   `explorer.auth.oidc.labelGrants` in the chart) for every label in use, as
+   described above. Without a grant a label is visible to nobody, so do this
+   before users notice their labelled documents disappear.
+3. **Start** the workspace. The migration runs before the listener serves;
+   read its line in the startup log.
+4. **Review the untranslatable list.** It is in the startup log, and
+   `shoal-explore-web -list-untranslatable-labels` (with the same
+   `-state-dir`, `-data` or `-policy-dir`) prints the stored report and exits
+   without serving. It also lists drifted documents to re-ingest. It writes
+   nothing: before opening the storage engine (which would otherwise create a
+   table, give a bare table a WAL, or replay a WAL), it refuses a directory
+   with no policy catalog, a catalog with unflushed writes (a non-empty
+   `wal.log`: the workspace is running, or stopped without a clean shutdown),
+   and a catalog with no committed records. Stop the workspace cleanly and run
+   it then.
+5. **Relabel** each listed document by ingesting its content again under a
+   **new source URI**, with labels inside the charset, as a principal holding
+   them. The original cannot be relabelled in place: the untranslatable
+   conjunct is on its source claim too, and no grant can satisfy it, so its URI
+   refuses every ingest and the original stays readable by nobody. That is
+   deliberate: leaving the claim open would let any source holder replace the
+   current revision and reopen whatever still keys on the document node.
+6. **Rebuild lexicon bundles.** A bundle built before the upgrade may name
+   entities of now-labelled documents, and a bundle already shipped cannot be
+   recalled; rebuild and redistribute them so new bundles are scoped to the
+   narrowed catalog.
+
+Residuals, stated rather than implied:
+
+- A relation written before `RegistrationKind` existed is stored as an
+  application edge naming no document, so the policy catalog alone cannot tell
+  it from a `Connect` edge. A relation that only a labelled document states,
+  between entities first extracted by **other**, public documents, would then
+  stay readable: both endpoints are visible. Re-extracting would not fix it
+  either, because the labelled rule changes the entity namespace, so
+  re-extraction mints new IDs and leaves the old relation where it is. The
+  migration therefore reads the corpus's own extraction records, which name
+  the document and revision behind every relation, and narrows each legacy
+  relation the document asserted. Two consequences: if a public document
+  asserts the same relation, it still closes (fail closed); and every
+  application edge touching the document's entities, or named by its
+  extraction records, takes the labels, so retrying the very same `Connect`
+  afterwards conflicts.
+- Shared entities and relations belong to the first document that extracted
+  them. If that document is labelled, they close for readers without its
+  labels even when a public document also mentions them (fail closed), and a
+  later extraction of that public document under the bare rule conflicts with
+  the narrowed registration.
+- Pending edge reservations keep their old rule; committing one conflicts.
+
 ### Discovery, keys, and validation options
 
 | Flag / environment fallback | Default |

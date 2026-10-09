@@ -50,6 +50,9 @@ type commandConfig struct {
 	contextBudgetBytes int
 	toolCallsPerMinute int
 	identity           identityConfig
+	// diagnostics receives startup reports such as the label migration's
+	// (#570). Nil discards them.
+	diagnostics io.Writer
 }
 
 type runtimeDependencies struct {
@@ -368,6 +371,7 @@ func parseCommandConfig(
 		contextBudgetBytes: int(contextBudgetBytes),
 		toolCallsPerMinute: int(toolCallsPerMinute),
 		identity:           identity,
+		diagnostics:        diagnostics,
 	}, nil
 }
 

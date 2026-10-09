@@ -816,6 +816,10 @@ var (
 		"CommitSourceClaim": {}, "PendSourceClaim": {}, "RollbackSourceClaim": {},
 		"PutRevision": {}, "ReserveEdge": {}, "RollbackEdgeReservation": {},
 		"PutEdge": {}, "PutNode": {},
+		// The startup label migration (#570) is the only caller of these;
+		// no request read path reaches them.
+		"TightenRule": {}, "TighteningIndex": {},
+		"LabelMigration": {}, "PutLabelMigration": {},
 	}
 )
 
