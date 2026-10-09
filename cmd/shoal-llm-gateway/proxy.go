@@ -114,31 +114,70 @@ func (p *proxy) permits(authority string) bool {
 	return false
 }
 
-// completions is the whole contract in one function, in the order that matters:
-// nothing reaches the upstream before Shoal has answered.
+// completions wraps the handler so a forwarded call is reported only once it
+// has stopped writing to the caller.
+//
+// That ordering is what makes the reported volume final (#427). Every byte the
+// caller can receive passes through counted, and the report is made after
+// admitAndForward returns, when nothing is left that could add one: the count
+// read here is the count, so the first report is the whole report — which is
+// what the plane's write-once field and its replay comparison require.
 func (p *proxy) completions(writer http.ResponseWriter, request *http.Request) {
+	counted := &egressCounter{ResponseWriter: writer}
+	settled := p.admitAndForward(counted, request)
+	if settled == nil {
+		return
+	}
+	// Only a failure carries a volume: on a success the field is refused, and
+	// the outcome's response_bytes already says how much was delivered.
+	var effected *admissionapi.Effected
+	if settled.failure != "" {
+		effected = counted.volume()
+	}
+	p.reportOutcome(
+		context.WithoutCancel(request.Context()), settled.token, settled.identity,
+		settled.status, settled.transferred, settled.failure, effected)
+}
+
+// forwarded is what a call that reached the upstream leaves to be reported.
+type forwarded struct {
+	token       admissionapi.Token
+	identity    callerIdentity
+	status      int
+	transferred int64
+	failure     string
+}
+
+// admitAndForward is the whole contract in one function, in the order that
+// matters: nothing reaches the upstream before Shoal has answered.
+//
+// It returns what to report for a call that reached the upstream, and nil when
+// it has already reported (or had nothing to report). Every inline report
+// below is made before the refusal is written, so none of them follows an
+// egress.
+func (p *proxy) admitAndForward(writer http.ResponseWriter, request *http.Request) *forwarded {
 	raw, err := io.ReadAll(io.LimitReader(request.Body, maxRequestBytes+1))
 	if err != nil || len(raw) > maxRequestBytes {
 		p.refuse(writer, http.StatusRequestEntityTooLarge, "request_too_large",
 			"request body exceeds the proxy's bound")
-		return
+		return nil
 	}
 	parsed, err := parseChatRequest(raw)
 	if err != nil {
 		p.refuse(writer, http.StatusBadRequest, "invalid_request", err.Error())
-		return
+		return nil
 	}
 	references, err := parsed.references()
 	if err != nil {
 		p.refuse(writer, http.StatusBadRequest, "invalid_request", err.Error())
-		return
+		return nil
 	}
 	identity, err := newCallerIdentity()
 	if err != nil {
 		// No identity means no admission, and no admission means no call.
 		p.refuse(writer, http.StatusServiceUnavailable, "plane_unavailable",
 			"the decision plane could not be consulted")
-		return
+		return nil
 	}
 
 	now := p.clock()
@@ -152,7 +191,7 @@ func (p *proxy) completions(writer http.ResponseWriter, request *http.Request) {
 		p.log("admission denied request_id=%s", identity.RequestID)
 		p.refuse(writer, http.StatusForbidden, "denied",
 			"the decision plane denied this call")
-		return
+		return nil
 	case errors.Is(err, ErrPlaneUnreachable):
 		// Fail closed, and say which kind of failure it is. A caller told
 		// "denied" will not retry; one told "unavailable" should. The operator
@@ -160,12 +199,12 @@ func (p *proxy) completions(writer http.ResponseWriter, request *http.Request) {
 		p.log("admission unavailable request_id=%s: %v", identity.RequestID, err)
 		p.refuse(writer, http.StatusServiceUnavailable, "plane_unavailable",
 			"the decision plane could not be consulted")
-		return
+		return nil
 	case err != nil:
 		p.log("admission failed request_id=%s: %v", identity.RequestID, err)
 		p.refuse(writer, http.StatusServiceUnavailable, "plane_unavailable",
 			"the decision plane could not be consulted")
-		return
+		return nil
 	}
 
 	outbound, satisfiable, err := parsed.applyObligations(granted.Withhold)
@@ -178,13 +217,13 @@ func (p *proxy) completions(writer http.ResponseWriter, request *http.Request) {
 		p.reportFailure(request.Context(), granted.token, identity, "obligation_unsatisfiable")
 		p.refuse(writer, http.StatusForbidden, "obligation_unsatisfiable",
 			"the call cannot be made within the obligations returned")
-		return
+		return nil
 	}
 
-	p.forward(writer, request, granted, identity, outbound, parsed.stream)
+	return p.forward(writer, request, granted, identity, outbound, parsed.stream)
 }
 
-// forward sends the obligated request upstream and reports the outcome.
+// forward sends the obligated request upstream and returns what to report.
 func (p *proxy) forward(
 	writer http.ResponseWriter,
 	request *http.Request,
@@ -192,7 +231,7 @@ func (p *proxy) forward(
 	identity callerIdentity,
 	outbound json.RawMessage,
 	stream bool,
-) {
+) *forwarded {
 	// The upstream call is bounded by the grant's real expiry, not only by the
 	// configured timeout.
 	//
@@ -217,7 +256,7 @@ func (p *proxy) forward(
 			p.reportFailure(ctx, granted.token, identity, "grant_window_exhausted")
 			p.refuse(writer, http.StatusServiceUnavailable, "plane_unavailable",
 				"the decision plane could not be consulted")
-			return
+			return nil
 		}
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, budget)
@@ -231,7 +270,7 @@ func (p *proxy) forward(
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_unreachable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")
-		return
+		return nil
 	}
 	// A credential is required of a remote provider and optional for a
 	// loopback one, because a local model server generally has no notion of
@@ -254,7 +293,7 @@ func (p *proxy) forward(
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_credential_unavailable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")
-		return
+		return nil
 	case err == nil:
 		upstreamRequest.Header.Set("Authorization", "Bearer "+credential)
 	}
@@ -268,7 +307,7 @@ func (p *proxy) forward(
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_unreachable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")
-		return
+		return nil
 	}
 	defer response.Body.Close()
 
@@ -301,9 +340,11 @@ func (p *proxy) forward(
 		// consequence of that fix rather than an independent oversight.
 		failure = "upstream_error"
 	}
-	p.reportOutcome(
-		context.WithoutCancel(request.Context()), granted.token, identity,
-		response.StatusCode, transferred, failure)
+	// Reported by completions, after this returns: see there for why.
+	return &forwarded{
+		token: granted.token, identity: identity,
+		status: response.StatusCode, transferred: transferred, failure: failure,
+	}
 }
 
 // relay streams the response through, flushing per chunk so a streamed body
@@ -349,7 +390,10 @@ func (p *proxy) relay(
 //
 // A streamed response is reported once, after it finishes, which is why this
 // is the only place a forwarded call reports: reporting before the stream ends
-// would record an outcome the proxy had not yet observed.
+// would record an outcome the proxy had not yet observed. effected is the
+// volume of a failure that followed a partial egress, nil when nothing left
+// or the call succeeded; completions reads it once the handler has stopped
+// writing.
 //
 // The report is bounded by minimumReportWindow rather than by a timeout of its
 // own, because that constant is the margin validateDurations withholds from the
@@ -365,6 +409,7 @@ func (p *proxy) reportOutcome(
 	status int,
 	transferred int64,
 	failure string,
+	effected *admissionapi.Effected,
 ) {
 	outcome, _ := json.Marshal(map[string]any{
 		"upstream_status": status,
@@ -373,7 +418,7 @@ func (p *proxy) reportOutcome(
 	ctx, cancel := context.WithTimeout(ctx, minimumReportWindow)
 	defer cancel()
 	if err := p.admission.report(
-		ctx, token, identity, outcome, failure, p.clock()); err != nil {
+		ctx, token, identity, outcome, failure, effected, p.clock()); err != nil {
 		// An unreported grant is the gap the report closes, so this is said out
 		// loud. The plane already shows it as outstanding; the operator should
 		// not have to find it there to learn the proxy could not report.
@@ -387,7 +432,7 @@ func (p *proxy) reportFailure(
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), minimumReportWindow)
 	defer cancel()
 	if err := p.admission.report(
-		ctx, token, identity, nil, code, p.clock()); err != nil {
+		ctx, token, identity, nil, code, nil, p.clock()); err != nil {
 		p.log("report failed request_id=%s: %v", identity.RequestID, err)
 	}
 }

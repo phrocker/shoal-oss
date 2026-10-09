@@ -1235,23 +1235,18 @@ func TestATruncatedStreamIsReportedAsTruncated(t *testing.T) {
 		t.Fatalf("report = %+v, want one naming the truncation", plane.reports[0])
 	}
 
-	// And the byte count is NOT carried, which is what the seam allows rather
-	// than an oversight here.
-	//
-	// I expected a partial count and asserted one; the assertion failed and the
-	// reason is a real constraint. pkg/explorer/fleet/admission.go:933 refuses a
-	// failed report that carries an outcome, because the completion path
-	// discards the outcome and the replay comparison would then read any two
-	// failures sharing an error code as the same report — letting a caller
-	// replace a reported outcome and be told the second was recorded.
-	//
-	// So a partial egress tells the plane that it failed and not how much
-	// escaped, and this proxy is where that gap costs the most: it cannot
-	// recall tokens already sent, so volume is the one thing it has left to
-	// report. Pinned as current behaviour, not endorsed — tracked as #427.
+	// The count no longer travels in an outcome — a failed report still
+	// carries none, which the admission surface refuses — but as the report's
+	// effected volume (#427). This harness's upstream is loopback, so the
+	// proxy declares no egress and the volume is omitted here; the counted
+	// cases are in egress_test.go, against a proxy declaring egress.
 	if len(plane.reports[0].Outcome) != 0 {
 		t.Fatalf("a failed report carried an outcome, which the admission "+
 			"surface refuses: %s", plane.reports[0].Outcome)
+	}
+	if plane.reports[0].Effected != nil {
+		t.Fatalf("a proxy declaring no egress reported a volume the plane "+
+			"would refuse: %+v", plane.reports[0].Effected)
 	}
 	_ = firstChunk
 }

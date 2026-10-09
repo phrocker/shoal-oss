@@ -183,12 +183,26 @@ func (c *admissionClient) request(
 // accumulator charges (#389), which is why a failure to report is logged and
 // surfaced rather than discarded — a silently unreported grant is
 // indistinguishable from a caller that went dark.
+//
+// effected is how much escaped before a failure (#427), nil when nothing did.
+// It is sent only on a failure, only when it counts at least one byte, and only
+// when this proxy declares egresses-content: the plane refuses it in each other
+// case, and a refused report is a grant left unreported, which is worse than a
+// report without the number.
+//
+// A report whose answer was lost is resent once, as the identical report. The
+// plane's replay comparison includes effected and the field is write-once, so
+// the resend is accepted only if it carries the value the first attempt did;
+// a different value is a different report and is refused. The value is
+// therefore copied into the report here, once, and the resend reuses that
+// report — it is never re-derived, from the caller's pointer or anywhere else.
 func (c *admissionClient) report(
 	ctx context.Context,
 	token admissionapi.Token,
 	identity callerIdentity,
 	outcome json.RawMessage,
 	failure string,
+	effected *admissionapi.Effected,
 	now time.Time,
 ) error {
 	body := admissionapi.Report{
@@ -206,6 +220,12 @@ func (c *admissionClient) report(
 	if failure != "" {
 		body.Failed = true
 		body.ErrorCode = failure
+		if effected != nil && effected.Bytes > 0 && c.declaresEgress() {
+			// A copy: the report is the record of what was sent, and the
+			// resend below must carry the same number.
+			frozen := *effected
+			body.Effected = &frozen
+		}
 	} else {
 		body.Outcome = outcome
 	}
@@ -213,10 +233,48 @@ func (c *admissionClient) report(
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
 	}
-	if _, err := plane.Report(ctx, body); err != nil {
+	_, err = plane.Report(ctx, body)
+	if err != nil && answerLost(err) && ctx.Err() == nil {
+		// The same body, not a rebuilt one.
+		_, err = plane.Report(ctx, body)
+	}
+	if err != nil {
 		return planeError("report", err)
 	}
 	return nil
+}
+
+// declaresEgress reports whether this proxy's declared effects include
+// egresses-content, the only declaration a volume may accompany.
+func (c *admissionClient) declaresEgress() bool {
+	for _, effect := range c.effects {
+		if effect == admissionapi.EffectEgressesContent {
+			return true
+		}
+	}
+	return false
+}
+
+// answerLost is a report that may have been recorded whose answer did not
+// arrive: a transport failure, a 200 the client could not accept (the route
+// commits before it answers), a status the plane marked indeterminate, or a
+// 502, 503 or 504 that a proxy in front of the plane can answer after the
+// plane processed the request. A definite refusal is not lost and is not
+// resent: resending it would only repeat the refusal.
+func answerLost(err error) bool {
+	var protocol *admissionapi.ProtocolError
+	if errors.As(err, &protocol) {
+		return protocol.Committed
+	}
+	var status *admissionapi.HTTPError
+	if errors.As(err, &status) {
+		return status.Indeterminate ||
+			status.Status == http.StatusBadGateway ||
+			status.Status == http.StatusServiceUnavailable ||
+			status.Status == http.StatusGatewayTimeout
+	}
+	return !errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded)
 }
 
 // planeError folds every way of not getting an answer into

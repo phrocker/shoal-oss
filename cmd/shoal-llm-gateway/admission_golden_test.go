@@ -34,6 +34,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	admissionapi "github.com/phrocker/shoal-oss/pkg/admission/api"
 )
 
 // The gateway golden fixtures pin exactly what this proxy puts on the wire to
@@ -177,16 +179,27 @@ func TestGatewayAdmissionWireGolden(t *testing.T) {
 	checkGatewayGolden(t, "request_with_disclosures", plane.take(t).String())
 
 	if err := client.report(ctx, granted.token, identity,
-		json.RawMessage(`{"usage":{"total_tokens":12}}`), "", now); err != nil {
+		json.RawMessage(`{"usage":{"total_tokens":12}}`), "", nil, now); err != nil {
 		t.Fatal(err)
 	}
 	checkGatewayGolden(t, "report_outcome", plane.take(t).String())
 
 	if err := client.report(ctx, granted.token, identity,
-		nil, "upstream_unreachable", now); err != nil {
+		nil, "upstream_unreachable", nil, now); err != nil {
 		t.Fatal(err)
 	}
 	checkGatewayGolden(t, "report_failed", plane.take(t).String())
+
+	// A failure after a partial egress (#427). The field appears here and
+	// nowhere else: the fixtures above are unchanged, which is the evidence
+	// that a report with nothing to say about volume sends the bytes it sent
+	// before the field existed.
+	if err := client.report(ctx, granted.token, identity,
+		nil, "response_truncated", &admissionapi.Effected{Bytes: 2048, Chunks: 3},
+		now); err != nil {
+		t.Fatal(err)
+	}
+	checkGatewayGolden(t, "report_failed_effected", plane.take(t).String())
 }
 
 func checkGatewayGolden(t *testing.T, name, got string) {

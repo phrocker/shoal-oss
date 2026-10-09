@@ -294,6 +294,10 @@ type Action struct {
 	ClaimFence      uint64
 	ClaimLeaseUntil time.Time
 	EffectPossible  bool
+	// Effected is the volume a failed record says escaped before the failure
+	// (#427), zero when none was reported. Read back on a resend, never
+	// re-derived: the field is write-once and compared on replay.
+	Effected fleet.EffectedVolume
 }
 
 // ClaimTimes returns the server timestamps Anchor needs.
@@ -322,6 +326,14 @@ type actionWire struct {
 	ClaimFence      uint64              `json:"claim_fence,omitempty"`
 	ClaimLeaseUntil time.Time           `json:"claim_lease_until,omitempty"`
 	EffectPossible  bool                `json:"effect_possible"`
+	Effected        *effectedWire       `json:"effected,omitempty"`
+}
+
+// effectedWire is the /complete route's volume object, accepted on a failed
+// completion and returned on the record.
+type effectedWire struct {
+	Bytes  int64 `json:"bytes"`
+	Chunks int64 `json:"chunks,omitempty"`
 }
 
 func (w actionWire) decode() (Action, error) {
@@ -344,6 +356,11 @@ func (w actionWire) decode() (Action, error) {
 		ErrorCode: w.ErrorCode, Deadline: w.Deadline, CreatedAt: w.CreatedAt,
 		UpdatedAt: w.UpdatedAt, ClaimID: claimID, ClaimFence: w.ClaimFence,
 		ClaimLeaseUntil: w.ClaimLeaseUntil, EffectPossible: w.EffectPossible,
+	}
+	if w.Effected != nil {
+		action.Effected = fleet.EffectedVolume{
+			Bytes: w.Effected.Bytes, Chunks: w.Effected.Chunks,
+		}
 	}
 	if w.ExecutorKey != "" {
 		// The HTTP wire spells the key raw-URL; ParseExecutorKey also accepts
@@ -557,6 +574,19 @@ type Completion struct {
 	Output          json.RawMessage
 	Failed          bool
 	ErrorCode       string
+	// Effected is how much of an irreversible egress happened before a
+	// failure (#427): an upper bound on bytes handed to the transport, "at
+	// most N bytes may have reached the target", never a receipt. Zero when
+	// nothing left, and then omitted from the wire. Valid only on a failure,
+	// and only for an action declaring egresses-content; on any other action
+	// the explorer adjudicates it as invalid_executor_effected, which
+	// Complete returns as DispatchRecordedOtherwise.
+	//
+	// The caller fixes it once, when its send has completed or failed, and
+	// the resend below carries the identical value: the record is write-once
+	// and the replay branch compares it, so a different number is a different
+	// report.
+	Effected fleet.EffectedVolume
 }
 
 // Complete reports the outcome under the claim. Evidence is never sent: the
@@ -649,6 +679,17 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 		return Action{}, refusedLocally(op, "a successful completion carries no error code")
 	case !completion.Failed && len(completion.Output) == 0:
 		return Action{}, refusedLocally(op, "a successful completion requires output")
+	case !completion.Failed && !completion.Effected.Zero():
+		return Action{}, refusedLocally(op, "a successful completion carries no effected volume")
+	case completion.Effected.Bytes < 0 || completion.Effected.Chunks < 0 ||
+		completion.Effected.Bytes > fleet.MaxEffectedBytes ||
+		completion.Effected.Chunks > fleet.MaxEffectedChunks:
+		return Action{}, refusedLocally(op, "effected volume is outside its bound")
+	case completion.Effected.Chunks > 0 && completion.Effected.Bytes == 0:
+		// The explorer would adjudicate this rather than refuse it, and the
+		// record would then say the volume is unknown when the worker meant
+		// "nothing": a chunk that left carried something.
+		return Action{}, refusedLocally(op, "effected volume counts chunks but no bytes")
 	}
 	contextValue, err := completion.Context.wire(op, c.clock())
 	if err != nil {
@@ -661,11 +702,18 @@ func (c *DispatchClient) Complete(ctx context.Context, actionID []byte, completi
 		Output          json.RawMessage `json:"output,omitempty"`
 		ErrorCode       string          `json:"error_code,omitempty"`
 		Failed          bool            `json:"failed,omitempty"`
+		Effected        *effectedWire   `json:"effected,omitempty"`
 	}{
 		Context: contextValue, ExpectedVersion: completion.ExpectedVersion,
 		ClaimID: base64.RawURLEncoding.EncodeToString(completion.ClaimID),
 		Output:  completion.Output, ErrorCode: completion.ErrorCode,
 		Failed: completion.Failed,
+	}
+	if !completion.Effected.Zero() {
+		// Built once with the body, so every attempt below sends this value.
+		body.Effected = &effectedWire{
+			Bytes: completion.Effected.Bytes, Chunks: completion.Effected.Chunks,
+		}
 	}
 	path := actionPath(actionID, "complete")
 	unconfirmed := func(cause error) error {
@@ -775,11 +823,17 @@ func answerLost(err error) bool {
 }
 
 // recordedAsReported compares the committed record with the report: state,
-// error code, and for a success the output, compared as JSON values because
-// the explorer canonicalizes what it stores.
+// error code, for a failure the effected volume, and for a success the output,
+// compared as JSON values because the explorer canonicalizes what it stores.
+//
+// The volume is read back from the record and compared, never assumed: a
+// record that kept a different number (or dropped it, as an adjudicated
+// invalid_executor_effected does) is recorded otherwise.
 func recordedAsReported(action Action, completion Completion) bool {
 	if completion.Failed {
-		return action.State == fleet.DispatchFailed && action.ErrorCode == completion.ErrorCode
+		return action.State == fleet.DispatchFailed &&
+			action.ErrorCode == completion.ErrorCode &&
+			action.Effected == completion.Effected
 	}
 	if action.State != fleet.DispatchSucceeded || action.ErrorCode != "" {
 		return false
