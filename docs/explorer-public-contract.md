@@ -297,9 +297,18 @@ these calls, so they inherit it.
 - A trusted service whose role requires service visibility (every role but
   `data_read` and `data_write`) sees a labelled set only when it also carries
   that role's `svc:<role>` term, as at the tablet. No record does, so such a
-  service, an executor worker included, sees no labelled stored record.
+  service, an executor worker included, sees no labelled stored record, and
+  no dispatch evidence reference at all, since every document rule's terms
+  would have to carry its role.
   `shoal-explore-web` mints no trusted-service decision and configures no
   ceiling.
+- After a document is **tightened**, the explorer refuses an interaction
+  record that touched it to every reader until it is re-recorded (its stored
+  visibility no longer covers its sources), while dispatch evidence naming
+  the same node is decided by the node's current rule and stays visible to a
+  holder of the new labels. A cross-plane test pins both verdict tables.
+- Re-ingesting a document's earlier revision exactly (same content, same
+  labels) returns that revision and does not move any rule back.
 
 ### Cross-session provenance traversal
 

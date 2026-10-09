@@ -200,6 +200,70 @@ func (c *Client) LabelVisibility() *LabelVisibility {
 	return c.labelVisibility
 }
 
+// NodeGate decides whether the reader behind ctx may see nodes under their
+// current access rules: every term of every policy in each node's rule
+// (d:, s:, g:, svc:) must pass the reader label evaluator, which for a user
+// is exactly the domain, source and policy check AccessRule.Authorize makes
+// on interaction reads, and for a trusted service is additionally bounded
+// by its ceiling. A node the catalog does not know is not visible. It
+// implements evidencelabels.NodeGate for the dispatch and event planes.
+type NodeGate struct {
+	client *Client
+}
+
+var _ evidencelabels.NodeGate = (*NodeGate)(nil)
+
+// NodeGate returns the current-rule node gate over this client's catalog.
+func (c *Client) NodeGate() *NodeGate {
+	return &NodeGate{client: c}
+}
+
+// NodesVisibleToReader implements evidencelabels.NodeGate.
+func (g *NodeGate) NodesVisibleToReader(
+	ctx context.Context, nodeIDs []shoal.ID,
+) (bool, error) {
+	if g == nil || g.client == nil {
+		return false, shoal.NewError(
+			shoal.ErrorUnavailable, "node gate is unavailable")
+	}
+	c := g.client
+	if err := contextFailure(ctx); err != nil {
+		return false, err
+	}
+	decision, err := c.resolver.Resolve(ctx)
+	if err != nil {
+		return false, resolverFailure(ctx, err)
+	}
+	now := c.clock()
+	terms := make([]string, 0)
+	for start := 0; start < len(nodeIDs); {
+		end := chunkEnd(start, len(nodeIDs), maxInteractionAuthorizationIDs)
+		chunk := nodeIDs[start:end]
+		start = end
+		registrations, err := c.resolveNodes(ctx, chunk)
+		if err != nil {
+			return false, err
+		}
+		for _, nodeID := range chunk {
+			registration, ok := registrations[nodeID]
+			if !ok || len(registration.Rule.policies) == 0 {
+				return false, nil
+			}
+			for _, policy := range registration.Rule.policies {
+				policyTerms, err := policy.VisibilityTerms()
+				if err != nil {
+					return false, nil
+				}
+				terms = append(terms, policyTerms...)
+			}
+		}
+	}
+	if len(terms) == 0 {
+		return false, nil
+	}
+	return c.labelVisibility.permits(ctx, decision, terms, now)
+}
+
 // LabelTranslator rewrites a stored label set's free-form ingest terms into
 // the structured grant labels of the label policies enforcing them (#570).
 // It implements evidencelabels.Translator for the dispatch plane, which calls

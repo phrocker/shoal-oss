@@ -36,13 +36,18 @@ type labelPlane struct {
 	backend   *Adapter
 	completed fleet.ActionRecord
 	reference fleet.EvidenceRef
+	open      fleet.EvidenceRef
+	client    *authorized.Client
+	ingester  context.Context
 	now       time.Time
 }
 
-// fullLabels is the production wiring: the client's evaluator and translator.
+// fullLabels is the production wiring: the client's evaluator, translator
+// and current-rule node gate.
 func fullLabels(client *authorized.Client) explorerfleet.DispatchLabels {
 	return explorerfleet.DispatchLabels{
 		Visibility: client.LabelVisibility(), Translator: client.LabelTranslator(),
+		Nodes: client.NodeGate(),
 	}
 }
 
@@ -55,7 +60,26 @@ func newLabelPlane(
 	wireEvents bool,
 ) labelPlane {
 	t.Helper()
-	now := time.Now().UTC().Truncate(time.Second)
+	return newLabelPlaneWith(t, planeOptions{
+		choose: choose, wireEvents: wireEvents, label: "secret",
+	})
+}
+
+// planeOptions shapes a plane: the dispatch labels, whether events get the
+// evaluator and gate, the free-form label set on the recorded document, and
+// the label policies the action's owner (its enqueuer and claimant) holds.
+type planeOptions struct {
+	choose      func(*authorized.Client) explorerfleet.DispatchLabels
+	wireEvents  bool
+	label       string
+	ownerLabels [][]byte
+}
+
+func newLabelPlaneWith(t *testing.T, options planeOptions) labelPlane {
+	t.Helper()
+	choose, wireEvents := options.choose, options.wireEvents
+	// A minute ahead, so corpus snapshots taken in real time precede it.
+	now := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
 	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
@@ -71,9 +95,11 @@ func newLabelPlane(
 	}
 	client, err := authorized.NewClient(authorized.Config{
 		Base: corpus, Resolver: authority.Resolver(), PolicySelector: selector,
-		PolicyStore:      authorized.NewMemoryPolicyStore(),
-		GenerationReader: integrationGeneration{},
-		Clock:            func() time.Time { return now },
+		PolicyStore:       authorized.NewMemoryPolicyStore(),
+		GenerationReader:  integrationGeneration{},
+		InteractionWriter: corpus, InteractionReader: corpus,
+		SnapshotValidator: corpus,
+		Clock:             func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -81,38 +107,14 @@ func newLabelPlane(
 	labels := choose(client)
 
 	// The labelled document, ingested by a principal holding its label.
-	ingester := bindPlaneSubject(t, authority, now, "ingester", true,
-		auth.OperationIngest, auth.OperationRead)
-	receipt, err := client.Ingest(ingester, explorer.Source{
-		URI: "file:///b/closed.md", MediaType: explorer.MediaTypeMarkdown,
-		Content:  "# Closed\n\nA paragraph the action retrieved.\n",
-		Metadata: shoal.Metadata{interaction.PropertyVisibility: "secret"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	view, err := client.Document(ingester, receipt.Document.ID, receipt.Revision.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	section := view.Root
-	for len(section.Spans) == 0 {
-		if len(section.Children) == 0 {
-			t.Fatal("the ingested document has no span")
-		}
-		section = section.Children[0]
-	}
-	span := section.Spans[0]
+	ingester := bindPlaneSubjectWith(t, authority, now, "ingester",
+		allLabels(), auth.OperationIngest, auth.OperationRead,
+		auth.OperationRetrieve)
 	// What an executor reports: the node's shoal.visibility, free-form.
-	reported := fleet.EvidenceRef{
-		AnchorID: "anchor-b-closed", Kind: interaction.EvidenceDocument,
-		Citation: document.Citation{
-			DocumentID: receipt.Document.ID, RevisionID: receipt.Revision.ID,
-			SectionID: span.SectionID, SpanID: span.ID, Range: span.Range,
-		},
-		NodeIDs:    []shoal.ID{receipt.Document.ID, span.SectionID, span.ID},
-		Visibility: []string{"secret"},
-	}
+	reported := ingestReference(t, client, ingester, "file:///b/closed.md",
+		"anchor-b-closed", options.label)
+	open := ingestReference(t, client, ingester, "file:///b/open.md",
+		"anchor-b-open", "")
 
 	config := runtimeConfig(t.TempDir())
 	config = explorerfleet.ConfigureRuntime(config)
@@ -125,7 +127,7 @@ func newLabelPlane(
 	executor := &integrationExecutor{result: fleet.ExecutionResult{
 		Output:             json.RawMessage(`{"ok":true}`),
 		EvidenceSnapshotID: "snapshot", EvidenceSnapshotAsOf: now,
-		Evidence: []fleet.EvidenceRef{openEvidence, reported},
+		Evidence: []fleet.EvidenceRef{open, reported},
 	}}
 	registry, _ := newIntegrationRegistry(t, authority.Resolver(), now, executor)
 	backend, err := New(runtime, config.Domain)
@@ -133,13 +135,14 @@ func newLabelPlane(
 		t.Fatal(err)
 	}
 	var visibility evidencelabels.Visibility
+	var nodes evidencelabels.NodeGate
 	if wireEvents {
-		visibility = client.LabelVisibility()
+		visibility, nodes = client.LabelVisibility(), client.NodeGate()
 	}
 	events, publisher, err := composeWithPublisher(
 		backend, authority.Resolver(), integrationGeneration{},
 		integrationAuditor{}, integrationLease{}, bytes.Repeat([]byte{7}, 32),
-		func() time.Time { return now }, visibility)
+		func() time.Time { return now }, visibility, nodes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,8 +152,8 @@ func newLabelPlane(
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner := bindPlaneSubject(t, authority, now, "owner", false,
-		auth.OperationDispatch, auth.OperationInvoke)
+	owner := bindPlaneSubjectWith(t, authority, now, "owner",
+		options.ownerLabels, auth.OperationDispatch, auth.OperationInvoke)
 	queued, err := dispatch.Enqueue(owner,
 		integrationEnqueueRequest(now, "labelled", "enqueue-labelled"))
 	if err != nil {
@@ -171,7 +174,62 @@ func newLabelPlane(
 	return labelPlane{
 		authority: authority, dispatch: dispatch, events: events,
 		backend: backend, completed: completed, reference: reported, now: now,
+		open: open, client: client, ingester: ingester,
 	}
+}
+
+// allLabels is every label policy on B the tests use.
+func allLabels() [][]byte {
+	return [][]byte{sourceBLabelPolicy("secret"), sourceBLabelPolicy("pii")}
+}
+
+// ingestReference ingests one document on B, labelled when label is set,
+// and returns the reference an executor would report for its first span.
+func ingestReference(
+	t *testing.T, client *authorized.Client, ctx context.Context,
+	uri string, anchor shoal.ID, label string,
+) fleet.EvidenceRef {
+	t.Helper()
+	metadata := shoal.Metadata{}
+	if label != "" {
+		metadata[interaction.PropertyVisibility] = label
+	}
+	receipt, err := client.Ingest(ctx, explorer.Source{
+		URI: uri, MediaType: explorer.MediaTypeMarkdown,
+		Content:  "# Closed\n\nA paragraph the action retrieved.\n",
+		Metadata: metadata,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := client.Document(ctx, receipt.Document.ID, receipt.Revision.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	section := view.Root
+	for len(section.Spans) == 0 {
+		if len(section.Children) == 0 {
+			t.Fatal("the ingested document has no span")
+		}
+		section = section.Children[0]
+	}
+	span := section.Spans[0]
+	reference := fleet.EvidenceRef{
+		AnchorID: anchor, Kind: interaction.EvidenceDocument,
+		Citation: document.Citation{
+			DocumentID: receipt.Document.ID, RevisionID: receipt.Revision.ID,
+			SectionID: span.SectionID, SpanID: span.ID, Range: span.Range,
+		},
+		NodeIDs: []shoal.ID{receipt.Document.ID, span.SectionID, span.ID},
+	}
+	if label != "" {
+		labels, err := interaction.ParseVisibility(label)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reference.Visibility = labels
+	}
+	return reference
 }
 
 // bindPlaneSubject binds a decision on the action's source and on B; holds
@@ -181,10 +239,21 @@ func bindPlaneSubject(
 	subject shoal.ID, holds bool, operations ...auth.Operation,
 ) context.Context {
 	t.Helper()
-	policies := [][]byte{[]byte("policy"), []byte("policy-b")}
+	var labels [][]byte
 	if holds {
-		policies = append(policies, sourceBLabelPolicy("secret"))
+		labels = append(labels, sourceBLabelPolicy("secret"))
 	}
+	return bindPlaneSubjectWith(t, authority, now, subject, labels, operations...)
+}
+
+// bindPlaneSubjectWith binds a decision on the action's source and on B,
+// holding exactly the label policies given.
+func bindPlaneSubjectWith(
+	t *testing.T, authority *auth.Authority, now time.Time,
+	subject shoal.ID, labels [][]byte, operations ...auth.Operation,
+) context.Context {
+	t.Helper()
+	policies := append([][]byte{[]byte("policy"), []byte("policy-b")}, labels...)
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: subject, Actor: "actor", ClientID: "client",
 		AuthorizationDomain:   []byte("domain"),
@@ -299,7 +368,7 @@ func TestTheProductionCompositionRecordsAndDecidesStructuredLabels(t *testing.T)
 	outsider := bindPlaneSubject(t, plane.authority, plane.now, "owner", false,
 		auth.OperationDispatch, auth.OperationInvoke)
 	if got := anchorsOf(plane.status(t, outsider).Evidence); !reflect.DeepEqual(
-		got, []shoal.ID{openEvidence.AnchorID}) {
+		got, []shoal.ID{plane.open.AnchorID}) {
 		t.Fatalf("an outsider's Status returned anchors %v", got)
 	}
 
@@ -321,7 +390,7 @@ func TestTheProductionCompositionRecordsAndDecidesStructuredLabels(t *testing.T)
 }
 
 // TestEachConsumerFailsClosedWithoutTheEvaluator is the wiring check: with
-// the evaluator or the translator left out of one consumer, a holder no
+// the node gate left out of one consumer, a holder no
 // longer sees the labelled evidence there. Every probe here must fail, which
 // is what makes the passing composition above evidence of its wiring.
 func TestEachConsumerFailsClosedWithoutTheEvaluator(t *testing.T) {
@@ -331,29 +400,24 @@ func TestEachConsumerFailsClosedWithoutTheEvaluator(t *testing.T) {
 			auth.OperationDispatch, auth.OperationInvoke)
 		return anchorsOf(plane.status(t, holder).Evidence)
 	}
-	only := []shoal.ID{openEvidence.AnchorID}
-	t.Run("dispatch without the translator", func(t *testing.T) {
+	// Every reference here names nodes, so the current-rule node gate
+	// decides it and the stored labels are provenance only (#564).
+	t.Run("dispatch without the node gate", func(t *testing.T) {
 		plane := newLabelPlane(t, func(client *authorized.Client) explorerfleet.DispatchLabels {
-			return explorerfleet.DispatchLabels{Visibility: client.LabelVisibility()}
+			return explorerfleet.DispatchLabels{
+				Visibility: client.LabelVisibility(), Translator: client.LabelTranslator(),
+			}
 		}, true)
-		if got := holderSees(t, plane); !reflect.DeepEqual(got, only) {
-			t.Fatalf("without the translator a holder still saw %v", got)
+		if got := holderSees(t, plane); len(got) != 0 {
+			t.Fatalf("without the node gate a holder still saw %v", got)
 		}
 	})
-	t.Run("dispatch without the evaluator", func(t *testing.T) {
-		plane := newLabelPlane(t, func(client *authorized.Client) explorerfleet.DispatchLabels {
-			return explorerfleet.DispatchLabels{Translator: client.LabelTranslator()}
-		}, true)
-		if got := holderSees(t, plane); !reflect.DeepEqual(got, only) {
-			t.Fatalf("without the evaluator a holder still saw %v", got)
-		}
-	})
-	t.Run("events without the evaluator", func(t *testing.T) {
+	t.Run("events without the node gate", func(t *testing.T) {
 		plane := newLabelPlane(t, fullLabels, false)
 		got := plane.delivered(t, "holder", true)
 		for _, reference := range got.ConsumedEvidence {
 			if reference.AnchorID == plane.reference.AnchorID {
-				t.Fatal("without the evaluator a holding subscriber still " +
+				t.Fatal("without the node gate a holding subscriber still " +
 					"received the labelled reference")
 			}
 		}

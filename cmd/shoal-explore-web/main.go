@@ -1342,7 +1342,7 @@ func openService(
 				// The reader label evaluator (#564): the same one the
 				// dispatch reads below and the client's own interaction
 				// and fold reads use, so no plane answers differently.
-				client.LabelVisibility(),
+				client.LabelVisibility(), client.NodeGate(),
 			)
 		if err != nil {
 			store.Close()
@@ -1362,6 +1362,7 @@ func openService(
 			explorerfleet.DispatchLabels{
 				Visibility: client.LabelVisibility(),
 				Translator: client.LabelTranslator(),
+				Nodes:      client.NodeGate(),
 			},
 		)
 		if err != nil {

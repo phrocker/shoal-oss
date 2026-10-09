@@ -631,19 +631,29 @@ Lifecycle publication reauthorizes the original exact `dispatch` or `invoke`
 operation and retains complete representable evidence. Subscription delivery
 uses the dedicated `subscription_deliver` operation and rechecks the shared
 policy-generation authority during long polls. Delivery also drops, per
-subscriber, every evidence reference whose visibility labels that subscriber
-does not hold, whole and with no count (#562, under #398's rule); the stored
-event keeps them. `shoal-explore-web` wires the authorized client's reader
-label evaluator (`authorized.LabelVisibility`, #564) into
-`fleetevents.Config.EvidenceVisibility` and, through
-`explorerfleet.ComposeDispatchWithAttestations`, into every dispatch read
-(#369), so a reader holding a reference's labels sees it unchanged. When an
-executor's evidence is recorded, the free-form label it reports for a node is
-replaced by the structured terms of the label policy enforcing it on that
-node (`authorized.LabelTranslator`); a host that wires no evaluator withholds
-labelled evidence from every reader. Evidence recorded before this carries
-free-form labels, which no reader holds, and stays withheld: the evaluator
-interface has no node to translate through.
+subscriber, every evidence reference that subscriber may not see, whole and
+with no count (#562, under #398's rule); the stored event keeps them.
+
+The same per-reference rule (`evidencelabels.FilterReferences`, #564) decides
+every dispatch read that returns a record (Status, the Pull and TeamActions
+pages, and the enqueue, invoke and approval replays) and every delivery:
+
+- A reference that names nodes is decided by those nodes' **current** access
+  rules (`authorized.NodeGate`), the same rules interaction reads re-check. A
+  document relabelled after the action ran therefore governs its evidence:
+  tightened, a holder of only the old labels loses it; loosened, a reader of
+  the new rule gains it. The labels stored with the reference are provenance
+  only.
+- A reference that names no node has nothing current to consult and is
+  decided by its stored labels (`authorized.LabelVisibility`).
+
+`shoal-explore-web` wires the authorized client's gate and evaluator into
+`fleetevents.Config` and, through `explorerfleet.ComposeDispatchWithAttestations`,
+into dispatch. A host that wires no gate withholds every reference naming a
+node from every reader. When an executor's evidence is recorded, the free-form
+label it reports is replaced by the structured terms of the label policy
+enforcing it (`authorized.LabelTranslator`), so the stored provenance names
+what was enforced at the time.
 
 Fleet event cursors are AES-GCM-protected, restart-stable, and scoped to the
 subscription and authorization identity. Event and subscription storage use

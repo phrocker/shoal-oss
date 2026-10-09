@@ -65,6 +65,9 @@ type HostConfig struct {
 	// (authorized.LabelVisibility). Nil withholds labelled evidence from
 	// every subscriber.
 	EvidenceVisibility evidencelabels.Visibility
+	// EvidenceNodes is the current-rule node gate (authorized.NodeGate). Nil
+	// withholds every reference that names a node.
+	EvidenceNodes evidencelabels.NodeGate
 }
 
 // HostedServices is the compact production construction and mounting seam.
@@ -122,7 +125,8 @@ func ComposeHosted(ctx context.Context, config HostConfig) (*HostedServices, err
 	events, actionEvents, err := ComposeWithPublisherAndReader(
 		config.Runtime, config.Domain, config.Resolver, config.Generations,
 		config.EventInteraction, config.InteractionReader, config.Snapshots,
-		registry, cursorKey, config.Clock, config.EvidenceVisibility)
+		registry, cursorKey, config.Clock, config.EvidenceVisibility,
+		config.EvidenceNodes)
 	if err != nil {
 		return nil, err
 	}

@@ -33,6 +33,7 @@ type DispatchService struct {
 	attestations       ExecutorAttestations
 	evidenceVisibility EvidenceVisibility
 	evidenceLabels     evidencelabels.Translator
+	evidenceNodes      evidencelabels.NodeGate
 }
 
 func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
@@ -52,6 +53,7 @@ func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
 		outbox: outbox, attestations: config.Attestations,
 		evidenceVisibility: config.EvidenceVisibility,
 		evidenceLabels:     config.EvidenceLabels,
+		evidenceNodes:      config.EvidenceNodes,
 	}
 	return service, nil
 }
@@ -3694,12 +3696,17 @@ func (s *DispatchService) structuredEvidence(
 func (s *DispatchService) readableRecord(
 	ctx context.Context, record ActionRecord,
 ) (ActionRecord, error) {
-	// The rule itself lives in evidencelabels.Filter, shared with fleet
-	// event delivery (#562), so the dispatch reads and the event stream
-	// cannot answer the same question differently.
-	readable, withheld, err := evidencelabels.Filter(
-		ctx, s.evidenceVisibility, record.Evidence,
-		func(reference EvidenceRef) []string { return reference.Visibility })
+	// The rule itself lives in evidencelabels.FilterReferences, shared with
+	// fleet event delivery (#562), so the dispatch reads and the event stream
+	// cannot answer the same question differently. Every dispatch read that
+	// returns a record passes here: Status, the Pull and TeamActions pages,
+	// and the enqueue, invoke and approval replays. A reference naming nodes
+	// is decided by their current rules; one naming none, by its stored
+	// labels (#564).
+	readable, withheld, err := evidencelabels.FilterReferences(
+		ctx, s.evidenceVisibility, s.evidenceNodes, record.Evidence,
+		func(reference EvidenceRef) []string { return reference.Visibility },
+		func(reference EvidenceRef) []shoal.ID { return reference.NodeIDs })
 	if err != nil {
 		return ActionRecord{}, err
 	}

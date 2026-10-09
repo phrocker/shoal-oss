@@ -7,6 +7,7 @@ import (
 	"context"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,6 +106,73 @@ func ownerUntil(
 	return decision
 }
 
+// catalogGate is a NodeGate over a fixed catalog of node rules: each node's
+// rule is the conjunction of the structured terms listed for it, and the
+// reader is decided by the real evaluator. The authorized client's NodeGate
+// reads the same thing from the policy catalog (dispatch_node_gate_test.go
+// in internal/explorerfleetevents drives that one); this lets the fleet's own
+// fixtures, whose node IDs exist in no corpus, keep a current rule per node.
+type catalogGate struct {
+	evaluator *authorized.LabelVisibility
+	mu        sync.Mutex
+	rules     map[shoal.ID][]string
+	err       error
+}
+
+func (g *catalogGate) NodesVisibleToReader(
+	ctx context.Context, nodeIDs []shoal.ID,
+) (bool, error) {
+	g.mu.Lock()
+	if g.err != nil {
+		g.mu.Unlock()
+		return false, g.err
+	}
+	var terms []string
+	for _, id := range nodeIDs {
+		rule, ok := g.rules[id]
+		if !ok {
+			g.mu.Unlock()
+			return false, nil
+		}
+		terms = append(terms, rule...)
+	}
+	g.mu.Unlock()
+	return g.evaluator.VisibleToReader(ctx, terms)
+}
+
+// policyTerms is the structured terms of one policy on "domain".
+func policyTerms(t *testing.T, source, grant []byte) []string {
+	t.Helper()
+	policy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: []byte("domain"), SourceID: source,
+		GrantPolicyID: grant, Epoch: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terms, err := policy.VisibilityTerms()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return terms
+}
+
+// fixtureCatalog is the current rules of structuredEvidence's two nodes:
+// node-open is governed by the action's own source policy, node-secret by
+// that and its secret label policy.
+func fixtureCatalog(t *testing.T, resolver auth.Resolver, now time.Time) *catalogGate {
+	t.Helper()
+	source := policyTerms(t, []byte("source"), []byte("policy"))
+	return &catalogGate{
+		evaluator: realEvaluator(t, resolver, now),
+		rules: map[shoal.ID][]string{
+			"node-open": source,
+			"node-secret": append(append([]string(nil), source...),
+				policyTerms(t, []byte("source"), secretLabelPolicyID(t))...),
+		},
+	}
+}
+
 func realEvaluator(
 	t *testing.T, resolver auth.Resolver, now time.Time,
 	ceilings ...auth.ServiceCeilingConfig,
@@ -130,6 +198,8 @@ func labelledFixture(t *testing.T, evidence ...EvidenceRef) *executorClaimFixtur
 	t.Helper()
 	fixture := newExecutorClaimFixture(t)
 	fixture.service.evidenceVisibility = realEvaluator(
+		t, fixture.authority.Resolver(), fixture.now)
+	fixture.service.evidenceNodes = fixtureCatalog(
 		t, fixture.authority.Resolver(), fixture.now)
 	stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
 	stored.Evidence = evidence
@@ -299,6 +369,7 @@ func TestADispatchReplayShowsAHolderTheStoredEvidence(t *testing.T) {
 					recorder: &dispatchRecorder{}, events: dispatchEvents{},
 					clock:              func() time.Time { return now },
 					evidenceVisibility: realEvaluator(t, authority.Resolver(), now),
+					evidenceNodes:      fixtureCatalog(t, authority.Resolver(), now),
 				},
 				store: &memoryApprovalStore{records: map[string]ApprovalRecord{
 					string(approval.ID): CloneApprovalRecord(approval),
@@ -369,9 +440,13 @@ func setEvidence(fixture *executorClaimFixture, evidence ...EvidenceRef) {
 }
 
 // TestAnExecutorWhoseCeilingLacksTheLabelIsRefused: a bound worker is a
-// trusted service, so even holding the label policy grant it sees labelled
-// evidence only when every term is inside its configured ceiling (and, as at
-// the tablet, the set names its own role).
+// trusted service, so even holding the label policy grant it sees a
+// reference only when every term of the nodes' current rules is inside its
+// configured ceiling and, as at the tablet, the rule names its own role. No
+// document rule names svc:action_execution, so a worker sees no reference
+// that names a node whatever its ceiling holds; the ceiling-bounded positive
+// case is pinned on the interaction reads (authorized
+// TestATrustedServiceIsBoundedByItsCeiling).
 func TestAnExecutorWhoseCeilingLacksTheLabelIsRefused(t *testing.T) {
 	role := auth.ServiceRoleActionExecution
 	labelled, open := structuredEvidence(t)
@@ -393,15 +468,18 @@ func TestAnExecutorWhoseCeilingLacksTheLabelIsRefused(t *testing.T) {
 		ceiling shoal.ID
 		want    []shoal.ID
 	}{
-		{"full-ceiling", []shoal.ID{"anchor-secret", "anchor-open"}},
-		{"lacking-ceiling", []shoal.ID{"anchor-open"}},
-		{"unconfigured-ceiling", []shoal.ID{"anchor-open"}},
+		{"full-ceiling", []shoal.ID{}},
+		{"lacking-ceiling", []shoal.ID{}},
+		{"unconfigured-ceiling", []shoal.ID{}},
 	} {
 		t.Run(string(probe.ceiling), func(t *testing.T) {
 			fixture := newExecutorClaimFixture(t)
 			fixture.service.evidenceVisibility = realEvaluator(
 				t, fixture.authority.Resolver(), fixture.now,
 				ceiling("full-ceiling", true), ceiling("lacking-ceiling", false))
+			gate := fixtureCatalog(t, fixture.authority.Resolver(), fixture.now)
+			gate.evaluator = fixture.service.evidenceVisibility.(*authorized.LabelVisibility)
+			fixture.service.evidenceNodes = gate
 			setEvidence(fixture, labelled, open)
 			decision, err := auth.NewDecision(auth.DecisionConfig{
 				Subject: "worker-subject", Actor: "worker-actor",
@@ -429,4 +507,188 @@ func TestAnExecutorWhoseCeilingLacksTheLabelIsRefused(t *testing.T) {
 			assertAnchors(t, "Pull (execute route)", pulled[0].Evidence, probe.want)
 		})
 	}
+}
+
+// tightenSecret adds the pii label policy to node-secret's current rule;
+// loosenSecret leaves it governed by the source policy alone.
+func tightenSecret(t *testing.T, gate *catalogGate) {
+	t.Helper()
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	gate.rules["node-secret"] = append(append([]string(nil), gate.rules["node-secret"]...),
+		policyTerms(t, []byte("source"), labelPolicyOn(t, "source", "pii"))...)
+}
+
+func loosenSecret(t *testing.T, gate *catalogGate) {
+	t.Helper()
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	gate.rules["node-secret"] = policyTerms(t, []byte("source"), []byte("policy"))
+}
+
+// approvalReplay is the approval re-request replay of an action completed by
+// another principal with evidence, under the catalog gate, after relabel.
+func approvalReplay(
+	t *testing.T, holds bool, relabel func(*testing.T, *catalogGate),
+	evidence ...EvidenceRef,
+) ActionRecord {
+	t.Helper()
+	approval := decided(validApprovalRecord(t), ApprovalApproved, ApprovalVerdictApprove)
+	now := approval.DecidedAt.Add(2 * time.Second)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := fixtureCatalog(t, authority.Resolver(), now)
+	relabel(t, gate)
+	dispatchStore := newMemoryDispatchStore()
+	service := &ApprovalService{
+		dispatch: &DispatchService{
+			store: dispatchStore, outbox: dispatchStore,
+			recorder: &dispatchRecorder{}, events: dispatchEvents{},
+			clock: func() time.Time { return now }, evidenceNodes: gate,
+		},
+		store: &memoryApprovalStore{records: map[string]ApprovalRecord{
+			string(approval.ID): CloneApprovalRecord(approval),
+		}},
+		recorder:    unguardedApprovalRecorder{},
+		narrowed:    func(context.Context) bool { return false },
+		generations: fixedGenerations{generation: approval.PolicyGeneration},
+		window:      DefaultApprovalWindow,
+	}
+	action := cloneActionRecord(approval.Request)
+	action.ApprovalRequestDigest = approval.RequestDigest
+	action.ApproverSubject = approval.ApproverSubject
+	action.ApproverActor = approval.ApproverActor
+	action.ApproverClientID = approval.ApproverClientID
+	action.ApprovedAt = approval.DecidedAt
+	action.State = DispatchSucceeded
+	action.ClaimID = []byte("worker-claim")
+	action.ClaimFence = 1
+	action.ClaimLease = time.Minute
+	action.ClaimLeaseUntil = now.Add(time.Minute).UTC()
+	action.ClaimantSubject = "worker-subject"
+	action.ClaimantActor = "worker-actor"
+	action.ExecutionPolicyGeneration = 1
+	action.ExecutionExpiresAt = action.Deadline
+	action.Evidence = evidence
+	ctx := bindDecision(t, authority, ownerUntil(t, now.Add(time.Hour), holds, auth.OperationInvoke))
+	replayed, err := service.replayMaterialized(ctx, action, approval)
+	if err != nil {
+		t.Fatalf("the materialized replay was refused: %v", err)
+	}
+	return replayed
+}
+
+func hasAnchor(evidence []EvidenceRef, anchor shoal.ID) bool {
+	for _, reference := range evidence {
+		if reference.AnchorID == anchor {
+			return true
+		}
+	}
+	return false
+}
+
+// TestARelabelGovernsEveryDispatchRead: a reference that names a node is
+// decided by the node's current rule on Status, Pull, TeamActions and all
+// three replays, not by the labels stored with it (#564). Tightened, a
+// holder of the old label loses it; loosened, a reader without the removed
+// label gains it.
+func TestARelabelGovernsEveryDispatchRead(t *testing.T) {
+	noop := func(*testing.T, *catalogGate) {}
+	t.Run("Status, Pull and TeamActions", func(t *testing.T) {
+		labelled, open := structuredEvidence(t)
+		fixture := labelledFixture(t, labelled, open)
+		gate := fixture.service.evidenceNodes.(*catalogGate)
+		holder := bindDecision(t, fixture.authority, labelHolder(t,
+			auth.OperationDispatch, auth.OperationInvoke))
+		overseer := bindDecision(t, fixture.authority, labelHolder(t,
+			auth.OperationTeamOverviewRead))
+		outsiderOverseer := bindDecision(t, fixture.authority, dispatchDecision(
+			t, "owner", "actor", "request", auth.OperationTeamOverviewRead))
+		check := func(stage string, reader, team context.Context, want bool) {
+			t.Helper()
+			reads := readDispatch(t, fixture, reader, team)
+			for name, record := range map[string]ActionRecord{
+				"Status": reads.status, "Pull": reads.pull, "TeamActions": reads.team,
+			} {
+				if got := hasAnchor(record.Evidence, "anchor-secret"); got != want {
+					t.Fatalf("%s: %s visible = %v, want %v", stage, name, got, want)
+				}
+			}
+		}
+		check("a holder before", holder, overseer, true)
+		tightenSecret(t, gate)
+		check("a holder of the old label after tightening", holder, overseer, false)
+		loosenSecret(t, gate)
+		check("a reader without the label after loosening",
+			fixture.enqueuer, outsiderOverseer, true)
+	})
+	for _, probe := range []struct {
+		name   string
+		replay func(*testing.T, *executorClaimFixture, context.Context) ActionRecord
+	}{
+		{"enqueue replay", func(t *testing.T, f *executorClaimFixture, ctx context.Context) ActionRecord {
+			record, err := f.service.Enqueue(ctx, enqueueOf(f))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return record
+		}},
+		{"invoke terminal replay", func(t *testing.T, f *executorClaimFixture, ctx context.Context) ActionRecord {
+			record, err := f.service.Invoke(ctx, InvokeRequest{
+				Enqueue: enqueueOf(f), ClaimID: []byte("invoke-claim"), Lease: time.Minute,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return record
+		}},
+	} {
+		t.Run(probe.name+" after tightening", func(t *testing.T) {
+			labelled, open := structuredEvidence(t)
+			fixture := labelledFixture(t)
+			holder := bindDecision(t, fixture.authority, labelHolder(t,
+				auth.OperationDispatch, auth.OperationInvoke))
+			queued, err := fixture.service.Enqueue(holder, holderEnqueue(fixture.now))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.queued, fixture.enqueuer = queued, holder
+			completedByAnotherPrincipal(t, fixture)
+			setEvidence(fixture, labelled, open)
+			if !hasAnchor(probe.replay(t, fixture, holder).Evidence, "anchor-secret") {
+				t.Fatal("the holder lost the reference before the relabel")
+			}
+			tightenSecret(t, fixture.service.evidenceNodes.(*catalogGate))
+			if hasAnchor(probe.replay(t, fixture, holder).Evidence, "anchor-secret") {
+				t.Fatal("a holder of the old label kept the reference after tightening")
+			}
+		})
+		t.Run(probe.name+" after loosening", func(t *testing.T) {
+			labelled, open := structuredEvidence(t)
+			fixture := labelledFixture(t)
+			completedByAnotherPrincipal(t, fixture)
+			setEvidence(fixture, labelled, open)
+			if hasAnchor(probe.replay(t, fixture, fixture.enqueuer).Evidence, "anchor-secret") {
+				t.Fatal("a reader without the label saw the reference before loosening")
+			}
+			loosenSecret(t, fixture.service.evidenceNodes.(*catalogGate))
+			if !hasAnchor(probe.replay(t, fixture, fixture.enqueuer).Evidence, "anchor-secret") {
+				t.Fatal("a reader without the removed label did not see the reference after loosening")
+			}
+		})
+	}
+	t.Run("approval re-request", func(t *testing.T) {
+		labelled, open := structuredEvidence(t)
+		if !hasAnchor(approvalReplay(t, true, noop, labelled, open).Evidence, "anchor-secret") {
+			t.Fatal("the holder lost the reference before the relabel")
+		}
+		if hasAnchor(approvalReplay(t, true, tightenSecret, labelled, open).Evidence, "anchor-secret") {
+			t.Fatal("a holder of the old label kept the reference after tightening")
+		}
+		if !hasAnchor(approvalReplay(t, false, loosenSecret, labelled, open).Evidence, "anchor-secret") {
+			t.Fatal("a reader without the removed label did not see the reference after loosening")
+		}
+	})
 }

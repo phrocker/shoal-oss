@@ -42,6 +42,9 @@ type DispatchLabels struct {
 	// label-policy terms when its evidence is recorded
 	// (authorized.LabelTranslator).
 	Translator evidencelabels.Translator
+	// Nodes decides a reference that names nodes by their current access
+	// rules (authorized.NodeGate). Nil withholds every such reference.
+	Nodes evidencelabels.NodeGate
 }
 
 // ComposeDispatchWithAttestations is ComposeDispatch with the executor
@@ -70,5 +73,6 @@ func ComposeDispatchWithAttestations(
 		Attestations:       attestations,
 		EvidenceVisibility: labels.Visibility,
 		EvidenceLabels:     labels.Translator,
+		EvidenceNodes:      labels.Nodes,
 	})
 }

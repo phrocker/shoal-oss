@@ -49,6 +49,64 @@ func realLabels(now time.Time) func(auth.Resolver) evidencelabels.Visibility {
 
 var deliveryNow = time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
 
+// catalogGate is an evidencelabels.NodeGate over a fixed catalog of the
+// current node rules: each node's rule is the conjunction of its listed
+// structured terms, and the subscriber is decided by the real evaluator.
+// The references below name nodes that exist in no corpus, so their rules
+// are listed here; label_evaluator_e2e_test.go drives the authorized
+// client's own gate over a real catalog.
+type catalogGate struct {
+	evaluator evidencelabels.Visibility
+	rules     map[shoal.ID][]string
+}
+
+func (g catalogGate) NodesVisibleToReader(
+	ctx context.Context, nodeIDs []shoal.ID,
+) (bool, error) {
+	var terms []string
+	for _, id := range nodeIDs {
+		rule, ok := g.rules[id]
+		if !ok {
+			return false, nil
+		}
+		terms = append(terms, rule...)
+	}
+	return g.evaluator.VisibleToReader(ctx, terms)
+}
+
+func termsOf(source, grant []byte) []string {
+	policy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: []byte("domain"), SourceID: source,
+		GrantPolicyID: grant, Epoch: 1,
+	})
+	if err != nil {
+		panic(err)
+	}
+	terms, err := policy.VisibilityTerms()
+	if err != nil {
+		panic(err)
+	}
+	return terms
+}
+
+// deliveryCatalog is the current rules of the two references' nodes: A's
+// open document is governed by A's source policy; B's labelled document by
+// B's source policy and its secret and project-x label policies.
+func deliveryCatalog(evaluator evidencelabels.Visibility) catalogGate {
+	open := termsOf([]byte("source"), []byte("policy"))
+	closed := append(append(termsOf(sourceB, []byte("policy-b")),
+		termsOf(sourceB, sourceBLabelPolicy("secret"))...),
+		termsOf(sourceB, sourceBLabelPolicy("project-x"))...)
+	rules := map[shoal.ID][]string{}
+	for _, id := range openEvidence.NodeIDs {
+		rules[id] = open
+	}
+	for _, id := range secretEvidence.NodeIDs {
+		rules[id] = closed
+	}
+	return catalogGate{evaluator: evaluator, rules: rules}
+}
+
 // sourceB is the source of the labelled document, and its two free-form
 // labels are enforced as (source, label) policies (#570).
 var sourceB = []byte("source-b")
@@ -183,8 +241,10 @@ func newLabelledDelivery(
 		t.Fatal(err)
 	}
 	var evaluator evidencelabels.Visibility
+	var nodes evidencelabels.NodeGate
 	if visibility != nil {
 		evaluator = visibility(authority.Resolver())
+		nodes = deliveryCatalog(evaluator)
 	}
 	capability := explorerfleetcap.New()
 	events, err := fleetevents.NewWithLifecycleCapability(fleetevents.Config{
@@ -193,6 +253,7 @@ func newLabelledDelivery(
 		Auditor: integrationAuditor{}, CursorKey: bytes.Repeat([]byte{7}, 32),
 		Clock:              func() time.Time { return now },
 		EvidenceVisibility: evaluator,
+		EvidenceNodes:      nodes,
 	}, capability)
 	if err != nil {
 		t.Fatal(err)
@@ -247,7 +308,7 @@ func bindSubject(
 	policies := [][]byte{[]byte("policy")}
 	if subject == "holder" {
 		sources = append(sources, sourceB)
-		policies = append(policies,
+		policies = append(policies, []byte("policy-b"),
 			sourceBLabelPolicy("secret"), sourceBLabelPolicy("project-x"))
 	}
 	decision, err := auth.NewDecision(auth.DecisionConfig{
@@ -536,25 +597,23 @@ func TestASubscriberReceivesOnlyEvidenceItsLabelsCover(t *testing.T) {
 }
 
 // TestWithNoEvaluatorLabelledEvidenceIsWithheldFromEverySubscriber is the
-// fail-closed direction, the same as the dispatch read paths: nothing can
-// evaluate the label, so nothing may be shown it. Unlabelled evidence is
-// delivered unchanged.
+// fail-closed direction, the same as the dispatch read paths: with no node
+// gate nothing can evaluate a referenced node's current rule, so no
+// reference naming a node is delivered, to a holder or anyone else (#564).
+// The event itself is still delivered.
 func TestWithNoEvaluatorLabelledEvidenceIsWithheldFromEverySubscriber(t *testing.T) {
 	delivery := newLabelledDelivery(t, nil)
 	for _, path := range deliveryPaths {
 		t.Run(path.name, func(t *testing.T) {
-			// "holder" holds the labels under the other test's evaluator;
-			// with none wired, holding them cannot be established.
 			ctx, subscription := delivery.subscribe(t, "holder")
 			completed, delivered := path.read(t, delivery, ctx, subscription)
 			if !completed.found {
 				t.Fatal("the completion was not delivered at all")
 			}
 			assertNoSecretBytes(t, path.name, delivered)
-			if got := anchors(completed.event.ConsumedEvidence); !reflect.DeepEqual(
-				got, []shoal.ID{"anchor-a-open"}) {
-				t.Fatalf("%s delivered anchors %v with no evaluator, want "+
-					"the unlabelled one only", path.name, got)
+			if got := anchors(completed.event.ConsumedEvidence); len(got) != 0 {
+				t.Fatalf("%s delivered anchors %v with no node gate, want none",
+					path.name, got)
 			}
 		})
 	}

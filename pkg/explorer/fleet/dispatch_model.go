@@ -1150,6 +1150,11 @@ type DispatchConfig struct {
 	// reference stored with a free-form label is then withheld from every
 	// reader, holders included: fail closed, never open.
 	EvidenceLabels evidencelabels.Translator
+	// EvidenceNodes decides an evidence reference that names nodes by those
+	// nodes' current access rules, so a relabel after recording governs
+	// the evidence as it governs the document (#564). Optional, and nil
+	// withholds every reference that names a node from every reader.
+	EvidenceNodes evidencelabels.NodeGate
 }
 
 // EvidenceVisibility answers whether the current reader holds the labels an

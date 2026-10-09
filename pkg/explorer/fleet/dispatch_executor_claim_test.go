@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -4543,31 +4544,34 @@ func TestADispatchReaderSeesOnlyEvidenceItsLabelsCover(t *testing.T) {
 	labelled, open := structuredEvidence(t)
 
 	for _, probe := range []struct {
-		name       string
-		visibility EvidenceVisibility
-		want       []shoal.ID
-		wantErr    bool
+		name    string
+		nodes   func(*executorClaimFixture) evidencelabels.NodeGate
+		want    []shoal.ID
+		wantErr bool
 	}{
 		{
-			// No host filter at all. Nothing can evaluate the label, so
-			// nothing may be shown it — the direction Attestations takes
-			// when nil.
-			name: "no evaluator is wired", want: []shoal.ID{"anchor-open"},
+			// No host gate at all. Nothing can evaluate the nodes' rules, so
+			// nothing naming a node may be shown — the direction
+			// Attestations takes when nil.
+			name: "no node gate is wired", want: []shoal.ID{},
+			nodes: func(*executorClaimFixture) evidencelabels.NodeGate { return nil },
 		},
 		{
 			// A failing question is not a false answer. Returning the error
 			// keeps a transient fault from reading as a redaction, which
 			// would be indistinguishable from a permanent one.
 			name: "the question fails",
-			visibility: &stubEvidenceVisibility{
-				err: shoal.NewError(shoal.ErrorUnavailable, "label store down"),
+			nodes: func(f *executorClaimFixture) evidencelabels.NodeGate {
+				gate := fixtureCatalog(t, f.authority.Resolver(), f.now)
+				gate.err = shoal.NewError(shoal.ErrorUnavailable, "label store down")
+				return gate
 			},
 			wantErr: true,
 		},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
 			fixture := newExecutorClaimFixture(t)
-			fixture.service.evidenceVisibility = probe.visibility
+			fixture.service.evidenceNodes = probe.nodes(fixture)
 			stored := fixture.dispatchStore.records[string(fixture.queued.ID)]
 			stored.Evidence = []EvidenceRef{labelled, open}
 			fixture.dispatchStore.records[string(fixture.queued.ID)] = stored

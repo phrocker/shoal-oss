@@ -58,6 +58,10 @@ type Config struct {
 	// references are withheld from every delivered envelope while unlabelled
 	// ones are delivered unchanged.
 	EvidenceVisibility evidencelabels.Visibility
+	// EvidenceNodes decides, at delivery, a reference that names nodes by
+	// those nodes' current access rules (#564), as the dispatch reads do.
+	// Nil withholds every such reference from every subscriber.
+	EvidenceNodes evidencelabels.NodeGate
 }
 
 type Service struct {
@@ -74,6 +78,7 @@ type Service struct {
 	// evidenceVisibility is asked under the subscriber's context at
 	// delivery, never under the publisher's at publish.
 	evidenceVisibility evidencelabels.Visibility
+	evidenceNodes      evidencelabels.NodeGate
 }
 
 func New(config Config) (*Service, error) {
@@ -127,6 +132,7 @@ func newService(
 		leases: config.LeaseValidator, auditor: config.Auditor, cursors: codec,
 		now: config.Clock, poll: config.PollInterval, maxWait: config.MaxWait,
 		reconcile: capability, evidenceVisibility: config.EvidenceVisibility,
+		evidenceNodes: config.EvidenceNodes,
 	}, nil
 }
 
@@ -835,9 +841,10 @@ func (s *Service) readableEvidenceGroup(
 			labelled[i].visibility = visibility[i]
 		}
 	}
-	kept, withheld, err := evidencelabels.Filter(
-		ctx, s.evidenceVisibility, labelled,
-		func(value labelledReference) []string { return value.visibility })
+	kept, withheld, err := evidencelabels.FilterReferences(
+		ctx, s.evidenceVisibility, s.evidenceNodes, labelled,
+		func(value labelledReference) []string { return value.visibility },
+		func(value labelledReference) []shoal.ID { return value.reference.NodeIDs })
 	if err != nil || !withheld {
 		return references, visibility, false, err
 	}

@@ -90,7 +90,7 @@ func ComposeWithPublisher(
 		return nil, nil, err
 	}
 	return composeWithPublisher(
-		backend, resolver, generations, auditor, leases, cursorKey, clock, nil)
+		backend, resolver, generations, auditor, leases, cursorKey, clock, nil, nil)
 }
 
 // ComposeWithPublisherAndReader constructs the production event service with
@@ -110,6 +110,7 @@ func ComposeWithPublisherAndReader(
 	cursorKey []byte,
 	clock func() time.Time,
 	evidenceVisibility evidencelabels.Visibility,
+	evidenceNodes evidencelabels.NodeGate,
 ) (*fleetevents.Service, *ActionEventPublisher, error) {
 	backend, err := New(runtime, domain)
 	if err != nil {
@@ -122,7 +123,7 @@ func ComposeWithPublisherAndReader(
 	}
 	return composeWithPublisher(
 		backend, resolver, generations, auditor, leases, cursorKey, clock,
-		evidenceVisibility)
+		evidenceVisibility, evidenceNodes)
 }
 
 func composeWithPublisher(
@@ -134,12 +135,14 @@ func composeWithPublisher(
 	cursorKey []byte,
 	clock func() time.Time,
 	evidenceVisibility evidencelabels.Visibility,
+	evidenceNodes evidencelabels.NodeGate,
 ) (*fleetevents.Service, *ActionEventPublisher, error) {
 	capability := explorerfleetcap.New()
 	service, err := fleetevents.NewWithLifecycleCapability(fleetevents.Config{
 		Backend: backend, Resolver: resolver, GenerationReader: generations,
 		LeaseValidator: leases, Auditor: auditor, CursorKey: cursorKey,
 		Clock: clock, EvidenceVisibility: evidenceVisibility,
+		EvidenceNodes: evidenceNodes,
 	}, capability)
 	if err != nil {
 		return nil, nil, err

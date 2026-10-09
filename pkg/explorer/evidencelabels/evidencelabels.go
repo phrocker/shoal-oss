@@ -136,3 +136,66 @@ func Filter[T any](
 	}
 	return readable, true, nil
 }
+
+// NodeGate answers whether the reader behind ctx may see every node in
+// nodeIDs under the nodes' CURRENT access rules. It is the gate interaction
+// reads already apply to their touched nodes (#567), offered to the planes
+// that store evidence references, so that a document relabelled after an
+// action recorded evidence from it governs that evidence as it governs the
+// document. Implemented by the host that owns the policy catalog
+// (authorized.NodeGate).
+type NodeGate interface {
+	// NodesVisibleToReader reports whether the reader may see every node.
+	// A node the catalog no longer knows is not visible. An error is the
+	// question failing, never a refusal.
+	NodesVisibleToReader(ctx context.Context, nodeIDs []shoal.ID) (bool, error)
+}
+
+// FilterReferences is the per-reference rule for stored evidence (#564):
+//
+//   - A reference that names nodes is decided by those nodes' current rules,
+//     through nodes. Its stored visibility is provenance only and is not
+//     consulted: after a relabel it is wrong in both directions, admitting
+//     too much once a label was added and withholding too much once one was
+//     removed. A nil gate withholds it.
+//   - A reference that names no node has nothing current to consult, so it
+//     is decided by its stored labels exactly as Filter decides them.
+//
+// Withheld references are dropped whole with no count, and an error is
+// returned rather than read as a refusal, as for Filter. values is never
+// modified, and when nothing is withheld the input slice itself is returned.
+func FilterReferences[T any](
+	ctx context.Context, visibility Visibility, nodes NodeGate, values []T,
+	labels func(T) []string, nodeIDs func(T) []shoal.ID,
+) (kept []T, withheld bool, err error) {
+	if len(values) == 0 {
+		return values, false, nil
+	}
+	readable := make([]T, 0, len(values))
+	for _, value := range values {
+		ids := nodeIDs(value)
+		if len(ids) > 0 {
+			if nodes == nil {
+				continue
+			}
+			visible, err := nodes.NodesVisibleToReader(ctx, ids)
+			if err != nil {
+				return nil, false, err
+			}
+			if visible {
+				readable = append(readable, value)
+			}
+			continue
+		}
+		// No node to consult: the stored labels are all there is.
+		single, _, err := Filter(ctx, visibility, []T{value}, labels)
+		if err != nil {
+			return nil, false, err
+		}
+		readable = append(readable, single...)
+	}
+	if len(readable) == len(values) {
+		return values, false, nil
+	}
+	return readable, true, nil
+}

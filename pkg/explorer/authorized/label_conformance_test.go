@@ -907,6 +907,7 @@ var labelExcludedMethods = map[string]string{
 	"ValidateAuthorization":                   "compares the caller's own fingerprint with a pin; returns no data",
 	"LabelVisibility":                         "returns the reader label evaluator, a host wiring seam; reads no data (label_visibility_test.go)",
 	"LabelTranslator":                         "returns the record-time label translator, a host wiring seam; reads no data (label_visibility_test.go)",
+	"NodeGate":                                "returns the current-rule node gate, a host wiring seam; reads no data (dispatch and delivery relabel tests)",
 }
 
 func TestLabelConformanceCoversEveryClientMethod(t *testing.T) {
