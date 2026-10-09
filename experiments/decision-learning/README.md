@@ -20,6 +20,14 @@ check identity, not the authority or truth of a submitting assessor.
   assessor independently. Emit `hold` or `shadow_candidate`. Both require full
   review and disable optimization. No result permits source exclusion.
 
+The library also exposes `promote_candidate` and `rollback_release`. Promotion
+requires a sealed candidate artifact, a clean `shadow_candidate` evaluation,
+and a separately bound explicit approval; it emits an immutable active-release
+record without changing a serving pointer. Rollback appends a new release that
+points at a prior complete release and requires a bound approval. Neither
+function authenticates the caller or enables live traffic by itself; a service
+must enforce those boundaries around the records.
+
 Every output is content-addressed, schema-versioned JSON and created with
 exclusive file creation. A new batch produces a new ledger snapshot, never an
 in-place label correction. Conflicts stay excluded until a later explicitly

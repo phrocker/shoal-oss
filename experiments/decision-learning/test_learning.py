@@ -117,5 +117,35 @@ class LearningTests(unittest.TestCase):
         result=l.evaluate(self.ledger,self.data,self.ep,candidate,reseal(self.predictions))
         self.assertEqual(result['disposition'],'hold')
 
+    def test_promotion_requires_clean_evaluation_and_bound_approval(self):
+        evaluation = l.evaluate(self.ledger, self.data, self.ep, self.candidate, self.predictions)
+        artifact = l.seal('candidate_artifact', candidate_id=self.candidate['id'], evaluation_id=evaluation['id'], dataset_id=self.data['id'], model_digest='model', runtime_digest='runtime')
+        approval = l.seal('promotion_approval', candidate_id=self.candidate['id'], evaluation_id=evaluation['id'], owner='owner', approved=True)
+        release = l.promote_candidate(self.candidate, evaluation, artifact, approval)
+        self.assertEqual(release['state'], 'active')
+        self.assertIsNone(release['predecessor_release_id'])
+        approval['approved'] = False
+        with self.assertRaisesRegex(ValueError, 'identity'):
+            l.promote_candidate(self.candidate, evaluation, artifact, approval)
+
+    def test_failed_evaluation_cannot_promote(self):
+        self.predictions['rows'][0]['proposal'] = 'lower_priority'
+        evaluation = l.evaluate(self.ledger, self.data, self.ep, self.candidate, reseal(self.predictions))
+        artifact = l.seal('candidate_artifact', candidate_id=self.candidate['id'], evaluation_id=evaluation['id'], dataset_id=self.data['id'], model_digest='model', runtime_digest='runtime')
+        approval = l.seal('promotion_approval', candidate_id=self.candidate['id'], evaluation_id=evaluation['id'], owner='owner', approved=True)
+        with self.assertRaisesRegex(ValueError, 'shadow evaluation'):
+            l.promote_candidate(self.candidate, evaluation, artifact, approval)
+
+    def test_rollback_is_append_only_and_requires_bound_approval(self):
+        evaluation = l.evaluate(self.ledger, self.data, self.ep, self.candidate, self.predictions)
+        artifact = l.seal('candidate_artifact', candidate_id=self.candidate['id'], evaluation_id=evaluation['id'], dataset_id=self.data['id'], model_digest='model', runtime_digest='runtime')
+        approval = l.seal('promotion_approval', candidate_id=self.candidate['id'], evaluation_id=evaluation['id'], owner='owner', approved=True)
+        first = l.promote_candidate(self.candidate, evaluation, artifact, approval)
+        second = l.promote_candidate(self.candidate, evaluation, artifact, approval, predecessor_release=first)
+        rollback_approval = l.seal('rollback_approval', active_release_id=second['id'], prior_release_id=first['id'], owner='owner', approved=True)
+        rollback = l.rollback_release(second, first, rollback_approval)
+        self.assertEqual(rollback['rollback_of'], second['id'])
+        self.assertNotEqual(rollback['id'], second['id'])
+
 
 if __name__ == '__main__':unittest.main()
