@@ -887,6 +887,7 @@ var labelExcludedMethods = map[string]string{
 	"Ingest":           "write; label refusal is covered by TestLabelIngest* and the ingest-refusal rows",
 	"MaterializeGraph": "write of caller-supplied nodes only; TestLabelGraphMaterialization* pins it",
 	"BackfillExistingDocumentsForDevelopment": "development write; TestLabelBackfill* pins it",
+	"MigrateLabelledDocuments":                "startup catalog write under an internal capability; TestLabelMigration* runs this whole table after it",
 	"EnsureInteractionSink":                   "sink setup; reads no document",
 	"AnalyticsInteractionSink":                "sink constructor; reads no document",
 	"FleetActionInteractionSink":              "sink constructor; reads no document",

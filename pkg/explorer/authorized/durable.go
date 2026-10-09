@@ -252,9 +252,11 @@ func (s *DurablePolicyStore) load() error {
 	nodes := make(map[string]persistedNode)
 	coOccurrences := make(map[string]persistedCoOccurrence)
 	var (
-		versionRecord persistedSourceVersion
-		haveVersion   bool
-		maxSeq        uint64
+		versionRecord   persistedSourceVersion
+		haveVersion     bool
+		migrationRecord persistedLabelMigration
+		haveMigration   bool
+		maxSeq          uint64
 	)
 
 	for scanner.Next() {
@@ -281,6 +283,18 @@ func (s *DurablePolicyStore) load() error {
 			if !haveVersion || record.Seq >= versionRecord.Seq {
 				versionRecord = record
 				haveVersion = true
+			}
+			maxSeq = maxUint64(maxSeq, record.Seq)
+		case bytes.Equal(row, []byte(policyRowLabelMigration)):
+			var record persistedLabelMigration
+			if err := decodePolicyRecord(
+				value, policyKindLabelMigration, &record,
+			); err != nil {
+				return corruptPolicyRecord("label migration", err)
+			}
+			if !haveMigration || record.Seq >= migrationRecord.Seq {
+				migrationRecord = record
+				haveMigration = true
 			}
 			maxSeq = maxUint64(maxSeq, record.Seq)
 		case bytes.HasPrefix(row, []byte(policyRowSourceClaim)):
@@ -371,6 +385,13 @@ func (s *DurablePolicyStore) load() error {
 		coOccurrences, versionRecord, haveVersion,
 	); err != nil {
 		return err
+	}
+	if haveMigration {
+		migration, err := labelMigrationFromPersisted(migrationRecord)
+		if err != nil {
+			return corruptPolicyRecord("label migration", err)
+		}
+		s.memory.labelMigration = &migration
 	}
 	s.seq = maxSeq + 1
 	return nil

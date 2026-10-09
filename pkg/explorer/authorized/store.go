@@ -165,6 +165,27 @@ type PolicyStore interface {
 	// Edges resolves many edge registrations in one round trip under exactly
 	// the contract Nodes carries for node registrations.
 	Edges(context.Context, []shoal.ID) (map[shoal.ID]EdgeRegistration, error)
+	// DocumentRevisions returns every immutable revision registration of one
+	// document, ordered by revision ID, with Current set on the current one.
+	// An unregistered document yields an empty slice.
+	DocumentRevisions(context.Context, shoal.ID) ([]RevisionRegistration, error)
+	// TightenRule narrows a document's catalog rule in place, atomically per
+	// call (#570). It accepts only a `to` whose components are a strict
+	// superset of `from`'s and never widens anything; see
+	// MemoryPolicyStore.TightenRule for exactly what it rewrites. It reports
+	// whether anything changed, so a repeated call is a no-op.
+	TightenRule(
+		ctx context.Context,
+		documentID, revisionID shoal.ID,
+		sourceURI string,
+		from, to AccessRule,
+	) (bool, error)
+	// LabelMigration returns the label-migration marker recorded by
+	// PutLabelMigration, if any.
+	LabelMigration(context.Context) (LabelMigrationRecord, bool, error)
+	// PutLabelMigration records the label-migration marker. It is written
+	// only after every document has been migrated.
+	PutLabelMigration(context.Context, LabelMigrationRecord) error
 }
 
 type revisionKey struct {
@@ -198,6 +219,7 @@ type MemoryPolicyStore struct {
 	edgeClaims     map[shoal.ID]EdgeRegistration
 	edges          map[shoal.ID]EdgeRegistration
 	coOccurrence   map[string]CoOccurrenceRecord
+	labelMigration *LabelMigrationRecord
 }
 
 // NewMemoryPolicyStore constructs an empty reference catalog.
