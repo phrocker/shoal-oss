@@ -192,6 +192,25 @@ type Report struct {
 	Outcome   json.RawMessage `json:"outcome,omitempty"`
 	Failed    bool            `json:"failed,omitempty"`
 	ErrorCode string          `json:"error_code,omitempty"`
+	// Effected is how much of an irreversible egress happened before the
+	// failure (#427). Valid only with Failed, and only for an action that
+	// declares it may egress content.
+	//
+	// Omitted when nothing left, so a caller that has nothing to report
+	// sends the same bytes it sent before this field existed.
+	Effected *Effected `json:"effected,omitempty"`
+}
+
+// Effected is the volume of a partial egress, in units the plane already
+// understands.
+//
+// Fixed integers, not a unit/value pair: a unit label would be
+// caller-controlled text on a durable record. A gateway with a tokenizer
+// derives tokens from bytes itself; that is its own observation and not
+// something the plane carries.
+type Effected struct {
+	Bytes  int64 `json:"bytes"`
+	Chunks int64 `json:"chunks,omitempty"`
 }
 
 // Receipt acknowledges a Report.

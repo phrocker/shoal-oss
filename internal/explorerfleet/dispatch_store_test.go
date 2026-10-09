@@ -1104,6 +1104,41 @@ func TestDispatchStoreEnforcesMonotonicFenceAndEffect(t *testing.T) {
 			prepare: func(r *fleet.ActionRecord) { r.EffectPossible = true },
 			rewrite: func(r *fleet.ActionRecord) { r.EffectPossible = false },
 		},
+		{
+			// Write-once, a third class: zero before the terminal
+			// transition, written exactly once by it, immutable after
+			// (#427). Neither immutable from creation — the terminal
+			// transition must set it — nor monotonic, because a larger
+			// number is not more valid and a different one is a rewrite of
+			// what was reported.
+			//
+			// The seed must be a *failed* record: Validate refuses a volume
+			// on any other state, so seeding a queued one would be refused
+			// for an unrelated reason and the rewrite would never run, which
+			// is exactly how the fence probe above first "passed".
+			name: "an effected volume is written once",
+			prepare: func(r *fleet.ActionRecord) {
+				now := r.CreatedAt
+				r.State = fleet.DispatchFailed
+				r.ErrorCode = "response_truncated"
+				r.EffectPossible = true
+				r.ClaimID = []byte("claim")
+				r.ClaimFence = 1
+				r.ClaimLease = time.Minute
+				r.ClaimLeaseUntil = now.Add(time.Minute)
+				r.ClaimantSubject = r.Subject
+				r.ClaimantActor = r.Actor
+				r.ClaimantClientID = r.ClientID
+				r.ClaimantOnBehalfOf = r.OnBehalfOf
+				r.TransitionOperation = auth.OperationInvoke
+				r.ExecutionPolicyGeneration = 1
+				r.ExecutionExpiresAt = now.Add(time.Hour)
+				r.Effected = fleet.EffectedVolume{Bytes: 2 << 20, Chunks: 64}
+			},
+			rewrite: func(r *fleet.ActionRecord) {
+				r.Effected = fleet.EffectedVolume{Bytes: 1}
+			},
+		},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
 			directory := t.TempDir()

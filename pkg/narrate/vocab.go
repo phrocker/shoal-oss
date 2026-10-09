@@ -60,6 +60,11 @@ var FleetErrorCodes = []string{
 	"invalid_executor_output",
 	"invalid_executor_evidence",
 	"invalid_executor_error",
+	// The service's adjudication when a reported effected volume is not
+	// usable — out of bounds, or attached to an action that declares no
+	// egress (#427). Like the others it is the service's own code, so a
+	// reader can tell it from anything the executor said.
+	"invalid_executor_effected",
 	"executor_error",
 }
 

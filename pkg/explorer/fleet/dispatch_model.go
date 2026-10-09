@@ -413,6 +413,16 @@ type ActionRecord struct {
 	Input           json.RawMessage
 	Output          json.RawMessage
 	ErrorCode       string
+	// Effected is how much of an irreversible egress happened before a
+	// failure, for the boundary where a failure follows a partial effect
+	// (#427). Zero on every other record, including every success: a
+	// completed egress's volume is not what this answers.
+	//
+	// Written exactly once, by the terminal transition, and immutable after —
+	// the store enforces that (#461). An operator reconciling a failed
+	// external call reads it to tell "nothing left" from "two megabytes
+	// left", which arrived identically before.
+	Effected EffectedVolume
 	// ErrorCodeOrigin says whether the service or the executor decided
 	// ErrorCode. Empty on a record written before the field existed.
 	ErrorCodeOrigin                ErrorCodeOrigin
@@ -941,6 +951,12 @@ type ExecutionResult struct {
 	EvidenceSnapshotID   shoal.ID
 	EvidenceSnapshotAsOf time.Time
 	Evidence             []EvidenceRef
+	// Effected is how much of an irreversible egress happened before a
+	// failure (#427). Carried here rather than only on the admission report
+	// because both completion paths go through applyExecutionResult, and a
+	// field validated on one of them is a hole on the other — which is the
+	// shape of several defects this package has already had.
+	Effected EffectedVolume
 }
 
 // ActionTransition is the immutable, durable event outbox entry created in the
@@ -1281,6 +1297,20 @@ func (r ActionRecord) Validate() error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument, "action claim lease lacks a claim ID")
 	}
+	// A volume means one thing — how much of an irreversible egress happened
+	// before a failure — so it is only coherent on a failed record (#427).
+	// Permitting it elsewhere would make it a number attached to work that
+	// did not fail, which no reader could interpret.
+	if !r.Effected.Zero() {
+		if r.State != DispatchFailed {
+			return shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"a "+string(r.State)+" action carries an effected volume")
+		}
+		if err := r.Effected.validate(); err != nil {
+			return err
+		}
+	}
 	if (r.State == DispatchClaimed || r.State == DispatchSucceeded || r.State == DispatchFailed) &&
 		(r.ExecutionPolicyGeneration <= 0 || r.ExecutionExpiresAt.IsZero()) {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "action execution authorization is incomplete")
@@ -1374,6 +1404,7 @@ var reservedActionErrorCodes = map[string]struct{}{
 	"invalid_executor_output":   {},
 	"invalid_executor_evidence": {},
 	"invalid_executor_error":    {},
+	"invalid_executor_effected": {},
 	"executor_error":            {},
 }
 

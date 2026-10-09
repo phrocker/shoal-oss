@@ -306,6 +306,23 @@ func admissionGoldenCases() []admissionGoldenCase {
 			body: goldenReport.without("outcome").plus("failed", "true").
 				plus("error_code", `"upstream_unreachable"`).String(),
 			provider: receipt},
+		// #427: the volume of a partial egress reaches the provider. Three
+		// cases, because the whole point is that they stop arriving
+		// identically: nothing left, a little, and a framed stream.
+		{name: "report_failed_effected_absent", path: report,
+			body: goldenReport.without("outcome").plus("failed", "true").
+				plus("error_code", `"response_truncated"`).String(),
+			provider: receipt},
+		{name: "report_failed_effected_bytes", path: report,
+			body: goldenReport.without("outcome").plus("failed", "true").
+				plus("error_code", `"response_truncated"`).
+				plus("effected", `{"bytes":50}`).String(),
+			provider: receipt},
+		{name: "report_failed_effected_chunked", path: report,
+			body: goldenReport.without("outcome").plus("failed", "true").
+				plus("error_code", `"response_truncated"`).
+				plus("effected", `{"bytes":2097152,"chunks":64}`).String(),
+			provider: receipt},
 		{name: "report_failed_false_with_code", path: report,
 			body:     goldenReport.plus("failed", "false").plus("error_code", `""`).String(),
 			provider: receipt},

@@ -3351,3 +3351,191 @@ func TestAdmissionDenialNamesNothing(t *testing.T) {
 		}
 	}
 }
+
+// TestAFailureReportsHowMuchEscaped is #427.
+//
+// Report is either {Outcome} or {Failed, ErrorCode}, and that exclusivity is
+// right for an executor: work that failed did not happen, so there is nothing
+// to quantify. The proxy is the one boundary where a failure follows a partial
+// irreversible effect — a streamed completion that breaks halfway has already
+// put bytes in front of the caller and cannot recall them — and the byte count
+// was dropped. So three different events arrived identically as
+// response_truncated: nothing left, fifty bytes left, two megabytes left. The
+// first is a non-event, the third a near-complete disclosure, and #389
+// consumes these reports to shape the next decision.
+func TestAFailureReportsHowMuchEscaped(t *testing.T) {
+	escaped := EffectedVolume{Bytes: 2 << 20, Chunks: 64}
+
+	t.Run("committed on an egressing action", func(t *testing.T) {
+		harness := newAdmissionHarness(t, nil)
+		grant, err := harness.service.Request(
+			harness.context(t, "request"), harness.request(
+				"request", "admission", "complete",
+				Effects{EffectEgressesContent}, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err := harness.service.Report(
+			harness.context(t, "report"), AdmissionReport{
+				Token: grant.Token, Failed: true,
+				ErrorCode: "response_truncated", Effected: escaped,
+				Context: dispatchContext(harness.now, "report"),
+			})
+		if err != nil {
+			t.Fatalf("a failure carrying a volume was refused: %v", err)
+		}
+		if record.Effected != escaped {
+			t.Fatalf("returned volume = %#v, want %#v", record.Effected, escaped)
+		}
+		stored, err := harness.stored(t, "admission")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Effected != escaped {
+			t.Fatalf("stored volume = %#v, want %#v: the durable record is "+
+				"what an operator reconciling the egress reads",
+				stored.Effected, escaped)
+		}
+	})
+
+	// The property the exclusivity rule exists to protect, and the reason a
+	// quantity may ride on a failure at all. An outcome was refused there
+	// because the completion path *discarded* it, so two failures with the
+	// same error code compared equal and a caller could replace what it
+	// reported and be told the second was recorded. Effected is committed and
+	// compared, so it has none of that.
+	t.Run("a different volume is a different report", func(t *testing.T) {
+		harness := newAdmissionHarness(t, nil)
+		grant, err := harness.service.Request(
+			harness.context(t, "request"), harness.request(
+				"request", "admission", "complete",
+				Effects{EffectEgressesContent}, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		report := AdmissionReport{
+			Token: grant.Token, Failed: true,
+			ErrorCode: "response_truncated", Effected: escaped,
+			Context: dispatchContext(harness.now, "report"),
+		}
+		if _, err := harness.service.Report(
+			harness.context(t, "report"), report); err != nil {
+			t.Fatal(err)
+		}
+		// The identical report replays as a receipt.
+		if _, err := harness.service.Report(
+			harness.context(t, "report"), report); err != nil {
+			t.Fatalf("an identical replay was refused: %v", err)
+		}
+		// A different volume is not this report, so the spent token says so
+		// rather than quietly accepting a rewritten number.
+		lying := report
+		lying.Effected = EffectedVolume{Bytes: 1}
+		if _, err := harness.service.Report(
+			harness.context(t, "report"), lying,
+		); !errors.Is(err, ErrAdmissionSpent) {
+			t.Fatalf("a failure reporting a different volume = %v, want "+
+				"ErrAdmissionSpent: otherwise a caller replaces how much "+
+				"escaped and is told the second number was recorded", err)
+		}
+		stored, err := harness.stored(t, "admission")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Effected != escaped {
+			t.Fatalf("the record's volume changed to %#v", stored.Effected)
+		}
+	})
+
+	for _, probe := range []struct {
+		name   string
+		action string
+		mutate func(*AdmissionReport)
+	}{
+		{
+			// Not a free-form channel. An action the host did not declare may
+			// send content outside Shoal has no egress to quantify, and
+			// recording a number there would make this a place to write
+			// arbitrary values on a durable record.
+			name: "an action that does not declare egress", action: "summarize",
+			mutate: func(r *AdmissionReport) { r.Effected = escaped },
+		},
+		{
+			// Meaningless on a success: this field answers how much escaped
+			// before a failure, not how much a completed call sent.
+			name: "a successful report", action: "complete",
+			mutate: func(r *AdmissionReport) {
+				r.Failed = false
+				r.ErrorCode = ""
+				r.Outcome = json.RawMessage(`{"prompt_digest":"abc"}`)
+				r.Effected = escaped
+			},
+		},
+		{
+			name: "a volume over its byte bound", action: "complete",
+			mutate: func(r *AdmissionReport) {
+				r.Effected = EffectedVolume{Bytes: MaxEffectedBytes + 1}
+			},
+		},
+		{
+			name: "a volume over its chunk bound", action: "complete",
+			mutate: func(r *AdmissionReport) {
+				r.Effected = EffectedVolume{
+					Bytes: 1, Chunks: MaxEffectedChunks + 1}
+			},
+		},
+		{
+			name: "a negative volume", action: "complete",
+			mutate: func(r *AdmissionReport) {
+				r.Effected = EffectedVolume{Bytes: -1}
+			},
+		},
+		{
+			// A chunk that left carried something, so chunks without bytes
+			// describes nothing that can have happened.
+			name: "chunks with no bytes", action: "complete",
+			mutate: func(r *AdmissionReport) {
+				r.Effected = EffectedVolume{Chunks: 3}
+			},
+		},
+	} {
+		t.Run("refused: "+probe.name, func(t *testing.T) {
+			harness := newAdmissionHarness(t, nil)
+			effects := Effects{EffectEgressesContent}
+			if probe.action == "summarize" {
+				effects = Effects{EffectReadsCorpus}
+			}
+			grant, err := harness.service.Request(
+				harness.context(t, "request"), harness.request(
+					"request", "admission", probe.action, effects, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			report := AdmissionReport{
+				Token: grant.Token, Failed: true,
+				ErrorCode: "response_truncated",
+				Context:   dispatchContext(harness.now, "report"),
+			}
+			probe.mutate(&report)
+			if _, err := harness.service.Report(
+				harness.context(t, "report"), report,
+			); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+				t.Fatalf("report = %v, want invalid argument", err)
+			}
+			// Refused before anything committed: the token is still live, so
+			// a caller that sends a usable report next is not told its work
+			// was already recorded.
+			stored, err := harness.stored(t, "admission")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.State != DispatchClaimed {
+				t.Fatalf("the refused report moved the record to %q",
+					stored.State)
+			}
+			if !stored.Effected.Zero() {
+				t.Fatalf("the refused report recorded %#v", stored.Effected)
+			}
+		})
+	}
+}
