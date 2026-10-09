@@ -40,7 +40,8 @@ func NewLayaPredictor(cfg LayaConfig) (*LayaPredictor, error) {
 	if err := validateIdentity(cfg.Identity); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(cfg.BearerToken) == "" {
+	token := strings.TrimSpace(cfg.BearerToken)
+	if token == "" || strings.ContainsAny(token, "\r\n") {
 		return nil, fmt.Errorf("%w: Laya bearer token is required", ErrInvalidConfig)
 	}
 	maxBody := cfg.MaxResponseBytes
@@ -54,7 +55,7 @@ func NewLayaPredictor(cfg LayaConfig) (*LayaPredictor, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &LayaPredictor{baseURL: strings.TrimRight(cfg.BaseURL, "/"), token: cfg.BearerToken, id: cfg.Identity, client: client, maxBody: maxBody}, nil
+	return &LayaPredictor{baseURL: strings.TrimRight(cfg.BaseURL, "/"), token: token, id: cfg.Identity, client: client, maxBody: maxBody}, nil
 }
 
 func (p *LayaPredictor) Identity() TypedIdentity { return p.id }
@@ -145,8 +146,8 @@ type layaResponse struct {
 type layaAnswer struct {
 	Type             string             `json:"type"`
 	Choice           string             `json:"choice"`
-	Score            float64            `json:"score"`
-	Noul             float64            `json:"noul"`
+	Score            *float64           `json:"score"`
+	Noul             *float64           `json:"noul"`
 	Confidence       float64            `json:"confidence"`
 	AnswerConfidence float64            `json:"answer_confidence"`
 	Probabilities    map[string]float64 `json:"probabilities"`
@@ -164,7 +165,7 @@ func decodeLayaResult(req TypedRequest, wire layaResponse) (TypedResult, error) 
 		if !ok {
 			return TypedResult{}, fmt.Errorf("%w: missing Laya answer %q", ErrMalformedResponse, q.ID)
 		}
-		ta := TypedAnswer{QuestionID: q.ID, Choice: answer.Choice, Score: answer.Score, Probability: answer.Probabilities[answer.Choice], Confidence: answer.Confidence, AnswerConfidence: answer.AnswerConfidence, PTrue: answer.Noul}
+		ta := TypedAnswer{QuestionID: q.ID, Choice: answer.Choice, Confidence: answer.Confidence, AnswerConfidence: answer.AnswerConfidence}
 		switch q.Kind {
 		case TypedChoice:
 			if answer.Type != "choice" {
@@ -187,6 +188,10 @@ func decodeLayaResult(req TypedRequest, wire layaResponse) (TypedResult, error) 
 			if len(answer.Probabilities) != len(q.Options) {
 				return TypedResult{}, fmt.Errorf("%w: unexpected Laya score labels", ErrMalformedResponse)
 			}
+			if answer.Score == nil {
+				return TypedResult{}, fmt.Errorf("%w: missing Laya score", ErrMalformedResponse)
+			}
+			ta.Score = *answer.Score
 			for i := range q.Options {
 				key := strconv.Itoa(i)
 				value, ok := answer.Probabilities[key]
@@ -199,6 +204,10 @@ func decodeLayaResult(req TypedRequest, wire layaResponse) (TypedResult, error) 
 			if answer.Type != "noul" {
 				return TypedResult{}, fmt.Errorf("%w: wrong Laya answer type", ErrMalformedResponse)
 			}
+			if answer.Noul == nil {
+				return TypedResult{}, fmt.Errorf("%w: missing Laya proposition probability", ErrMalformedResponse)
+			}
+			ta.PTrue = *answer.Noul
 		default:
 			return TypedResult{}, fmt.Errorf("%w: unsupported question kind", ErrMalformedResponse)
 		}
