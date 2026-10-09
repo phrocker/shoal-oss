@@ -707,6 +707,8 @@ func decodeTransition(value []byte) (storedTransition, error) {
 // Claim state is deliberately absent: the claimant fields and
 // ClaimAttestationID (#446) move on every re-claim, and an extension under a
 // newer attestation replaces the latter. They are #461's mutable list.
+// ClaimExecutorRef (#391) is claim state of the same kind and sits in the
+// deliberately-absent set listed at rewrittenIdentity, which says why.
 //
 // ErrorInternal rather than ErrorInvalidArgument, for two reasons. The only
 // way to reach it is a service that rewrote its own record, so it is an
@@ -879,7 +881,13 @@ func refuseRewrittenIdentity(current, next fleet.ActionRecord) error {
 // the evidence fails validation; CancelKey is written by Cancel and by the
 // admission denial; AuthorizedOperations is widened by Cancel and by the
 // effect admission; TransitionOperation and the claimant fields move on every
-// re-claim, which is what they are for; TransitionRequestID and
+// re-claim, which is what they are for; ClaimAttestationID and
+// ClaimExecutorRef are claim-scoped in the same way — ClaimExecutorRef
+// (#391) is the executor ref the *current* claim was taken under, so a
+// re-claim after the descriptor is rebound must move it, and it is neither
+// immutable (it changes with the claim) nor monotonic (a ref has no order),
+// nor write-once (every claim writes it), so it fits none of the three
+// classes above and is deliberately unchecked; TransitionRequestID and
 // TransitionCorrelationID are per-transition by definition; the execution
 // fingerprint, its generation and its expiry are re-derived at each execution
 // boundary; the cancel authorization fields are written when a cancellation

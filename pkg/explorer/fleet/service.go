@@ -373,6 +373,9 @@ func (s *Service) Resolve(ctx context.Context, request ResolveRequest) (Resolved
 	if err != nil {
 		return Resolved{}, err
 	}
+	if !resolvableUnderBinding(decision, descriptor) {
+		return Resolved{}, auth.ObjectNotFound()
+	}
 	if err := s.record(ctx, decision, request.Context, auth.OperationAgentResolve,
 		request.ID, registryDigests{}); err != nil {
 		return Resolved{}, err
@@ -428,7 +431,8 @@ func (s *Service) List(ctx context.Context, request ListRequest) (ListPage, erro
 		item := stored.Entries[0]
 		descriptor := item.Descriptor
 		visible := matchesFilter(descriptor, request) && !descriptorExpired(descriptor, now) &&
-			authorizeDescriptor(decision, auth.OperationAgentResolve, descriptor, now) == nil
+			authorizeDescriptor(decision, auth.OperationAgentResolve, descriptor, now) == nil &&
+			resolvableUnderBinding(decision, descriptor)
 		if visible && descriptor.ParentID != "" {
 			if _, parentErr := s.authorizedActive(
 				ctx, decision, descriptor.ParentID, now,
@@ -504,10 +508,34 @@ func (s *Service) validateDelivery(
 	if err != nil {
 		return err
 	}
+	if !resolvableUnderBinding(decision, descriptor) {
+		return auth.ObjectNotFound()
+	}
 	if pinned && descriptor.Generation != expectedGeneration {
 		return auth.ObjectNotFound()
 	}
 	return nil
+}
+
+// resolvableUnderBinding confines an action-execution decision's agent_resolve
+// to the one descriptor its executor binding names (#391).
+//
+// A worker resolves its own descriptor to learn what it serves, and nothing
+// else: it holds no registrar credential and never heartbeats, because it
+// cannot truthfully assert a descriptor's liveness. So the role may resolve,
+// and only where the descriptor's executor reference is its binding. Applied
+// to the descriptor being resolved or listed, not to its parents, which are
+// authorized as before. Every other decision is unaffected.
+//
+// Keyed on the role rather than on a non-empty binding, so a role without a
+// binding — which auth refuses to mint — would resolve nothing rather than
+// everything.
+func resolvableUnderBinding(decision auth.Decision, descriptor Descriptor) bool {
+	if decision.ServiceRole() != auth.ServiceRoleActionExecution {
+		return true
+	}
+	binding := decision.ExecutorBinding()
+	return binding != "" && descriptor.ExecutorRef == binding
 }
 
 func (s *Service) begin(ctx context.Context, operation auth.Operation, request RequestContext) (auth.Decision, time.Time, error) {
@@ -586,6 +614,18 @@ func (s *Service) activeChain(
 	id shoal.ID,
 	now time.Time,
 ) ([]Descriptor, error) {
+	return s.activeChainLapsing(ctx, id, now, false)
+}
+
+// activeChainLapsing is activeChain that, when allowLapsed, accepts a
+// descriptor whose lease has lapsed. A revoked descriptor is refused either
+// way. Only resolveActionBindingLapsing asks for it.
+func (s *Service) activeChainLapsing(
+	ctx context.Context,
+	id shoal.ID,
+	now time.Time,
+	allowLapsed bool,
+) ([]Descriptor, error) {
 	seen := make(map[shoal.ID]struct{}, MaxDelegationDepth)
 	chain := make([]Descriptor, 0, MaxDelegationDepth)
 	currentID := id
@@ -599,7 +639,8 @@ func (s *Service) activeChain(
 			return nil, concealStoreRead(err)
 		}
 		descriptor := stored.Descriptor
-		if descriptorExpired(descriptor, now) {
+		if descriptorExpired(descriptor, now) &&
+			(!allowLapsed || !descriptor.RevokedAt.IsZero()) {
 			return nil, auth.ObjectNotFound()
 		}
 		chain = append(chain, descriptor)

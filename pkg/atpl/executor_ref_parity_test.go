@@ -64,20 +64,35 @@ func TestExecutorRefParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor, err := auth.NewDecision(auth.DecisionConfig{
-		Subject: "worker", Actor: "worker", ClientID: "worker-client",
-		AuthorizationDomain:   []byte("domain"),
-		AllowedOperations:     []auth.Operation{auth.OperationExecute},
-		PolicyGeneration:      1,
-		AuthenticationExpires: now.Add(time.Hour),
-		RequestID:             "present", CorrelationID: "present-correlation",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	presentCtx, err := authority.Binder().Bind(context.Background(), executor)
-	if err != nil {
-		t.Fatal(err)
+	// A worker presents only for the executor it is bound to (#391), so the
+	// presenting decision is bound to the reference under test. A reference
+	// the binding refuses gets a decision bound elsewhere, which Present
+	// must still refuse on the reference's shape before the binding.
+	presentCtx := func(ref string) context.Context {
+		config := auth.DecisionConfig{
+			Subject: "worker", Actor: "worker", ClientID: "worker-client",
+			AuthorizationDomain:    []byte("domain"),
+			AllowedOperations:      []auth.Operation{auth.OperationExecute},
+			PolicyGeneration:       1,
+			AuthenticationExpires:  now.Add(time.Hour),
+			RequestID:              "present",
+			CorrelationID:          "present-correlation",
+			ServiceRole:            auth.ServiceRoleActionExecution,
+			ServiceCeilingIdentity: "ceiling-execute",
+			ExecutorBinding:        ref,
+		}
+		executor, err := auth.NewDecision(config)
+		if err != nil {
+			config.ExecutorBinding = "worker"
+			if executor, err = auth.NewDecision(config); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ctx, err := authority.Binder().Bind(context.Background(), executor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ctx
 	}
 
 	sites := map[string]func(ref string) error{
@@ -100,7 +115,7 @@ func TestExecutorRefParity(t *testing.T) {
 			return err
 		},
 		"attestation presentation": func(ref string) error {
-			_, err := attestations.Present(presentCtx, fleet.AttestationPresentation{
+			_, err := attestations.Present(presentCtx(ref), fleet.AttestationPresentation{
 				ExecutorRef: ref, IdempotencyKey: []byte("key"),
 				Report: []byte(`{}`),
 			})

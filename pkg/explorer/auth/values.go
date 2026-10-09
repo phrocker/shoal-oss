@@ -155,7 +155,8 @@ const (
 
 	ServiceRoleActionInvocation ServiceRole = "action_invocation"
 	// ServiceRoleActionExecution is the role a worker holds: it may take and
-	// finish queued work and do nothing else. Deliberately not granted by
+	// finish queued work, and resolve the one descriptor its executor binding
+	// names (#391), and do nothing else. Deliberately not granted by
 	// ServiceRoleActionInvocation, so a principal that may enqueue cannot
 	// thereby claim.
 	ServiceRoleActionExecution ServiceRole = "action_execution"
@@ -220,7 +221,13 @@ func (r ServiceRole) Allows(operation Operation) bool {
 	case ServiceRoleActionInvocation:
 		return operation == OperationInvoke || operation == OperationValidate
 	case ServiceRoleActionExecution:
-		return operation == OperationExecute || operation == OperationValidate
+		// agent_resolve so a worker can read the one descriptor it is bound
+		// to; the fleet confines it to that descriptor (#391). Never
+		// heartbeat: a worker cannot truthfully assert a descriptor's
+		// liveness.
+		return operation == OperationExecute ||
+			operation == OperationAgentResolve ||
+			operation == OperationValidate
 	case ServiceRoleActionApproval:
 		return operation == OperationActionApprove ||
 			operation == OperationValidate

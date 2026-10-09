@@ -118,6 +118,19 @@ type principal struct {
 	onBehalfOf []shoal.ID
 	operations []auth.Operation
 	generation int64
+	// binding makes the principal an executor-bound worker (#391): the
+	// action-execution role, bound to this ref.
+	binding string
+}
+
+// bindExecutor applies a principal's executor binding to a decision config.
+func (who principal) bindExecutor(config auth.DecisionConfig) auth.DecisionConfig {
+	if who.binding != "" {
+		config.ServiceRole = auth.ServiceRoleActionExecution
+		config.ServiceCeilingIdentity = "executor-ceiling"
+		config.ExecutorBinding = who.binding
+	}
+	return config
 }
 
 var (
@@ -147,7 +160,7 @@ func (h *approvalHarness) as(who principal) context.Context {
 	if generation == 0 {
 		generation = workspacePolicyGeneration
 	}
-	decision, err := auth.NewDecision(auth.DecisionConfig{
+	decision, err := auth.NewDecision(who.bindExecutor(auth.DecisionConfig{
 		Subject: who.subject, Actor: who.actor, ClientID: who.client,
 		OnBehalfOf:            who.onBehalfOf,
 		AuthorizationDomain:   workspaceAuthorizationDomain,
@@ -159,7 +172,7 @@ func (h *approvalHarness) as(who principal) context.Context {
 		RequestID: shoal.ID(fmt.Sprintf(
 			"approval-request-%d", h.requests.Add(1))),
 		CorrelationID: "approval-correlation",
-	})
+	}))
 	if err != nil {
 		h.t.Fatal(err)
 	}

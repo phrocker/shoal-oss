@@ -154,10 +154,17 @@ func newAttestationFixture(t *testing.T, require bool) *attestationFixture {
 func (f *attestationFixture) worker(t *testing.T, name string, onBehalfOf ...shoal.ID) (context.Context, RequestContext) {
 	t.Helper()
 	request := name + "-request-" + hex.EncodeToString([]byte(f.now().Format(time.RFC3339Nano)))
-	decision := dispatchDecisionFor(t, principal{
+	who := principal{
 		subject: name, actor: name + "-actor", request: request,
 		clientID: shoal.ID(name + "-client"), onBehalfOf: onBehalfOf,
-	}, auth.OperationExecute)
+	}
+	// Bound to the descriptor's executor, as a worker is since #391. A
+	// delegated caller cannot be bound, so it stays an unbound execute-holder,
+	// which the execute route refuses.
+	decision := executorDecisionFor(t, who, "exec")
+	if len(onBehalfOf) > 0 {
+		decision = dispatchDecisionFor(t, who, auth.OperationExecute)
+	}
 	return bindDecision(t, f.authority, decision), dispatchContext(f.now(), request)
 }
 
@@ -500,17 +507,26 @@ func TestAnotherPrincipalsAttestationDoesNotCover(t *testing.T) {
 	_, err := f.claim(t, "beta", time.Minute)
 	requireAttestationRefusal(t, err)
 	// alpha acting on behalf of someone is not alpha attested as itself, even
-	// with the delegate authority the binding requires.
+	// with the delegate authority the binding requires. Since #391 it does
+	// not reach the attestation gate at all: a delegated decision cannot be
+	// executor-bound, and the execute route refuses an unbound or delegated
+	// caller as not-found before the attestation store is read.
 	decision := dispatchDecisionFor(t, principal{
 		subject: "alpha", actor: "alpha-actor", request: "delegated",
 		clientID: "alpha-client", onBehalfOf: []shoal.ID{"delegator"},
 	}, auth.OperationExecute, auth.OperationDelegate)
+	calls := f.attestations.callCount()
 	_, err = f.service.Claim(bindDecision(t, f.authority, decision), ClaimRequest{
 		ID: f.queued.ID, ExpectedVersion: f.queued.Version,
 		ClaimID: []byte("delegated"), Lease: time.Minute,
 		Context: dispatchContext(f.now(), "delegated"),
 	})
-	requireAttestationRefusal(t, err)
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
+		f.attestations.callCount() != calls {
+		t.Fatalf("a delegated execute claim = %v, store reads %d -> %d; "+
+			"want not-found with no store read", err, calls,
+			f.attestations.callCount())
+	}
 	// And alpha as itself is covered, so the refusal above was the chain.
 	if _, err := f.claim(t, "alpha", time.Minute); err != nil {
 		t.Fatal(err)
