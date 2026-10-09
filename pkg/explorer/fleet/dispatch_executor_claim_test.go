@@ -4493,8 +4493,10 @@ func (s *stubEvidenceVisibility) VisibleToReader(
 // of B's labels. Content was not exposed; identity, structure and the label
 // expression were.
 //
-// Label enforcement in this plane normally happens at the scan: a document a
-// reader may not see does not come back from storage. An EvidenceRef is
+// These labels are enforced nowhere else, which is not what this test
+// originally said — it claimed the scan filtered them and that an EvidenceRef
+// merely escaped that. Free-form labels never become cell visibility
+// (#570), so the scan filters nothing. An EvidenceRef is
 // different — it was recorded by the action's principal and is stored as a
 // field of the record — so it needed a check of its own.
 func TestADispatchReaderSeesOnlyEvidenceItsLabelsCover(t *testing.T) {
