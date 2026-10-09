@@ -16,14 +16,28 @@
 // interaction.PropertyVisibility ("shoal.visibility") is written into a
 // node's *properties* by explorer.setVisibility, reached from parse.go, and
 // never into a cell visibility — so the scan has nothing to filter on and
-// internal/visfilter never sees it. Authorized reads gate on the access
-// rule's domain, source and policy, so a reader granted a source receives
-// every labelled document, span and node in it, label included (#570).
+// internal/visfilter never sees it.
 //
-// So Filter is not restoring a check that existed at a lower layer. It is the
-// only check, which makes the nil case load-bearing rather than defensive: a
-// deployment with no Visibility withholds labelled evidence precisely because
-// nothing else would.
+// This paragraph said something else until #570 landed, and the way it went
+// stale is worth leaving on the record. It said authorized reads gate only on
+// the access rule's domain, source and policy, so a reader granted a source
+// receives every labelled document, span and node in it. That was true when
+// written and is now false: #570 translates each (source, label) pair into a
+// policy and conjoins it into the labelled document's AccessRule, which
+// ruleAllows enforces on every authorized read. Documents, spans and nodes
+// are covered.
+//
+// Evidence references are not, and that is what Filter is still for. An
+// EvidenceRef is a field of a fleet ActionRecord rather than a labelled
+// document, so no AccessRule governs it and ruleAllows never sees it — #570
+// did not touch it and #564 has not yet wired an evaluator. So Filter
+// remains the only check here, which keeps the nil case load-bearing rather
+// than defensive: a deployment with no Visibility withholds labelled
+// evidence precisely because nothing else would.
+//
+// The narrower claim is the durable one. "Nothing enforces these labels" was
+// true of the whole system for a while and is now true only of this seam, so
+// state it about this seam.
 //
 // An evidence reference recorded on another record — a dispatch action
 // (#369), or the lifecycle event published for it (#562) — was recorded by
