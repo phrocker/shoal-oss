@@ -4350,6 +4350,18 @@ func TestAnUnconfinedExecutorMayNotRunWiderThanItsScope(t *testing.T) {
 			},
 		},
 		{
+			// Only a canonical label policy is left out. An ID that merely
+			// shares the namespace prefix is compared like any policy.
+			name:     "a malformed label-namespace grant",
+			executor: confiningExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, onlyA, [][]byte{
+					[]byte("policy-a"), []byte(auth.LabelPolicyIDPrefix + "9/source-a/x"),
+				}, auth.OperationRetrieve)
+			},
+			refused: true,
+		},
+		{
 			// A label policy on another source comes with that source, and
 			// the source is what widens.
 			name:     "a label holder on another source",

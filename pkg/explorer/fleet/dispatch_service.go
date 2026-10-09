@@ -3573,7 +3573,7 @@ func refuseUnconfinedRetrieval(
 		return err
 	}
 	if withinScope(sources, record.SourceID) &&
-		withinScope(withoutLabelPolicies(policies), record.PolicyID) {
+		withinScope(withoutOwnLabelPolicies(policies, record.SourceID), record.PolicyID) {
 		return nil
 	}
 	// Names no source it does not already hold: the refusal says the
@@ -3586,22 +3586,33 @@ func refuseUnconfinedRetrieval(
 			"descriptor's scope would not describe what the record carries")
 }
 
-// withoutLabelPolicies drops grant policies in the label namespace (#570).
+// withoutOwnLabelPolicies drops the canonical label policies (#570) of the
+// action's own source from the policy comparison above.
 //
-// A label policy is only ever conjoined onto its own source's policy in an
-// AccessRule; no rule is a label policy alone. Holding one therefore opens
-// nothing outside the source and policy checks already made here: every
-// document it lets the principal retrieve is also governed by a source
-// policy, which those checks bound. Counting it as a wider policy refused
-// every holder of a label an unconfined executor, so no reader cleared for a
-// labelled document could invoke an action grounded in one (#564). A label
-// policy on another source is still refused, by the sources check.
-func withoutLabelPolicies(ids [][]byte) [][]byte {
+// A label narrows and can never widen. Every label rule is
+// NewAccessRule(sourcePolicy, labelPolicy...) (authorized.LabelRule): the
+// source policy is always in the conjunction, and AccessRule.Authorize
+// requires every term. So the documents a label policy on source A governs
+// are a strict subset of A's documents, already within the action's scope,
+// and #561 refuses only widening. Counting such a grant as a wider policy
+// refused every principal cleared for a label an unconfined executor (#564).
+//
+// Only an ID auth.ParseLabelPolicyID accepts, and whose encoded source is
+// the action's own, is dropped. Anything else in the label namespace is
+// compared like any other policy, so it still refuses. A canonical label
+// policy on another source B is compared too, and is refused when the
+// principal may retrieve from B (the sources check). Without B's source, a
+// held label on B reaches nothing: every term of a B rule, the source policy
+// and the label policy alike, names source B, and AccessRule.Authorize checks
+// each term's source against the decision.
+func withoutOwnLabelPolicies(ids [][]byte, source []byte) [][]byte {
 	kept := make([][]byte, 0, len(ids))
 	for _, id := range ids {
-		if !auth.IsLabelPolicyID(id) {
-			kept = append(kept, id)
+		labelSource, _, err := auth.ParseLabelPolicyID(id)
+		if err == nil && bytes.Equal(labelSource, source) {
+			continue
 		}
+		kept = append(kept, id)
 	}
 	return kept
 }

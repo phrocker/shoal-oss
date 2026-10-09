@@ -738,6 +738,19 @@ func (c *Client) selectEdgeRule(
 	if err != nil {
 		return AccessRule{}, policySelectionError(ctx, err)
 	}
+	// An edge rule is never a label policy alone (#570), as a document's
+	// source policy is not (selectIngestRule). A label policy stands for one
+	// label conjoined onto its source's policy; a rule of it alone would let
+	// a label grant stand in for the source grant, and would break the
+	// premise the dispatch confinement check relies on (label rules only
+	// narrow their source).
+	if auth.IsLabelPolicyID(policy.GrantPolicyID()) {
+		return AccessRule{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted edge policy selection returned a policy in the label namespace "+
+				auth.LabelPolicyNamespace,
+		)
+	}
 	return selectedPolicyRule(decision, auth.OperationConnect, policy, now)
 }
 

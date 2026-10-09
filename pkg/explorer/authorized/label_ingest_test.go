@@ -184,6 +184,50 @@ func TestLabelIngestRefusesLabelNamespaceSourcePolicy(t *testing.T) {
 	}
 }
 
+// TestConnectRefusesLabelNamespaceEdgePolicy closes the same gap for edges:
+// a host EdgePolicySelectorFunc returning a lone label policy is refused even
+// when the caller holds it, so no rule is ever a label policy alone.
+func TestConnectRefusesLabelNamespaceEdgePolicy(t *testing.T) {
+	f := newFixture(t)
+	labelID := labelPolicy(t, f.sourceA, "secret")
+	static := f.staticSelector(t, f.sourceA, f.policyA)
+	edges := authorized.EdgePolicySelectorFunc(func(
+		_ context.Context, decision auth.Decision, _ graph.Edge,
+	) (auth.Policy, error) {
+		return auth.NewPolicy(auth.PolicyConfig{
+			AuthorizationDomain: decision.AuthorizationDomain(),
+			SourceID:            f.sourceA,
+			GrantPolicyID:       labelID,
+			Epoch:               decision.PolicyGeneration(),
+		})
+	})
+	client, err := authorized.NewClient(authorized.Config{
+		Base: f.base, Resolver: f.authority.Resolver(),
+		PolicySelector: static, EdgePolicySelector: edges,
+		PolicyStore: f.store, GenerationReader: f.reader, Clock: f.clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := f.labelIngester(t, "connector", "secret")
+	from, err := client.Ingest(ctx, labelledSource("file:///label/edge-from.txt", "from", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	to, err := client.Ingest(ctx, labelledSource("file:///label/edge-to.txt", "to", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Connect(ctx, graph.Edge{
+		ID: "label-namespace-edge", From: from.Document.ID, To: to.Document.ID,
+		Type: "related_to", Weight: 1,
+	})
+	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+		!strings.Contains(err.Error(), auth.LabelPolicyNamespace) {
+		t.Fatalf("label-namespace edge policy error = %v", err)
+	}
+}
+
 func TestLabelRelabelRequiresOldAndNewLabels(t *testing.T) {
 	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
 		f := newFixture(t)
