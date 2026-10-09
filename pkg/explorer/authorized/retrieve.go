@@ -257,6 +257,7 @@ func (c *Client) retrieve(
 				DocumentID: documentID,
 				RevisionID: registration.RevisionID,
 				Rule:       registration.Rule,
+				Kind:       RegistrationDocument,
 			}
 		}
 	}

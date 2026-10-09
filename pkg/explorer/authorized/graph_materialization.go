@@ -87,6 +87,7 @@ func (c *Client) MaterializeGraph(
 		DocumentID: planned.MaterializationID,
 		RevisionID: planned.MutationID,
 		Rule:       mustCloneRule(rule),
+		Kind:       RegistrationMaterialized,
 	}
 	for _, node := range planned.GraphNodes {
 		nodeRegistration.Node = node
@@ -101,6 +102,7 @@ func (c *Client) MaterializeGraph(
 		if err := c.policyStore.PutEdge(ctx, EdgeRegistration{
 			Edge: edge, DocumentID: planned.MaterializationID,
 			RevisionID: planned.MutationID, Rule: mustCloneRule(rule),
+			Kind: RegistrationMaterialized,
 		}); err != nil {
 			return explorer.GraphMaterializationResult{},
 				policyCatalogWriteError(ctx, err)

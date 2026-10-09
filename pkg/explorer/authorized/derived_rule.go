@@ -21,46 +21,79 @@ package authorized
 
 import (
 	"context"
-	"strings"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// materializationOwnerPrefix opens every graph-materialization identity
-// (explorer.materializedID("materialization", ...)). A node registered by
-// MaterializeGraph names its materialization as DocumentID; it is not derived
-// from any document and has no current revision.
-const materializationOwnerPrefix = "materialized-materialization-"
-
-// effectiveNodeRegistrations applies the rule a derived node registration
-// carries today. An entity extracted from a document (ExtractDocument, via
-// PutNode) is governed by the rule of the revision it came from AND the
-// document's current rule, exactly
-// as revisionAllows governs an older revision: when the document is
-// relabelled, an entity extracted from an earlier, less restricted revision
-// closes with it (#570). A document-derived node whose document has no
-// current registration, or whose conjoined rule cannot be built, is dropped,
-// which every caller treats as unregistered and therefore denied.
+// Extracted registrations (RegistrationExtracted) are bound to the document
+// revision that asserted them. Their effective rule is their own rule AND the
+// asserting document's current rule, exactly as revisionAllows governs an
+// older revision: when a document is relabelled, the entities and relations
+// extracted from it close with it (#570). An extracted registration whose
+// document has no current registration, or whose conjoined rule cannot be
+// built, is dropped, which every caller treats as unregistered and denied.
 //
-// Intrinsic nodes always belong to the current revision and keep their rule.
-// Graph-materialization nodes are owned by a materialization, not a document,
-// and keep their registered rule. Extracted edges are registered without a
-// document; they are admitted only when both endpoints pass this check.
+// Every other kind keeps its registered rule: intrinsic (document) nodes and
+// edges always name the current revision, and materialized and application
+// registrations are not derived from any document. The decision is made on
+// the stored RegistrationKind, never on which fields happen to be empty.
+
+// effectiveNodeRegistrations applies the extracted-registration rule to node
+// registrations. It runs where node registrations are resolved (resolveNodes,
+// authorizedNode, the lexicon batch).
 func (c *Client) effectiveNodeRegistrations(
 	ctx context.Context,
 	registrations map[shoal.ID]NodeRegistration,
 ) (map[shoal.ID]NodeRegistration, error) {
+	return effectiveRegistrations(c, ctx, registrations,
+		func(registration NodeRegistration) (RegistrationKind, shoal.ID, shoal.ID, AccessRule) {
+			return registration.Kind, registration.DocumentID,
+				registration.RevisionID, registration.Rule
+		},
+		func(registration NodeRegistration, rule AccessRule) NodeRegistration {
+			registration.Rule = rule
+			return registration
+		})
+}
+
+// effectiveEdgeRegistrations applies the same rule to edge registrations. It
+// runs where edge registrations are resolved (resolveEdges, edgeAllows), so a
+// relation asserted only by a relabelled document closes even when both of
+// its endpoint entities are shared with, and owned by, public documents.
+func (c *Client) effectiveEdgeRegistrations(
+	ctx context.Context,
+	registrations map[shoal.ID]EdgeRegistration,
+) (map[shoal.ID]EdgeRegistration, error) {
+	return effectiveRegistrations(c, ctx, registrations,
+		func(registration EdgeRegistration) (RegistrationKind, shoal.ID, shoal.ID, AccessRule) {
+			return registration.Kind, registration.DocumentID,
+				registration.RevisionID, registration.Rule
+		},
+		func(registration EdgeRegistration, rule AccessRule) EdgeRegistration {
+			registration.Rule = rule
+			return registration
+		})
+}
+
+func effectiveRegistrations[R any](
+	c *Client,
+	ctx context.Context,
+	registrations map[shoal.ID]R,
+	fields func(R) (RegistrationKind, shoal.ID, shoal.ID, AccessRule),
+	withRule func(R, AccessRule) R,
+) (map[shoal.ID]R, error) {
 	documentIDs := make([]shoal.ID, 0, len(registrations))
 	seen := make(map[shoal.ID]struct{}, len(registrations))
 	for _, registration := range registrations {
-		if !documentDerived(registration) {
+		kind, documentID, _, _ := fields(registration)
+		if kind != RegistrationExtracted {
 			continue
 		}
-		if _, duplicate := seen[registration.DocumentID]; duplicate {
+		if _, duplicate := seen[documentID]; duplicate {
 			continue
 		}
-		seen[registration.DocumentID] = struct{}{}
-		documentIDs = append(documentIDs, registration.DocumentID)
+		seen[documentID] = struct{}{}
+		documentIDs = append(documentIDs, documentID)
 	}
 	if len(documentIDs) == 0 {
 		return registrations, nil
@@ -69,39 +102,28 @@ func (c *Client) effectiveNodeRegistrations(
 	if err != nil {
 		return nil, policyCatalogReadError(ctx, err)
 	}
-	effective := make(map[shoal.ID]NodeRegistration, len(registrations))
-	for nodeID, registration := range registrations {
-		if !documentDerived(registration) {
-			effective[nodeID] = registration
+	effective := make(map[shoal.ID]R, len(registrations))
+	for id, registration := range registrations {
+		kind, documentID, revisionID, rule := fields(registration)
+		if kind != RegistrationExtracted {
+			effective[id] = registration
 			continue
 		}
-		current, ok := currents[registration.DocumentID]
-		if !ok || current.DocumentID != registration.DocumentID {
+		current, ok := currents[documentID]
+		if !ok || current.DocumentID != documentID {
 			continue
 		}
-		if current.RevisionID == registration.RevisionID {
-			effective[nodeID] = registration
+		if current.RevisionID == revisionID {
+			effective[id] = registration
 			continue
 		}
-		rule, err := conjoinRules(registration.Rule, current.Rule)
+		conjoined, err := conjoinRules(rule, current.Rule)
 		if err != nil {
 			continue
 		}
-		registration.Rule = rule
-		effective[nodeID] = registration
+		effective[id] = withRule(registration, conjoined)
 	}
 	return effective, nil
-}
-
-// documentDerived reports whether a registration was written by PutNode for a
-// document (ExtractDocument), as opposed to an intrinsic node of the current
-// revision or a graph-materialization node. Intrinsic registrations are
-// written by PutRevision's current projection without a Node and always name
-// the current revision, so they need no conjunction; PutNode registrations
-// always carry the Node they register.
-func documentDerived(registration NodeRegistration) bool {
-	return registration.Node.ID != "" &&
-		!strings.HasPrefix(string(registration.DocumentID), materializationOwnerPrefix)
 }
 
 // conjoinRules is the AND of two rules, built only through NewAccessRule.

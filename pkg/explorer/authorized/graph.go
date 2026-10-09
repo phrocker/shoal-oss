@@ -107,7 +107,9 @@ func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := guard.Check(ctx); err != nil {
 		return err
 	}
-	registration := EdgeRegistration{Edge: ownedEdge, Rule: edgeRule}
+	registration := EdgeRegistration{
+		Edge: ownedEdge, Rule: edgeRule, Kind: RegistrationApplication,
+	}
 	if err := c.policyStore.ReserveEdge(ctx, registration); err != nil {
 		return policyCatalogWriteError(ctx, err)
 	}
@@ -204,6 +206,15 @@ func (c *Client) edgeAllows(
 	operation auth.Operation,
 	now time.Time,
 ) (bool, error) {
+	effective, err := c.effectiveEdgeRegistrations(
+		ctx, map[shoal.ID]EdgeRegistration{registration.Edge.ID: registration})
+	if err != nil {
+		return false, err
+	}
+	registration, ok := effective[registration.Edge.ID]
+	if !ok {
+		return false, nil
+	}
 	allowed, err := ruleAllows(registration.Rule, decision, operation, now)
 	if err != nil || !allowed {
 		return allowed, err
@@ -340,7 +351,11 @@ func (c *Client) resolveEdges(
 		}
 		resolved[edgeID] = registration
 	}
-	return resolved, nil
+	effective, err := c.effectiveEdgeRegistrations(ctx, resolved)
+	if err != nil {
+		return nil, err
+	}
+	return effective, nil
 }
 
 // edgeAllowsResolved authorizes one edge against endpoint registrations that

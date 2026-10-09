@@ -90,6 +90,7 @@ func (c *Client) ExtractDocument(
 		DocumentID: source.DocumentID,
 		RevisionID: source.RevisionID,
 		Rule:       mustCloneRule(source.Rule),
+		Kind:       RegistrationExtracted,
 	}
 	for _, node := range result.GraphNodes {
 		// This node registration is load-bearing; TestExtractDocumentAuthorizationControlsDerivedGraph pins that extracted entities remain governed by their source document rule.
@@ -101,9 +102,14 @@ func (c *Client) ExtractDocument(
 	edgeRule := mustCloneRule(source.Rule)
 	for _, edge := range result.GraphEdges {
 		// This edge registration is load-bearing; TestExtractDocumentAuthorizationControlsDerivedGraph pins authorization filtering for extracted graph edges.
+		// Bound to the asserting revision, so a relabel of this document
+		// also closes the relations only it asserts (#570).
 		if err := c.policyStore.PutEdge(ctx, EdgeRegistration{
-			Edge: edge,
-			Rule: edgeRule,
+			Edge:       edge,
+			DocumentID: source.DocumentID,
+			RevisionID: source.RevisionID,
+			Rule:       edgeRule,
+			Kind:       RegistrationExtracted,
 		}); err != nil {
 			return explorer.ExtractionResult{}, extractionCatalogWriteError(ctx, err)
 		}
