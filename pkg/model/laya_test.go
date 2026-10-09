@@ -14,7 +14,7 @@ func layaTestIdentity() TypedIdentity {
 }
 
 func layaTestRequest() TypedRequest {
-	return TypedRequest{ModelAlias: "english", QuestionSetID: "set-v1", State: []byte(`{"sample":"x"}`), Questions: []TypedQuestion{{ID: "risk", Kind: TypedChoice, Options: []string{"low", "high"}}, {ID: "score", Kind: TypedOrdinalScore, Options: []string{"routine", "urgent"}}, {ID: "safe", Kind: TypedPropositionProbability}}}
+	return TypedRequest{ModelAlias: "english", QuestionSetID: "set-v1", State: []byte(`{"sample":"x"}`), Questions: []TypedQuestion{{ID: "risk", Kind: TypedChoice, Instructions: "Classify risk", Options: []string{"low", "high"}, OptionDescriptions: map[string]string{"low": "routine", "high": "requires review"}}, {ID: "score", Kind: TypedOrdinalScore, Options: []string{"routine", "urgent"}}, {ID: "safe", Kind: TypedPropositionProbability}}}
 }
 
 func TestLayaPredictorMapsBoundedResponse(t *testing.T) {
@@ -23,14 +23,20 @@ func TestLayaPredictorMapsBoundedResponse(t *testing.T) {
 			t.Errorf("request = %s %s", r.Method, r.URL.Path)
 		}
 		var request struct {
-			Model     string              `json:"model"`
-			Questions map[string]struct{} `json:"questions"`
+			Model     string `json:"model"`
+			Questions map[string]struct {
+				Instructions string `json:"instructions"`
+				Criteria     any    `json:"criteria"`
+			} `json:"questions"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatal(err)
 		}
 		if request.Model != "english" || len(request.Questions) != 3 {
 			t.Fatalf("request = %+v", request)
+		}
+		if request.Questions["risk"].Instructions != "Classify risk" {
+			t.Fatalf("instructions = %+v", request.Questions["risk"])
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"answers":{"risk":{"type":"choice","choice":"high","confidence":0.8,"answer_confidence":0.8,"probabilities":{"low":0.2,"high":0.8}},"score":{"type":"score","score":1,"confidence":0.8,"answer_confidence":0.8,"probabilities":{"0":0.2,"1":0.8}},"safe":{"type":"noul","noul":0.1,"confidence":0.1,"answer_confidence":0.1}}}`))

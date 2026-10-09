@@ -107,18 +107,31 @@ func (p *LayaPredictor) Predict(ctx context.Context, req TypedRequest) (TypedRes
 	}
 	payload := layaRequest{Model: p.id.ModelAlias, State: json.RawMessage(req.State), Questions: make(map[string]layaQuestion, len(req.Questions))}
 	for _, q := range req.Questions {
-		lq := layaQuestion{Instructions: q.ID}
+		instructions := q.Instructions
+		if instructions == "" {
+			instructions = q.ID
+		}
+		lq := layaQuestion{Instructions: instructions}
 		switch q.Kind {
 		case TypedChoice:
 			lq.Type = "choice"
 			criteria := make(map[string]string, len(q.Options))
 			for _, option := range q.Options {
 				criteria[option] = option
+				if description, ok := q.OptionDescriptions[option]; ok {
+					criteria[option] = description
+				}
 			}
 			lq.Criteria = criteria
 		case TypedOrdinalScore:
 			lq.Type = "score"
-			lq.Criteria = append([]string(nil), q.Options...)
+			criteria := make([]string, len(q.Options))
+			for i, option := range q.Options {
+				criteria[i] = option
+				if description, ok := q.OptionDescriptions[option]; ok {
+					criteria[i] = description
+				}
+			}
 		case TypedPropositionProbability:
 			lq.Type = "noul"
 			lq.Criteria = map[string]string{"true": "true", "false": "false"}

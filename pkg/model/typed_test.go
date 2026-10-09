@@ -19,7 +19,7 @@ func testTypedRequest() TypedRequest {
 	return TypedRequest{
 		ModelAlias: "laya-threat-v1", QuestionSetID: "threat-triage-v1", State: []byte("bounded picture"),
 		Questions: []TypedQuestion{
-			{ID: "risk", Kind: TypedChoice, Options: []string{"low", "high"}},
+			{ID: "risk", Kind: TypedChoice, Instructions: "Classify risk", Options: []string{"low", "high"}, OptionDescriptions: map[string]string{"low": "routine", "high": "requires review"}},
 			{ID: "confidence", Kind: TypedPropositionProbability},
 		},
 	}
