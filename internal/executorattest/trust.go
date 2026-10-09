@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/ed25519key"
 	"github.com/phrocker/shoal-oss/internal/strictjson"
+	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -24,7 +27,7 @@ const (
 	// ClockSkewCeiling bounds every verifier's clock_skew.
 	ClockSkewCeiling = time.Minute
 	// MaxExecutorRefBytes matches the fleet's executor ref bound.
-	MaxExecutorRefBytes = 1024
+	MaxExecutorRefBytes = executorref.MaxExecutorRefBytes
 	maxTrustBytes       = 1 << 20
 	digestPrefix        = "sha256:"
 )
@@ -60,6 +63,12 @@ func ValidDigest(s string) bool {
 	return e == nil && len(b) == sha256.Size && hex.EncodeToString(b) == h
 }
 
+// validRef bounds a ref looked up at run time (a claim's attestation check,
+// an expectation). It is deliberately the old, looser bound and not
+// executorref.ValidExecutorRef: a descriptor stored before that rule may name
+// a ref it refuses, and looking one up must answer "not attested" (no trust
+// root can name it, since NewTrust applies the rule) rather than an argument
+// error the claim gate would surface as unavailable.
 func validRef(ref string) bool {
 	return ref != "" && len(ref) <= MaxExecutorRefBytes && utf8.ValidString(ref)
 }
@@ -75,9 +84,16 @@ func NewTrust(executors map[string]ExecutorTrust) (*Trust, error) {
 	out := &Trust{executors: make(map[string]ExecutorTrust, len(executors))}
 	keyOf := map[shoal.ID]string{}
 	idOf := map[string]shoal.ID{}
-	for ref, t := range executors {
-		if !validRef(ref) {
-			return nil, invalidTrust("executor ref")
+	refs := slices.Sorted(maps.Keys(executors))
+	for position, ref := range refs {
+		t := executors[ref]
+		// The trust file is operator configuration, so it is held to the
+		// one executor-reference rule and refused at startup. The error
+		// names the ref's position in sorted order, never its bytes.
+		if err := executorref.ValidExecutorRef(ref); err != nil {
+			return nil, invalidTrust(fmt.Sprintf(
+				"executor ref %d of %d (in sorted order): %v",
+				position+1, len(refs), err))
 		}
 		if len(t.Verifiers) == 0 {
 			return nil, invalidTrust("no verifiers for " + ref)

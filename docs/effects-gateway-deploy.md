@@ -79,27 +79,36 @@ The executor reference the gateway's descriptor registers, and that an
 executor-bound dispatch credential names, follows one rule:
 
 An executor reference must pass `executorref.ValidExecutorRef`
-(`pkg/executorref`, #391). That is the one rule fleet registration, the ATPL
-compiler, attestation presentation (server and `pkg/attestation/api`) and an
-action-execution decision's executor binding all apply, so a parity test holds
-them to the same verdict. A reference must be non-empty, at most 1024 bytes,
-and valid UTF-8. Every rune must be printable, so control, format, zero-width
-and bidi characters are refused, and the only space allowed is an ASCII space
-that is not at either end. It must not begin with a combining mark, and it
-must already be in NFKC form. A reference that is not normalized is refused,
-never rewritten, because rewriting would change what fingerprints and digests
-cover. `café` written with precomposed `é` is accepted. `cafe` plus U+0301,
-the `ﬁ` ligature, full-width letters, a tab, U+200B, NBSP and U+2003 are
-refused.
+(`pkg/executorref`, #391). Every place that accepts one applies this same rule,
+and parity tests hold them all to the same verdict:
+- fleet registration;
+- the ATPL compiler;
+- attestation presentation, on the server and in `pkg/attestation/api`;
+- an action-execution decision's executor binding;
+- the explorer's `-fleet-executor-refs`, `-fleet-external-executor-refs`,
+  `-fleet-external-egress-executor-refs` and `-fleet-ask-executor-ref` flags,
+  the `-fleet-executor-attestation` trust file, and the chart's
+  `explorer.fleet.*ExecutorRef(s)` values.
 
-**Migration.** The rule tightens *registration*, as #544's floor did. Stored
-descriptors keep resolving. A descriptor whose reference the rule now refuses
-is refused at its next `Register`, or at the next ATPL `plan`/`apply` that
-declares it, with `invalid_argument` on the executor reference. A new
-attestation presentation for such a reference is refused the same way, and no
-executor binding can name it. If that happens to a descriptor that has worked for a long time,
-the control is working: rename the executor reference (and its host binding)
-to a plain form and re-register.
+The rule is a fixed ASCII charset, `^[A-Za-z0-9][A-Za-z0-9._:/@-]*$`, from 1
+to 1024 bytes. A reference starts with a letter or digit and continues with
+letters, digits and `. _ : / @ -`. It contains no spaces and no non-ASCII
+characters. References are compared byte for byte, and inside this charset
+two references that look alike are equal.
+
+**Migration.** The rule tightens *registration*, as #544's floor did.
+- Stored descriptors keep resolving.
+- A descriptor whose reference falls outside the charset is refused with
+  `invalid_argument` at its next `Register`, or at the next ATPL
+  `plan`/`apply` that declares it.
+- A new attestation presentation for such a reference is refused the same way,
+  and no executor binding can name it.
+- Host configuration naming one is refused at startup. The error names the
+  flag and the entry's position.
+
+If this happens to a descriptor that has worked for a long time, the control
+is working: rename the executor reference, and its host binding, into the
+charset and re-register.
 
 ### Lease arithmetic
 

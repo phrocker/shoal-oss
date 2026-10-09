@@ -160,13 +160,21 @@
        in depth rather than the only line, but a values file that cannot mean
        two things should be refused where it is written. */ -}}
 {{- range $setting, $references := dict "executorRefs" $explorer.fleet.executorRefs "askExecutorRef" (list $explorer.fleet.askExecutorRef) "externalExecutorRefs" $explorer.fleet.externalExecutorRefs "externalEgressExecutorRefs" $explorer.fleet.externalEgressExecutorRefs -}}
-{{- range $reference := $references -}}
+{{- range $index, $reference := $references -}}
 {{- $text := toString $reference -}}
 {{- if contains "," $text -}}
 {{- fail (printf "explorer.fleet.%s contains %q, which holds a comma: references are comma-joined into one container argument, so this single entry becomes two bindings and the collision guards below compare the unsplit string. Give each reference its own list entry" $setting $text) -}}
 {{- end -}}
 {{- if regexMatch `[\p{Cc}\p{Zl}\p{Zp}]` $text -}}
 {{- fail (printf "explorer.fleet.%s contains %q, which holds a control or line-separator character: the reference reaches the container inside one quoted argument, so it matches no registered executor and binds nothing while the pod starts and serves normally. Before those arguments were quoted, a line break here made the remainder of the entry an arbitrary argument of the explorer container" $setting $text) -}}
+{{- end -}}
+{{- /* The executor-reference charset (#391, pkg/executorref). The explorer
+       refuses any other reference at startup; refusing it here says so where
+       it is written. Blank entries are left to the guards that name them.
+       The value is not echoed: outside the charset it may be invisible. */ -}}
+{{- $candidate := trim $text -}}
+{{- if and $candidate (or (gt (len $candidate) 1024) (not (regexMatch `^[A-Za-z0-9][A-Za-z0-9._:/@-]*$` $candidate))) -}}
+{{- fail (printf "explorer.fleet.%s entry %d is outside the executor-reference charset: a reference is 1 to 1024 characters, starts with an ASCII letter or digit, and continues with ASCII letters, digits and . _ : / @ - only. The explorer refuses any other reference at startup, because a look-alike would register, bind and attest as a different executor" $setting (add1 $index)) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

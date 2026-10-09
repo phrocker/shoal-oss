@@ -24,8 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
 
+	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
@@ -53,17 +53,32 @@ type boundFleetDispatch struct {
 	resolver auth.Resolver
 }
 
+// validFleetExecutorRefFlag holds one configured executor reference to the
+// executor-reference rule (#391), so a host cannot allowlist, bind or trust a
+// reference no descriptor could register or no worker could be bound to. The
+// error names the flag and the entry's 1-based position (position < 0 for a
+// single-valued flag) and never echoes the value, which may hold any bytes.
+func validFleetExecutorRefFlag(flag string, position int, reference string) error {
+	err := executorref.ValidExecutorRef(reference)
+	if err == nil {
+		return nil
+	}
+	where := flag
+	if position >= 0 {
+		where = fmt.Sprintf("%s entry %d", flag, position+1)
+	}
+	return shoal.NewError(shoal.ErrorInvalidArgument, where+": "+err.Error())
+}
+
 func newConfiguredFleetExecutors(
 	references []string,
 ) (configuredFleetExecutors, error) {
 	result := make(configuredFleetExecutors, len(references))
-	for _, reference := range references {
-		if reference == "" || strings.TrimSpace(reference) != reference ||
-			len(reference) > fleet.MaxExecutorRefBytes {
-			return nil, shoal.NewError(
-				shoal.ErrorInvalidArgument,
-				"fleet executor reference is outside its bound",
-			)
+	for position, reference := range references {
+		if err := validFleetExecutorRefFlag(
+			"-fleet-executor-refs", position, reference,
+		); err != nil {
+			return nil, err
 		}
 		result[reference] = configuredFleetExecutor{reference: reference}
 	}
@@ -590,6 +605,13 @@ func bindExternalFleetEffects(
 	executors configuredFleetExecutors,
 	config externalFleetEffectBindings,
 ) error {
+	if config.askReference != "" {
+		if err := validFleetExecutorRefFlag(
+			"-fleet-ask-executor-ref", -1, config.askReference,
+		); err != nil {
+			return err
+		}
+	}
 	claimedBy := make(
 		map[string]string, len(config.mutating)+len(config.transmitting))
 	for _, group := range []struct {
@@ -610,7 +632,12 @@ func bindExternalFleetEffects(
 			},
 		},
 	} {
-		for _, reference := range group.references {
+		for position, reference := range group.references {
+			if err := validFleetExecutorRefFlag(
+				group.flag, position, reference,
+			); err != nil {
+				return err
+			}
 			if config.askReference != "" &&
 				reference == config.askReference {
 				return fmt.Errorf(

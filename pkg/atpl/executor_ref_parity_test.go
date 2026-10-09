@@ -47,7 +47,10 @@ func (discardAttestationAudit) RecordAttestation(
 // public client, the ATPL compiler, and an action-execution decision's
 // binding) agrees with executorref.ValidExecutorRef on the whole probe table
 // (#391). A site with its own local check would accept a look-alike the
-// others refuse, or refuse a worker that could never then be bound.
+// others refuse, or refuse a worker that could never then be bound. The host
+// configuration sites (the explorer's executor-ref flags and the attestation
+// trust file) run the same table in cmd/shoal-explore-web's
+// TestExecutorRefConfigParity.
 func TestExecutorRefParity(t *testing.T) {
 	now := testNow
 	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })

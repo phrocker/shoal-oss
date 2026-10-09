@@ -16,8 +16,8 @@
 // server-side and never returned.
 //
 // This package imports only the standard library, pkg/shoal and
-// pkg/executorref (itself only the standard library and golang.org/x/text),
-// so an extension may depend on it (internal/importboundary enforces that).
+// pkg/executorref (itself only the standard library), so an extension may
+// depend on it (internal/importboundary enforces that).
 package api
 
 import (
