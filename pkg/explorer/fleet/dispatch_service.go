@@ -2654,7 +2654,15 @@ func (s *DispatchService) authorizedCurrentBinding(ctx context.Context, decision
 		// heartbeat changes. The requirement itself is checked by
 		// approvalGate and attestationGate. See resolveActionBinding.
 		false,
-		executeRoute && phase.reportsOnClaim(),
+		// Not gated on the route either. #573 scoped this to the execute
+		// route to stay contained, and the same argument applies to
+		// invoke: synchronous Invoke and the admission report path both
+		// complete through completeClaim under executorPhaseComplete, so
+		// a gateway's report arriving after the descriptor's lease
+		// lapsed lost the record of an effect that happened. A revoked
+		// descriptor is still refused — activeChainLapsing checks
+		// RevokedAt regardless of this flag.
+		phase.reportsOnClaim(),
 		// Not gated on the route: a rebind must not strand a completion
 		// whichever operation it arrives under (#391 follow-up).
 		phase.reportsOnClaim(),
@@ -2842,7 +2850,15 @@ func (s *DispatchService) claimableBy(
 			// heartbeat changes. The requirement itself is checked by
 			// approvalGate and attestationGate. See resolveActionBinding.
 			false,
-			executeRoute && phase.reportsOnClaim(),
+			// Not gated on the route either. #573 scoped this to the execute
+			// route to stay contained, and the same argument applies to
+			// invoke: synchronous Invoke and the admission report path both
+			// complete through completeClaim under executorPhaseComplete, so
+			// a gateway's report arriving after the descriptor's lease
+			// lapsed lost the record of an effect that happened. A revoked
+			// descriptor is still refused — activeChainLapsing checks
+			// RevokedAt regardless of this flag.
+			phase.reportsOnClaim(),
 			// Also here, and not false: claimableBy is on the completion
 			// path too — applyExecutionResult re-confirms the claim through
 			// it after the effect — so leaving it false would fire the
