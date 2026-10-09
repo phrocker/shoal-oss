@@ -3573,7 +3573,7 @@ func refuseUnconfinedRetrieval(
 		return err
 	}
 	if withinScope(sources, record.SourceID) &&
-		withinScope(policies, record.PolicyID) {
+		withinScope(withoutLabelPolicies(policies), record.PolicyID) {
 		return nil
 	}
 	// Names no source it does not already hold: the refusal says the
@@ -3584,6 +3584,26 @@ func refuseUnconfinedRetrieval(
 		"the bound executor does not confine retrieval to this action's "+
 			"scope, and the invoking principal may retrieve beyond it; the "+
 			"descriptor's scope would not describe what the record carries")
+}
+
+// withoutLabelPolicies drops grant policies in the label namespace (#570).
+//
+// A label policy is only ever conjoined onto its own source's policy in an
+// AccessRule; no rule is a label policy alone. Holding one therefore opens
+// nothing outside the source and policy checks already made here: every
+// document it lets the principal retrieve is also governed by a source
+// policy, which those checks bound. Counting it as a wider policy refused
+// every holder of a label an unconfined executor, so no reader cleared for a
+// labelled document could invoke an action grounded in one (#564). A label
+// policy on another source is still refused, by the sources check.
+func withoutLabelPolicies(ids [][]byte) [][]byte {
+	kept := make([][]byte, 0, len(ids))
+	for _, id := range ids {
+		if !auth.IsLabelPolicyID(id) {
+			kept = append(kept, id)
+		}
+	}
+	return kept
 }
 
 // withinScope reports whether permitted contains nothing beyond one identity.

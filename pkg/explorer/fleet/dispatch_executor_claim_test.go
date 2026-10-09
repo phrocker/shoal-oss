@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
-	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -4339,6 +4338,30 @@ func TestAnUnconfinedExecutorMayNotRunWiderThanItsScope(t *testing.T) {
 			},
 		},
 		{
+			// A label policy on the action's own source only narrows what
+			// the principal retrieves (#570), so a holder of one is no wider
+			// than the scope (#564).
+			name:     "a label holder no wider than the scope",
+			executor: confiningExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, onlyA, [][]byte{
+					[]byte("policy-a"), labelPolicyOn(t, "source-a", "secret"),
+				}, auth.OperationRetrieve)
+			},
+		},
+		{
+			// A label policy on another source comes with that source, and
+			// the source is what widens.
+			name:     "a label holder on another source",
+			executor: confiningExecutor{},
+			decision: func(t *testing.T) auth.Decision {
+				return decisionWith(t, aAndB, [][]byte{
+					[]byte("policy-a"), labelPolicyOn(t, "source-b", "secret"),
+				}, auth.OperationRetrieve)
+			},
+			refused: true,
+		},
+		{
 			// A wider *policy* is the same defect by the other component, and
 			// a check that read only sources would miss it.
 			name:     "a wider policy and an unconfined executor",
@@ -4499,15 +4522,13 @@ func (s *stubEvidenceVisibility) VisibleToReader(
 // (#570), so the scan filters nothing. An EvidenceRef is
 // different — it was recorded by the action's principal and is stored as a
 // field of the record — so it needed a check of its own.
+//
+// Holding and lacking the label are decided by the real evaluator over
+// structured labels in TestADispatchHolderSeesTheStoredEvidence
+// (dispatch_label_evaluator_test.go); this test keeps the two directions no
+// decision can answer: no evaluator, and the question failing.
 func TestADispatchReaderSeesOnlyEvidenceItsLabelsCover(t *testing.T) {
-	labelled := EvidenceRef{
-		AnchorID: "anchor-secret", Kind: interaction.EvidenceDocument,
-		NodeIDs: []shoal.ID{"node-secret"}, Visibility: []string{"secret"},
-	}
-	open := EvidenceRef{
-		AnchorID: "anchor-open", Kind: interaction.EvidenceDocument,
-		NodeIDs: []shoal.ID{"node-open"},
-	}
+	labelled, open := structuredEvidence(t)
 
 	for _, probe := range []struct {
 		name       string
@@ -4520,16 +4541,6 @@ func TestADispatchReaderSeesOnlyEvidenceItsLabelsCover(t *testing.T) {
 			// nothing may be shown it — the direction Attestations takes
 			// when nil.
 			name: "no evaluator is wired", want: []shoal.ID{"anchor-open"},
-		},
-		{
-			name:       "the reader holds the labels",
-			visibility: &stubEvidenceVisibility{visible: true},
-			want:       []shoal.ID{"anchor-secret", "anchor-open"},
-		},
-		{
-			name:       "the reader does not hold the labels",
-			visibility: &stubEvidenceVisibility{},
-			want:       []shoal.ID{"anchor-open"},
 		},
 		{
 			// A failing question is not a false answer. Returning the error
