@@ -435,6 +435,16 @@ func (s *Service) publish(
 		result.Audit = request.Audit
 	}
 	auditTime := request.Event.OccurredAt
+	// Note, for anyone tempted to pass a different operation here than the
+	// one this publication was gated on: `operation` does two jobs at once.
+	// It is the gate — lifecyclePublicationPermits and authorize above both
+	// run against it — and it is *attribution*, because it is persisted on
+	// the audit record below. So a caller publishing a transition it did not
+	// perform cannot substitute its own operation to get past the gate: that
+	// would record the wrong authority as having performed the transition,
+	// which is #460's defect in a new place. #480 item 3 is drained by
+	// skipping foreign rows instead, leaving them for the principal whose
+	// authority they carry.
 	record := AuditRecord{
 		Operation: operation, ActionID: cloneBytes(request.Event.ActionID),
 		ObjectID:         cloneBytes(result.EventID),

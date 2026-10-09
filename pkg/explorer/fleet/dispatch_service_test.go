@@ -1391,6 +1391,12 @@ type dispatchEvents struct{}
 
 func (dispatchEvents) PublishActionEvent(context.Context, string, ActionRecord) error { return nil }
 
+func (dispatchEvents) MayPublishActionEvent(
+	context.Context, string, ActionRecord,
+) (bool, error) {
+	return true, nil
+}
+
 type controlledDispatchEvents struct {
 	calls int
 	err   error
@@ -1402,12 +1408,28 @@ type terminalFailEvents struct {
 	err   error
 }
 
+func (e *terminalFailEvents) MayPublishActionEvent(
+	context.Context, string, ActionRecord,
+) (bool, error) {
+	// These doubles exercise publication *failure*, not entitlement. Saying
+	// yes keeps every existing test asking its own question.
+	return true, nil
+}
+
 func (e *terminalFailEvents) PublishActionEvent(_ context.Context, kind string, _ ActionRecord) error {
 	if kind == "action.completed" || kind == "action.failed" {
 		e.calls++
 		return e.err
 	}
 	return nil
+}
+
+func (e *controlledDispatchEvents) MayPublishActionEvent(
+	context.Context, string, ActionRecord,
+) (bool, error) {
+	// These doubles exercise publication *failure*, not entitlement. Saying
+	// yes keeps every existing test asking its own question.
+	return true, nil
 }
 
 func (e *controlledDispatchEvents) PublishActionEvent(

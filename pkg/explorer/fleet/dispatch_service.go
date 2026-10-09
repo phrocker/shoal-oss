@@ -2279,6 +2279,42 @@ func (s *DispatchService) ReconcileActionTransitions(
 	if err := validateOpaque("action ID", actionID, false); err != nil {
 		return err
 	}
+	return s.reconcileActionTransitions(ctx, actionID, "", 0)
+}
+
+// reconcileActionTransitions drains the rows this caller may publish and
+// leaves the rest pending.
+//
+// It used to return on the first publication refusal, and that is #480 item
+// 3. The gates are per-kind — publisherMatchesTransition wants the enqueuer
+// for action.enqueued and the claimant for action.claimed, and both the
+// publisher's AuthorizeObject and fleetevents' own authorize run against the
+// row's operation — so once an action has a stranded row from one principal
+// and a fresh row from another, neither caller can drain the pair in one
+// pass.
+//
+// The outbox is not actually stuck: the enqueuer drains the enqueued row and
+// fails on the claimed one, then the claimant drains the claimed one, and
+// nothing is left. #480 recorded this as "no principal can drain this
+// action's outbox" because its repro stopped at the first failure. What was
+// really wrong is that a reconciliation which is achievable looked
+// impossible, and — worse — a worker's committed claim was answered
+// ErrActionCommitted over somebody else's stranded row, telling a gateway
+// that had just performed an irreversible external effect to reconcile an
+// outcome that needed no reconciling.
+//
+// So a row that is not this caller's own and that it is not entitled to
+// publish is not an error here. It belongs to another principal's authority
+// and will drain when that principal next reconciles. The caller's own
+// transition is still an error, which is what ErrActionCommitted is for:
+// that one it does need to know about.
+//
+// ownKind and ownVersion name the caller's own transition, or are zero for a
+// reconcile that is not publishing anything of its own (an operator draining
+// an action, where every row belongs to someone else).
+func (s *DispatchService) reconcileActionTransitions(
+	ctx context.Context, actionID []byte, ownKind string, ownVersion uint64,
+) error {
 	var after []byte
 	for {
 		page, err := s.outbox.PendingActionTransitions(
@@ -2287,6 +2323,28 @@ func (s *DispatchService) ReconcileActionTransitions(
 			return err
 		}
 		for _, transition := range page.Transitions {
+			own := ownKind != "" &&
+				transition.Kind == ownKind &&
+				transition.Record.Version == ownVersion
+			// Asked, not inferred. A row this caller may not publish is
+			// skipped and stays pending, so the principal whose authority it
+			// carries still delivers it — but the caller's own transition is
+			// never skipped, because there is nobody else to drain that one
+			// and a committed write whose event never published is exactly
+			// what ErrActionCommitted reports.
+			//
+			// An error from the question is not a skip. Only a false answer
+			// is.
+			if !own {
+				may, err := s.events.MayPublishActionEvent(
+					ctx, transition.Kind, transition.Record)
+				if err != nil {
+					return err
+				}
+				if !may {
+					continue
+				}
+			}
 			if err := s.events.PublishActionEvent(
 				ctx, transition.Kind, transition.Record); err != nil {
 				return err
@@ -2311,7 +2369,9 @@ func (s *DispatchService) publishTransition(
 			shoal.ErrorInvalidArgument,
 			"fleet action transition kind does not match action state")
 	}
-	return s.ReconcileActionTransitions(ctx, record.ID)
+	// The caller's own transition is named, so a refusal on *it* is still an
+	// error while another principal's stranded row is not (#480 item 3).
+	return s.reconcileActionTransitions(ctx, record.ID, kind, record.Version)
 }
 
 // beginClaimant admits a caller holding either of the operations that

@@ -78,17 +78,7 @@ func (p *ActionEventPublisher) PublishActionEvent(
 	if err != nil {
 		return err
 	}
-	if !publisherMatchesTransition(decision, kind, record) {
-		return shoal.NewError(
-			shoal.ErrorUnauthorized,
-			"fleet action event authorization does not match durable transition",
-		)
-	}
-	if err := decision.AuthorizeObject(operation, auth.ResourceRequest{
-		AuthorizationDomain: decision.AuthorizationDomain(),
-		SourceID:            record.SourceID, PolicyID: record.PolicyID,
-		ObjectID: record.ObjectID,
-	}, now); err != nil {
+	if err := p.authorizeTransition(decision, kind, record, operation, now); err != nil {
 		return err
 	}
 	references := actionEvidenceReferences(record.Evidence)
@@ -117,6 +107,73 @@ func (p *ActionEventPublisher) PublishActionEvent(
 			AuthorizationExpiresAt:   expiresAt,
 		})
 	return err
+}
+
+// authorizeTransition is the identity and standing gate for publishing one
+// transition. Shared with MayPublishActionEvent so the question "may this
+// caller publish this row" and the act of publishing it cannot answer
+// differently — two copies of this rule is how the per-kind identity check
+// and the object authorization came to be separate causes of the same wedge
+// (#480 item 3).
+func (p *ActionEventPublisher) authorizeTransition(
+	decision auth.Decision,
+	kind string,
+	record fleet.ActionRecord,
+	operation auth.Operation,
+	now time.Time,
+) error {
+	if !publisherMatchesTransition(decision, kind, record) {
+		return shoal.NewError(
+			shoal.ErrorUnauthorized,
+			"fleet action event authorization does not match durable transition",
+		)
+	}
+	return decision.AuthorizeObject(operation, auth.ResourceRequest{
+		AuthorizationDomain: decision.AuthorizationDomain(),
+		SourceID:            record.SourceID, PolicyID: record.PolicyID,
+		ObjectID: record.ObjectID,
+	}, now)
+}
+
+// MayPublishActionEvent answers whether this caller is entitled to publish
+// this transition, without publishing it.
+//
+// It runs the gates this publisher owns — the per-kind identity match and the
+// object authorization under the row's own operation — which is where the
+// rule that strands a row lives. A refusal is a false answer rather than an
+// error, so the reconciler skips by decision instead of classifying an error
+// code: that is what keeps correctness independent of whether #398's
+// concealment renders a denial as unauthorized or as object-not-found.
+//
+// Deliberately *not* a full dry run. fleetevents applies its own gates when
+// the event is published, and a refusal from there still surfaces as an
+// error. That is the honest split: this answers the question the reconciler
+// is asking — "is this row somebody else's to deliver" — and does not
+// promise that a true answer makes publication certain, which nothing here
+// could promise anyway.
+func (p *ActionEventPublisher) MayPublishActionEvent(
+	ctx context.Context, kind string, record fleet.ActionRecord,
+) (bool, error) {
+	operation, _, _, err := actionEventAuthorization(kind, record)
+	if err != nil {
+		return false, err
+	}
+	decision, err := p.resolver.Resolve(ctx)
+	if err != nil {
+		return false, err
+	}
+	if err := p.authorizeTransition(
+		decision, kind, record, operation, p.now().UTC()); err != nil {
+		// Unauthorized or concealed-as-absent both mean the same thing to the
+		// caller asking this question: not yours. Any other error is the
+		// question failing, which is not an answer.
+		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
+			shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func actionAuthorizationEvidence(
