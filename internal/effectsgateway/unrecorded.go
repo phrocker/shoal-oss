@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/dirlock"
@@ -240,19 +241,47 @@ type UnrecordedLog struct {
 // open of the same directory, in this process or another, is
 // ErrGatewayLocked.
 func OpenUnrecordedLog(dir string, now Clock) (*UnrecordedLog, error) {
+	return openUnrecordedLog(dir, now, true)
+}
+
+// ErrUnrecordedDirMissing says the directory OpenExistingUnrecordedLog was
+// given does not exist, or is not a directory.
+var ErrUnrecordedDirMissing = errors.New("unrecorded log directory does not exist")
+
+// OpenExistingUnrecordedLog is OpenUnrecordedLog for an operator's command:
+// it never creates the directory. A mistyped path is ErrUnrecordedDirMissing,
+// not an empty log that says nothing awaits reconciliation. Nothing on this
+// path creates a directory, so there is no check-then-create window: the
+// lock file is created inside the directory only if the directory is there.
+func OpenExistingUnrecordedLog(dir string, now Clock) (*UnrecordedLog, error) {
+	return openUnrecordedLog(dir, now, false)
+}
+
+func openUnrecordedLog(dir string, now Clock, create bool) (*UnrecordedLog, error) {
 	if dir == "" {
 		return nil, errors.New("unrecorded log directory is required")
 	}
 	if now == nil {
 		now = time.Now
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, errors.New("unrecorded log directory cannot be created")
+	if create {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, errors.New("unrecorded log directory cannot be created")
+		}
+	} else if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return nil, ErrUnrecordedDirMissing
 	}
-	lock, err := dirlock.Acquire(dir, LockFileName)
+	acquire := dirlock.Acquire
+	if !create {
+		acquire = dirlock.AcquireExisting
+	}
+	lock, err := acquire(dir, LockFileName)
 	if err != nil {
 		if errors.Is(err, dirlock.ErrLocked) {
 			return nil, ErrGatewayLocked
+		}
+		if !create && (errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)) {
+			return nil, ErrUnrecordedDirMissing
 		}
 		return nil, errors.New("unrecorded log lock cannot be taken")
 	}

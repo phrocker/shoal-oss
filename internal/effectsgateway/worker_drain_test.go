@@ -19,6 +19,8 @@ package effectsgateway
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -438,5 +440,103 @@ func TestAnchorAnswer(t *testing.T) {
 	}
 	if _, err := AnchorAnswer(received, sent, claim); err == nil {
 		t.Fatal("an answer before its request")
+	}
+}
+
+// TestAHardStopAccountsForEveryRequest: the loop is inside the claim of a
+// second action when the hard stop takes its snapshot, and the stop's write
+// is held on a slow disk. The claim then succeeds, after the snapshot; the
+// worker must not register or work it, so every request that left is one the
+// write accounts for — the in-flight run, and nothing else.
+func TestAHardStopAccountsForEveryRequest(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	gate := make(chan struct{})
+	h.target.mu.Lock()
+	h.target.gate = gate
+	h.target.mu.Unlock()
+	t.Cleanup(func() { close(gate) })
+	claimHeld, claimRelease := make(chan struct{}, 1), make(chan struct{})
+	var claims atomic.Int32
+	h.explorer.setGate(func(ctx context.Context, op string) error {
+		if op == "claim" && claims.Add(1) == 2 {
+			claimHeld <- struct{}{}
+			<-claimRelease
+		}
+		return nil
+	})
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.explorer.enqueue("a2", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.start()
+	for what, ch := range map[string]chan struct{}{"a1's request": h.target.entered, "a2's claim": claimHeld} {
+		select {
+		case <-ch:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("never saw %s", what)
+		}
+	}
+
+	blocked, unblock := make(chan struct{}, 1), make(chan struct{})
+	previous := fileSyncer
+	fileSyncer = func(file *os.File) error {
+		select {
+		case blocked <- struct{}{}:
+		default:
+		}
+		<-unblock
+		return file.Sync()
+	}
+	t.Cleanup(func() { fileSyncer = previous })
+	stopped := make(chan int, 1)
+	go func() { stopped <- h.worker.HardStop() }()
+	select {
+	case <-blocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hard stop never wrote")
+	}
+	// The snapshot is taken and the write is under way: a2's claim answers
+	// now, after it.
+	close(claimRelease)
+	settle()
+	close(unblock)
+	if abandoned := <-stopped; abandoned != 1 {
+		t.Fatalf("abandoned %d", abandoned)
+	}
+	if err := h.runResult(); err == nil {
+		t.Fatal("Run reported a clean stop after a hard stop")
+	}
+	settle()
+	if _, requests, _ := h.target.stats(); requests != 1 {
+		t.Fatalf("%d target requests for %d unrecorded entries", requests, h.log.Len())
+	}
+	entries := h.log.Entries()
+	if len(entries) != 1 || string(entries[0].ActionID) != "a1" ||
+		entries[0].Outcome != fleet.AmbiguityOutcomeUnknown {
+		t.Fatalf("entries = %+v", entries)
+	}
+	// a2 was claimed and never worked: nothing past its claim is logged.
+	a2 := base64.RawURLEncoding.EncodeToString([]byte("a2"))
+	for _, line := range h.logs.lines() {
+		if line["action_id"] == a2 && line["event"] != string(EventClaimed) {
+			t.Fatalf("a2, claimed after the stop's snapshot, was worked: %v", line)
+		}
+	}
+}
+
+// TestAStoppedWorkerSendsNothing: a run the worker stopped before abandon
+// saw it — registered, not yet abandoned — sends nothing.
+func TestAStoppedWorkerSendsNothing(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	t.Cleanup(func() { _ = h.log.Close() })
+	route, _ := h.cfg.Routes.Lookup("charge")
+	key := testExecutorKey(t, "a1")
+	run := &claimRun{action: Action{ID: []byte("a1"), ClaimFence: 1, ExecutorKey: key}, route: route}
+	bound, err := h.cfg.Binder.Bind(route, json.RawMessage(chargeInput), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.worker.killed.Store(true)
+	observation, _, _, _ := h.worker.attempt(run, bound, "Authorization", "Bearer sk_test")
+	if _, requests, _ := h.target.stats(); requests != 0 || run.attempted || observation.Written {
+		t.Fatalf("a stopped worker sent: %d requests, attempted %v", requests, run.attempted)
 	}
 }

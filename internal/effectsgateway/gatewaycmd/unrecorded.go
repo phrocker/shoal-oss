@@ -25,7 +25,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -77,11 +76,11 @@ func openForOperator(dir string, env Env) (*effectsgateway.UnrecordedLog, int) {
 	// An operator command never creates the directory: a mistyped path must
 	// be an error, not an empty log that says nothing awaits reconciliation.
 	// Only run creates it.
-	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+	log, err := effectsgateway.OpenExistingUnrecordedLog(dir, env.Clock.Now)
+	if errors.Is(err, effectsgateway.ErrUnrecordedDirMissing) {
 		return nil, failf(env, ExitFailure, "-unrecorded-dir %s is not an existing directory; "+
 			"name the directory the gateway runs with", dir)
 	}
-	log, err := effectsgateway.OpenUnrecordedLog(dir, env.Clock.Now)
 	if errors.Is(err, effectsgateway.ErrGatewayLocked) {
 		return nil, failf(env, ExitFailure, "a gateway is running on %s; stop it first, "+
 			"because the running gateway owns the log and would write back what this changes", dir)

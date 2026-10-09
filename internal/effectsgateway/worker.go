@@ -221,6 +221,10 @@ type Worker struct {
 	// runs are the claims in hand, for abandonment at the end of a drain.
 	runsMu sync.Mutex
 	runs   map[*claimRun]struct{}
+	// abandonMu is held for the whole of an abandonment, and Run takes it
+	// before returning, so a HardStop's write finishes before the caller
+	// closes the log.
+	abandonMu sync.Mutex
 
 	work sync.WaitGroup
 }
@@ -329,13 +333,18 @@ func (w *Worker) Kill() {
 	w.kill()
 }
 
-// HardStop is the second signal: it stops at once, without draining, but
-// first does what a drain that runs out does (abandon) — every run whose
-// request may have reached the target, and whose outcome is not yet on the
-// record or in the log, goes to the unrecorded log as outcome_unknown in one
-// durable rewrite — and then cancels everything. It returns how many runs
-// were unfinished.
+// HardStop is the second signal: it stops at once, without draining, and
+// does what a drain that runs out does (abandon). Nothing more is claimed or
+// sent, every run is marked abandoned, everything in flight is cancelled, and
+// then every run whose request may have reached the target, and whose outcome
+// is not yet on the record or in the log, goes to the unrecorded log as
+// outcome_unknown in one durable rewrite. It returns how many runs were
+// unfinished. The write is bounded only by the disk: a stuck fsync holds it.
 func (w *Worker) HardStop() int {
+	// Stored before abandon takes its snapshot of the runs: a claim that
+	// would register after the snapshot sees it and is not registered, and
+	// a run that would send after it sees it and does not (attempt), so no
+	// request leaves that the write below does not account for.
 	w.killed.Store(true)
 	return w.abandon()
 }
@@ -350,6 +359,12 @@ func (w *Worker) HardStop() int {
 // Run returns when the drain ends or Kill is called.
 func (w *Worker) Run(ctx context.Context) error {
 	defer w.kill()
+	// Deferred after kill, so it runs first: an abandonment under way (a
+	// HardStop from another goroutine) finishes its write before Run returns.
+	defer func() {
+		w.abandonMu.Lock()
+		w.abandonMu.Unlock() //nolint:staticcheck // a barrier, not a critical section
+	}()
 	// The start-up retry stops on SIGTERM as well as on Kill; whatever it
 	// did not reach stays on disk for the next start.
 	retryCtx, stopRetry := context.WithCancel(ctx)
@@ -449,12 +464,16 @@ func (w *Worker) drain() int {
 // It is the one abandonment path: the drain bound running out and HardStop
 // both come here. A run already abandoned is not written twice.
 func (w *Worker) abandon() int {
+	w.abandonMu.Lock()
+	defer w.abandonMu.Unlock()
 	w.runsMu.Lock()
 	runs := make([]*claimRun, 0, len(w.runs))
 	for run := range w.runs {
 		runs = append(runs, run)
 	}
 	w.runsMu.Unlock()
+	// Mark every run first: from here none sends (attempt refuses an
+	// abandoned run) and none reports.
 	var written []*claimRun
 	var entries []UnrecordedEntry
 	for _, run := range runs {
@@ -468,7 +487,13 @@ func (w *Worker) abandon() int {
 				fleet.AmbiguityOutcomeUnknown, "", nil))
 		}
 	}
-	// One durable rewrite for all of them: the exit margin is short.
+	// Then cancel, so requests in flight stop now rather than after the
+	// write. Cancelling does not unsend: every run that may have reached
+	// the target is still written below.
+	w.kill()
+	// One durable rewrite for all of them: the exit margin is short. It is
+	// bounded by the disk; a stuck fsync holds it, and nothing short of
+	// dropping the entries could do better.
 	err := w.cfg.Unrecorded.AppendAll(entries)
 	for _, run := range written {
 		record := w.record(run, EventUnrecorded)
@@ -481,7 +506,6 @@ func (w *Worker) abandon() int {
 	}
 	w.log.Log(LogRecord{Event: EventAbandoned, Abandoned: len(runs),
 		Unrecorded: w.cfg.Unrecorded.Len()})
-	w.kill()
 	return len(runs)
 }
 
@@ -672,6 +696,10 @@ func (w *Worker) pullLoop(ctx context.Context) {
 // nothing claimable.
 func (w *Worker) pullOnce(ctx context.Context, held *ticket, cursor string) (bool, string, error) {
 	defer func() { w.release(held) }()
+	if w.killed.Load() {
+		// Stopped: nothing more is pulled or claimed.
+		return false, "", errors.New("worker stopped")
+	}
 	request, err := w.requestContext("gateway_pull")
 	if err != nil {
 		return false, "", err
@@ -702,6 +730,10 @@ func (w *Worker) pullOnce(ctx context.Context, held *ticket, cursor string) (boo
 				break
 			}
 		}
+		if w.killed.Load() {
+			// Stopped: nothing more is claimed.
+			break
+		}
 		if w.cfg.RequiresAttestation(offered.Action) {
 			if err := w.ensureAttestation(ctx, false); err != nil {
 				return claimedAny, "", err
@@ -716,12 +748,20 @@ func (w *Worker) pullOnce(ctx context.Context, held *ticket, cursor string) (boo
 			}
 			return claimedAny, "", err
 		}
+		// Registered under runsMu with the killed check, so a HardStop's
+		// snapshot either includes this run or this run is never registered.
+		// An unregistered claim has sent nothing, and lapses.
+		w.runsMu.Lock()
+		if w.killed.Load() {
+			w.runsMu.Unlock()
+			run.renewCancel()
+			return claimedAny, "", errors.New("worker stopped")
+		}
 		claimedAny = true
 		run.ticket, held = held, nil
-		w.runsMu.Lock()
 		w.runs[run] = struct{}{}
-		w.runsMu.Unlock()
 		w.work.Add(1)
+		w.runsMu.Unlock()
 		go w.handle(run)
 	}
 	if claimedAny {
@@ -1303,9 +1343,9 @@ func (w *Worker) attempt(run *claimRun, bound BoundRequest, header, credential s
 		return Observation{Err: err}, 0, 0, 0
 	}
 	run.mu.Lock()
-	if run.abandoned {
-		// abandon decided what to write from attempted; a run it gave up on
-		// sends nothing after that decision.
+	if run.abandoned || w.killed.Load() {
+		// abandon decided what to write from attempted; a run it gave up on,
+		// or one the worker stopped before abandon saw it, sends nothing.
 		run.mu.Unlock()
 		return Observation{Err: context.Canceled}, 0, 0, 0
 	}

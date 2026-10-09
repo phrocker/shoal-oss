@@ -584,8 +584,8 @@ the worker's own clock, and stopping a renewal cancels its call in flight
 rather than waiting for it, so the honest worst path (request, completion,
 both fallback reports) fits inside the drain bound; a test drives it with
 every call blocking to its timeout and measures it. `HardStop` (a second
-signal) takes the same abandonment path at once: the unrecorded-log write,
-then cancellation. `Kill` is SIGKILL itself, for tests: it abandons everything
+signal) takes the same abandonment path at once: mark, cancel, then the
+unrecorded-log write, which `Run` waits for before it returns. `Kill` is SIGKILL itself, for tests: it abandons everything
 and writes nothing, and the next instance re-claims after the lapse and
 resends under the same `ExecutorKey`.
 
@@ -652,11 +652,18 @@ shoal-gateway grace-period [-operation-timeout T] [-plane-timeout P]
 
 **Signals.** The first SIGTERM or SIGINT drains (above, *Shutdown*), within
 `DrainBound`. A second is a hard stop (`Worker.HardStop`). It does not wait,
-but it is not SIGKILL either: before cancelling, it does what a drain that runs
-out does — every run whose request may have reached the target, and whose
-outcome is not yet on the record or in the log, is written to the unrecorded
-log as `outcome_unknown`, all in one durable rewrite — and then everything in
-flight is cancelled and nothing more is reported. Runs that sent nothing
+but it is not SIGKILL either; it does what a drain that runs out does, in
+this order: nothing more is claimed or sent (a claim taken after the stop
+began is not registered, and a run the stop has not yet marked refuses to
+send), every run is marked abandoned, everything in flight is cancelled, and
+then every run whose request may have reached the target, and whose outcome
+is not yet on the record or in the log, is written to the unrecorded log as
+`outcome_unknown`, all in one durable rewrite. Cancelling does not unsend, so
+the write comes after it and still covers those runs. Nothing more is
+reported. The write is bounded only by the disk: a stuck fsync holds the
+process in it, and the alternative — exiting without the entries — is the
+loss the log exists to prevent; the kubelet's SIGKILL at the end of the grace
+period is the bound then. Runs that sent nothing
 simply lapse, and the next instance re-claims them under the same
 `ExecutorKey`. A real SIGKILL (the kubelet after the grace period, or an OOM
 kill) still writes nothing; there the re-claim, resending under the same

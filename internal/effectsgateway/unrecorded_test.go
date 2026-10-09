@@ -346,3 +346,32 @@ func TestAckAllIsOneRewriteOrNone(t *testing.T) {
 		}
 	})
 }
+
+// TestOpenExistingNeverCreatesTheDirectory: the operator's open refuses a
+// missing directory, or a file, and creates nothing; it opens an existing
+// one, as the gateway's own open does.
+func TestOpenExistingNeverCreatesTheDirectory(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if _, err := OpenExistingUnrecordedLog(missing, nil); !errors.Is(err, ErrUnrecordedDirMissing) {
+		t.Fatalf("missing directory: %v", err)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("the operator's open created the directory: %v", err)
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExistingUnrecordedLog(file, nil); !errors.Is(err, ErrUnrecordedDirMissing) {
+		t.Fatalf("a file: %v", err)
+	}
+	dir := t.TempDir()
+	log, err := OpenExistingUnrecordedLog(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExistingUnrecordedLog(dir, nil); !errors.Is(err, ErrGatewayLocked) {
+		t.Fatalf("a second open: %v", err)
+	}
+	_ = log.Close()
+}
