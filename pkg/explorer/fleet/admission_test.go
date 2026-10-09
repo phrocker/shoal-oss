@@ -29,7 +29,11 @@ type admissionHarness struct {
 	events    *controlledDispatchEvents
 	recorder  *dispatchRecorder
 	registry  *Service
-	executor  *runnableCeilingExecutor
+	// registryStore is exposed so a test can lapse the descriptor's lease
+	// without advancing the clock, which would also expire the admission
+	// token and the action deadline and refuse for those reasons instead.
+	registryStore *memoryStore
+	executor      *runnableCeilingExecutor
 }
 
 type stubRestrictor struct {
@@ -148,6 +152,7 @@ func newAdmissionHarness(
 		Descriptor: admissionDescriptor(harness.now),
 	}
 	harness.registry = registry
+	harness.registryStore = registryStore
 	harness.executor = executor
 	harness.store = newMemoryDispatchStore()
 	harness.recorder = &dispatchRecorder{}
@@ -3535,6 +3540,75 @@ func TestAFailureReportsHowMuchEscaped(t *testing.T) {
 			}
 			if !stored.Effected.Zero() {
 				t.Fatalf("the refused report recorded %#v", stored.Effected)
+			}
+		})
+	}
+}
+
+// TestAnAdmissionReportSurvivesALapsedLease is the path a gateway actually
+// hits, and the reason the invoke-route half of #577 matters in practice.
+//
+// An admission is a dispatch action born claimed, and Report completes it
+// through completeClaim under executorPhaseComplete. The lapse toleration was
+// gated on the execute route, and an admission caller is not on it — so a
+// gateway that performed an irreversible egress and then reported it, after
+// the operator stopped renewing the descriptor's lease, lost the record of
+// the effect.
+//
+// Revocation is still refused, which is the line this keeps: "stopped
+// renewing" and "withdrew the agent" are different statements.
+func TestAnAdmissionReportSurvivesALapsedLease(t *testing.T) {
+	for _, probe := range []struct {
+		name    string
+		revoke  bool
+		refused bool
+	}{
+		{name: "a lapsed lease is tolerated"},
+		{name: "a revoked descriptor is refused", revoke: true, refused: true},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			harness := newAdmissionHarness(t, nil)
+			grant, err := harness.service.Request(
+				harness.context(t, "request"), harness.request(
+					"request", "admission", "complete",
+					Effects{EffectEgressesContent}, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored := harness.registryStore.records["agent"]
+			descriptor := cloneDescriptor(stored.Descriptor)
+			descriptor.LeaseExpiresAt = descriptor.UpdatedAt.Add(-time.Second)
+			if probe.revoke {
+				descriptor.RevokedAt = descriptor.UpdatedAt
+			}
+			stored.Descriptor = descriptor
+			harness.registryStore.records["agent"] = stored
+
+			_, err = harness.service.Report(
+				harness.context(t, "report"), AdmissionReport{
+					Token: grant.Token, Failed: true,
+					ErrorCode: "target_rejected_502",
+					Context:   dispatchContext(harness.now, "report"),
+				})
+			if probe.refused {
+				if err == nil {
+					t.Fatal("an admission report resolved against a revoked " +
+						"descriptor; tolerating a lapse must not tolerate a " +
+						"withdrawal")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a gateway's report was refused because the "+
+					"descriptor's lease had lapsed, so the egress happened "+
+					"and the record does not say so: %v", err)
+			}
+			// And it committed, rather than being accepted and dropped.
+			committed, storeErr := harness.stored(t, "admission")
+			if storeErr != nil || committed.State != DispatchFailed ||
+				committed.ErrorCode != "target_rejected_502" {
+				t.Fatalf("the report was accepted but not recorded: %#v, %v",
+					committed, storeErr)
 			}
 		})
 	}

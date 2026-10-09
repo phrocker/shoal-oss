@@ -1099,8 +1099,22 @@ func (s *AdmissionService) Report(
 	// requirement rather than taking the executor routes #437 added. An
 	// admission is also not reclaimable, so there is no second claimant for
 	// those routes to serve.
-	current, _, err := dispatch.authorizedCurrent(
-		ctx, decision, report.Token.ActionID, auth.OperationInvoke, true, now)
+	// Named as a completion phase rather than going through
+	// authorizedCurrent, which hardcodes executorPhaseNone.
+	//
+	// A report *is* a report on a claim already taken — an admission is a
+	// dispatch action born claimed — so it must resolve with the tolerations
+	// that phase carries, or a lease that lapsed after the admission was
+	// granted refuses the report and loses the record of an effect that
+	// happened (#577). The phase is what the tolerations are keyed on, so a
+	// path that does not declare its phase cannot receive them.
+	//
+	// executorPhaseComplete also activates #391's binding rule, which is
+	// correct and inert here: that applies on the execute route and this
+	// resolves under invoke.
+	current, _, _, err := dispatch.authorizedCurrentBinding(
+		ctx, decision, report.Token.ActionID, auth.OperationInvoke, true, now,
+		executorPhaseComplete, 0)
 	if err != nil {
 		return ActionRecord{}, err
 	}
@@ -1122,7 +1136,20 @@ func (s *AdmissionService) Report(
 	// authorizedCurrent has already resolved and authorized this action and
 	// discarded what it resolved; this is how the declared schema is obtained,
 	// not a second authorization.
-	_, action, _, err := dispatch.registry.resolveActionBinding(
+	// Lapsing, and reporting on a claim. This is a *report* on an admission
+	// already granted: the caller was admitted while the descriptor was
+	// live, performed the effect, and is now saying what happened. Refusing
+	// it because the operator stopped renewing the lease in the meantime
+	// does not un-send the egress — it loses the record of it, which is the
+	// one thing a gateway's report exists to produce (#577).
+	//
+	// This is the third site, and the one a gateway actually hits: Report
+	// resolves here rather than through authorizedCurrentBinding, so fixing
+	// the two dispatch sites left the admission path still refusing. A
+	// revoked descriptor is still refused — activeChainLapsing checks
+	// RevokedAt regardless of the flag — which keeps "stopped renewing"
+	// and "withdrew the agent" different answers.
+	_, action, _, err := dispatch.registry.resolveActionBindingLapsing(
 		ctx, decision, current.AgentID, current.AgentGeneration,
 		current.Capability, current.Action, current.SourceID, current.PolicyID,
 		current.ObjectID, auth.OperationInvoke, now,
@@ -1132,6 +1159,8 @@ func (s *AdmissionService) Report(
 		// heartbeat changes. The requirement itself is checked by
 		// approvalGate and attestationGate. See resolveActionBinding.
 		false,
+		true,
+		true,
 	)
 	if err != nil {
 		return ActionRecord{}, err
