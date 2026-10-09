@@ -13,6 +13,8 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -23,7 +25,6 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/effectsgateway"
-	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -55,6 +56,12 @@ func newGatewayOps(t *testing.T) *gatewayOps {
 // each phase, because the world's own helpers replace the handler.
 func (g *gatewayOps) gateway(ref string) *effectsgateway.DispatchClient {
 	g.t.Helper()
+	return g.gatewayAs(testExecutorSubject, ref)
+}
+
+// gatewayAs is gateway for the executor with this service-account subject.
+func (g *gatewayOps) gatewayAs(subject, ref string) *effectsgateway.DispatchClient {
+	g.t.Helper()
 	g.record()
 	base, err := url.Parse(g.server.URL)
 	if err != nil {
@@ -63,7 +70,7 @@ func (g *gatewayOps) gateway(ref string) *effectsgateway.DispatchClient {
 	httpClient := *g.server.Client()
 	httpClient.Transport = recordingTransport{ops: g, next: g.server.Client().Transport}
 	client, err := effectsgateway.NewDispatchClient(base, &httpClient,
-		func() (string, error) { return g.executorToken(testExecutorSubject), nil }, g.h.now)
+		func() (string, error) { return g.executorToken(subject), nil }, g.h.now)
 	if err != nil {
 		g.t.Fatal(err)
 	}
@@ -93,6 +100,34 @@ func (r recordingTransport) RoundTrip(request *http.Request) (*http.Response, er
 	})
 	r.ops.mu.Unlock()
 	return r.next.RoundTrip(request)
+}
+
+// listAgents is the registry's list route as the executor with this subject,
+// returning the IDs of the descriptors on the page.
+func (g *gatewayOps) listAgents(subject string) []string {
+	g.t.Helper()
+	got, _ := g.send(call{token: g.executorToken(subject)}, "/api/v1/fleet/agents/resolve",
+		map[string]any{"context": g.contextWire(g.h.now().Add(time.Minute)), "limit": fleet.MaxListResults})
+	if got.status != http.StatusOK {
+		g.t.Fatalf("list as %s = %d %s", subject, got.status, got.raw)
+	}
+	var page struct {
+		Agents []struct {
+			ID string `json:"id"`
+		} `json:"agents"`
+	}
+	if err := json.Unmarshal(got.raw, &page); err != nil {
+		g.t.Fatal(err)
+	}
+	ids := make([]string, 0, len(page.Agents))
+	for _, agent := range page.Agents {
+		id, err := base64.RawURLEncoding.DecodeString(agent.ID)
+		if err != nil {
+			g.t.Fatal(err)
+		}
+		ids = append(ids, string(id))
+	}
+	return ids
 }
 
 func (g *gatewayOps) requests() []sentRequest {
@@ -189,23 +224,19 @@ func TestTheGatewayExtendsToTheClampedDeadlineAndCompletesOnTheFence(t *testing.
 	g.enqueueUntil("stripe-clamp", "alice-trace-clamp", deadline)
 	client := g.gateway(testExecutorRef)
 
-	// The gateway's own descriptor resolves; another ref's is concealed.
-	//
-	// COUNTERFACTUAL: the executor mint (#626) grants [execute] alone, so the
-	// shipped decision cannot resolve at all, although the action-execution
-	// role's ceiling admits agent_resolve and the fleet confines it to the
-	// binding (resolvableUnderBinding). This is the minted decision with
-	// agent_resolve added — everything else about the request is real.
-	g.current.Store(g.handlerFor(g.counterfactual(func(config *auth.DecisionConfig) {
-		config.AllowedOperations = append(config.AllowedOperations, auth.OperationAgentResolve)
-	})))
+	// The gateway's own descriptor resolves with the minted credential
+	// ([execute agent_resolve], the fleet confining resolve to the binding).
+	// Another ref's descriptor is concealed as not found, and so is the
+	// "gateway" agent on the local ref.
 	descriptor, err := client.Resolve(ctx, []byte("stripe-agent"), g.context("gateway_startup"))
 	if err != nil || descriptor.ExecutorRef != testExecutorRef {
 		t.Fatalf("resolve own descriptor = %+v, %v", descriptor, err)
 	}
-	if _, err := client.Resolve(ctx, []byte("ledger-agent"), g.context("gateway_startup")); effectsgateway.DispatchKind(err) !=
-		effectsgateway.DispatchNotFound {
-		t.Fatalf("resolve another ref's descriptor = %v", err)
+	for _, foreign := range []string{"ledger-agent", "gateway"} {
+		if _, err := client.Resolve(ctx, []byte(foreign), g.context("gateway_startup")); effectsgateway.DispatchKind(err) !=
+			effectsgateway.DispatchNotFound {
+			t.Fatalf("resolve %s outside the binding = %v", foreign, err)
+		}
 	}
 	// A client bound to the other ref, holding this credential, refuses the
 	// descriptor the explorer hands it rather than adopting it.
@@ -216,6 +247,14 @@ func TestTheGatewayExtendsToTheClampedDeadlineAndCompletesOnTheFence(t *testing.
 	if _, err := other.Resolve(ctx, []byte("stripe-agent"), g.context("gateway_startup")); effectsgateway.DispatchKind(err) !=
 		effectsgateway.DispatchRefusedLocal {
 		t.Fatalf("a descriptor bound to another ref = %v", err)
+	}
+	// List is confined the same way: each executor's page holds its own
+	// descriptor and nothing outside its binding.
+	if listed := g.listAgents(testExecutorSubject); strings.Join(listed, ",") != "stripe-agent" {
+		t.Fatalf("the stripe executor listed %q, want only its own descriptor", listed)
+	}
+	if listed := g.listAgents(testOtherExecutorSubject); strings.Join(listed, ",") != "ledger-agent" {
+		t.Fatalf("the ledger executor listed %q, want only its own descriptor", listed)
 	}
 	g.record()
 
@@ -300,16 +339,16 @@ func TestTheGatewayCannotExtendAfterARebindButStillCompletes(t *testing.T) {
 		t.Fatalf("extend after a rebind = %v, want fence_lost (404)", err)
 	}
 	// The descriptor now names another ref, so the old ref's worker cannot
-	// resolve it. COUNTERFACTUAL as in the clamp test: the minted decision
-	// plus agent_resolve, which the mint does not grant today.
-	g.current.Store(g.handlerFor(g.counterfactual(func(config *auth.DecisionConfig) {
-		config.AllowedOperations = append(config.AllowedOperations, auth.OperationAgentResolve)
-	})))
+	// resolve it, and the new ref's worker can.
 	if _, err := client.Resolve(ctx, []byte("stripe-agent"), g.context("gateway_startup")); effectsgateway.DispatchKind(err) !=
 		effectsgateway.DispatchNotFound {
 		t.Fatalf("resolving a rebound descriptor for the old ref = %v", err)
 	}
-	g.record()
+	ledger := g.gatewayAs(testOtherExecutorSubject, testOtherExecutorRef)
+	if rebound, err := ledger.Resolve(ctx, []byte("stripe-agent"), g.context("gateway_startup")); err != nil ||
+		rebound.ExecutorRef != testOtherExecutorRef {
+		t.Fatalf("the new ref's worker resolving the rebound descriptor = %+v, %v", rebound, err)
+	}
 	completed, err := g.complete(client, claimed, claimID, claimed.Version)
 	if err != nil || completed.State != fleet.DispatchSucceeded {
 		t.Fatalf("complete after a rebind = %+v, %v", completed, err)

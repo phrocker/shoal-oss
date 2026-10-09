@@ -83,9 +83,17 @@ type ExtendRequest struct {
 	Context         RequestContext
 	ExpectedVersion uint64
 	ClaimID         []byte
-	// ClaimFence is the fence from the claim response. The route does not
-	// take it; an extension never moves the fence, and the client refuses a
-	// response under any other fence as not describing this claim.
+	// ClaimFence is the fence from the claim response. It is checked
+	// against the response only and is NOT sent: an extension never moves
+	// the fence, and the client refuses a response under any other fence as
+	// not describing this claim.
+	//
+	// FOLLOW-UP: the extend route still binds on ExpectedVersion alone, and
+	// its strict decoder answers 400 to an unknown field, so claim_fence
+	// must stay off this body until the explorer supports fence-bound
+	// extend (in progress with the fleet owner). When it lands, send it as
+	// Complete does, so a version moved by someone's ambiguity report no
+	// longer refuses the holder's renewal.
 	ClaimFence uint64
 	// Lease is the silence budget requested from the explorer's now, at most
 	// fleet.MaxActionClaimTTL. The explorer clamps the new end to the

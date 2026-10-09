@@ -227,8 +227,8 @@ TLS that it trusts:
 
 | | |
 |---|---|
-| operations | `execute`, and nothing else |
-| service role | `action_execution`. The role also lets the worker resolve the one descriptor its binding names. It cannot heartbeat or register. |
+| operations | `execute` and `agent_resolve`, and nothing else. `agent_resolve` is confined to the descriptor the binding names: resolving another reference's descriptor answers `not_found`, and a list holds only the bound descriptor (`resolvableUnderBinding`, #573). The gateway resolves its own descriptor at startup. |
+| service role | `action_execution`. It cannot heartbeat or register: a worker cannot truthfully assert a descriptor's liveness. |
 | executor binding | the entry's `executor_ref`. The fleet narrows every execute route to it (#573). Another reference's work answers `not_found`. |
 | subject, actor, client ID | `oidcexec:<issuer>#<sub>`, one identity. It is outside the human identity family (`oidc:`, `oidcid:`, `entra:`), so it is never compared with a requester or an approver. The client ID is set because attestation requires one. |
 | on behalf of | none. A worker acts as itself. |

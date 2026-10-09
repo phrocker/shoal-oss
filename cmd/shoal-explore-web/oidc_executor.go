@@ -79,7 +79,16 @@ const (
 // oidcExecutorOperations is the whole authority of a mapped executor, and the
 // only list in this command that grants OperationExecute.
 // oidc_execute_grant_test.go asserts both.
-var oidcExecutorOperations = []auth.Operation{auth.OperationExecute}
+//
+// agent_resolve lets the worker read its own descriptor at startup (#391:
+// action_execution may resolve only its own bound ref). The fleet confines
+// it for this role to the descriptor whose executor ref is the binding
+// (resolvableUnderBinding, applied to resolve, list and delivery
+// validation), so another ref's descriptor answers not_found. No heartbeat
+// and no register: a worker cannot truthfully assert a descriptor's liveness.
+var oidcExecutorOperations = []auth.Operation{
+	auth.OperationExecute, auth.OperationAgentResolve,
+}
 
 var (
 	// errExecutorAudienceConfusion is returned for a token carrying the

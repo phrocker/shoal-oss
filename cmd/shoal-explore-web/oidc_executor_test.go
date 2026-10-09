@@ -146,8 +146,10 @@ func TestExecutorTokenMintsExecuteBoundToItsReference(t *testing.T) {
 	claims["groups"] = []string{labelGroupSecret}
 	decision := f.mustMint(t, bearerRequest(f.executorToken(t, claims)))
 
-	if got := decision.AllowedOperations(); len(got) != 1 || got[0] != auth.OperationExecute {
-		t.Fatalf("executor operations = %v, want [execute]", got)
+	// The decision holds its operations sorted.
+	if got := decision.AllowedOperations(); len(got) != 2 || got[0] != auth.OperationAgentResolve ||
+		got[1] != auth.OperationExecute {
+		t.Fatalf("executor operations = %v, want [execute agent_resolve]", got)
 	}
 	if decision.ServiceRole() != auth.ServiceRoleActionExecution {
 		t.Fatalf("role = %q, want action_execution", decision.ServiceRole())

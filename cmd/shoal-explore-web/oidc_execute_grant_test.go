@@ -103,10 +103,13 @@ func TestTheFleetMappingDoesNotGrantExecute(t *testing.T) {
 // unbound execute decision would claim nothing (#573) at best, and would be
 // the cross-principal hazard above at worst.
 func TestExecuteComesOnlyFromTheExecutorMint(t *testing.T) {
-	// The list is exactly [execute].
-	if len(oidcExecutorOperations) != 1 ||
-		oidcExecutorOperations[0] != auth.OperationExecute {
-		t.Fatalf("oidcExecutorOperations = %v, want [execute] alone",
+	// The list is exactly [execute, agent_resolve]: execute, and the
+	// resolve of its own descriptor that the fleet confines to the binding
+	// (#391). Nothing that registers, heartbeats or reads beyond that.
+	if len(oidcExecutorOperations) != 2 ||
+		oidcExecutorOperations[0] != auth.OperationExecute ||
+		oidcExecutorOperations[1] != auth.OperationAgentResolve {
+		t.Fatalf("oidcExecutorOperations = %v, want [execute agent_resolve]",
 			oidcExecutorOperations)
 	}
 
