@@ -7,6 +7,8 @@ import platform
 import time
 from pathlib import Path
 
+from huggingface_hub import snapshot_download
+
 import challenger_manifest as contract
 import unixcoder_challenger as challenger
 
@@ -86,6 +88,9 @@ def main():
     args = parser.parse_args()
     if not args.snapshot.is_dir() or args.snapshot.name != REVISION:
         raise SystemExit('snapshot must be the pinned UniXcoder revision directory')
+    canonical = Path(snapshot_download(REPO, revision=REVISION, local_files_only=True)).resolve()
+    if args.snapshot.resolve() != canonical:
+        raise SystemExit('snapshot is not the local Hugging Face cache for the pinned revision')
     report = run(args.snapshot, args.device)
     with args.output.open('x') as stream:
         json.dump(report, stream, indent=2, sort_keys=True)
