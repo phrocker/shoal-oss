@@ -234,6 +234,19 @@ explorer:
       # changes. Every grant's source must be shoal-explore-web/workspace,
       # the one source the workspace configures.
       labelGrants: {}
+      # The executor mapping (#391; docs/effects-gateway-deploy.md, "Issuing
+      # executor credentials"): the shoal.executors/v1 document itself, as a
+      # map. It is the only source of the execute operation: each entry binds
+      # one service credential's subject (for example a projected
+      # ServiceAccount token's system:serviceaccount:<ns>:<name>) to one
+      # executor reference, on an audience of its own and under an issuer it
+      # names, which may be the cluster's ServiceAccount issuer rather than
+      # explorer.auth.oidc.issuer. Empty means no token may pull, claim or
+      # complete queued work. Rendered into a ConfigMap this chart owns,
+      # mounted read-only and passed as -oidc-executor-mapping-file; a
+      # checksum annotation rolls the pod when it changes. Every executor_ref
+      # must also appear in explorer.fleet.executorRefs.
+      executorMapping: {}
       # A stable identity claim (#526) as a list of path segments, for example
       # [oid] for Entra on a tenant issuer. Requesters and approvers are then
       # named oidcid:<issuer>#<path tag>#<value> on both branches.

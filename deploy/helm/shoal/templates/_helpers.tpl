@@ -100,6 +100,12 @@ release name shortens the stem rather than overflowing the name.
 {{- printf "%s-label-grants" (include "shoal.explorerStem" .) -}}
 {{- end -}}
 
+{{- /* The executor mapping ConfigMap (#391): stem plus -executors, 55
+       characters at most. */ -}}
+{{- define "shoal.explorerExecutorsName" -}}
+{{- printf "%s-executors" (include "shoal.explorerStem" .) -}}
+{{- end -}}
+
 {{- define "shoal.explorerSelectorLabels" -}}
 app.kubernetes.io/name: shoal-explore-web
 app.kubernetes.io/instance: {{ .Release.Name }}
