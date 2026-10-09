@@ -33,6 +33,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 )
 
 // TestLoggingNeverCarriesAFilledURL is the url.Error case the policy exists
@@ -123,9 +125,13 @@ func TestLogRecordAdmitsOnlyThePolicyFields(t *testing.T) {
 		"Failure":        reflect.TypeOf(FailureKind("")),
 		"Gate":           reflect.TypeOf(GateRefusal("")),
 		"DispatchError":  reflect.TypeOf(DispatchErrorKind("")),
-		"RequestBytes":   reflect.TypeOf(int64(0)),
-		"ResponseBytes":  reflect.TypeOf(int64(0)),
-		"Duration":       reflect.TypeOf(time.Duration(0)),
+		// Closed sets and a count, added with the worker loop.
+		"Ambiguity":     reflect.TypeOf(fleet.AmbiguityOutcome("")),
+		"Unrecorded":    reflect.TypeOf(0),
+		"NotReady":      reflect.TypeOf(NotReadyReason("")),
+		"RequestBytes":  reflect.TypeOf(int64(0)),
+		"ResponseBytes": reflect.TypeOf(int64(0)),
+		"Duration":      reflect.TypeOf(time.Duration(0)),
 	}
 	record := reflect.TypeOf(LogRecord{})
 	if record.NumField() != len(allowed) {

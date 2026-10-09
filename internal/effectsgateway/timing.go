@@ -181,6 +181,9 @@ const (
 	GateDeadline      GateRefusal = "deadline"
 	GateLease         GateRefusal = "lease"
 	GateMisconfigured GateRefusal = "misconfigured"
+	// GateRetention is the PRECHECK retention rule refusing a key route's
+	// action whose deadline outlives the target's idempotency window.
+	GateRetention GateRefusal = "retention"
 )
 
 // Check evaluates the gate at local instant now:
