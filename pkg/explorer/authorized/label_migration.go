@@ -272,38 +272,43 @@ func (r migrationRun) document(
 	}
 	labels, raw, reason, err := c.currentRevisionLabels(
 		ctx, documentID, current.RevisionID)
+	currentServed := true
 	if errors.Is(err, errRevisionNotServed) {
 		if summary.Revision.ID == current.RevisionID {
 			return inconsistentBase()
 		}
-		// The registered revision is not served, so it cannot be read or
-		// labelled; the drift entry above already names the document.
-		return nil
+		// The registered current revision is not served, so it cannot be
+		// read or labelled; the drift entry above already names the
+		// document. Only its own tightening is skipped: every historical
+		// revision the base still serves is narrowed below all the same.
+		currentServed, err = false, nil
 	}
 	if err != nil {
 		return err
 	}
-	outcome, err := r.tightenRevision(ctx, current, summary.SourceURI,
-		r.assertedFor(documentID, current.RevisionID, true), labels, reason)
-	if err != nil {
-		return err
-	}
-	if outcome.untranslatable != "" {
-		record.Untranslatable = append(record.Untranslatable, UntranslatableLabel{
-			DocumentID:   documentID,
-			RevisionID:   current.RevisionID,
-			SourceURI:    summary.SourceURI,
-			EscapedLabel: escapeLabel(raw),
-			Reason:       outcome.untranslatable,
-		})
-	}
-	switch {
-	case outcome.unlabelled:
-		record.Unlabelled++
-	case outcome.changed:
-		record.Tightened++
-	default:
-		record.AlreadyTightened++
+	if currentServed {
+		outcome, err := r.tightenRevision(ctx, current, summary.SourceURI,
+			r.assertedFor(documentID, current.RevisionID, true), labels, reason)
+		if err != nil {
+			return err
+		}
+		if outcome.untranslatable != "" {
+			record.Untranslatable = append(record.Untranslatable, UntranslatableLabel{
+				DocumentID:   documentID,
+				RevisionID:   current.RevisionID,
+				SourceURI:    summary.SourceURI,
+				EscapedLabel: escapeLabel(raw),
+				Reason:       outcome.untranslatable,
+			})
+		}
+		switch {
+		case outcome.unlabelled:
+			record.Unlabelled++
+		case outcome.changed:
+			record.Tightened++
+		default:
+			record.AlreadyTightened++
+		}
 	}
 
 	// Historical revisions, read after the sweep above so their rules
