@@ -249,20 +249,22 @@ var (
 	}
 )
 
-// A result does not say whether the service or the predictor set its reason
-// (#509), so these are narrated conditionally and attributed to both.
-//
 // DecisionServiceReasons are the whole-request reasons the decision service
-// writes (internal/decisionservice/service.go, terminal(...)), by status.
-// Mirrored for the same reason as the gateway codes. A predictor may return
-// its own whole-request abstention with any reason; such a reason is quoted.
-var DecisionServiceReasons = map[decision.ResultStatus][]string{
-	decision.Abstained: {"evidence_ineligible"},
-	decision.Failed: {
-		"predictor_unavailable", "predictor_identity_mismatch",
-		"deadline_exceeded", "predictor_failed", "invalid_predictor_response",
-	},
-}
+// writes, by status.
+//
+// Taken from pkg/decision rather than mirrored. The mirror carried the note
+// that "a result does not say whether the service or the predictor set its
+// reason (#509), so these are narrated conditionally and attributed to both"
+// — which is no longer true: these reasons are reserved, so a predictor
+// cannot return one and seeing one means the service established it. The
+// conditional attribution can go, and a renderer may state the service fact
+// outright.
+//
+// Not mirrored, because the mirror was the drift risk: a reason added to the
+// service and not to this list would have been quoted as the predictor's own
+// words. A predictor's whole-request reason is still quoted, which is correct
+// — it is now guaranteed to be the predictor's.
+var DecisionServiceReasons = decision.ServiceReasons()
 
 // AnswerAbstentionReasons are per-answer abstention reasons with a meaning
 // documented in docs/decision-contracts.md. Any other reason is the

@@ -152,7 +152,8 @@ func (s *Service) Evaluate(ctx context.Context, requestID shoal.ID, key []byte) 
 	// Resolve the registered runtime only after access and eligibility checks.
 	var result decision.ResultConfig
 	if ineligible {
-		result = terminal(bundle.Request, decision.Abstained, "evidence_ineligible", s.now())
+		result = terminal(bundle.Request, decision.Abstained,
+			decision.ReasonEvidenceIneligible, s.now())
 	} else {
 		if err := ctx.Err(); err != nil {
 			return Response{}, err
@@ -162,11 +163,13 @@ func (s *Service) Evaluate(ctx context.Context, requestID shoal.ID, key []byte) 
 			return Response{}, err
 		}
 		if resolveErr != nil || nilDependency(provider) {
-			result = terminal(bundle.Request, decision.Failed, "predictor_unavailable", s.now())
+			result = terminal(bundle.Request, decision.Failed,
+				decision.ReasonPredictorUnavailable, s.now())
 		} else {
 			identity := provider.Identity()
 			if identity.Validate() != nil || identity.ID() != bundle.Request.PredictorID() {
-				result = terminal(bundle.Request, decision.Failed, "predictor_identity_mismatch", s.now())
+				result = terminal(bundle.Request, decision.Failed,
+					decision.ReasonPredictorIdentityMismatch, s.now())
 			} else {
 				// Registry latency must not bypass revocation checks or consume the lease.
 				principal, bundle, _, err = s.authorizeSame(ctx, requestID, auth.OperationInvoke, principal, bundle)
@@ -185,7 +188,8 @@ func (s *Service) Evaluate(ctx context.Context, requestID shoal.ID, key []byte) 
 					until = principal.AuthenticationExpires()
 				}
 				if !until.After(now) {
-					result = terminal(bundle.Request, decision.Failed, "deadline_exceeded", now)
+					result = terminal(bundle.Request, decision.Failed,
+						decision.ReasonDeadlineExceeded, now)
 				} else {
 					callCtx, cancel := context.WithTimeout(ctx, until.Sub(now))
 					if err := callCtx.Err(); err != nil {
@@ -198,14 +202,38 @@ func (s *Service) Evaluate(ctx context.Context, requestID shoal.ID, key []byte) 
 					completed := s.now()
 					switch {
 					case callErr != nil || completed.After(until):
-						result = terminal(bundle.Request, decision.Failed, "deadline_exceeded", completed)
+						result = terminal(bundle.Request, decision.Failed,
+							decision.ReasonDeadlineExceeded, completed)
 					case predictErr != nil:
-						result = terminal(bundle.Request, decision.Failed, "predictor_failed", completed)
+						result = terminal(bundle.Request, decision.Failed,
+							decision.ReasonPredictorFailed, completed)
 					default:
 						// Completion time is stamped by this executor, not trusted from output.
 						native.CompletedAt = completed
-						if _, err := decision.NewPredictionRecord(bundle.Request, native); err != nil {
-							result = terminal(bundle.Request, decision.Failed, "invalid_predictor_response", completed)
+						// A predictor may not claim one of the service's own
+						// reasons. Passing its reason through unchecked let a
+						// predictor returning "evidence_ineligible" produce a
+						// stored result reading "the service found the
+						// evidence ineligible and ran no predictor", which is
+						// false and which nothing in the record contradicted
+						// (#509).
+						//
+						// Adjudicated as invalid_predictor_response, the
+						// reason that already exists for a response that is
+						// not a valid prediction. A response claiming an
+						// authority it does not have is exactly that, and
+						// reusing it needs no new vocabulary — note that the
+						// reason the service then writes is itself reserved,
+						// so a reader can tell this adjudication from
+						// anything the predictor said.
+						if decision.ReservedServiceReason(native.Reason) {
+							result = terminal(
+								bundle.Request, decision.Failed,
+								decision.ReasonInvalidPredictorResponse,
+								completed)
+						} else if _, err := decision.NewPredictionRecord(bundle.Request, native); err != nil {
+							result = terminal(bundle.Request, decision.Failed,
+								decision.ReasonInvalidPredictorResponse, completed)
 						} else {
 							result = native
 						}

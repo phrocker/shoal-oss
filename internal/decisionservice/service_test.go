@@ -628,3 +628,96 @@ func TestCancellationBeforeProviderInvocation(t *testing.T) {
 		})
 	}
 }
+
+// TestAPredictorCannotClaimAServiceReason is #509.
+//
+// The predictor's native Abstained/Failed result passed through with whatever
+// reason it gave, and the service also stamps its own terminal reasons through
+// terminal(...). The stored result recorded neither which one set it nor any
+// constraint on what the predictor could say. So a predictor returning
+// "evidence_ineligible" produced a receipt reading "the service found the
+// evidence ineligible and ran no predictor" — false, and nothing in the record
+// contradicted it.
+//
+// Reserved rather than attributed. An origin field makes the misattribution
+// legible; reserving makes it unrepresentable, needs no new persisted field on
+// every stored result, and lets a reader take the reason at face value. A
+// predictor with its own view of the same situation says so in its own words,
+// which is more honest — its judgement that evidence was unusable is not the
+// service's eligibility gate.
+func TestAPredictorCannotClaimAServiceReason(t *testing.T) {
+	// Every reserved reason, on the status it is reserved for and on the
+	// other one. A per-status check would admit a predictor returning
+	// "evidence_ineligible" on a Failed result, which is the same false
+	// claim.
+	for _, status := range []decision.ResultStatus{
+		decision.Abstained, decision.Failed,
+	} {
+		for _, reason := range append(
+			append([]string(nil), decision.ServiceReasons()[decision.Abstained]...),
+			decision.ServiceReasons()[decision.Failed]...,
+		) {
+			t.Run(string(status)+"/"+reason, func(t *testing.T) {
+				h := newHarness(t, false)
+				h.registry.p.run = func(
+					_ context.Context, r decision.DecisionRequest, _ []byte,
+				) (decision.ResultConfig, error) {
+					out := validOutput(r)
+					out.Status = status
+					out.Reason = reason
+					out.Answers = nil
+					return out, nil
+				}
+				out, err := h.s.Evaluate(
+					h.ctx, h.catalog.bundle.Request.ID(), []byte("key"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if out.Receipt.Result.Reason != decision.ReasonInvalidPredictorResponse {
+					t.Fatalf("a predictor returned the service's own reason "+
+						"%q and the receipt kept it (reason=%q): the record "+
+						"now reads as a finding the service never made",
+						reason, out.Receipt.Result.Reason)
+				}
+				if out.Receipt.Result.Status != decision.Failed {
+					t.Fatalf("status = %q, want failed: a response claiming "+
+						"an authority it does not have is not a valid "+
+						"prediction", out.Receipt.Result.Status)
+				}
+			})
+		}
+	}
+
+	// And a predictor's own words still pass through, which is the half that
+	// must not break: reserving the service's vocabulary is not the same as
+	// refusing the predictor a voice.
+	t.Run("the predictor's own reason survives", func(t *testing.T) {
+		h := newHarness(t, false)
+		const own = "model_declined_low_support"
+		if decision.ReservedServiceReason(own) {
+			t.Fatal("the fixture's reason is reserved, so this cannot tell " +
+				"a passed-through reason from a refused one")
+		}
+		h.registry.p.run = func(
+			_ context.Context, r decision.DecisionRequest, _ []byte,
+		) (decision.ResultConfig, error) {
+			out := validOutput(r)
+			out.Status = decision.Abstained
+			out.Reason = own
+			out.Answers = nil
+			return out, nil
+		}
+		out, err := h.s.Evaluate(
+			h.ctx, h.catalog.bundle.Request.ID(), []byte("key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Receipt.Result.Reason != own {
+			t.Fatalf("the predictor's own reason = %q, want %q",
+				out.Receipt.Result.Reason, own)
+		}
+		if out.Receipt.Result.Status != decision.Abstained {
+			t.Fatalf("status = %q, want abstained", out.Receipt.Result.Status)
+		}
+	})
+}
