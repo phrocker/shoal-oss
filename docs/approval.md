@@ -431,9 +431,12 @@ heartbeat interval; this is the same property queued dispatch work already has.
 
 ## Storage and compatibility
 
-- The registry mutation digest appends the flag only when it is true, so every
-  existing digest, and every heartbeat or revoke retry spanning the upgrade, is
-  unchanged. The JSON form omits the key when false.
+- The v1 registry mutation digest appended the flag only when it was true, so
+  every digest from before the flag existed stayed unchanged. The v2 digest
+  (#521), which all new receipts carry, writes the flag explicitly as a 0 or 1
+  field on every action; v1 is still computed only to reconcile a retry with a
+  receipt written before v2 (see `docs/atpl.md`). The JSON form omits the key
+  when false.
 - The descriptor codec writes version 4, with one flag byte per action, only
   for a descriptor in which some action requires approval. Every other
   descriptor is still version 3, byte for byte. A previous build refuses to

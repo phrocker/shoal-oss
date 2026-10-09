@@ -40,25 +40,29 @@ func approvalDigestMutation(requireApproval bool) Mutation {
 	}
 }
 
-// TestRegistryDigestIsUnchangedWithoutApproval pins the mutation digest of a
-// descriptor that does not require approval to the value the encoding produced
-// before the field existed. The digest is embedded in the lifecycle
-// QueryDigest, so a change here reads as a divergent mutation and refuses every
-// heartbeat or revoke retry that spans the upgrade.
+// TestRegistryDigestIsUnchangedWithoutApproval pins the v1 mutation digest of
+// a descriptor that does not require approval to the value the encoding
+// produced before the field existed. A v1 digest is embedded in the QueryDigest
+// of every receipt written before v2 (#521), so the legacy reader must still
+// reproduce it, or a heartbeat or revoke retry that spans the upgrade reads as
+// a divergent mutation.
 //
 // The golden value was computed by the previous build's registryMutationDigest
 // (extracted verbatim from origin/main and run over this mutation), not by the
 // function under test, so it is an independent statement of the old encoding.
 func TestRegistryDigestIsUnchangedWithoutApproval(t *testing.T) {
 	const golden = "54af49ed8009c6c7c8d4862c19d5875176dfa8dbe51dd5188521a0c8b672138a"
-	plain := registryMutationDigest(approvalDigestMutation(false))
+	plain := registryMutationDigestV1(approvalDigestMutation(false))
 	if got := hex.EncodeToString(plain[:]); got != golden {
-		t.Fatalf("mutation digest without approval = %s, want %s", got, golden)
+		t.Fatalf("v1 mutation digest without approval = %s, want %s", got, golden)
 	}
-	held := registryMutationDigest(approvalDigestMutation(true))
-	if held == plain {
-		t.Fatal("requiring approval did not change the mutation digest, so a " +
-			"replay could add or drop it under the same identity")
+	for _, version := range registryDigestVersions {
+		if version.digest(approvalDigestMutation(true)) ==
+			version.digest(approvalDigestMutation(false)) {
+			t.Fatalf("%s: requiring approval did not change the mutation "+
+				"digest, so a replay could add or drop it under the same "+
+				"identity", version.name)
+		}
 	}
 	// The JSON form, which descriptorDigest hashes, carries no key at all
 	// when the flag is false.

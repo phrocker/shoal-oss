@@ -134,9 +134,12 @@ it as `"attestation": {"required": true}` on an action (`docs/atpl.md`).
   executor ref (`fleet.Config.AttestationTrust`; nil configures none).
 - Delegation and re-registration may add it and never drop it
   (`capabilitiesSubset`).
-- The registry mutation digest appends the tag
-  `shoal.fleet.requires-attestation.v1` only when it is set, so every existing
-  digest is byte-identical. The durable descriptor codec writes version 5 only
+- The v1 registry mutation digest appended the tag
+  `shoal.fleet.requires-attestation.v1` only when it was set, so every earlier
+  digest stayed byte-identical. The v2 digest (#521), which all new receipts
+  carry, writes the requirement explicitly as a 0 or 1 field on every action;
+  v1 is still computed only to reconcile a retry with a receipt written before
+  v2. The durable descriptor codec writes version 5 only
   for a descriptor that requires it; an earlier build refuses version 5 rather
   than reading the action without the requirement.
 

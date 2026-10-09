@@ -54,15 +54,22 @@ type Store interface {
 }
 
 type Lifecycle struct {
-	Operation                auth.Operation
-	RequestID                shoal.ID
-	CorrelationID            shoal.ID
-	Subject                  shoal.ID
-	Actor                    shoal.ID
-	ClientID                 shoal.ID
-	OnBehalfOf               []shoal.ID
-	AgentID                  shoal.ID
-	MutationDigest           [sha256.Size]byte
+	Operation     auth.Operation
+	RequestID     shoal.ID
+	CorrelationID shoal.ID
+	Subject       shoal.ID
+	Actor         shoal.ID
+	ClientID      shoal.ID
+	OnBehalfOf    []shoal.ID
+	AgentID       shoal.ID
+	// MutationDigest is the registry mutation digest the receipt is written
+	// with: the v2 encoding (see registryMutationDigest), or zero for a read.
+	MutationDigest [sha256.Size]byte
+	// LegacyMutationDigest is the same mutation under the v1 encoding, which
+	// receipts written before v2 carry. It is read, never written: a recorder
+	// uses it only to reconcile a retry with such a receipt, and only for a
+	// receipt whose identity says it holds a v1 digest.
+	LegacyMutationDigest     [sha256.Size]byte
 	ReasonCode               string
 	ReasonDetail             string
 	Deadline                 int64

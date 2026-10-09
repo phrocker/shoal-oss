@@ -176,33 +176,38 @@ func TestMutationDigestSeparatesEffects(t *testing.T) {
 			}}}},
 		}}
 	}
-	evidence := registryMutationDigest(mutation(nil))
-	external := registryMutationDigest(mutation(Effects{EffectMutatesExternal}))
-	if evidence == external {
-		t.Fatal("effect must change the mutation digest")
+	for _, version := range registryDigestVersions {
+		digest := version.digest
+		evidence := digest(mutation(nil))
+		external := digest(mutation(Effects{EffectMutatesExternal}))
+		if evidence == external {
+			t.Fatalf("%s: effect must change the mutation digest", version.name)
+		}
+		if digest(mutation(Effects{EffectMutatesExternal})) != external {
+			t.Fatalf("%s: the digest must stay stable for an unchanged effect",
+				version.name)
+		}
+		// Distinct classes are distinct mutations, and a wider set is
+		// distinct from either — otherwise a replay could widen a declaration
+		// under the same mutation identity.
+		egress := digest(mutation(Effects{EffectEgressesContent}))
+		both := digest(mutation(Effects{
+			EffectEgressesContent, EffectMutatesExternal,
+		}))
+		if egress == external || both == external || both == egress ||
+			egress == evidence {
+			t.Fatalf("%s: distinct effect sets collided in the mutation digest",
+				version.name)
+		}
+		// Declaration order is not part of the declaration.
+		reordered := digest(mutation(Effects{
+			EffectMutatesExternal, EffectEgressesContent,
+		}))
+		if reordered != both {
+			t.Fatalf("%s: declaration order changed the mutation digest; "+
+				"canonicalization must happen before hashing", version.name)
+		}
 	}
-	if registryMutationDigest(mutation(Effects{EffectMutatesExternal})) != external {
-		t.Fatal("the digest must stay stable for an unchanged effect")
-	}
-	// Distinct classes are distinct mutations, and a wider set is distinct
-	// from either — otherwise a replay could widen a declaration under the
-	// same mutation identity.
-	egress := registryMutationDigest(mutation(Effects{EffectEgressesContent}))
-	both := registryMutationDigest(mutation(Effects{
-		EffectEgressesContent, EffectMutatesExternal,
-	}))
-	if egress == external || both == external || both == egress || egress == evidence {
-		t.Fatal("distinct effect sets collided in the mutation digest")
-	}
-	// Declaration order is not part of the declaration.
-	reordered := registryMutationDigest(mutation(Effects{
-		EffectMutatesExternal, EffectEgressesContent,
-	}))
-	if reordered == both {
-		return
-	}
-	t.Fatal("declaration order changed the mutation digest; canonicalization " +
-		"must happen before hashing")
 }
 
 // TestExternalMutationDigestIsUnchangedAcrossTheSetUpgrade is the cross-upgrade
@@ -830,19 +835,18 @@ func effectDecision(t *testing.T, requestID string) auth.Decision {
 }
 
 // TestEvidenceMutationDigestIsUnchangedAcrossTheUpgrade pins the byte-level
-// stability of an evidence-only mutation digest. The value below was computed
-// from main before the effect field existed.
+// stability of an evidence-only v1 mutation digest. The value below was
+// computed from main before the effect field existed.
 //
-// It matters because the digest namespace is still v1 and the value is
-// embedded in the lifecycle QueryDigest, where a changed digest reads as a
-// divergent mutation. Hashing the zero value would have changed every existing
-// mutation, since an empty field still contributes its eight-byte length
-// prefix, and a heartbeat or revoke retry that spanned an upgrade would then
-// have been rejected.
+// It matters because a v1 digest is embedded in the QueryDigest of every
+// receipt written before v2 (#521), where a changed digest reads as a
+// divergent mutation, so the legacy reader must reproduce it exactly. Hashing
+// the zero value would have changed every existing mutation, since an empty
+// field still contributes its eight-byte length prefix.
 func TestEvidenceMutationDigestIsUnchangedAcrossTheUpgrade(t *testing.T) {
 	const beforeTheEffectField = "990a0fe870e3c27d873e281441bcb7cb" +
 		"cf299cf6dd5c6a5060d3dda992d5512f"
-	digest := registryMutationDigest(Mutation{Descriptor: Descriptor{
+	digest := registryMutationDigestV1(Mutation{Descriptor: Descriptor{
 		ID: "agent", Generation: 1,
 		Capabilities: []Capability{{Name: "deploy", Actions: []Action{{
 			Name: "ship", InputSchema: anyObject, OutputSchema: anyObject,

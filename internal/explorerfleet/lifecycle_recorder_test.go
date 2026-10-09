@@ -106,11 +106,17 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 		t.Fatalf("record attempts = %d", len(store.requests))
 	}
 	expectedID := interaction.DerivedID(
-		"session", "fleet.lifecycle.v3", string(lifecycle.Operation),
+		"session", "fleet.lifecycle.v4", string(lifecycle.Operation),
 		string(lifecycle.RequestID), string(lifecycle.AgentID),
 	)
-	// The pre-asserted-reason identity is still derived exactly, because
-	// retries reconcile against receipts written under it.
+	// The earlier identities are still derived exactly, because retries
+	// reconcile against receipts written under them.
+	if v3LifecycleSessionID(lifecycle) != interaction.DerivedID(
+		"session", "fleet.lifecycle.v3", string(lifecycle.Operation),
+		string(lifecycle.RequestID), string(lifecycle.AgentID),
+	) {
+		t.Fatal("v3 lifecycle receipt identity drifted")
+	}
 	if v2LifecycleSessionID(lifecycle) != interaction.DerivedID(
 		"session", "fleet.lifecycle.v2", string(lifecycle.Operation),
 		string(lifecycle.RequestID), string(lifecycle.AgentID),
@@ -153,8 +159,34 @@ func TestLifecycleRecorderReconcilesLegacyReceiptBeforeWritingV2(t *testing.T) {
 	); err != nil {
 		t.Fatalf("legacy receipt reconciliation = %v", err)
 	}
-	if len(store.requests) != 0 {
-		t.Fatalf("v2 receipt was written despite legacy match: %d", len(store.requests))
+	if store.stored.ID != accepted.ID {
+		t.Fatal("reconciliation rewrote the legacy receipt")
+	}
+	requireV4Receipt(t, store, lifecycle)
+}
+
+// requireV4Receipt checks that a retry reconciled with a legacy receipt also
+// wrote exactly one v4 receipt, carrying the current registry digest, beside
+// it (#521): the v1 digest the legacy receipt holds can be shared by two
+// different mutations, so the one actually applied is recorded under v2.
+func requireV4Receipt(
+	t *testing.T, store *reconcilingLifecycleStore, lifecycle fleet.Lifecycle,
+) {
+	t.Helper()
+	id := LifecycleReceiptID(
+		lifecycle.Operation, lifecycle.RequestID, lifecycle.AgentID)
+	written, ok := store.written[id]
+	if !ok || len(store.requests) != 1 || store.requests[0].ID != id {
+		t.Fatalf("legacy reconciliation did not write the v4 receipt: %d "+
+			"requests", len(store.requests))
+	}
+	asserted, err := fleet.CallerAssertedRegistryReason(
+		lifecycle.ReasonCode, lifecycle.ReasonDetail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written.QueryDigest != lifecycleQueryDigest(lifecycle, asserted) {
+		t.Fatal("v4 receipt does not carry the current registry digest")
 	}
 }
 
@@ -413,10 +445,23 @@ func (r *trustedLifecycleRecorder) RecordInteractionResult(
 	return result, nil
 }
 
+// reconcilingLifecycleStore is a session store keyed by ID. stored is the
+// first receipt (seeded by a test or written first); later receipts under
+// other IDs are kept in written. A write to an ID that already holds a
+// receipt is refused, as the corpus refuses it.
 type reconcilingLifecycleStore struct {
 	trustedLifecycleRecorder
 	stored    interaction.Session
+	written   map[shoal.ID]interaction.Session
 	recordErr error
+}
+
+func (r *reconcilingLifecycleStore) lookup(id shoal.ID) (interaction.Session, bool) {
+	if r.stored.ID != "" && r.stored.ID == id {
+		return r.stored, true
+	}
+	session, ok := r.written[id]
+	return session, ok
 }
 
 func (r *reconcilingLifecycleStore) RecordInteractionResult(
@@ -427,7 +472,7 @@ func (r *reconcilingLifecycleStore) RecordInteractionResult(
 		r.requests = append(r.requests, request)
 		return interaction.Session{}, r.recordErr
 	}
-	if r.stored.ID != "" {
+	if _, exists := r.lookup(request.ID); exists {
 		r.requests = append(r.requests, request)
 		return interaction.Session{}, shoal.NewError(
 			shoal.ErrorConflict,
@@ -438,7 +483,14 @@ func (r *reconcilingLifecycleStore) RecordInteractionResult(
 		ctx, request,
 	)
 	if err == nil {
-		r.stored = result
+		if r.stored.ID == "" {
+			r.stored = result
+		} else {
+			if r.written == nil {
+				r.written = make(map[shoal.ID]interaction.Session)
+			}
+			r.written[result.ID] = result
+		}
 	}
 	return result, err
 }
@@ -447,10 +499,11 @@ func (r *reconcilingLifecycleStore) InteractionRecord(
 	_ context.Context,
 	id shoal.ID,
 ) (explorer.InteractionRecord, error) {
-	if r.stored.ID == "" || r.stored.ID != id {
+	session, ok := r.lookup(id)
+	if !ok {
 		return explorer.InteractionRecord{}, shoal.NewError(
 			shoal.ErrorNotFound, "interaction receipt not found",
 		)
 	}
-	return explorer.InteractionRecord{Session: r.stored}, nil
+	return explorer.InteractionRecord{Session: session}, nil
 }
