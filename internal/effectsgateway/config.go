@@ -18,6 +18,7 @@
 package effectsgateway
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -30,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 )
 
@@ -53,14 +55,6 @@ const (
 	// minPullInterval keeps an idle worker from spinning on the explorer.
 	minPullInterval = 100 * time.Millisecond
 )
-
-// renewalAvailable is false until claim renewal (#430) exists on the dispatch
-// surface. -renew is parsed and its arithmetic validated, and then refused,
-// because a gateway started with -renew against a surface that cannot renew
-// would gate every send on a renewal that never happens — or, worse, a later
-// worker that trusted the flag would hold an operation past a lease nothing
-// extended.
-const renewalAvailable = false
 
 // ErrNoCredential says no credential was supplied, as distinct from one that
 // was supplied and could not be read. Only the env form can be absent; naming
@@ -95,12 +89,31 @@ type Config struct {
 	PullInterval     time.Duration
 	HealthAddress    string
 	Renew            bool
+
+	// ExecutorRef is the ref the dispatch credential is minted for; the
+	// client is bound to it and resolves only the descriptor that names it.
+	ExecutorRef string
+	// UnrecordedDir holds the unrecorded log and the single-replica lock.
+	UnrecordedDir string
+	MaxInFlight   int
+	// Pod names this replica in its claim IDs.
+	Pod string
+	// AttestationStatementFile and AttestationKeyFile are presented when an
+	// action of the capability requires attestation; both or neither.
+	AttestationStatementFile string
+	AttestationKeyFile       string
 }
 
 // GracePeriod is the minimum terminationGracePeriodSeconds for this
 // configuration: T + max(ReportWindow, 3×planeTimeout) + 2×ReportWindow + 5s.
 func (c *Config) GracePeriod() time.Duration {
 	return GracePeriod(c.OperationTimeout, c.PlaneTimeout)
+}
+
+// GracePeriodSeconds is GracePeriod rounded up to whole seconds: the
+// terminationGracePeriodSeconds this configuration needs.
+func (c *Config) GracePeriodSeconds() int64 {
+	return GracePeriodSeconds(c.OperationTimeout, c.PlaneTimeout)
 }
 
 // SendGate is the gate this configuration implies.
@@ -202,10 +215,31 @@ func ParseFlags(args []string, output io.Writer) (*Config, error) {
 	pullInterval := flags.Duration("pull-interval", DefaultPullInterval,
 		"Pause between pulls when the queue offered nothing")
 	healthAddress := flags.String("health-address", "",
-		"Optional listener for GET /healthz and GET /readyz")
+		"Optional listener for GET /healthz, GET /readyz and GET /metrics")
 	renew := flags.Bool("renew", false,
-		"Renew the claim every L/2. Requires claim renewal (#430), which the "+
-			"dispatch surface does not provide yet; refused until it does")
+		"Extend the claim every L/2 (#430). The lease is then a silence "+
+			"interval rather than the bound on the whole call, so "+
+			"-operation-timeout may exceed it; each action's deadline still "+
+			"bounds the operation")
+	executorRef := flags.String("executor-ref", "",
+		"Executor reference the dispatch credential is minted for and the "+
+			"descriptor registers. Required. The gateway resolves only the "+
+			"descriptor that names it")
+	unrecordedDir := flags.String("unrecorded-dir", "",
+		"Directory holding the unrecorded-report log and the lock that keeps "+
+			"one gateway per surface. Required; a persistent volume, or a report "+
+			"the explorer refused is lost with the pod")
+	maxInFlight := flags.Int("max-in-flight", DefaultMaxInFlight,
+		fmt.Sprintf("Claims held at once, 1 to %d", MaxInFlightLimit))
+	podName := flags.String("pod-name", "",
+		"Name of this replica in its claim IDs. Defaults to the host name, "+
+			"which in Kubernetes is the pod name")
+	attestationStatement := flags.String("attestation-statement-file", "",
+		"Attestation statement presented when an action requires attestation. "+
+			"Requires -attestation-key-file")
+	attestationKey := flags.String("attestation-key-file", "",
+		"Idempotency key for the attestation presentation. Requires "+
+			"-attestation-statement-file")
 
 	if err := flags.Parse(args); err != nil {
 		return nil, err
@@ -294,10 +328,6 @@ func ParseFlags(args []string, output io.Writer) (*Config, error) {
 		config.IdempotencyRetention, config.OperationTimeout); err != nil {
 		return nil, err
 	}
-	if config.Renew && !renewalAvailable {
-		return nil, errors.New("-renew requires claim renewal (#430), which the " +
-			"dispatch surface does not provide yet")
-	}
 	if config.MaxResponseBytes <= 0 || config.MaxResponseBytes > MaxResponseBytesLimit {
 		return nil, fmt.Errorf("-max-response-bytes must be 1 to %d",
 			MaxResponseBytesLimit)
@@ -314,8 +344,37 @@ func ParseFlags(args []string, output io.Writer) (*Config, error) {
 		}
 		config.HealthAddress = address
 	}
+	if err := executorref.ValidExecutorRef(*executorRef); err != nil {
+		return nil, fmt.Errorf("-executor-ref %v", err)
+	}
+	config.ExecutorRef = *executorRef
+	if config.UnrecordedDir = strings.TrimSpace(*unrecordedDir); config.UnrecordedDir == "" {
+		return nil, errors.New("-unrecorded-dir is required")
+	}
+	if *maxInFlight <= 0 || *maxInFlight > MaxInFlightLimit {
+		return nil, fmt.Errorf("-max-in-flight must be 1 to %d", MaxInFlightLimit)
+	}
+	config.MaxInFlight = *maxInFlight
+	if config.Pod = *podName; config.Pod == "" {
+		if config.Pod, err = os.Hostname(); err != nil {
+			return nil, errors.New("-pod-name is required where the host name cannot be read")
+		}
+	}
+	if _, _, err := NewClaimID(config.Pod, bytes.NewReader(make([]byte, ClaimNonceBytes))); err != nil {
+		return nil, fmt.Errorf("-pod-name: %v", err)
+	}
+	config.AttestationStatementFile = strings.TrimSpace(*attestationStatement)
+	config.AttestationKeyFile = strings.TrimSpace(*attestationKey)
+	if (config.AttestationStatementFile == "") != (config.AttestationKeyFile == "") {
+		return nil, errors.New("-attestation-statement-file and -attestation-key-file " +
+			"are required together")
+	}
 	return config, nil
 }
+
+// MaxInFlightLimit bounds -max-in-flight. Each claim held reserves one entry
+// of the unrecorded log, so the bound sits far below the log's.
+const MaxInFlightLimit = 64
 
 // ValidateDurations is the lease arithmetic, as a function so it can be
 // tested without parsing flags.

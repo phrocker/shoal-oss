@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/dirlock"
@@ -240,19 +241,47 @@ type UnrecordedLog struct {
 // open of the same directory, in this process or another, is
 // ErrGatewayLocked.
 func OpenUnrecordedLog(dir string, now Clock) (*UnrecordedLog, error) {
+	return openUnrecordedLog(dir, now, true)
+}
+
+// ErrUnrecordedDirMissing says the directory OpenExistingUnrecordedLog was
+// given does not exist, or is not a directory.
+var ErrUnrecordedDirMissing = errors.New("unrecorded log directory does not exist")
+
+// OpenExistingUnrecordedLog is OpenUnrecordedLog for an operator's command:
+// it never creates the directory. A mistyped path is ErrUnrecordedDirMissing,
+// not an empty log that says nothing awaits reconciliation. Nothing on this
+// path creates a directory, so there is no check-then-create window: the
+// lock file is created inside the directory only if the directory is there.
+func OpenExistingUnrecordedLog(dir string, now Clock) (*UnrecordedLog, error) {
+	return openUnrecordedLog(dir, now, false)
+}
+
+func openUnrecordedLog(dir string, now Clock, create bool) (*UnrecordedLog, error) {
 	if dir == "" {
 		return nil, errors.New("unrecorded log directory is required")
 	}
 	if now == nil {
 		now = time.Now
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, errors.New("unrecorded log directory cannot be created")
+	if create {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, errors.New("unrecorded log directory cannot be created")
+		}
+	} else if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return nil, ErrUnrecordedDirMissing
 	}
-	lock, err := dirlock.Acquire(dir, LockFileName)
+	acquire := dirlock.Acquire
+	if !create {
+		acquire = dirlock.AcquireExisting
+	}
+	lock, err := acquire(dir, LockFileName)
 	if err != nil {
 		if errors.Is(err, dirlock.ErrLocked) {
 			return nil, ErrGatewayLocked
+		}
+		if !create && (errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)) {
+			return nil, ErrUnrecordedDirMissing
 		}
 		return nil, errors.New("unrecorded log lock cannot be taken")
 	}
@@ -586,6 +615,47 @@ func (l *UnrecordedLog) AppendAll(entries []UnrecordedEntry) error {
 // reports whether an entry was removed.
 func (l *UnrecordedLog) Ack(actionID []byte, fence uint64) (bool, error) {
 	return l.remove(actionID, fence)
+}
+
+// UnrecordedKey names one entry: an action and the fence its report is for.
+type UnrecordedKey struct {
+	ActionID []byte
+	Fence    uint64
+}
+
+// AckAll removes several entries with one durable rewrite, or none: every
+// key must name a held entry, and a failed write restores the log as it was.
+// It is what `shoal-gateway unrecorded ack` calls, so an ack that fails part
+// way never leaves some of the named reports cleared and others not.
+func (l *UnrecordedLog) AckAll(keys []UnrecordedKey) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return errors.New("unrecorded log is closed")
+	}
+	previousEntries := append([]UnrecordedEntry(nil), l.entries...)
+	previousLines := append([][]byte(nil), l.lines...)
+	previousSize := l.size
+	restore := func() { l.entries, l.lines, l.size = previousEntries, previousLines, previousSize }
+	for _, key := range keys {
+		index := l.find(key.ActionID, key.Fence)
+		if index < 0 {
+			restore()
+			return fmt.Errorf("no held report for action %s fence %d",
+				base64.RawURLEncoding.EncodeToString(key.ActionID), key.Fence)
+		}
+		l.size -= len(l.lines[index])
+		l.entries = append(l.entries[:index:index], l.entries[index+1:]...)
+		l.lines = append(l.lines[:index:index], l.lines[index+1:]...)
+	}
+	if err := l.persist(); err != nil {
+		restore()
+		return err
+	}
+	return nil
 }
 
 // cleared removes an entry the explorer has now recorded.

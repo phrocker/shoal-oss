@@ -19,6 +19,8 @@ package effectsgateway
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -155,7 +157,11 @@ func TestADrainThatRunsOutWritesNothingForAnUnsentRun(t *testing.T) {
 	<-entered
 	h.cancel()
 	eventually(t, "draining", func() bool { _, reason := h.worker.Ready(); return reason == NotReadyDraining })
-	h.clock.Advance(GracePeriod(h.cfg.OperationTimeout, h.cfg.PlaneTimeout))
+	// The drain arms its bound after it reports draining: wait for the timer
+	// before passing it, or the advance can land first and nothing fires.
+	bound := DrainBound(h.cfg.OperationTimeout, h.cfg.PlaneTimeout)
+	eventually(t, "the drain's bound", func() bool { return h.clock.waiting(bound) })
+	h.clock.Advance(bound)
 	if err := h.runResult(); !errors.Is(err, ErrDrainAbandoned) {
 		t.Fatalf("Run = %v", err)
 	}
@@ -438,5 +444,272 @@ func TestAnchorAnswer(t *testing.T) {
 	}
 	if _, err := AnchorAnswer(received, sent, claim); err == nil {
 		t.Fatal("an answer before its request")
+	}
+}
+
+// TestAHardStopAccountsForEveryRequest: the loop is inside the claim of a
+// second action when the hard stop takes its snapshot, and the stop's write
+// is held on a slow disk. The claim then succeeds, after the snapshot; the
+// worker must not register or work it, so every request that left is one the
+// write accounts for — the in-flight run, and nothing else.
+func TestAHardStopAccountsForEveryRequest(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	gate := make(chan struct{})
+	h.target.mu.Lock()
+	h.target.gate = gate
+	h.target.mu.Unlock()
+	t.Cleanup(func() { close(gate) })
+	claimHeld, claimRelease := make(chan struct{}, 1), make(chan struct{})
+	var claims atomic.Int32
+	h.explorer.setGate(func(ctx context.Context, op string) error {
+		if op == "claim" && claims.Add(1) == 2 {
+			claimHeld <- struct{}{}
+			<-claimRelease
+		}
+		return nil
+	})
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.explorer.enqueue("a2", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.start()
+	for what, ch := range map[string]chan struct{}{"a1's request": h.target.entered, "a2's claim": claimHeld} {
+		select {
+		case <-ch:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("never saw %s", what)
+		}
+	}
+
+	blocked, unblock := make(chan struct{}, 1), make(chan struct{})
+	previous := fileSyncer
+	fileSyncer = func(file *os.File) error {
+		select {
+		case blocked <- struct{}{}:
+		default:
+		}
+		<-unblock
+		return file.Sync()
+	}
+	t.Cleanup(func() { fileSyncer = previous })
+	stopped := make(chan int, 1)
+	go func() { stopped <- h.worker.HardStop() }()
+	select {
+	case <-blocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hard stop never wrote")
+	}
+	// The snapshot is taken and the write is under way: a2's claim answers
+	// now, after it.
+	close(claimRelease)
+	settle()
+	close(unblock)
+	if abandoned := <-stopped; abandoned != 1 {
+		t.Fatalf("abandoned %d", abandoned)
+	}
+	if err := h.runResult(); err == nil {
+		t.Fatal("Run reported a clean stop after a hard stop")
+	}
+	settle()
+	if _, requests, _ := h.target.stats(); requests != 1 {
+		t.Fatalf("%d target requests for %d unrecorded entries", requests, h.log.Len())
+	}
+	entries := h.log.Entries()
+	if len(entries) != 1 || string(entries[0].ActionID) != "a1" ||
+		entries[0].Outcome != fleet.AmbiguityOutcomeUnknown {
+		t.Fatalf("entries = %+v", entries)
+	}
+	// a2 was claimed and never worked: nothing past its claim is logged.
+	a2 := base64.RawURLEncoding.EncodeToString([]byte("a2"))
+	for _, line := range h.logs.lines() {
+		if line["action_id"] == a2 && line["event"] != string(EventClaimed) {
+			t.Fatalf("a2, claimed after the stop's snapshot, was worked: %v", line)
+		}
+	}
+}
+
+// TestAStoppedWorkerSendsNothing: a run the worker stopped before abandon
+// saw it — registered, not yet abandoned — sends nothing.
+func TestAStoppedWorkerSendsNothing(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	t.Cleanup(func() { _ = h.log.Close() })
+	route, _ := h.cfg.Routes.Lookup("charge")
+	key := testExecutorKey(t, "a1")
+	run := &claimRun{action: Action{ID: []byte("a1"), ClaimFence: 1, ExecutorKey: key}, route: route}
+	bound, err := h.cfg.Binder.Bind(route, json.RawMessage(chargeInput), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.worker.killed.Store(true)
+	observation, _, _, _ := h.worker.attempt(run, bound, "Authorization", "Bearer sk_test")
+	if _, requests, _ := h.target.stats(); requests != 0 || run.attempted || observation.Written {
+		t.Fatalf("a stopped worker sent: %d requests, attempted %v", requests, run.attempted)
+	}
+}
+
+// TestAnAttemptedRunLeavesRunsOnlyOnceSettled is the invariant on Worker.runs
+// directly: a run whose request reached the target and whose goroutine then
+// exits unsettled — here because the worker was killed mid-request — stays
+// in runs, so a HardStop after it still finds and writes it; and the write is
+// what removes it.
+func TestAnAttemptedRunLeavesRunsOnlyOnceSettled(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	gate := make(chan struct{})
+	h.target.mu.Lock()
+	h.target.gate = gate
+	h.target.mu.Unlock()
+	t.Cleanup(func() { close(gate) })
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.start()
+	select {
+	case <-h.target.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the target saw no request")
+	}
+	// Cancel everything without writing, as a crash would, and let the
+	// run's goroutine exit.
+	h.worker.Kill()
+	_ = h.runResult()
+	eventually(t, "the run's goroutine to exit", func() bool {
+		done := make(chan struct{})
+		go func() { h.worker.work.Wait(); close(done) }()
+		select {
+		case <-done:
+			return true
+		case <-time.After(10 * time.Millisecond):
+			return false
+		}
+	})
+	if n := h.worker.InFlight(); n != 1 {
+		t.Fatalf("an attempted, unsettled run left runs: %d held", n)
+	}
+	// The write is what removes it. (Run has returned, so HardStop is now a
+	// no-op; abandon is the write both stop paths share.)
+	if abandoned := h.worker.abandon(); abandoned != 1 {
+		t.Fatalf("abandoned %d", abandoned)
+	}
+	if n := h.worker.InFlight(); n != 0 || h.log.Len() != 1 {
+		t.Fatalf("after the write: %d held, %d entries", n, h.log.Len())
+	}
+}
+
+// TestAHardStopAfterRunHasReturnedDoesNothing: the caller may close the log
+// once Run returns, and a second signal can arrive after that. It must not
+// touch the log, even with a run still held (here one a Kill left behind).
+func TestAHardStopAfterRunHasReturnedDoesNothing(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	gate := make(chan struct{})
+	h.target.mu.Lock()
+	h.target.gate = gate
+	h.target.mu.Unlock()
+	t.Cleanup(func() { close(gate) })
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.start()
+	select {
+	case <-h.target.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the target saw no request")
+	}
+	h.worker.Kill()
+	_ = h.runResult()
+	eventually(t, "the run to be held", func() bool { return h.worker.InFlight() == 1 })
+	_ = h.log.Close()
+	if abandoned := h.worker.HardStop(); abandoned != 0 {
+		t.Fatalf("a HardStop after Run returned abandoned %d, against a closed log", abandoned)
+	}
+}
+
+// unwritableReport drives one run to a lost-fence report the explorer will
+// not record, with the unrecorded log's writes failing until heal is called:
+// the report's own append fails, and the run is left attempted and unsettled.
+func unwritableReport(t *testing.T) (h *workerHarness, heal func()) {
+	t.Helper()
+	h = newWorkerHarness(t, nil)
+	h.explorer.onExtend = func(int, []byte, ExtendRequest) (Action, error, bool) {
+		return Action{}, &DispatchError{Op: "extend", Kind: DispatchFenceLost, Status: 409}, true
+	}
+	h.explorer.onAmbiguity = func(int, []byte, AmbiguityReport) (Action, error, bool) {
+		return Action{}, &DispatchError{Op: "ambiguity", Kind: DispatchAmbiguityUnrecorded, Status: 400}, true
+	}
+	var broken atomic.Bool
+	broken.Store(true)
+	previous := fileSyncer
+	fileSyncer = func(file *os.File) error {
+		if broken.Load() {
+			return errors.New("disk")
+		}
+		return file.Sync()
+	}
+	t.Cleanup(func() { fileSyncer = previous })
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.startGated()
+	h.clock.Advance(30 * time.Second)
+	eventually(t, "the fence to be lost", func() bool { return h.logs.has("fence_lost") })
+	h.release()
+	eventually(t, "the failed write", func() bool {
+		for _, line := range h.logs.lines() {
+			if line["event"] == string(EventDispatch) && line["ambiguity"] == string(fleet.AmbiguityEffectObserved) {
+				return true
+			}
+		}
+		return false
+	})
+	if h.log.Len() != 0 || h.worker.InFlight() != 1 {
+		t.Fatalf("after the failed write: %d entries, %d held", h.log.Len(), h.worker.InFlight())
+	}
+	return h, func() { broken.Store(false) }
+}
+
+// TestTheDrainRetriesAReportItCouldNotWrite: a report whose append failed
+// leaves its run held; the drain writes that report's own entry — the
+// outcome and reference it had, not an outcome_unknown in its place — and
+// Run returns cleanly only once it is written.
+func TestTheDrainRetriesAReportItCouldNotWrite(t *testing.T) {
+	h, heal := unwritableReport(t)
+	heal()
+	if err := h.stop(); err != nil {
+		t.Fatalf("Run = %v after the retry succeeded", err)
+	}
+	entries := h.log.Entries()
+	if len(entries) != 1 || string(entries[0].ActionID) != "a1" ||
+		entries[0].Outcome != fleet.AmbiguityEffectObserved || entries[0].Reference != "ch_1" {
+		t.Fatalf("entries = %+v", entries)
+	}
+	if n := h.worker.InFlight(); n != 0 {
+		t.Fatalf("%d runs still held after the retry", n)
+	}
+}
+
+// TestADrainThatCannotWriteIsNotClean: if the retry fails too, Run says so;
+// it never returns nil with an effect on no record and in no log.
+func TestADrainThatCannotWriteIsNotClean(t *testing.T) {
+	h, _ := unwritableReport(t)
+	if err := h.stop(); !errors.Is(err, ErrUnrecordedUnwritten) {
+		t.Fatalf("Run = %v, want ErrUnrecordedUnwritten", err)
+	}
+}
+
+// TestAHardStopWhoseWriteFailsIsNotAKill: Run reports the failed write ahead
+// of the hard stop itself, so the caller never reads it as "every sent
+// request accounted for".
+func TestAHardStopWhoseWriteFailsIsNotAKill(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	gate := make(chan struct{})
+	h.target.mu.Lock()
+	h.target.gate = gate
+	h.target.mu.Unlock()
+	t.Cleanup(func() { close(gate) })
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.start()
+	select {
+	case <-h.target.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the target saw no request")
+	}
+	previous := fileSyncer
+	fileSyncer = func(*os.File) error { return errors.New("disk") }
+	t.Cleanup(func() { fileSyncer = previous })
+	h.cancel()
+	h.worker.HardStop()
+	if err := h.runResult(); !errors.Is(err, ErrUnrecordedUnwritten) {
+		t.Fatalf("Run = %v, want ErrUnrecordedUnwritten", err)
 	}
 }

@@ -48,6 +48,18 @@ type Lock struct {
 // duplicate ownership in this process, and acquires a nonblocking OS lock.
 // name must be one plain file name and should be stable for the store type.
 func Acquire(directory, name string) (*Lock, error) {
+	return acquire(directory, name, true)
+}
+
+// AcquireExisting is Acquire for a directory that must already exist: it
+// never creates one, so a caller that must not conjure an empty store from
+// a mistyped path has no check-then-create window. A missing directory is an
+// error wrapping fs.ErrNotExist.
+func AcquireExisting(directory, name string) (*Lock, error) {
+	return acquire(directory, name, false)
+}
+
+func acquire(directory, name string, create bool) (*Lock, error) {
 	if strings.TrimSpace(directory) == "" {
 		return nil, errors.New("directory lock: directory is required")
 	}
@@ -55,8 +67,10 @@ func Acquire(directory, name string) (*Lock, error) {
 		filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
 		return nil, errors.New("directory lock: lock file name is invalid")
 	}
-	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return nil, fmt.Errorf("directory lock: create directory: %w", err)
+	if create {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			return nil, fmt.Errorf("directory lock: create directory: %w", err)
+		}
 	}
 	canonical, err := canonicalDirectory(directory)
 	if err != nil {

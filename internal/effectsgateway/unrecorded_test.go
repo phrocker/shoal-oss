@@ -275,3 +275,103 @@ func TestASecondGatewayIsRefusedByTheLock(t *testing.T) {
 	_ = second.Close()
 	_ = bytes.MinRead
 }
+
+// TestAckAllIsOneRewriteOrNone: AckAll clears every named entry with one
+// durable rewrite; a key that names nothing, or a write that fails, leaves
+// every entry in place, in memory and on disk.
+func TestAckAllIsOneRewriteOrNone(t *testing.T) {
+	keys := []UnrecordedKey{{[]byte("a1"), 1}, {[]byte("a2"), 1}, {[]byte("a3"), 2}}
+	seed := func(t *testing.T) (string, *UnrecordedLog) {
+		dir := t.TempDir()
+		log, err := OpenUnrecordedLog(dir, newTimerClock().Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range append(keys, UnrecordedKey{[]byte("kept"), 1}) {
+			if err := log.Append(heldEntry(string(key.ActionID), key.Fence)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir, log
+	}
+	onDisk := func(t *testing.T, dir string) int {
+		t.Helper()
+		log := openLog(t, dir)
+		defer log.Close()
+		return log.Len()
+	}
+	previous := fileSyncer
+	t.Cleanup(func() { fileSyncer = previous })
+
+	t.Run("a failed write removes nothing", func(t *testing.T) {
+		dir, log := seed(t)
+		fileSyncer = func(*os.File) error { return errors.New("disk") }
+		err := log.AckAll(keys)
+		fileSyncer = previous
+		if err == nil || log.Len() != 4 {
+			t.Fatalf("ack after a failed fsync = %v, %d entries left", err, log.Len())
+		}
+		_ = log.Close()
+		if n := onDisk(t, dir); n != 4 {
+			t.Fatalf("%d entries on disk after a failed ack", n)
+		}
+	})
+	t.Run("an unknown key removes nothing", func(t *testing.T) {
+		dir, log := seed(t)
+		if err := log.AckAll(append(keys[:2:2], UnrecordedKey{[]byte("a9"), 1})); err == nil || log.Len() != 4 {
+			t.Fatalf("ack naming an unknown entry = %v, %d entries left", err, log.Len())
+		}
+		_ = log.Close()
+		if n := onDisk(t, dir); n != 4 {
+			t.Fatalf("%d entries on disk", n)
+		}
+	})
+	t.Run("one rewrite", func(t *testing.T) {
+		dir, log := seed(t)
+		writes := 0
+		fileSyncer = func(file *os.File) error {
+			if filepath.Base(file.Name()) == unrecordedTemp {
+				writes++
+			}
+			return file.Sync()
+		}
+		err := log.AckAll(keys)
+		fileSyncer = previous
+		if err != nil || log.Len() != 1 || writes != 1 {
+			t.Fatalf("ack = %v, %d left, %d rewrites (want 1)", err, log.Len(), writes)
+		}
+		_ = log.Close()
+		if n := onDisk(t, dir); n != 1 {
+			t.Fatalf("%d entries on disk", n)
+		}
+	})
+}
+
+// TestOpenExistingNeverCreatesTheDirectory: the operator's open refuses a
+// missing directory, or a file, and creates nothing; it opens an existing
+// one, as the gateway's own open does.
+func TestOpenExistingNeverCreatesTheDirectory(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if _, err := OpenExistingUnrecordedLog(missing, nil); !errors.Is(err, ErrUnrecordedDirMissing) {
+		t.Fatalf("missing directory: %v", err)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("the operator's open created the directory: %v", err)
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExistingUnrecordedLog(file, nil); !errors.Is(err, ErrUnrecordedDirMissing) {
+		t.Fatalf("a file: %v", err)
+	}
+	dir := t.TempDir()
+	log, err := OpenExistingUnrecordedLog(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExistingUnrecordedLog(dir, nil); !errors.Is(err, ErrGatewayLocked) {
+		t.Fatalf("a second open: %v", err)
+	}
+	_ = log.Close()
+}

@@ -142,3 +142,27 @@ func TestAcquireHelperProcess(t *testing.T) {
 	}
 	os.Exit(0)
 }
+
+// TestAcquireExistingNeverCreatesTheDirectory: a missing directory is an
+// fs.ErrNotExist error and stays missing; an existing one locks as Acquire
+// does.
+func TestAcquireExistingNeverCreatesTheDirectory(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if _, err := AcquireExisting(missing, ".store.lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing directory: %v", err)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("AcquireExisting created the directory: %v", err)
+	}
+	dir := t.TempDir()
+	lock, err := AcquireExisting(dir, ".store.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Acquire(dir, ".store.lock"); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second acquire: %v", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
