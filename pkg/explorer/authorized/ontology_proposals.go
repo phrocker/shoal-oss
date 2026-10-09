@@ -462,7 +462,8 @@ func (c *Client) ontologyEvidenceAllows(
 	if !ok {
 		return false, nil
 	}
-	allowed, err := ruleAllows(registration.Rule, decision, operation, now)
+	allowed, err := c.revisionAllows(
+		ctx, registration, decision, operation, now)
 	if err != nil || !allowed {
 		return allowed, err
 	}

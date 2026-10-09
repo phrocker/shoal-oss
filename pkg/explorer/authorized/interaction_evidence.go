@@ -82,8 +82,8 @@ func (c *Client) verifyInteractionDocumentEvidence(
 	if !ok {
 		return auth.ObjectNotFound()
 	}
-	allowed, err := ruleAllows(
-		registration.Rule, decision, auth.OperationRetrieve, now)
+	allowed, err := c.revisionAllows(
+		ctx, registration, decision, auth.OperationRetrieve, now)
 	if err != nil {
 		return err
 	}

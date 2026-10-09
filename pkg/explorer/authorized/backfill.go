@@ -26,6 +26,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/devbackfill"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -82,7 +83,9 @@ var backfillSourceProbe = explorer.Source{
 //     other operation uses, must authorize OperationIngest, and must satisfy
 //     the generation guard, so callers need the binding capability too;
 //   - the source it can reconstruct for a stored document is always lossy --
-//     the original content is gone, metadata is not retained on the summary,
+//     the original content is gone, metadata is not retained on the summary
+//     (only the visibility labels are read back, from the stored document
+//     node, and conjoined into the rule; see storedDocumentVisibility),
 //     and the title is the stored one rather than the submitted one -- so a
 //     selector that keys on any source field could derive a rule the document
 //     was never ingested under. Rather than guess, this refuses unless the
@@ -123,7 +126,10 @@ func (c *Client) BackfillExistingDocumentsForDevelopment(
 		return 0, err
 	}
 
-	registered := 0
+	// Every rule is derived before anything is written, so a document that
+	// cannot be backfilled (for example one whose labels the operator does
+	// not hold) refuses the whole run instead of leaving it half applied.
+	pending := make([]RevisionRegistration, 0, len(summaries))
 	for _, summary := range summaries {
 		if err := validateSummary(summary); err != nil {
 			return 0, inconsistentBase()
@@ -135,14 +141,30 @@ func (c *Client) BackfillExistingDocumentsForDevelopment(
 		if exists {
 			continue
 		}
-		rule, err := c.backfillRule(ctx, decision, summary, now)
+		// A stored document's labels are read back from its own document
+		// node, never assumed absent: the reconstructed source has no
+		// metadata, and registering a labelled document under the bare
+		// source rule would publish it to every source holder (#570).
+		visibility, err := c.storedDocumentVisibility(ctx, summary)
 		if err != nil {
 			return 0, err
 		}
-		registration, err := c.existingRevisionRegistration(ctx, summary, rule)
+		rule, err := c.backfillRule(ctx, decision, summary, visibility, now)
 		if err != nil {
 			return 0, err
 		}
+		registration, err := c.existingRevisionRegistration(
+			ctx, summary, visibility, rule)
+		if err != nil {
+			return 0, err
+		}
+		pending = append(pending, registration)
+	}
+	if err := guard.Check(ctx); err != nil {
+		return 0, err
+	}
+	registered := 0
+	for _, registration := range pending {
 		if err := c.policyStore.PutRevision(ctx, registration); err != nil {
 			return 0, policyCatalogWriteError(ctx, err)
 		}
@@ -164,17 +186,30 @@ func (c *Client) backfillRule(
 	ctx context.Context,
 	decision auth.Decision,
 	summary explorer.DocumentSummary,
+	visibility string,
 	now time.Time,
 ) (AccessRule, error) {
+	var metadata shoal.Metadata
+	if visibility != "" {
+		metadata = shoal.Metadata{interaction.PropertyVisibility: visibility}
+	}
 	rule, err := c.selectIngestRule(ctx, decision, explorer.Source{
 		URI:       summary.SourceURI,
 		Title:     summary.Document.Title,
 		MediaType: summary.SourceMediaType,
+		Metadata:  metadata,
 	}, now)
 	if err != nil {
 		return AccessRule{}, err
 	}
-	probed, err := c.selectIngestRule(ctx, decision, backfillSourceProbe, now)
+	// The probe carries the same stored labels, so the comparison still
+	// isolates the selector's dependence on the source: the labels are
+	// conjoined after selection and are the same on both sides.
+	probe := cloneSource(backfillSourceProbe)
+	if visibility != "" {
+		probe.Metadata[interaction.PropertyVisibility] = visibility
+	}
+	probed, err := c.selectIngestRule(ctx, decision, probe, now)
 	if err != nil {
 		return AccessRule{}, err
 	}
@@ -182,6 +217,47 @@ func (c *Client) backfillRule(
 		return AccessRule{}, backfillSourceLoss()
 	}
 	return rule, nil
+}
+
+// storedDocumentVisibility reads the canonical visibility expression stored on
+// the current revision's document node. The node is where parse.go records a
+// source's labels for the graph, so it is the authority the backfill uses. A
+// missing node, a node of another revision, or a visibility that cannot be
+// read refuses the backfill: the document is left unregistered (hidden) rather
+// than registered unlabelled.
+func (c *Client) storedDocumentVisibility(
+	ctx context.Context,
+	summary explorer.DocumentSummary,
+) (string, error) {
+	neighborhood, err := c.base.Neighborhood(ctx, explorer.NeighborhoodRequest{
+		NodeIDs:   []shoal.ID{summary.Document.ID},
+		Depth:     1,
+		EdgeTypes: []string{"contains"},
+	})
+	if err != nil {
+		return "", err
+	}
+	for _, node := range neighborhood.Nodes {
+		if node.ID != summary.Document.ID {
+			continue
+		}
+		if node.Properties["revision_id"] != string(summary.Revision.ID) {
+			return "", inconsistentBase()
+		}
+		labels, err := interaction.NodeVisibility(node)
+		if err != nil {
+			return "", backfillLabelsUnreadable()
+		}
+		return interaction.Expression(labels), nil
+	}
+	return "", inconsistentBase()
+}
+
+func backfillLabelsUnreadable() error {
+	return shoal.NewError(shoal.ErrorInvalidArgument,
+		"refusing to backfill the policy catalog: a stored document's "+
+			"visibility labels cannot be read, and it is never registered "+
+			"as unlabelled")
 }
 
 func backfillSourceLoss() error {
@@ -199,6 +275,7 @@ func backfillSourceLoss() error {
 func (c *Client) existingRevisionRegistration(
 	ctx context.Context,
 	summary explorer.DocumentSummary,
+	visibility string,
 	rule AccessRule,
 ) (RevisionRegistration, error) {
 	view, err := c.base.Document(
@@ -211,6 +288,13 @@ func (c *Client) existingRevisionRegistration(
 		view.Revision.ID != summary.Revision.ID ||
 		view.Revision.DocumentID != summary.Document.ID {
 		return RevisionRegistration{}, inconsistentBase()
+	}
+	// The revision's own metadata must declare exactly the labels read from
+	// its document node; any disagreement refuses rather than picks one.
+	declared, err := interaction.ParseVisibility(
+		view.Document.Metadata[interaction.PropertyVisibility])
+	if err != nil || interaction.Expression(declared) != visibility {
+		return RevisionRegistration{}, backfillLabelsUnreadable()
 	}
 	nodeIDs, err := documentViewNodeIDs(view)
 	if err != nil {

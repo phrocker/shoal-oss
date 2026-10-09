@@ -31,6 +31,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -158,12 +159,30 @@ func buildCanonicalRetrievalDocument(
 		edges:        make(map[shoal.ID]graph.Edge),
 		edgePairs:    make(map[canonicalEdgePair]graph.Edge),
 	}
+	// The base copies a source's declared visibility onto its document,
+	// section and span nodes (parse.go materializeGraph). The canonical
+	// reconstruction must carry the same property, or every labelled
+	// document fails validation and is unreadable even to a reader holding
+	// every label (#570). The labels come from the digest-verified revision
+	// metadata, never from the untrusted node being compared.
+	labels, err := interaction.ParseVisibility(
+		view.Document.Metadata[interaction.PropertyVisibility])
+	if err != nil {
+		return nil, inconsistentRetrieval()
+	}
+	visibility := interaction.Expression(labels)
+	withVisibility := func(properties shoal.Metadata) shoal.Metadata {
+		if visibility != "" {
+			properties[interaction.PropertyVisibility] = visibility
+		}
+		return properties
+	}
 	canonical.nodes[view.Document.ID] = graph.Node{
 		ID: view.Document.ID, Kind: "document", Labels: []string{"document"},
-		Properties: shoal.Metadata{
+		Properties: withVisibility(shoal.Metadata{
 			"title":       view.Document.Title,
 			"revision_id": string(view.Revision.ID),
-		},
+		}),
 	}
 	expectedEdgePairs := make(map[canonicalEdgePair]struct{})
 	var visit func(explorer.SectionView) error
@@ -175,11 +194,11 @@ func buildCanonicalRetrievalDocument(
 		canonical.sections[section.ID] = section
 		canonical.nodes[section.ID] = graph.Node{
 			ID: section.ID, Kind: "section", Labels: []string{"section"},
-			Properties: shoal.Metadata{
+			Properties: withVisibility(shoal.Metadata{
 				"heading":     section.Heading,
 				"document_id": string(view.Document.ID),
 				"revision_id": string(view.Revision.ID),
-			},
+			}),
 		}
 		parentID := section.ParentID
 		if parentID == "" {
@@ -197,11 +216,11 @@ func buildCanonicalRetrievalDocument(
 			canonical.spans[span.ID] = span
 			canonical.nodes[span.ID] = graph.Node{
 				ID: span.ID, Kind: "span", Labels: []string{"evidence"},
-				Properties: shoal.Metadata{
+				Properties: withVisibility(shoal.Metadata{
 					"document_id": string(view.Document.ID),
 					"revision_id": string(view.Revision.ID),
 					"section_id":  string(span.SectionID),
-				},
+				}),
 			}
 			expectedEdgePairs[canonicalEdgePair{
 				from: section.ID,

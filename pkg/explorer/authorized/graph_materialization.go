@@ -10,6 +10,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -34,6 +35,9 @@ func (c *Client) MaterializeGraph(
 	if !ok {
 		return explorer.GraphMaterializationResult{}, shoal.NewError(
 			shoal.ErrorUnavailable, "graph materialization is unavailable")
+	}
+	if err := refuseMaterializedVisibility(request); err != nil {
+		return explorer.GraphMaterializationResult{}, err
 	}
 	decision, guard, now, err := c.begin(ctx, auth.OperationGraphMaterialize)
 	if err != nil {
@@ -114,6 +118,49 @@ func (c *Client) MaterializeGraph(
 			explorer.MarkIndeterminateCommit(err)
 	}
 	return result, nil
+}
+
+// refuseMaterializedVisibility refuses a materialization whose nodes or
+// relations declare visibility labels. A materialization is registered under
+// the bare selected source rule; it reads nothing from the corpus (relations
+// may only join its own nodes), so there are no input rules to conjoin, and a
+// declared label would be stored as if it were enforced while every holder of
+// the source could read it (#570). Labelled content is published through
+// Ingest, where labels become rule components.
+func refuseMaterializedVisibility(
+	request explorer.GraphMaterializationRequest,
+) error {
+	declares := func(properties shoal.Metadata) bool {
+		for _, key := range []string{
+			interaction.PropertyVisibility,
+			interaction.PropertyVisibilityDigest,
+			interaction.PropertyVisibilityCount,
+		} {
+			if _, ok := properties[key]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	for _, node := range request.Nodes {
+		if declares(node.Properties) {
+			return materializedVisibilityRefused()
+		}
+	}
+	for _, relation := range request.Relations {
+		if declares(relation.Properties) {
+			return materializedVisibilityRefused()
+		}
+	}
+	return nil
+}
+
+func materializedVisibilityRefused() error {
+	return shoal.NewError(
+		shoal.ErrorInvalidArgument,
+		"graph materialization cannot declare visibility labels: it is "+
+			"registered under the bare source rule, which would not enforce them",
+	)
 }
 
 func (c *Client) selectGraphMaterializationRule(

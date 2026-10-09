@@ -209,8 +209,8 @@ func (c *Client) changeVisible(
 		registration.RevisionID != change.Revision.ID {
 		return false, inconsistentBase()
 	}
-	allowed, err := ruleAllows(
-		registration.Rule, decision, auth.OperationList, now)
+	allowed, err := c.revisionAllows(
+		ctx, registration, decision, auth.OperationList, now)
 	if err != nil {
 		return false, err
 	}

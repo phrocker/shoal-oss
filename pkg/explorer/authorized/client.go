@@ -674,7 +674,45 @@ func (c *Client) selectIngestRule(
 	if err != nil {
 		return AccessRule{}, policySelectionError(ctx, err)
 	}
-	return selectedPolicyRule(decision, auth.OperationIngest, policy, now)
+	// A source policy is never a label policy (#570). StaticPolicySelector
+	// refuses one at construction; a host PolicySelectorFunc is checked here,
+	// because a label policy selected as the source would anchor further
+	// label policies and could stand in for a label grant.
+	if auth.IsLabelPolicyID(policy.GrantPolicyID()) {
+		return AccessRule{}, shoal.NewError(
+			shoal.ErrorUnavailable,
+			"trusted policy selection returned a policy in the label namespace "+
+				auth.LabelPolicyNamespace,
+		)
+	}
+	// The source policy alone must authorize ingest before labels are read,
+	// so a caller outside the source learns nothing from a label refusal.
+	if _, err := selectedPolicyRule(
+		decision, auth.OperationIngest, policy, now); err != nil {
+		return AccessRule{}, err
+	}
+	// Free-form ingest labels are enforced by conjoining one structured
+	// policy per label into the document's rule (#570). They are parsed with
+	// exactly the parser the base uses (parse.go), so the labels that reach
+	// the rule are the labels stored on the document's nodes.
+	labels, err := interaction.ParseVisibility(
+		source.Metadata[interaction.PropertyVisibility])
+	if err != nil {
+		return AccessRule{}, err
+	}
+	// LabelRule refuses, never truncates, a label set over MaxLabelsPerRule or
+	// the flattened term/byte bounds, and names the bound it hit.
+	rule, err := LabelRule(policy, labels)
+	if err != nil {
+		return AccessRule{}, err
+	}
+	// The ingester must hold every label it writes: each label policy is a
+	// component the decision has to authorize for ingest, so an unknown or
+	// ungranted label fails closed.
+	if err := rule.Authorize(decision, auth.OperationIngest, now); err != nil {
+		return AccessRule{}, authorizationDenied()
+	}
+	return rule, nil
 }
 
 func (c *Client) selectEdgeRule(
