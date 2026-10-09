@@ -30,6 +30,16 @@ def _ids(ids, name):
         raise ValueError(name + ' must be sorted and unique')
 
 
+def _text(value, name):
+    if not isinstance(value, str) or not value or len(value) > 512:
+        raise ValueError('invalid ' + name)
+
+
+def _digest_id(value, name):
+    if not isinstance(value, str) or len(value) != 64 or any(char not in '0123456789abcdef' for char in value):
+        raise ValueError('invalid ' + name)
+
+
 def verify(artifact):
     if not isinstance(artifact, dict) or artifact.get('schema') != SCHEMA or artifact.get('kind') != 'calibration_artifact':
         raise ValueError('invalid calibration artifact')
@@ -40,9 +50,13 @@ def verify(artifact):
     _finite(artifact.get('temperature'), 'temperature', .05, 20.)
     if artifact.get('method') != 'temperature-v1' or artifact.get('optimization_enabled') is not False:
         raise ValueError('unsupported calibration artifact')
-    for key in ('model_id', 'runtime_id', 'validation_manifest_id', 'validation_scores_digest', 'validation_labels_digest'):
-        if not isinstance(artifact.get(key), str) or not artifact[key]:
-            raise ValueError('missing calibration ' + key)
+    for key in ('model_id', 'runtime_id', 'validation_manifest_id'):
+        _text(artifact.get(key), key)
+    for key in ('validation_scores_digest', 'validation_labels_digest'):
+        _digest_id(artifact.get(key), key)
+    _text(artifact.get('limitation'), 'limitation')
+    if 'validation-only' not in artifact['limitation'].lower() or 'promotion' not in artifact['limitation'].lower():
+        raise ValueError('calibration limitation is missing')
     return artifact
 
 

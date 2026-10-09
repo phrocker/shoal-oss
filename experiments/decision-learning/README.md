@@ -54,7 +54,7 @@ report.
 
 `calibration.py` fits a deterministic temperature artifact on validation scores
 only and applies it only to disjoint test/inference IDs. The artifact binds the
-source model/runtime and validation score/label digests, accepts exact 0/1
+source model/runtime and well-formed validation score/label digests, accepts exact 0/1
 probabilities with bounded logits, and cannot mutate a serving pointer or
 authorize promotion.
 
