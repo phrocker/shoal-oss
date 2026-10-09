@@ -479,7 +479,7 @@ Roadmap: [#401](https://github.com/phrocker/shoal-oss/issues/401). Architecture 
 
 | Issue | Deliverable | Implementation dependencies |
 | --- | --- | --- |
-| [#402](https://github.com/phrocker/shoal-oss/issues/402) | Typed tasks and measurable picture manifests | — |
+| [#402](https://github.com/phrocker/shoal-oss/issues/402) | Typed tasks and measurable picture manifests | Complete via #422/#428/#434; issue closed |
 | [#403](https://github.com/phrocker/shoal-oss/issues/403) | Authorized durable predictions and outcomes | [#402](https://github.com/phrocker/shoal-oss/issues/402) |
 | [#404](https://github.com/phrocker/shoal-oss/issues/404) | Pinned local Laya adapter | [#402](https://github.com/phrocker/shoal-oss/issues/402) |
 | [#405](https://github.com/phrocker/shoal-oss/issues/405) | Dataset snapshots and temporal replay | [#402](https://github.com/phrocker/shoal-oss/issues/402), [#403](https://github.com/phrocker/shoal-oss/issues/403) |
@@ -490,5 +490,11 @@ Roadmap: [#401](https://github.com/phrocker/shoal-oss/issues/401). Architecture 
 
 Laya serving also composes with the durable receipt issue. Calibration/training
 follows the first measured shadow baseline; it does not block that first slice.
-All implementation issues remain open. This design note and runtime smoke test
-close none of them.
+The offline learning boundary now includes sealed quality, influence,
+calibration, challenger-comparison, and challenger-manifest verifiers. PRs
+#612, #613, #616, #617, #618, and #620 add repeated adversarial checks and
+green CI on each merged hardening PR while preserving shadow-only promotion. The remaining
+issues stay open where production authority, a prospective family-held-out
+cohort, independently verified frontier outcomes, or operational deployment
+evidence is still required; synthetic fixtures and retrospective replays do
+not satisfy those gates.
