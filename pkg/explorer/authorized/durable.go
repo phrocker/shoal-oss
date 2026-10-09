@@ -27,6 +27,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -140,6 +141,9 @@ type persistedCurrent struct {
 	RevisionID string
 }
 
+// Kind is RegistrationKind. Records written before it existed decode with a
+// zero Kind and take the explicit legacy path (legacyEdgeKind,
+// legacyNodeKind) once, at load.
 type persistedEdge struct {
 	Seq        uint64
 	Tombstone  bool
@@ -147,6 +151,7 @@ type persistedEdge struct {
 	DocumentID string
 	RevisionID string
 	Rule       persistedRule
+	Kind       uint8
 }
 
 type persistedNode struct {
@@ -156,6 +161,7 @@ type persistedNode struct {
 	RevisionID string
 	Node       persistedGraphNode
 	Rule       persistedRule
+	Kind       uint8
 }
 
 type persistedGraphNode struct {
@@ -437,10 +443,12 @@ func (s *DurablePolicyStore) reconstruct(
 				DocumentID: registration.DocumentID,
 				RevisionID: registration.RevisionID,
 				Rule:       mustCloneRule(registration.Rule),
+				Kind:       RegistrationDocument,
 			}
 		}
 		for _, edge := range registration.IntrinsicEdges {
 			memory.intrinsicEdges[edge.ID] = EdgeRegistration{
+				Kind:       RegistrationDocument,
 				Edge:       cloneGraphEdge(edge),
 				DocumentID: registration.DocumentID,
 				RevisionID: registration.RevisionID,
@@ -889,6 +897,7 @@ func (s *DurablePolicyStore) persistNode(nodeID shoal.ID) error {
 		RevisionID: string(registration.RevisionID),
 		Node:       graphNodeToPersisted(registration.Node),
 		Rule:       rule,
+		Kind:       uint8(registration.Kind),
 	}
 	return s.writeRow(policyNodeRow(nodeID), policyKindNode, record)
 }
@@ -1173,6 +1182,7 @@ func edgeToPersisted(
 		DocumentID: string(registration.DocumentID),
 		RevisionID: string(registration.RevisionID),
 		Rule:       rule,
+		Kind:       uint8(registration.Kind),
 	}, nil
 }
 
@@ -1187,13 +1197,43 @@ func edgeRegistrationFromPersisted(
 	if err := edge.Validate(); err != nil {
 		return EdgeRegistration{}, err
 	}
-	return EdgeRegistration{
+	kind := RegistrationKind(record.Kind)
+	if kind == RegistrationUnspecified {
+		kind = legacyEdgeKind()
+	}
+	return normalizeApplicationEdgeRegistration(EdgeRegistration{
 		Edge:       edge,
 		DocumentID: shoal.ID(record.DocumentID),
 		RevisionID: shoal.ID(record.RevisionID),
 		Rule:       rule,
-	}, nil
+		Kind:       kind,
+	})
 }
+
+// legacyEdgeKind is the kind of an edge record persisted before
+// RegistrationKind existed. Every such record came through PutEdge, which
+// stored no document for application, materialized or extracted edges alike,
+// so they cannot be told apart and all keep their pre-kind meaning: an
+// edge-local rule plus both endpoints re-checked. An extracted edge in such a
+// store regains its document binding the next time it is extracted (see
+// extractedEdgeMerge); PR4's migration covers the rest (#570).
+func legacyEdgeKind() RegistrationKind { return RegistrationApplication }
+
+// legacyNodeKind infers, once at load, the kind of a node record persisted
+// before RegistrationKind existed. Only PutNode records are persisted, and
+// only ExtractDocument and MaterializeGraph called PutNode; a materialization
+// names its own identity as the owner.
+func legacyNodeKind(documentID string) RegistrationKind {
+	if strings.HasPrefix(documentID, legacyMaterializationOwnerPrefix) {
+		return RegistrationMaterialized
+	}
+	return RegistrationExtracted
+}
+
+// legacyMaterializationOwnerPrefix opens every graph-materialization identity
+// (explorer.materializedID("materialization", ...)). It is used only to
+// classify records persisted before RegistrationKind existed.
+const legacyMaterializationOwnerPrefix = "materialized-materialization-"
 
 func nodeRegistrationFromPersisted(
 	record persistedNode,
@@ -1202,11 +1242,16 @@ func nodeRegistrationFromPersisted(
 	if err != nil {
 		return NodeRegistration{}, err
 	}
+	kind := RegistrationKind(record.Kind)
+	if kind == RegistrationUnspecified {
+		kind = legacyNodeKind(record.DocumentID)
+	}
 	return normalizeNodeRegistration(shoal.ID(record.NodeID), NodeRegistration{
 		DocumentID: shoal.ID(record.DocumentID),
 		RevisionID: shoal.ID(record.RevisionID),
 		Node:       graphNodeFromPersisted(record.Node),
 		Rule:       rule,
+		Kind:       kind,
 	})
 }
 

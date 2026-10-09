@@ -46,23 +46,50 @@ type RevisionRegistration struct {
 	Current        bool
 }
 
+// RegistrationKind records which writer produced a node or edge
+// registration. Authorization depends on it: an extracted registration is
+// bound to the document revision that asserted it and also needs that
+// document's current rule (#570), so the kind is stored, never inferred from
+// which fields happen to be empty. The zero value is valid only on input to
+// ReserveEdge/PutEdge (where it means RegistrationApplication) and on records
+// persisted before the field existed (see legacyNodeKind, legacyEdgeKind).
+type RegistrationKind uint8
+
+const (
+	RegistrationUnspecified RegistrationKind = iota
+	// RegistrationDocument is an intrinsic node or edge of a document's
+	// current revision, written by PutRevision.
+	RegistrationDocument
+	// RegistrationExtracted is ExtractDocument output. DocumentID and
+	// RevisionID name the revision that asserted it.
+	RegistrationExtracted
+	// RegistrationMaterialized is MaterializeGraph output, owned by a
+	// materialization rather than a document.
+	RegistrationMaterialized
+	// RegistrationApplication is an application edge written by Connect.
+	RegistrationApplication
+)
+
 // NodeRegistration identifies the current revision and rule owning a node.
 type NodeRegistration struct {
 	DocumentID shoal.ID
 	RevisionID shoal.ID
 	Node       graph.Node
 	Rule       AccessRule
+	Kind       RegistrationKind
 }
 
 // EdgeRegistration owns an edge and only its edge-local rule. Endpoint rules
 // are deliberately not flattened into this record and must be read from the
 // current node catalog on every authorization. DocumentID and RevisionID are
-// set for revision-intrinsic edges and empty for application edges.
+// set for revision-intrinsic edges and for extracted edges (the asserting
+// revision), and empty for application and materialized edges.
 type EdgeRegistration struct {
 	Edge       graph.Edge
 	DocumentID shoal.ID
 	RevisionID shoal.ID
 	Rule       AccessRule
+	Kind       RegistrationKind
 }
 
 // MutationLease serializes base mutations shared by clients using one store.
@@ -632,7 +659,8 @@ func (s *MemoryPolicyStore) PutNode(
 			return nil
 		}
 		// This same-rule merge is load-bearing; TestAuthorizedExtractDocumentSameTenantSharedEntityCollapses pins that shared derived entities collapse across a tenant's skill files without widening access.
-		if existing.Rule.equal(normalized.Rule) &&
+		if existing.Kind == normalized.Kind &&
+			existing.Rule.equal(normalized.Rule) &&
 			derivedEntityNodesEqual(existing.Node, normalized.Node) {
 			return nil
 		}
@@ -960,7 +988,12 @@ func (s *MemoryPolicyStore) PutEdge(
 		return catalogConflict()
 	}
 	if existing, ok := s.edges[normalized.Edge.ID]; ok {
-		if edgeRegistrationsEqual(existing, normalized) {
+		switch extractedEdgeMerge(existing, normalized) {
+		case edgeMergeKeep:
+			delete(s.edgeClaims, normalized.Edge.ID)
+			return nil
+		case edgeMergeReplace:
+			s.edges[normalized.Edge.ID] = cloneEdgeRegistration(normalized)
 			delete(s.edgeClaims, normalized.Edge.ID)
 			return nil
 		}
@@ -1301,10 +1334,12 @@ func (s *MemoryPolicyStore) replaceCurrent(
 			DocumentID: registration.DocumentID,
 			RevisionID: registration.RevisionID,
 			Rule:       mustCloneRule(registration.Rule),
+			Kind:       RegistrationDocument,
 		}
 	}
 	for _, edge := range registration.IntrinsicEdges {
 		s.intrinsicEdges[edge.ID] = EdgeRegistration{
+			Kind:       RegistrationDocument,
 			Edge:       cloneGraphEdge(edge),
 			DocumentID: registration.DocumentID,
 			RevisionID: registration.RevisionID,
@@ -1420,6 +1455,13 @@ func normalizeNodeRegistration(
 	); err != nil {
 		return NodeRegistration{}, err
 	}
+	switch registration.Kind {
+	case RegistrationExtracted, RegistrationMaterialized:
+	default:
+		return NodeRegistration{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"node registration kind must be extracted or materialized")
+	}
 	rule, err := registration.Rule.clone()
 	if err != nil {
 		return NodeRegistration{}, err
@@ -1439,6 +1481,7 @@ func normalizeNodeRegistration(
 		RevisionID: registration.RevisionID,
 		Node:       node,
 		Rule:       rule,
+		Kind:       registration.Kind,
 	}, nil
 }
 
@@ -1452,7 +1495,33 @@ func normalizeApplicationEdgeRegistration(
 	if err != nil {
 		return EdgeRegistration{}, err
 	}
-	return EdgeRegistration{Edge: cloneGraphEdge(registration.Edge), Rule: rule}, nil
+	normalized := EdgeRegistration{
+		Edge: cloneGraphEdge(registration.Edge), Rule: rule,
+		Kind: registration.Kind,
+	}
+	switch registration.Kind {
+	case RegistrationUnspecified:
+		// The pre-kind PutEdge/ReserveEdge contract registered Connect edges.
+		normalized.Kind = RegistrationApplication
+	case RegistrationApplication, RegistrationMaterialized:
+	case RegistrationExtracted:
+		// An extracted edge is bound to the revision that asserted it.
+		if err := shoal.ValidateRequiredID(
+			"extracted edge document ID", registration.DocumentID); err != nil {
+			return EdgeRegistration{}, err
+		}
+		if err := shoal.ValidateRequiredID(
+			"extracted edge revision ID", registration.RevisionID); err != nil {
+			return EdgeRegistration{}, err
+		}
+		normalized.DocumentID = registration.DocumentID
+		normalized.RevisionID = registration.RevisionID
+	default:
+		return EdgeRegistration{}, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"edge registration kind cannot be registered through PutEdge")
+	}
+	return normalized, nil
 }
 
 func revisionContentEqual(left, right RevisionRegistration) bool {
@@ -1483,15 +1552,55 @@ func intrinsicEdgesEqual(left, right []graph.Edge) bool {
 	return true
 }
 
+type edgeMerge uint8
+
+const (
+	edgeMergeConflict edgeMerge = iota
+	edgeMergeKeep
+	edgeMergeReplace
+)
+
+// extractedEdgeMerge decides a PutEdge over an existing registration of the
+// same edge ID. Identical registrations are idempotent. Relation edge IDs do
+// not depend on the asserting document, so two documents under the same rule
+// can extract the same edge: the registration stays with the FIRST asserter,
+// like a shared extracted node. If that first asserter is later labelled, the
+// edge closes for readers without the label even though another, public
+// document also asserts it. That fails closed and is accepted (#570). A
+// matching edge that was registered without a document (an application edge,
+// or an extracted edge persisted before RegistrationKind existed) is replaced
+// by the extracted registration, which only adds the asserting document's
+// current rule and so can only narrow who reads it.
+func extractedEdgeMerge(existing, incoming EdgeRegistration) edgeMerge {
+	if edgeRegistrationsEqual(existing, incoming) {
+		return edgeMergeKeep
+	}
+	if incoming.Kind != RegistrationExtracted ||
+		!graphEdgesEqual(existing.Edge, incoming.Edge) ||
+		!existing.Rule.equal(incoming.Rule) {
+		return edgeMergeConflict
+	}
+	switch existing.Kind {
+	case RegistrationExtracted:
+		return edgeMergeKeep
+	case RegistrationApplication:
+		return edgeMergeReplace
+	default:
+		return edgeMergeConflict
+	}
+}
+
 func edgeRegistrationsEqual(left, right EdgeRegistration) bool {
-	return graphEdgesEqual(left.Edge, right.Edge) &&
+	return left.Kind == right.Kind &&
+		graphEdgesEqual(left.Edge, right.Edge) &&
 		left.DocumentID == right.DocumentID &&
 		left.RevisionID == right.RevisionID &&
 		left.Rule.equal(right.Rule)
 }
 
 func nodeRegistrationsEqual(left, right NodeRegistration) bool {
-	return left.DocumentID == right.DocumentID &&
+	return left.Kind == right.Kind &&
+		left.DocumentID == right.DocumentID &&
 		left.RevisionID == right.RevisionID &&
 		graphNodesEqual(left.Node, right.Node) &&
 		left.Rule.equal(right.Rule)

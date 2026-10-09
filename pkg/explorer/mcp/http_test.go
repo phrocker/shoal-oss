@@ -570,9 +570,15 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 		return client
 	}
 	client := newClient(corpus, corpus)
+	// The document is labelled "restricted", so alice must hold that label's
+	// policy to ingest it and to read it back (#570).
+	restricted, err := authorized.LabelPolicyID(sourceID, "restricted")
+	if err != nil {
+		t.Fatal(err)
+	}
 	alice := httpScopedDecision(
 		t, "alice", "ingest-request", time.Now().Add(time.Hour),
-		sourceID, policyID)
+		sourceID, policyID, restricted)
 	aliceContext, err := authority.Binder().Bind(context.Background(), alice)
 	if err != nil {
 		t.Fatal(err)
@@ -637,7 +643,7 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 		return httpScopedDecision(
 			t, "alice",
 			shoal.ID("http-"+strconv.FormatUint(requestNumber.Add(1), 10)),
-			time.Now().Add(time.Hour), sourceID, policyID,
+			time.Now().Add(time.Hour), sourceID, policyID, restricted,
 		), nil
 	})
 	httpServer := httptest.NewUnstartedServer(nil)
@@ -684,7 +690,7 @@ func TestHTTPToolCallPersistsAuthorizedInteractionAcrossRestart(t *testing.T) {
 
 	readDecision := httpScopedDecision(
 		t, "alice", "read-interactions", time.Now().Add(time.Hour),
-		sourceID, policyID)
+		sourceID, policyID, restricted)
 	readContext, err := authority.Binder().Bind(
 		context.Background(), readDecision)
 	if err != nil {
@@ -1966,6 +1972,7 @@ func httpScopedDecision(
 	expires time.Time,
 	sourceID []byte,
 	policyID []byte,
+	labelPolicyIDs ...[]byte,
 ) auth.Decision {
 	t.Helper()
 	decision, err := auth.NewDecision(auth.DecisionConfig{
@@ -1977,7 +1984,7 @@ func httpScopedDecision(
 			auth.OperationConnect, auth.OperationValidate,
 		},
 		PermittedSourceIDs:    [][]byte{sourceID},
-		PermittedPolicyIDs:    [][]byte{policyID},
+		PermittedPolicyIDs:    append([][]byte{policyID}, labelPolicyIDs...),
 		PolicyGeneration:      1,
 		AuthenticationExpires: expires,
 		RequestID:             requestID,

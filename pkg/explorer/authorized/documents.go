@@ -221,8 +221,8 @@ func (c *Client) Document(
 			return explorer.DocumentView{}, auth.ObjectNotFound()
 		}
 	}
-	allowed, err := ruleAllows(
-		registration.Rule, decision, auth.OperationRead, now)
+	allowed, err := c.revisionAllows(
+		ctx, registration, decision, auth.OperationRead, now)
 	if err != nil {
 		return explorer.DocumentView{}, err
 	}
@@ -301,6 +301,41 @@ func verifyDocumentViewRegistrationMode(
 		}
 	}
 	return legacyDigest, nil
+}
+
+// revisionAllows authorizes one exact revision registration. The current
+// revision is governed by its own rule. An older revision is readable only
+// under its own rule AND the document's current rule, so relabelling a
+// document (a new revision whose rule conjoins more label policies) also
+// closes every older revision: content that was public under an old revision
+// cannot stay public after the document is relabelled (#570). An older
+// revision of a document with no current registration fails closed.
+func (c *Client) revisionAllows(
+	ctx context.Context,
+	registration RevisionRegistration,
+	decision auth.Decision,
+	operation auth.Operation,
+	now time.Time,
+) (bool, error) {
+	allowed, err := ruleAllows(registration.Rule, decision, operation, now)
+	if err != nil || !allowed {
+		return allowed, err
+	}
+	if registration.Current {
+		return true, nil
+	}
+	current, ok, err := c.policyStore.CurrentRevision(
+		ctx, registration.DocumentID)
+	if err != nil {
+		return false, policyCatalogReadError(ctx, err)
+	}
+	if !ok {
+		return false, nil
+	}
+	if current.DocumentID != registration.DocumentID {
+		return false, inconsistentBase()
+	}
+	return ruleAllows(current.Rule, decision, operation, now)
 }
 
 func ruleAllows(
