@@ -621,6 +621,7 @@ func TestDispatchCancelAddsDispatchAuthorizationToInvokeAction(t *testing.T) {
 	invokeCtx := bindDecision(t, authority, invokeDecision)
 	queued, err := service.enqueue(
 		invokeCtx, dispatchEnqueue(now, "invoke-request"), auth.OperationInvoke,
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
