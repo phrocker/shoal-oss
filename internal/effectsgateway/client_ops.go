@@ -55,14 +55,29 @@ func correlationHeader(op string, id []byte) (string, error) {
 		return "", refusedLocally(op,
 			"correlation ID is required: take it from the action record")
 	}
-	if len(id) > fleet.MaxActionIDBytes ||
-		interaction.ValidateCorrelationID(shoal.ID(id)) != nil {
+	if CheckCorrelationID(id) != nil {
 		// The validator's text is not carried: it is fixed, but the rule
 		// for this error type is that only closed text is formatted.
 		return "", refusedLocally(op,
-			"correlation ID must be bounded, valid UTF-8, printable and without spaces")
+			"correlation ID must be at most "+strconv.Itoa(shoal.MaxIDBytes)+
+				" bytes of valid UTF-8, printable and without spaces")
 	}
 	return string(id), nil
+}
+
+// CheckCorrelationID applies exactly the explorer's rules for a
+// Shoal-Correlation-ID it is handed: shoal.ValidateRequiredID (present, at
+// most shoal.MaxIDBytes) and interaction.ValidateCorrelationID (valid UTF-8,
+// printable, no spaces). It must accept every correlation the explorer
+// accepts — the record's correlation came through those same rules, and a
+// stricter check here would make that action unclaimable by any gateway. A
+// parity test in cmd/shoal-explore-web holds it to the explorer's header
+// validator.
+func CheckCorrelationID(id []byte) error {
+	if err := shoal.ValidateRequiredID("correlation ID", shoal.ID(id)); err != nil {
+		return err
+	}
+	return interaction.ValidateCorrelationID(shoal.ID(id))
 }
 
 // newPollCorrelation mints a fresh correlation for one poll.

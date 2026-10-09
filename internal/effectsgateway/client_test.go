@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // The dispatch client's wire behaviour is tested against the real explorer
@@ -142,7 +143,7 @@ func TestRequestContextWire(t *testing.T) {
 	for name, mutate := range map[string]func(*RequestContext){
 		"no request ID":        func(r *RequestContext) { r.RequestID = nil },
 		"long request ID":      func(r *RequestContext) { r.RequestID = make([]byte, fleet.MaxActionIDBytes+1) },
-		"long correlation ID":  func(r *RequestContext) { r.CorrelationID = make([]byte, fleet.MaxActionIDBytes+1) },
+		"long correlation ID":  func(r *RequestContext) { r.CorrelationID = make([]byte, shoal.MaxIDBytes+1) },
 		"no reason":            func(r *RequestContext) { r.ReasonCode = "" },
 		"untrimmed reason":     func(r *RequestContext) { r.ReasonCode = "claim " },
 		"long reason":          func(r *RequestContext) { r.ReasonCode = strings.Repeat("r", fleet.MaxReasonCodeBytes+1) },

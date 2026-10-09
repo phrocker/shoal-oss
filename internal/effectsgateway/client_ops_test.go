@@ -348,7 +348,7 @@ func TestCorrelationIsSentFromTheRecordAndCheckedFirst(t *testing.T) {
 	for name, correlation := range map[string][]byte{
 		"missing": nil, "a space": []byte("trace 391"), "a newline": []byte("trace\n391"),
 		"invalid UTF-8": []byte("trace\xff"), "a control": []byte("trace\x7f"),
-		"too long": bytes.Repeat([]byte("c"), fleet.MaxActionIDBytes+1),
+		"too long": bytes.Repeat([]byte("c"), shoal.MaxIDBytes+1),
 	} {
 		malformed := base
 		malformed.CorrelationID = correlation

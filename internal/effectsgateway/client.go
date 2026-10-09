@@ -34,6 +34,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/executorref"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // The dispatch client speaks the routes that exist on main and no others:
@@ -243,7 +244,9 @@ func (r RequestContext) wire(op string, now time.Time) (contextWire, error) {
 	if len(r.RequestID) == 0 || len(r.RequestID) > fleet.MaxActionIDBytes {
 		return contextWire{}, refusedLocally(op, "request ID is outside its bound")
 	}
-	if len(r.CorrelationID) > fleet.MaxActionIDBytes {
+	// The explorer bounds a correlation at shoal.MaxIDBytes, not at the
+	// action-ID bound; see CheckCorrelationID.
+	if len(r.CorrelationID) > shoal.MaxIDBytes {
 		return contextWire{}, refusedLocally(op, "correlation ID is outside its bound")
 	}
 	if r.ReasonCode == "" || len(r.ReasonCode) > fleet.MaxReasonCodeBytes ||
