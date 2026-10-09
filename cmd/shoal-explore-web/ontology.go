@@ -18,13 +18,12 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/strictjson"
 	"github.com/phrocker/shoal-oss/pkg/ontology"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -91,16 +90,12 @@ func loadOntologyVersionFile(path string) (ontology.OntologyVersion, error) {
 	if err != nil {
 		return ontology.OntologyVersion{}, fmt.Errorf("read ontology file %s: %w", path, err)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
+	// strictjson refuses duplicate keys, keys matching a field only up to
+	// case, unknown fields and trailing data at every level; encoding/json
+	// alone would let a case-aliased key silently override another.
 	var config ontologyFileConfig
-	if err := decoder.Decode(&config); err != nil {
+	if err := strictjson.Decode(data, &config); err != nil {
 		return ontology.OntologyVersion{}, fmt.Errorf("decode ontology file %s: %w", path, err)
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return ontology.OntologyVersion{}, fmt.Errorf(
-			"decode ontology file %s: file must contain one JSON object", path)
 	}
 	return ontologyVersionFromConfig(config)
 }

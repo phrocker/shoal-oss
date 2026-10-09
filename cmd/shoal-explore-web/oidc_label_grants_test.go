@@ -52,22 +52,22 @@ func TestLabelGrantsFileRefusals(t *testing.T) {
 	}{
 		{name: "unknown top-level field", edit: func(d map[string]any) {
 			d["policies"] = []string{"shoal.label/v1/!untranslatable"}
-		}, reason: "unknown field"},
+		}, reason: "does not match a field exactly"},
 		{name: "unknown grant field", edit: func(d map[string]any) {
 			d["grants"] = map[string]any{"g": []map[string]string{{
 				"source": workspace, "label": "secret",
 				"policy": "shoal.label/v1/!untranslatable",
 			}}}
-		}, reason: "unknown field"},
+		}, reason: "does not match a field exactly"},
 		{name: "duplicate key", raw: []byte(`{"version":"shoal.label-grants/v1",` +
-			`"version":"shoal.label-grants/v1"}`), reason: "duplicate key"},
+			`"version":"shoal.label-grants/v1"}`), reason: "duplicate JSON key"},
 		{name: "duplicate claim value", raw: []byte(`{"version":"shoal.label-grants/v1",` +
 			`"issuer":"` + issuer.server.URL + `","claim":["groups"],"max_values":4,` +
 			`"grants":{"g":[{"source":"` + workspace + `","label":"a"}],` +
 			`"g":[{"source":"` + workspace + `","label":"b"}]}}`),
-			reason: "duplicate key"},
+			reason: "duplicate JSON key"},
 		{name: "trailing data", raw: append(mustJSON(t, valid()), []byte(` {}`)...),
-			reason: "one JSON object"},
+			reason: "trailing JSON data"},
 		{name: "not UTF-8", raw: []byte{'{', 0xff, '}'}, reason: "UTF-8"},
 		{name: "wrong version", edit: func(d map[string]any) {
 			d["version"] = "shoal.label-grants/v2"
