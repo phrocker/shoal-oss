@@ -193,12 +193,47 @@ When an optional mapping is configured, that claim becomes required and must
 have the expected string shape. Token-derived identities are namespaced by the
 validated issuer so subjects from different issuers cannot collide.
 
-`-oidc-subject-claim` names identities `oidc:<iss>#<value>`, the same
-namespace `sub` derives into, so changing it (for example to `oid`) can give
-one human's value and another human's `sub` the same identity. For a stable,
-cross-client identity use `-oidc-identity-claim` instead, which has a
-namespace of its own (`oidcid:`) and cannot be combined with a non-default
-subject claim.
+Under the default subject claim, `sub`, identities are `oidc:<iss>#<sub>`,
+as they always were, and a `sub` (or actor, client or delegation value)
+containing `#` is refused. A non-default `-oidc-subject-claim` names
+identities `oidc:<iss>#<tag>#<value>`, where the tag is 16 hex digits of a
+digest of the claim name (#546), so its identities can never equal a
+`sub`-derived identity or another claim's; the actor, client and delegation
+values are named under the same prefix. Releases before #546 named them
+`oidc:<iss>#<value>`, in the namespace of `sub`, so one human's value and
+another human's `sub` could be the same identity. For a stable, cross-client
+identity use `-oidc-identity-claim` instead, which has a namespace of its
+own (`oidcid:`) and cannot be combined with a non-default subject claim.
+
+#### Upgrading a deployment that sets `-oidc-subject-claim`
+
+A deployment that runs a non-default `-oidc-subject-claim` (anything but
+`sub`; legacy Entra mode is not affected) changes identity scheme on upgrade
+to this release, although its flags do not change: the scheme digest covers
+the identity format. The first upgraded replica therefore **refuses to
+start**, saying that the recorded scheme is the same subject claim in the
+namespace of `sub` and printing the digest to migrate from. That is the
+intended fail-closed path:
+
+1. Roll out this release with
+   `-oidc-identity-scheme-migrate=<the printed digest>`
+   (`explorer.auth.oidc.identitySchemeMigrateFrom` in the chart), then remove
+   the flag.
+2. Expect principals to have new identities. Agents registered, and records
+   owned, under the old `oidc:<iss>#<value>` identities belong to identities
+   the new scheme no longer mints. Wherever such an identity is involved in an
+   approval, the approval is refused, naming the namespace, until #526's
+   adoption route moves the registration into the namespace in force.
+   Requests pending at the upgrade can only expire. Re-register agents, or
+   wait for adoption, as you would after any scheme switch (see
+   `docs/approval.md`, "Switching an issuer's identity scheme").
+3. Do not roll back to a release before #546 after the switch. That release
+   would refuse to start, because the recorded scheme is not its own. Passing
+   it the migrate flag would put the old shared namespace back.
+
+Deployments on the default `sub`, with or without an approver mapping, and
+legacy Entra deployments keep their recorded scheme and start without any
+flag.
 
 ### Granting visibility labels
 

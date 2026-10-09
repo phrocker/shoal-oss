@@ -4,6 +4,7 @@
 package fleet
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -113,5 +114,62 @@ func TestIdentitySchemeOnlyTheNamespaceInForceIsComparable(t *testing.T) {
 	if got := (IdentityScheme{}).foreignNamespace(
 		[]shoal.ID{"oidc:" + testIssuerFamily + "bob", "entra:bob"}); got != "" {
 		t.Fatalf("a host with no scheme refuses %q", got)
+	}
+}
+
+// TestIdentitySchemeFlatNamespace (#546): a non-default subject claim's
+// namespace oidc:<iss>#<tag># lies inside the sub-derived oidc:<iss># as a
+// string. Under a Flat scheme an identity with a '#' after Prefix is in a
+// nested namespace and foreign, named without the segment after Prefix;
+// under the claim's scheme a sub identity is foreign as before. A Flat flag
+// without a prefix is refused.
+func TestIdentitySchemeFlatNamespace(t *testing.T) {
+	sub := IdentityScheme{Prefix: "oidc:" + testIssuerFamily, Family: testFamily(), Flat: true}
+	claim := IdentityScheme{
+		Digest: auth.DigestBytes("scheme", []byte("oid")),
+		Prefix: "oidc:" + testIssuerFamily + "0123456789abcdef#",
+		Family: testFamily(),
+	}
+	for name, scheme := range map[string]IdentityScheme{"sub": sub, "claim": claim} {
+		if err := scheme.validate(); err != nil {
+			t.Fatalf("%s was refused: %v", name, err)
+		}
+	}
+	if err := (IdentityScheme{Flat: true}).validate(); err == nil {
+		t.Fatal("a flat scheme without a prefix was accepted")
+	}
+	plain := shoal.ID(sub.Prefix + "alice")
+	for _, nested := range []shoal.ID{
+		shoal.ID(claim.Prefix + "bob"),
+		shoal.ID(sub.Prefix + "fedcba9876543210#bob"),
+		shoal.ID(sub.Prefix + "bob#"),
+		shoal.ID(sub.Prefix + "#"),
+	} {
+		if got := sub.foreignNamespace([]shoal.ID{plain, nested}); got != sub.Prefix+"<nested>#" {
+			t.Errorf("under sub, %s is foreign as %q", nested, got)
+		}
+		if strings.Contains(sub.foreignNamespace([]shoal.ID{nested}), "bob") {
+			t.Errorf("the refusal for %s names the value", nested)
+		}
+	}
+	if got := sub.foreignNamespace([]shoal.ID{plain, "oidc:https://old.example#bob"}); got !=
+		"oidc:https://old.example#" {
+		t.Fatalf("under sub, another issuer is foreign as %q", got)
+	}
+	if got := claim.foreignNamespace([]shoal.ID{shoal.ID(claim.Prefix + "a#b"), plain}); got !=
+		"oidc:"+testIssuerFamily {
+		t.Fatalf("under the claim, a sub identity is foreign as %q", got)
+	}
+	if got := claim.foreignNamespace([]shoal.ID{shoal.ID(claim.Prefix + "a#b")}); got != "" {
+		t.Fatalf("a claim value containing '#' is foreign under its own scheme: %q", got)
+	}
+	if claim.of(shoal.ID(claim.Prefix+"a#b")) != claim.Digest || claim.of(plain) != (auth.Digest{}) {
+		t.Fatal("the claim scheme's stamp does not follow its namespace")
+	}
+	flatStamped := sub
+	flatStamped.Digest = claim.Digest
+	if flatStamped.of(shoal.ID(claim.Prefix+"bob")) != (auth.Digest{}) ||
+		flatStamped.of(plain) != claim.Digest {
+		t.Fatal("a flat scheme's stamp does not follow its namespace")
 	}
 }

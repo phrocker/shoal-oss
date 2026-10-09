@@ -12,6 +12,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -179,6 +180,18 @@ func stampIdentityScheme(
 					// change does: Entra v1 to v2, or a hostname move.
 					changed = fmt.Sprintf("; the recorded scheme is for issuer "+
 						"%q, and changing the issuer is a scheme change", stored.Issuer)
+				} else if shared := config.scheme.sharedNamespaceDigest; shared !=
+					(auth.Digest{}) && coordination.Digest(shared) == stored.Scheme {
+					// The upgrade across #546: the configuration is
+					// unchanged, the identities it mints are not.
+					changed = "; the recorded scheme is this same " +
+						"-oidc-subject-claim as releases before #546 minted " +
+						"it, in the namespace of sub (oidc:<iss>#<value>). " +
+						"This release names a non-sub subject claim's " +
+						"principals oidc:<iss>#<claim tag>#<value>, which is a " +
+						"scheme change. Identities minted before the switch " +
+						"are refused wherever they are involved in an " +
+						"approval until they are adopted (#526)"
 				}
 				return fmt.Errorf(
 					"refusing to start for issuer %s: %w (recorded %s, "+

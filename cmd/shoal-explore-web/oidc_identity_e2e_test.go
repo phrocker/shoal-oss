@@ -343,12 +343,19 @@ func TestStableIdentityFormatCannotCollide(t *testing.T) {
 	}
 
 	// The sub-derived authenticator on the same issuer: a sub that is
-	// literally a stable identity mints an oidc: identity, outside the
-	// stable namespace and inside the legacy one the approval service
-	// refuses under the stable scheme.
+	// literally a stable identity contains '#', which the sub-derived
+	// namespace refuses outright (#546). One that begins like a stable
+	// identity mints an oidc: identity, outside the stable namespace and
+	// inside the legacy one the approval service refuses under the stable
+	// scheme.
 	legacy := newTestOIDCAuthenticator(t, w.issuer.testConfig(w.h.now))
 	claims := w.issuer.defaultClaims(w.h.now())
 	claims["sub"] = string(w.stable("oid-alice"))
+	if _, err := legacy.Authenticate(bearerRequest(
+		w.issuer.signRS256(t, testKID, claims))); err == nil {
+		t.Fatal("a sub containing '#' was accepted")
+	}
+	claims["sub"] = oidcStableIdentityPrefix + w.issuer.server.URL
 	decision, err := legacy.Authenticate(
 		bearerRequest(w.issuer.signRS256(t, testKID, claims)))
 	if err != nil {
@@ -356,8 +363,7 @@ func TestStableIdentityFormatCannotCollide(t *testing.T) {
 	}
 	subject := string(decision.Subject())
 	if strings.HasPrefix(subject, oidcStableIdentityPrefix) ||
-		!strings.HasPrefix(subject, oidcIdentityPrefix+w.issuer.server.URL+"#") ||
-		shoal.ID(subject) == w.stable("oid-alice") {
+		!strings.HasPrefix(subject, oidcIdentityPrefix+w.issuer.server.URL+"#") {
 		t.Fatalf("a sub-derived identity entered the stable namespace: %q", subject)
 	}
 	approvals := w.authn.Load().identityScheme().approvals

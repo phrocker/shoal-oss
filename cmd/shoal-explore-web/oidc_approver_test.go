@@ -70,7 +70,11 @@ func approverTestConfig(
 	t.Helper()
 	config := issuer.testConfig(clock)
 	config.fleetValues = []string{"fleet"}
-	config.approverMappingFile = writeApproverMapping(t, document)
+	// A nil document is no mapping file: no approvers (a non-default
+	// subject claim refuses one, #546).
+	if document != nil {
+		config.approverMappingFile = writeApproverMapping(t, document)
+	}
 	return config
 }
 

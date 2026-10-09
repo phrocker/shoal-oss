@@ -202,6 +202,9 @@ explorer:
       jwksURI: ""
       allowedAlgs: ""      # defaults to RS256; HS* and none are always rejected
       clockSkew: ""        # defaults to 60s, capped at 5m
+      # A claim other than sub names principals oidc:<iss>#<tag>#<value>
+      # (#546); setting or changing it is an identity scheme switch, which
+      # needs identitySchemeMigrateFrom below.
       subjectClaim: ""     # defaults to sub
       actorClaim: ""
       clientIDClaim: ""

@@ -353,6 +353,11 @@ type oidcAuthenticator struct {
 	// set, every principal on both branches is oidcid:<iss>#<tag>#<value>, derived
 	// by stableIdentity and by nothing else.
 	identityClaim []string
+	// flatIdentityValues is set when identityPrefix is the sub-derived
+	// namespace oidc:<iss># (#546). Every value minted under it must then
+	// be free of '#', so that no such identity can be read as one in a
+	// non-default subject claim's namespace, oidc:<iss>#<claim tag>#.
+	flatIdentityValues bool
 	// labelGrants is the operator label grant file (#570), or nil. Only the
 	// workspace branch reads it, and only for a token a role mapping has
 	// already granted.
@@ -477,6 +482,8 @@ func newOIDCAuthenticator(
 					"it cannot be combined with the legacy Entra identity mode")
 		}
 	}
+	identityPrefix, flat := subjectIdentityPrefix(
+		config.identityPrefix, issuer, subjectClaim)
 	var grants *labelGrants
 	if path := strings.TrimSpace(config.labelGrantsFile); path != "" {
 		sources := config.labelGrantSources
@@ -580,7 +587,8 @@ func newOIDCAuthenticator(
 		contributorValues:          contributorValues,
 		fleetValues:                fleetValues,
 		authenticationLeeway:       skew,
-		identityPrefix:             firstNonEmpty(config.identityPrefix, oidcIdentityPrefix+issuer+"#"),
+		identityPrefix:             identityPrefix,
+		flatIdentityValues:         flat,
 		defaultActor:               firstNonZeroID(config.defaultActor, oidcActor),
 		auditPurpose:               firstNonEmpty(config.auditPurpose, oidcAuditPurpose),
 		allowUnmappedAuthorization: config.allowUnmappedAuthorization,
@@ -1021,7 +1029,9 @@ func (a *oidcAuthenticator) mintWorkspace(
 		if err != nil {
 			return auth.Decision{}, err
 		}
-		actor = a.identity(value)
+		if actor, err = a.identity(value); err != nil {
+			return auth.Decision{}, err
+		}
 	}
 	var clientID shoal.ID
 	if a.clientIDClaim != "" {
@@ -1029,7 +1039,9 @@ func (a *oidcAuthenticator) mintWorkspace(
 		if err != nil {
 			return auth.Decision{}, err
 		}
-		clientID = a.identity(value)
+		if clientID, err = a.identity(value); err != nil {
+			return auth.Decision{}, err
+		}
 	}
 	var onBehalfOf []shoal.ID
 	if a.delegationClaim != "" {
@@ -1039,7 +1051,11 @@ func (a *oidcAuthenticator) mintWorkspace(
 		}
 		onBehalfOf = make([]shoal.ID, 0, len(values))
 		for _, value := range values {
-			onBehalfOf = append(onBehalfOf, a.identity(value))
+			identity, err := a.identity(value)
+			if err != nil {
+				return auth.Decision{}, err
+			}
+			onBehalfOf = append(onBehalfOf, identity)
 		}
 	}
 
@@ -1089,7 +1105,7 @@ func (a *oidcAuthenticator) workspaceSubject(claims jwt.MapClaims) (shoal.ID, er
 		}
 		return "", err
 	}
-	return a.identity(subject), nil
+	return a.identity(subject)
 }
 
 // authority maps configured claim values to operations and corpus grants. It
@@ -1224,11 +1240,20 @@ func requiredStringListClaim(claims jwt.MapClaims, name string) ([]string, error
 	return result, nil
 }
 
-func (a *oidcAuthenticator) identity(value string) shoal.ID {
+// identity names a claim value under the identity prefix in force. Under the
+// sub-derived namespace oidc:<iss># a value containing '#' is refused
+// (#546): oidc:<iss>#<tag>#<value> is the form of a non-default subject
+// claim's identities, so a sub (or actor, client or delegation value) of
+// "<tag>#<value>" would otherwise mint exactly another scheme's identity.
+// OIDC Core leaves sub opaque, but no common issuer puts '#' in one.
+func (a *oidcAuthenticator) identity(value string) (shoal.ID, error) {
 	if a.trimIdentityValues {
 		value = strings.TrimSpace(value)
 	}
-	return shoal.ID(a.identityPrefix + value)
+	if a.flatIdentityValues && strings.Contains(value, "#") {
+		return "", errMalformedClaim
+	}
+	return shoal.ID(a.identityPrefix + value), nil
 }
 
 type legacyEntraConfig struct {
