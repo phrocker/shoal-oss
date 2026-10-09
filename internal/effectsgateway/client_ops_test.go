@@ -337,6 +337,11 @@ func TestCorrelationIsSentFromTheRecordAndCheckedFirst(t *testing.T) {
 	if strings.Join(transport.correlations, ",") != "trace-391,trace-391,trace-391,trace-391" {
 		t.Fatalf("correlations sent = %q", transport.correlations)
 	}
+	// The completion carries the claim's fence (#484); the real-handler test
+	// pins what the explorer does with it.
+	if !strings.Contains(string(transport.bodies[3]), `"claim_fence":1`) {
+		t.Fatalf("the completion carried no fence: %s", transport.bodies[3])
+	}
 
 	// Missing or malformed: refused locally, nothing sent.
 	client, transport = opsClient(t)
