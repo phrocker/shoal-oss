@@ -48,6 +48,12 @@ Wilson recall intervals, family count, and bounded training/inference/labeling
 costs. Targeted samples cannot make a population claim, and every report has
 `promotion_eligible: false`.
 
+`calibration.py` fits a deterministic temperature artifact on validation scores
+only and applies it only to disjoint test/inference IDs. The artifact binds the
+source model/runtime and validation score/label digests, accepts exact 0/1
+probabilities with bounded logits, and cannot mutate a serving pointer or
+authorize promotion.
+
 Every output is content-addressed, schema-versioned JSON and created with
 exclusive file creation. A new batch produces a new ledger snapshot, never an
 in-place label correction. Conflicts stay excluded until a later explicitly
