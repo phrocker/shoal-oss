@@ -16,6 +16,11 @@ def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
 
+def _digest_id(value, name):
+    if not isinstance(value, str) or len(value) != 64 or any(char not in '0123456789abcdef' for char in value):
+        raise ValueError('invalid ' + name)
+
+
 def seal(kind, **fields):
     body = dict(schema=SCHEMA, kind=kind, **fields)
     return dict(body, id=_digest(body))
@@ -69,6 +74,9 @@ def _verify_sample(sample):
 
 
 def _verify_structure(report):
+    for name in ('label_digest', 'score_digest', 'group_digest'):
+        _digest_id(report.get(name), name)
+    _finite(report.get('threshold'), 'threshold')
     _verify_sample(report.get('sample'))
     counts = report.get('counts')
     count_keys = {'total', 'resolved', 'unknown', 'disputed', 'positive', 'negative',
@@ -244,6 +252,8 @@ def evaluate(labels, scores, groups, *, sample, threshold=0.5, bins=10, costs=No
                 raise ValueError('invalid cost ' + key)
             cost[key] = float(value)
     return seal('quality_report', sample=sample, threshold=threshold,
+                label_digest=_digest(labels), score_digest=_digest(scores),
+                group_digest=_digest(groups),
                 counts={'total': len(labels), 'resolved': len(resolved), 'unknown': unknown,
                         'disputed': disputed, 'positive': positives, 'negative': negatives,
                         'true_positive': tp, 'true_negative': tn, 'false_positive': fp, 'false_negative': fn},

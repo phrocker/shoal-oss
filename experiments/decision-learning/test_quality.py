@@ -77,6 +77,12 @@ class QualityReportTests(unittest.TestCase):
         bad_bins = copy.deepcopy(report)
         bad_bins['calibration'][0]['count'] = 0
         mutations.append(bad_bins)
+        bad_digest = copy.deepcopy(report)
+        del bad_digest['score_digest']
+        mutations.append(bad_digest)
+        bad_threshold = copy.deepcopy(report)
+        bad_threshold['threshold'] = 2
+        mutations.append(bad_threshold)
         for mutation in mutations:
             mutation['id'] = quality._digest({key: value for key, value in mutation.items() if key != 'id'})
             with self.assertRaises(ValueError):
