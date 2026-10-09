@@ -61,6 +61,11 @@ func TestTheGatewayDoesNotLinkTheDecisionPlane(t *testing.T) {
 	const module = "github.com/phrocker/shoal-oss/"
 	allowedInternal := map[string]bool{
 		module + "internal/healthsurface": true,
+		// A standard-library-only decoder (#426): a request carrying
+		// shoal_attribution is decoded strictly so duplicate keys cannot make
+		// the gateway and the provider read different values. It holds no
+		// policy and no corpus.
+		module + "internal/strictjson": true,
 	}
 	sawAPI := false
 	for _, dependency := range strings.Fields(string(output)) {

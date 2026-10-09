@@ -7,19 +7,18 @@ refuses, and reports the outcome. The value is that it needs no cooperation from
 the caller — an agent framework, an IDE plugin, a shell script with `curl`:
 anything that speaks the API is governed by changing one base URL.
 
-**A withhold obligation is refused on this surface, not applied.** It used to be
-described — and implemented — as stripping the withheld references and
-forwarding the rest. That enforced nothing: `shoal_references` is a flat list of
-IDs, the material lives in `messages[].content` as free text, and nothing
-connects the two, so the gateway could not identify the bytes it had been told to
-withhold. Removing the label did not change what the model received either.
-Withholding is therefore as strong as a denial here, which is tracked as
-[#426](https://github.com/phrocker/shoal-oss/issues/426) rather than papered
-over. Read anything below about obligations with that in mind.
+**A withhold obligation is applied only to content the caller attributes.** A
+caller that sends `shoal_attribution` gets every segment it attributed to a
+withheld reference replaced by a fixed placeholder; a caller that does not gets
+the call refused as `obligation_unsatisfiable`. The guarantee is narrow and is
+stated in full under
+[Withhold obligations and attribution](#withhold-obligations-and-attribution).
+Read anything below about obligations with that in mind.
 
 - [Why this is a separate document](#why-this-is-a-separate-document)
 - [Why it is a separate process](#why-it-is-a-separate-process)
 - [The flag contract](#the-flag-contract)
+- [Withhold obligations and attribution](#withhold-obligations-and-attribution)
 - [Kubernetes: the Helm chart](#kubernetes-the-helm-chart)
 - [The render-time refusals](#the-render-time-refusals)
 - [Orchestrator probes: the health surface](#orchestrator-probes-the-health-surface)
@@ -207,6 +206,121 @@ client gets a different answer.
 
 A plane that wants to refuse unfamiliar models can deny on `other`. Deciding
 that here would make the gateway a model gate, which #390 lists as a non-goal.
+
+## Withhold obligations and attribution
+
+An admission can allow a call with an obligation to withhold some of the
+references the caller declared in `shoal_references`. A reference is an ID; the
+material it stands for is free text in `messages[].content`, and nothing on an
+OpenAI-compatible request connects the two. `shoal_attribution` is the optional
+connection (#426).
+
+**Guarantee.** When a caller attributes content to a reference, the gateway
+replaces every segment attributed to a withheld reference with a fixed
+placeholder. It refuses the call (`obligation_unsatisfiable`, before contacting
+the provider) when:
+
+- a withheld reference has no attributed content, or
+- a verbatim run of 96 bytes or more of withheld text appears anywhere else in
+  the forwarded body.
+
+**What this is not.** Attribution is the caller's own statement, as
+`shoal_references` already is, and the gateway does not authenticate inbound
+callers. This protects against mistakes by a *cooperating* caller, for example a
+RAG pipeline that attributes the chunks it retrieved but includes one of them
+twice. It does **not** protect against a caller that intends to send the
+material: one that doesn't declare a reference, pastes text without attributing
+it, misattributes it, or paraphrases it. To stop that caller, deny it the
+document at retrieval.
+
+### The shape
+
+```json
+"shoal_attribution": [{"reference":"<id>","message":3,"part":0,"start":120,"end":4210,"sha256":"<b64url>"}]
+```
+
+- **Decoding is strict.** When `shoal_attribution` is present the whole body is
+  strictly decoded, so a duplicate key at any depth, invalid UTF-8 or trailing
+  data is a 400, and edited messages are re-encoded. A body without it is parsed
+  exactly as before.
+- **`reference`** must be one of the declared `shoal_references`. Attribution
+  without `shoal_references` is a 400.
+- **`message`** is an index into `messages` and may be any role; the message
+  must have a string role. **`part`** is required for array content and must
+  point to a `text` part; it must be omitted for string content. Nothing else —
+  `tool_calls` arguments, images, names — can be attributed in v1.
+- **`start`/`end`** are UTF-8 byte offsets into the decoded string, on rune
+  boundaries, selecting a non-empty range.
+- **`sha256`** is the unpadded base64url SHA-256 of the segment, recomputed by
+  the gateway. It only checks that the offsets select the caller's own bytes. It
+  is never forwarded, logged or sent to the plane.
+- **Limits:** overlapping segments are refused, whatever their references, and
+  there are at most 256 entries.
+
+All of this is validated before admission: a malformed attribution is a 400
+that makes no call to the plane. `shoal_attribution`, like `shoal_references`,
+is stripped from what the provider receives.
+
+### What the provider receives
+
+- Each withheld segment becomes the constant `[shoal: content withheld]`, with
+  no ID, length or index. The segment is replaced, not removed, so surrounding
+  text like "see below" doesn't dangle.
+- The placeholder reveals to the provider that something was withheld. It
+  reveals nothing to the caller that a refusal doesn't already.
+- Segments attributed to references the plane allowed are forwarded unchanged.
+  Allowed references need no attribution, so an unmodified client keeps the
+  allow path, and a withhold against a caller that attributes nothing is
+  refused exactly as it was before attribution existed.
+
+### The residue check
+
+Every string the provider would receive — every value and key, in every message
+and in fields the gateway does not know — is searched for withheld text. Each
+withheld segment is sampled as 64-byte windows every 32 bytes; every forwarded
+string is scanned with a rolling hash of the same width, and each hit is
+confirmed by comparing bytes and extended to see whether it is part of a
+verbatim run of 96 bytes or more. Any run that long contains a sampled window,
+so none is missed. The work is bounded by the size of the body; a body that
+produces more coincidences with withheld text than that bound allows is refused
+rather than forwarded unexamined.
+
+**Known gaps:**
+
+- Splitting across messages, normalization changes and runs under 96 bytes all
+  get past the residue check.
+- Assistant turns, `tool_calls` arguments and images are not covered. The
+  residue check still scans every string in them for a verbatim run, but nothing
+  else about them is withheld.
+
+### Audit and logging
+
+- The admission's report outcome is unchanged; a refusal is reported to the
+  plane as the failure `obligation_unsatisfiable`, the same code the plane
+  already receives. The plane already records `Withhold`. There is no plane
+  change.
+- The gateway logs only counts (references, segments, bytes) and the refusal
+  class (`undeclared_reference`, `unattributed_reference`, `residue`,
+  `residue_bound`). It never logs content, digests, reference IDs or offsets.
+
+### What #390 guarantees
+
+#390's acceptance criterion, revised to describe what is actually guaranteed:
+
+> An admission returning a withhold obligation forwards a request in which every
+> segment the caller attributed to a withheld reference is replaced by a fixed
+> placeholder. It refuses with `obligation_unsatisfiable`, before contacting the
+> upstream, when a withheld reference has no attributed content or its text
+> appears verbatim elsewhere (96 bytes or more). This is pinned by a test that
+> embeds the material and fails if the material, not the ID, reaches the
+> provider. Attribution is asserted by the caller, and the criterion makes no
+> claim about unattributed content.
+
+The test is `TestWithheldMaterialNeverReachesTheProvider` in
+`cmd/shoal-llm-gateway`; `TestTheMutationsTheAcceptanceTestMustCatch` runs each
+known regression — stripping only the ID, skipping the digest check with offsets
+one rune off, skipping the residue check — through the same assertion and
+requires it to fail.
 
 ## No plaintext acknowledgement for the provider hop
 
@@ -718,11 +832,13 @@ Gaps in the flag contract, recorded rather than worked around.
 - **No report timeout.** `-request-timeout` bounds the upstream call. The report
   that follows it has no bound of its own, and an admission that is never
   reported is the outstanding case `docs/admission-seam.md` describes.
-- **A withhold obligation is refused rather than applied**, because the gateway
-  cannot identify which message content carries a withheld reference. Withholding
-  is therefore as strong as a denial on this surface, which leaves one of #390's
-  acceptance criteria unmet in substance. Tracked as
-  [#426](https://github.com/phrocker/shoal-oss/issues/426).
+- **A withhold obligation is enforced only over attributed content.** Without
+  `shoal_attribution` it is refused, as strong as a denial; with it, only what
+  the caller attributed is withheld, plus a 96-byte verbatim residue check.
+  Attribution is the caller's statement and is not authenticated, so this is no
+  defence against a caller that means to send the material. See
+  [Withhold obligations and attribution](#withhold-obligations-and-attribution)
+  for the guarantee and its gaps (#426).
 - **No ServiceAccount is created for the projected token form.** The chart
   references `llmGateway.serviceAccountName` and does not create the account or
   any RBAC, on the same principle as the Secrets. An operator wiring the

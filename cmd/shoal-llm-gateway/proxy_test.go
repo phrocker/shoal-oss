@@ -323,27 +323,17 @@ func TestAnUnreachablePlaneDeniesAndSaysSo(t *testing.T) {
 	assertRefusalNamesNothing(t, recorder.Body.String())
 }
 
-// TestObligationsAreAppliedToTheOutboundRequest is the criterion that fails if
-// the obligation is dropped. Obligations are better than refusal: the plane
-// said which part to remove, so removing it beats refusing the whole call.
-// TestAWithholdObligationCannotBeSatisfiedOnThisRequestShape replaces a test
-// that pinned the wrong behaviour.
+// TestAWithholdWithoutAttributionIsRefused is what a withhold obligation does
+// for a caller that attributes nothing (#426).
 //
-// It used to assert that a withheld reference was removed from the forwarded
-// body and the others kept — the metadata edit — and it passed. What it never
-// asserted was that anything was withheld from the provider, which is what a
-// withhold obligation means. Nothing was: shoal_references is a flat list of
-// IDs, the material lives in messages[].content as free text, and nothing
-// connects the two, so the proxy removed the label and forwarded the content.
-// Providers ignore unknown fields, so even the label's removal changed nothing
-// about what the model received.
-//
-// The case below is the one the old test could not express, and is why greping
-// the forwarded body for the reference ID was never enough: the ID and the
-// material are different strings. A caller declares a restricted document and
-// pastes its text in. Under the old behaviour the text was forwarded with the
-// label stripped, and every assertion passed.
-func TestAWithholdObligationCannotBeSatisfiedOnThisRequestShape(t *testing.T) {
+// It replaces a test that asserted a withheld reference was removed from the
+// forwarded body and the others kept — the metadata edit — and passed, while
+// the material went upstream: shoal_references is a flat list of IDs, the
+// material lives in messages[].content as free text, and the ID and the
+// material are different strings. Without shoal_attribution nothing connects
+// them, so the gateway cannot find the bytes and refuses. With it, see
+// TestWithheldMaterialNeverReachesTheProvider.
+func TestAWithholdWithoutAttributionIsRefused(t *testing.T) {
 	const material = "the restricted paragraph that doc-b actually contains"
 	plane := newFakePlane(t, admissionapi.OutcomeObligated, []string{docB})
 	upstream := newFakeUpstream(t)
