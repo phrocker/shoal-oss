@@ -98,8 +98,10 @@ type Config struct {
 }
 
 // GracePeriod is the minimum terminationGracePeriodSeconds for this
-// configuration: T + 2×ReportWindow + 5s.
-func (c *Config) GracePeriod() time.Duration { return GracePeriod(c.OperationTimeout) }
+// configuration: T + max(ReportWindow, 3×planeTimeout) + 2×ReportWindow + 5s.
+func (c *Config) GracePeriod() time.Duration {
+	return GracePeriod(c.OperationTimeout, c.PlaneTimeout)
+}
 
 // SendGate is the gate this configuration implies.
 func (c *Config) SendGate() SendGate {

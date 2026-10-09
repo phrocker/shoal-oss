@@ -95,20 +95,17 @@ func newPollCorrelation(random io.Reader) ([]byte, error) {
 // ExtendRequest renews the lease of a claim this worker holds.
 type ExtendRequest struct {
 	// Context's correlation is the action record's (Action.Correlate).
-	Context         RequestContext
-	ExpectedVersion uint64
-	ClaimID         []byte
-	// ClaimFence is the fence from the claim response. It is checked
-	// against the response only and is NOT sent: an extension never moves
-	// the fence, and the client refuses a response under any other fence as
-	// not describing this claim.
-	//
-	// FOLLOW-UP: the extend route still binds on ExpectedVersion alone, and
-	// its strict decoder answers 400 to an unknown field, so claim_fence
-	// must stay off this body until the explorer supports fence-bound
-	// extend (in progress with the fleet owner). When it lands, send it as
-	// Complete does, so a version moved by someone's ambiguity report no
-	// longer refuses the holder's renewal.
+	Context RequestContext
+	ClaimID []byte
+	// ClaimFence is the fence from the claim response, and it is what the
+	// renewal binds on (#629): the explorer compares it with the fence of the
+	// claim the record carries now and does not compare the version. A write
+	// that leaves the claim alone — a displaced former holder's ambiguity
+	// report is the case this exists for — moves the version, and the holder
+	// cannot learn the new one by any route it is authorized for, so a
+	// version-bound renewal would strand a live claim mid-effect. There is no
+	// version field: the client never sends one on this route, and a fence
+	// mismatch is ErrClaimLost (409), which is exactly fence_lost.
 	ClaimFence uint64
 	// Lease is the silence budget requested from the explorer's now, at most
 	// fleet.MaxActionClaimTTL. The explorer clamps the new end to the
@@ -116,7 +113,8 @@ type ExtendRequest struct {
 	Lease time.Duration
 }
 
-// Extend renews a live claim (#430) and returns the record as renewed.
+// Extend renews a live claim (#430), bound on its fence (#629), and returns
+// the record as renewed.
 //
 // The lease end to act on is the returned Action.ClaimLeaseUntil — the
 // explorer's clamped end, at most the action's deadline — never now plus the
@@ -130,30 +128,25 @@ type ExtendRequest struct {
 //     was re-claimed, the descriptor was rebound to another executor ref
 //     (#391: an extension needs the current and the claimed ref), or the
 //     action is gone. Completion stays possible after a rebind.
-//   - 409: the lease or the deadline has passed (ErrClaimLost), the record's
-//     version moved, or the attestation gate refused the renewal
-//     (ErrAttestationRequired). The explorer answers all three with the one
-//     code and the client never reads message text, so the status is kept
-//     on the error: a worker whose action requires attestation re-attests
-//     and extends once more before treating it as lost.
+//   - 409: the record's claim is under another fence, or the lease or the
+//     deadline has passed (ErrClaimLost), or the attestation gate refused the
+//     renewal (ErrAttestationRequired). The explorer answers these with the
+//     one code and the client never reads message text, so the status is
+//     kept on the error: a worker whose action requires attestation
+//     re-attests and extends once more before treating it as lost.
 //
 // A lost answer is handled as Complete handles one: a transport error, any
 // 503 (until #505 a bare 503 may hide ErrActionCommitted), a 502 or 504, or a
 // 2xx that does not describe this renewal, may have committed, and the
-// identical body is resent once. A record from the resend is returned. Any
-// other answer is DispatchIndeterminate — the lease may or may not have
-// moved, and the version may have advanced. There is no replay branch on this
-// route, so a resend after a committed first attempt sees the version moved
-// and answers 409; that 409 is never read as a refusal. On
-// DispatchIndeterminate the worker acts on the lease end it had before, and
-// completes with the fence, which does not compare the version.
+// identical body is resent once. Bound on the fence, the resend of a renewal
+// that did commit is a second renewal of the same claim, not a conflict. A
+// record from the resend is returned. Any other answer is
+// DispatchIndeterminate — the lease may or may not have moved; the worker
+// then acts on the lease end it had before, and completes with the fence.
 func (c *DispatchClient) Extend(ctx context.Context, actionID []byte, request ExtendRequest) (Action, error) {
 	const op = "extend"
 	if err := checkActionID(op, actionID); err != nil {
 		return Action{}, err
-	}
-	if request.ExpectedVersion == 0 {
-		return Action{}, refusedLocally(op, "expected version is required")
 	}
 	if len(request.ClaimID) == 0 || len(request.ClaimID) > fleet.MaxActionIDBytes {
 		return Action{}, refusedLocally(op, "claim ID is outside its bound")
@@ -173,13 +166,15 @@ func (c *DispatchClient) Extend(ctx context.Context, actionID []byte, request Ex
 	if err != nil {
 		return Action{}, err
 	}
+	// expected_version is omitted: with a fence the explorer does not compare
+	// it, and sending one would only invite a reader to think it binds.
 	body := struct {
-		Context         contextWire   `json:"context"`
-		ExpectedVersion uint64        `json:"expected_version"`
-		ClaimID         string        `json:"claim_id"`
-		Lease           time.Duration `json:"lease"`
+		Context    contextWire   `json:"context"`
+		ClaimFence uint64        `json:"claim_fence"`
+		ClaimID    string        `json:"claim_id"`
+		Lease      time.Duration `json:"lease"`
 	}{
-		Context: contextValue, ExpectedVersion: request.ExpectedVersion,
+		Context: contextValue, ClaimFence: request.ClaimFence,
 		ClaimID: base64.RawURLEncoding.EncodeToString(request.ClaimID),
 		Lease:   request.Lease,
 	}
@@ -193,13 +188,11 @@ func (c *DispatchClient) Extend(ctx context.Context, actionID []byte, request Ex
 		if err != nil {
 			return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol, reason: err.Error()}
 		}
-		// An extension writes exactly ExpectedVersion+1 and keeps the claim,
-		// its fence and its state. The end it grants is after nothing in
-		// particular the client can check against its own clock, but it is
-		// never past the action's deadline.
+		// An extension keeps the claim, its fence and its state, and grants
+		// an end never past the action's deadline. Its version is whatever
+		// the record reached; the client does not pin it.
 		if !bytes.Equal(action.ID, actionID) || !bytes.Equal(action.ClaimID, request.ClaimID) ||
-			action.ClaimFence != request.ClaimFence ||
-			action.Version != request.ExpectedVersion+1 ||
+			action.ClaimFence != request.ClaimFence || action.Version == 0 ||
 			action.State != fleet.DispatchClaimed || action.ClaimLeaseUntil.IsZero() ||
 			(!action.Deadline.IsZero() && action.ClaimLeaseUntil.After(action.Deadline)) {
 			return Action{}, &DispatchError{Op: op, Kind: DispatchProtocol,

@@ -259,22 +259,31 @@ func TestSkewedWorkersAgreeOnTheGate(t *testing.T) {
 }
 
 func TestGracePeriod(t *testing.T) {
-	// The design's example: T=10m gives 615s, of which the final 5s is the
-	// only slack beyond the request, its completion and the fallback report.
 	for _, row := range []struct {
-		operation time.Duration
-		seconds   int64
+		operation, plane time.Duration
+		seconds          int64
 	}{
-		{10 * time.Minute, 615},
-		{3 * time.Minute, 195},
-		{90 * time.Second, 105},
-		{1500 * time.Millisecond, 17},
+		// The completion budget is the report window until three plane
+		// timeouts exceed it.
+		{10 * time.Minute, time.Second, 620},
+		{10 * time.Minute, 15 * time.Second, 660},
+		{3 * time.Minute, 10 * time.Second, 225},
+		{90 * time.Second, time.Second, 110},
+		{1500 * time.Millisecond, time.Second, 22},
 	} {
-		if got := GracePeriodSeconds(row.operation); got != row.seconds {
-			t.Errorf("T=%s: grace %ds, want %ds", row.operation, got, row.seconds)
+		if got := GracePeriodSeconds(row.operation, row.plane); got != row.seconds {
+			t.Errorf("T=%s P=%s: grace %ds, want %ds", row.operation, row.plane, got, row.seconds)
 		}
-		if GracePeriod(row.operation) != row.operation+2*ReportWindow+5*time.Second {
-			t.Errorf("T=%s: grace is not T + 2×5s + 5s", row.operation)
-		}
+	}
+}
+
+// TestDrainBoundLeavesTheExitMargin: the drain gives up before the grace
+// period ends, by the margin the abandonment and the exit need.
+func TestDrainBoundLeavesTheExitMargin(t *testing.T) {
+	if DrainBound(time.Minute, time.Second) != GracePeriod(time.Minute, time.Second)-exitMargin {
+		t.Fatal("the drain bound does not leave the exit margin")
+	}
+	if CompletionBudget(time.Second) != ReportWindow || CompletionBudget(10*time.Second) != 30*time.Second {
+		t.Fatal("completion budget is not max(ReportWindow, 3×planeTimeout)")
 	}
 }

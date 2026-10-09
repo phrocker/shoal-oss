@@ -30,6 +30,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 )
 
 // The logging policy is enforced by the shape of the one function that writes
@@ -64,12 +66,33 @@ const (
 	EventFenceLost Event = "fence_lost"
 	EventDispatch  Event = "dispatch_error"
 	EventStartup   Event = "startup"
+	// EventExtended: the lease was renewed to the explorer's (clamped) end.
+	EventExtended Event = "extended"
+	// EventAttested: an attestation was presented ahead of a claim or an
+	// extension.
+	EventAttested Event = "attested"
+	// EventAmbiguity: a lost-fence report is on the record.
+	EventAmbiguity Event = "ambiguity_reported"
+	// EventUnrecorded: a report could not be recorded and is held in the
+	// local unrecorded log for operator reconciliation (#514). The line
+	// carries the log's entry count, which is the gauge.
+	EventUnrecorded Event = "unrecorded"
+	// EventUnrecordedCleared: a held report was recorded on a retry, or
+	// acknowledged by the operator, and left the log.
+	EventUnrecordedCleared Event = "unrecorded_cleared"
+	// EventReadiness: readiness changed; NotReady says why, empty when ready.
+	EventReadiness Event = "readiness"
+	// EventAbandoned: the drain's grace period ended with runs unfinished;
+	// Abandoned counts them.
+	EventAbandoned Event = "abandoned"
 )
 
 var validEvents = map[Event]bool{
 	EventSkipped: true, EventClaimed: true, EventSent: true, EventClassify: true,
 	EventCompleted: true, EventRefused: true, EventFenceLost: true,
-	EventDispatch: true, EventStartup: true,
+	EventDispatch: true, EventStartup: true, EventExtended: true,
+	EventAttested: true, EventAmbiguity: true, EventUnrecorded: true,
+	EventUnrecordedCleared: true, EventReadiness: true, EventAbandoned: true,
 }
 
 // FailureKind is a transport failure reduced to its category. Closed.
@@ -154,9 +177,18 @@ type LogRecord struct {
 	Failure        FailureKind
 	Gate           GateRefusal
 	DispatchError  DispatchErrorKind
-	RequestBytes   int64
-	ResponseBytes  int64
-	Duration       time.Duration
+	// Ambiguity is the outcome of a lost-fence report, closed.
+	Ambiguity fleet.AmbiguityOutcome
+	// Unrecorded is the unrecorded log's entry count after this event; set
+	// on EventUnrecorded and EventUnrecordedCleared.
+	Unrecorded int
+	// NotReady is why the worker is not ready, on EventReadiness.
+	NotReady NotReadyReason
+	// Abandoned is how many runs a drain gave up on, on EventAbandoned.
+	Abandoned     int
+	RequestBytes  int64
+	ResponseBytes int64
+	Duration      time.Duration
 }
 
 // Logger writes LogRecords as JSON lines.
@@ -188,6 +220,10 @@ type logLine struct {
 	Failure        string `json:"failure,omitempty"`
 	Gate           string `json:"gate,omitempty"`
 	DispatchError  string `json:"dispatch_error,omitempty"`
+	Ambiguity      string `json:"ambiguity,omitempty"`
+	Unrecorded     *int   `json:"unrecorded_entries,omitempty"`
+	NotReady       string `json:"not_ready,omitempty"`
+	Abandoned      int    `json:"abandoned_runs,omitempty"`
 	RequestBytes   int64  `json:"request_bytes,omitempty"`
 	ResponseBytes  int64  `json:"response_bytes,omitempty"`
 	DurationMillis int64  `json:"duration_ms,omitempty"`
@@ -238,6 +274,18 @@ func (l *Logger) Log(record LogRecord) {
 		line.DispatchError = closed(string(record.DispatchError),
 			validDispatchErrors[record.DispatchError])
 	}
+	if record.Ambiguity != "" {
+		line.Ambiguity = closed(string(record.Ambiguity), validAmbiguity[record.Ambiguity])
+	}
+	line.Abandoned = record.Abandoned
+	if record.Event == EventUnrecorded || record.Event == EventUnrecordedCleared ||
+		record.Event == EventAbandoned {
+		count := record.Unrecorded
+		line.Unrecorded = &count
+	}
+	if record.NotReady != "" {
+		line.NotReady = closed(string(record.NotReady), validNotReady[record.NotReady])
+	}
 	if record.Duration > 0 {
 		line.DurationMillis = record.Duration.Milliseconds()
 	}
@@ -266,4 +314,15 @@ var validKinds = map[Kind]bool{
 
 var validGates = map[GateRefusal]bool{
 	GateDraining: true, GateDeadline: true, GateLease: true, GateMisconfigured: true,
+	GateRetention: true,
+}
+
+var validAmbiguity = map[fleet.AmbiguityOutcome]bool{
+	fleet.AmbiguityRequestNotSent: true, fleet.AmbiguityEffectObserved: true,
+	fleet.AmbiguityOutcomeUnknown: true,
+}
+
+var validNotReady = map[NotReadyReason]bool{
+	NotReadyStarting: true, NotReadyDraining: true, NotReadyUnrecordedFull: true,
+	NotReadyStopped: true,
 }
