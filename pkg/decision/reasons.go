@@ -71,9 +71,11 @@ func ServiceReasons() map[ResultStatus][]string {
 // claim as one returning it on an Abstained result, and a per-status check
 // would admit exactly that.
 func ReservedServiceReason(reason string) bool {
-	for _, candidate := range ServiceReasons()[Abstained] {
-		if reason == candidate {
-			return true
+	for _, reasons := range ServiceReasons() {
+		for _, candidate := range reasons {
+			if reason == candidate {
+				return true
+			}
 		}
 	}
 	return false
