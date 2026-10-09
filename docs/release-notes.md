@@ -16,13 +16,25 @@ self-approval shape #553 closed for `oidcid:`. Now:
   where the tag is 16 hex digits of a digest of the claim name. Its actor,
   client and delegation values take the same prefix. Its requests are
   stamped with its scheme.
-- The `sub` namespace `oidc:<iss>#` is flat. A `sub`, actor, client or
+- The `sub` namespace `oidc:<iss>#` is flat (legacy Entra excepted). A `sub`, actor, client or
   delegation value containing `#` is refused on both branches, and an
   identity with a `#` after the issuer's is foreign under `sub`. So
   `oidc:<iss>#<sub>` and `oidc:<iss>#<tag>#<value>` cannot be confused.
-- The default `sub` scheme and legacy Entra mode are unchanged. They keep
-  the same identities and the same recorded scheme digest, and start
-  without any flag.
+- The default `sub` scheme and legacy Entra mode keep the same recorded
+  scheme digest and start without any flag. Every identity without a `#`
+  is unchanged.
+
+**Behaviour change on the default `sub` scheme: `#` is refused.** A token
+whose `sub`, or whose `-oidc-actor-claim`, `-oidc-client-id-claim` or
+`-oidc-delegation-claim` value, contains `#` is now refused with `401`, on
+the workspace branch and on the approver branch. The scheme digest does not
+change, so **nothing at startup warns about this**. If the client-ID or
+actor claim you configured routinely carries `#`, every user is locked out.
+Before upgrading, check that none of these claims can contain `#`. If one
+can, configure a different claim. The first refusal for each claim is
+logged at WARN, naming the claim but never the value, and the log repeats
+at most once a minute per claim. `shoal-demo-seed` likewise refuses an
+`oidc_subject_id` containing `#`, and an issuer containing one.
 
 **Upgrade action required for deployments that set `-oidc-subject-claim`.**
 The scheme digest covers the identity format, so such a deployment's

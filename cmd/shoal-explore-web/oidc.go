@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -358,6 +359,8 @@ type oidcAuthenticator struct {
 	// be free of '#', so that no such identity can be read as one in a
 	// non-default subject claim's namespace, oidc:<iss>#<claim tag>#.
 	flatIdentityValues bool
+	// hashRefusals logs the claims whose values were refused for '#'.
+	hashRefusals *hashRefusalLog
 	// labelGrants is the operator label grant file (#570), or nil. Only the
 	// workspace branch reads it, and only for a token a role mapping has
 	// already granted.
@@ -589,6 +592,7 @@ func newOIDCAuthenticator(
 		authenticationLeeway:       skew,
 		identityPrefix:             identityPrefix,
 		flatIdentityValues:         flat,
+		hashRefusals:               newHashRefusalLog(nil, clock),
 		defaultActor:               firstNonZeroID(config.defaultActor, oidcActor),
 		auditPurpose:               firstNonEmpty(config.auditPurpose, oidcAuditPurpose),
 		allowUnmappedAuthorization: config.allowUnmappedAuthorization,
@@ -1029,7 +1033,7 @@ func (a *oidcAuthenticator) mintWorkspace(
 		if err != nil {
 			return auth.Decision{}, err
 		}
-		if actor, err = a.identity(value); err != nil {
+		if actor, err = a.identity(a.actorClaim, value); err != nil {
 			return auth.Decision{}, err
 		}
 	}
@@ -1039,7 +1043,7 @@ func (a *oidcAuthenticator) mintWorkspace(
 		if err != nil {
 			return auth.Decision{}, err
 		}
-		if clientID, err = a.identity(value); err != nil {
+		if clientID, err = a.identity(a.clientIDClaim, value); err != nil {
 			return auth.Decision{}, err
 		}
 	}
@@ -1051,7 +1055,7 @@ func (a *oidcAuthenticator) mintWorkspace(
 		}
 		onBehalfOf = make([]shoal.ID, 0, len(values))
 		for _, value := range values {
-			identity, err := a.identity(value)
+			identity, err := a.identity(a.delegationClaim, value)
 			if err != nil {
 				return auth.Decision{}, err
 			}
@@ -1095,9 +1099,11 @@ func (a *oidcAuthenticator) workspaceSubject(claims jwt.MapClaims) (shoal.ID, er
 		identity, _, err := a.stableIdentity(claims)
 		return identity, err
 	}
-	subject, err := requiredStringClaim(claims, a.subjectClaim)
+	claim := a.subjectClaim
+	subject, err := requiredStringClaim(claims, claim)
 	if errors.Is(err, errMissingMappedClaim) && a.subjectFallbackClaim != "" {
-		subject, err = requiredStringClaim(claims, a.subjectFallbackClaim)
+		claim = a.subjectFallbackClaim
+		subject, err = requiredStringClaim(claims, claim)
 	}
 	if err != nil {
 		if err == errMissingMappedClaim {
@@ -1105,7 +1111,7 @@ func (a *oidcAuthenticator) workspaceSubject(claims jwt.MapClaims) (shoal.ID, er
 		}
 		return "", err
 	}
-	return a.identity(subject)
+	return a.identity(claim, subject)
 }
 
 // authority maps configured claim values to operations and corpus grants. It
@@ -1246,11 +1252,17 @@ func requiredStringListClaim(claims jwt.MapClaims, name string) ([]string, error
 // claim's identities, so a sub (or actor, client or delegation value) of
 // "<tag>#<value>" would otherwise mint exactly another scheme's identity.
 // OIDC Core leaves sub opaque, but no common issuer puts '#' in one.
-func (a *oidcAuthenticator) identity(value string) (shoal.ID, error) {
+//
+// The refusal is a 401 like any malformed claim, so it is also logged (by
+// hashRefusals, naming the claim and never the value): an issuer whose
+// client-ID or actor claim routinely carries '#' refuses every user, and the
+// scheme digest does not change, so nothing at startup would say why.
+func (a *oidcAuthenticator) identity(claim, value string) (shoal.ID, error) {
 	if a.trimIdentityValues {
 		value = strings.TrimSpace(value)
 	}
 	if a.flatIdentityValues && strings.Contains(value, "#") {
+		a.hashRefusals.note(claim)
 		return "", errMalformedClaim
 	}
 	return shoal.ID(a.identityPrefix + value), nil
@@ -1811,4 +1823,52 @@ func (k jsonWebKey) ecKey() (*ecdsa.PublicKey, error) {
 		return nil, fmt.Errorf("EC point is not on the curve")
 	}
 	return key, nil
+}
+
+// hashRefusalInterval bounds how often one claim's '#' refusal is logged.
+const hashRefusalInterval = time.Minute
+
+// hashRefusalLog logs a token refused because a claim value minted under
+// the sub-derived namespace contains '#' (#546): the first refusal for each
+// claim, then at most one per claim per hashRefusalInterval. It names the
+// claim and the rule, never the value, which is an identity.
+type hashRefusalLog struct {
+	logger *slog.Logger
+	clock  func() time.Time
+	mu     sync.Mutex
+	last   map[string]time.Time
+}
+
+// newHashRefusalLog logs to logger, or to slog.Default() when it is nil.
+func newHashRefusalLog(logger *slog.Logger, clock func() time.Time) *hashRefusalLog {
+	if clock == nil {
+		clock = time.Now
+	}
+	return &hashRefusalLog{logger: logger, clock: clock, last: map[string]time.Time{}}
+}
+
+func (l *hashRefusalLog) note(claim string) {
+	if l == nil {
+		return
+	}
+	now := l.clock()
+	l.mu.Lock()
+	previous, seen := l.last[claim]
+	if seen && now.Sub(previous) < hashRefusalInterval {
+		l.mu.Unlock()
+		return
+	}
+	l.last[claim] = now
+	l.mu.Unlock()
+	logger := l.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn("oidc: refused a token because a claim value contains '#'; "+
+		"under the default sub-derived identity namespace (oidc:<iss>#<value>) "+
+		"no sub, actor, client-ID or delegation value may contain '#' (#546). "+
+		"If this claim routinely carries '#', every such token is refused: "+
+		"choose another claim. Further refusals for this claim are logged at "+
+		"most once a minute",
+		"claim", claim)
 }

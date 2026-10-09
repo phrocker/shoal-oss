@@ -346,6 +346,21 @@ func TestConfigValidation(t *testing.T) {
 			want: "distinct oidc_subject_id",
 		},
 		{
+			// #546: shoal-explore-web refuses a sub containing '#'.
+			name: "subject containing a hash",
+			mutate: func(value *config) {
+				value.Users[1].OIDCSubject = "0123456789abcdef#subject-a"
+			},
+			want: "must not contain '#'",
+		},
+		{
+			name: "issuer with an empty fragment",
+			mutate: func(value *config) {
+				value.OIDCIssuer = "https://identity.example.test/#"
+			},
+			want: "HTTPS issuer",
+		},
+		{
 			name: "duplicate workspaces",
 			mutate: func(value *config) {
 				value.Users[1].WorkspaceID = value.Users[0].WorkspaceID

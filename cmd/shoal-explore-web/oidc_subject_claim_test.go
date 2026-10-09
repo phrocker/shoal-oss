@@ -14,9 +14,12 @@ package main
 // its only operation.
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -280,6 +283,75 @@ func TestSubjectClaimPrefixIsUnambiguous(t *testing.T) {
 	}
 	if strings.HasPrefix(standard.Prefix+"alice", oidScheme.Prefix) || oidScheme.Flat {
 		t.Fatalf("a sub identity lies in the claim's namespace %+v", oidScheme)
+	}
+}
+
+// TestHashRefusalIsLoggedByClaim: a '#' refusal is a 401 like any malformed
+// claim, and an issuer whose client-ID or actor claim routinely carries '#'
+// would refuse every user with nothing at startup to say why. So the first
+// refusal for each claim is logged, naming the claim and never the value,
+// and then at most once per claim per interval — on both branches.
+func TestHashRefusalIsLoggedByClaim(t *testing.T) {
+	issuer := newFakeOIDCIssuer(t)
+	now := time.Now()
+	config := approverTestConfig(t, issuer, fixedClock(now),
+		approverMappingDocument(issuer.server.URL))
+	config.actorClaim = "act_as"
+	config.clientIDClaim = "client_ref"
+	authenticator := newTestOIDCAuthenticator(t, config)
+	var logs bytes.Buffer
+	var clock atomic.Int64
+	clock.Store(now.UnixNano())
+	authenticator.hashRefusals = newHashRefusalLog(
+		slog.New(slog.NewTextHandler(&logs, nil)),
+		func() time.Time { return time.Unix(0, clock.Load()) })
+	workspace := func(sub, actor, client string) {
+		t.Helper()
+		claims := issuer.defaultClaims(now)
+		claims["sub"], claims["act_as"], claims["client_ref"] = sub, actor, client
+		if _, err := authenticator.Authenticate(bearerRequest(
+			issuer.signRS256(t, testKID, claims))); err == nil {
+			t.Fatalf("a '#' in sub %q, actor %q or client %q was accepted", sub, actor, client)
+		}
+	}
+	lines := func() []string {
+		return strings.FieldsFunc(logs.String(), func(r rune) bool { return r == '\n' })
+	}
+
+	workspace("alice", "svc", "secret-client#1")
+	workspace("alice", "svc", "secret-client#2")
+	workspace("bob", "svc", "secret-client#3")
+	if got := lines(); len(got) != 1 || !strings.Contains(got[0], "claim=client_ref") {
+		t.Fatalf("after three client-ID refusals the log is %q, want one line naming client_ref", got)
+	}
+	workspace("alice", "secret-actor#1", "client")
+	workspace("secret-sub#1", "svc", "client")
+	if _, err := authenticator.Authenticate(bearerRequest(issuer.signRS256(
+		t, testKID, approverClaims(issuer, now, "secret-approver#1")))); err == nil {
+		t.Fatal("an approver sub containing '#' was accepted")
+	}
+	got := lines()
+	if len(got) != 3 || !strings.Contains(got[1], "claim=act_as") ||
+		!strings.Contains(got[2], "claim=sub") {
+		t.Fatalf("one line per claim, the approver's sub sharing sub's: %q", got)
+	}
+	clock.Add(int64(hashRefusalInterval))
+	workspace("alice", "svc", "secret-client#4")
+	if got := lines(); len(got) != 4 || !strings.Contains(got[3], "claim=client_ref") {
+		t.Fatalf("after the interval the client-ID refusal is not logged again: %q", got)
+	}
+	if strings.Contains(logs.String(), "secret") {
+		t.Fatalf("the log discloses a claim value: %s", logs.String())
+	}
+	// Control: no '#', no log line.
+	claims := issuer.defaultClaims(now)
+	claims["act_as"], claims["client_ref"] = "svc", "client"
+	if _, err := authenticator.Authenticate(bearerRequest(
+		issuer.signRS256(t, testKID, claims))); err != nil {
+		t.Fatal(err)
+	}
+	if len(lines()) != 4 {
+		t.Fatalf("an accepted token was logged: %q", lines())
 	}
 }
 

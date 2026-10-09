@@ -194,8 +194,15 @@ have the expected string shape. Token-derived identities are namespaced by the
 validated issuer so subjects from different issuers cannot collide.
 
 Under the default subject claim, `sub`, identities are `oidc:<iss>#<sub>`,
-as they always were, and a `sub` (or actor, client or delegation value)
-containing `#` is refused. A non-default `-oidc-subject-claim` names
+as they always were. **No value named under that prefix may contain `#`**
+(#546): a token whose `sub`, or whose `-oidc-actor-claim`,
+`-oidc-client-id-claim` or `-oidc-delegation-claim` value, contains `#` is
+refused with `401` on both the workspace and the approver branch. The
+client-ID and actor claims you configure must therefore never carry `#`.
+One that routinely does locks out every user, and because the scheme digest
+does not change, startup cannot warn you. The first refusal for each claim
+is logged at WARN, naming the claim but never the value, and the log
+repeats at most once a minute per claim. Check those logs after upgrading. A non-default `-oidc-subject-claim` names
 identities `oidc:<iss>#<tag>#<value>`, where the tag is 16 hex digits of a
 digest of the claim name (#546), so its identities can never equal a
 `sub`-derived identity or another claim's; the actor, client and delegation
@@ -233,7 +240,8 @@ intended fail-closed path:
 
 Deployments on the default `sub`, with or without an approver mapping, and
 legacy Entra deployments keep their recorded scheme and start without any
-flag.
+flag. Default `sub` deployments do refuse a `#` in `sub`, actor, client-ID
+and delegation values (above). Legacy Entra (`entra:`) does not.
 
 ### Granting visibility labels
 
