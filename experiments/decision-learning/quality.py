@@ -59,6 +59,12 @@ def evaluate(labels, scores, groups, *, sample, threshold=0.5, bins=10, costs=No
     kind = sample.get('kind')
     if kind not in ('uniform', 'random', 'targeted'):
         raise ValueError('invalid sample kind')
+    inclusion_probability = sample.get('inclusion_probability')
+    if kind == 'uniform' and inclusion_probability not in (None, 1, 1.0):
+        raise ValueError('uniform sample must have unit inclusion probability')
+    if kind in ('random', 'targeted'):
+        if type(inclusion_probability) not in (int, float) or not math.isfinite(inclusion_probability) or not 0 < inclusion_probability <= 1:
+            raise ValueError('sample inclusion probability is required')
     if sample.get('future_inputs') is not False:
         raise ValueError('future inputs are not permitted')
     if type(sample.get('population')) is not int or not 0 < sample['population'] <= 1_000_000_000 or sample['population'] < len(labels):

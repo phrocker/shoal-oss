@@ -25,10 +25,17 @@ class QualityReportTests(unittest.TestCase):
         self.assertFalse(report['population_claim'])
 
     def test_targeted_sample_cannot_make_population_claim(self):
-        sample = {'kind': 'targeted', 'population': 100, 'split': 'test', 'predeclared': True, 'future_inputs': False}
+        sample = {'kind': 'targeted', 'population': 100, 'inclusion_probability': .1,
+                  'split': 'test', 'predeclared': True, 'future_inputs': False}
         labels, scores, groups, _ = self.fixture(sample)
         report = quality.evaluate(labels, scores, groups, sample=sample)
         self.assertFalse(report['population_claim'])
+
+    def test_nonuniform_sampling_requires_inclusion_probability(self):
+        sample = {'kind': 'random', 'population': 100, 'split': 'test', 'predeclared': True, 'future_inputs': False}
+        labels, scores, groups, _ = self.fixture(sample)
+        with self.assertRaises(ValueError):
+            quality.evaluate(labels, scores, groups, sample=sample)
 
     def test_complete_resolved_uniform_cohort_can_claim_its_declared_population(self):
         labels, scores, groups, sample = self.fixture()
