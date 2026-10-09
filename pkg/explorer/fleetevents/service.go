@@ -32,6 +32,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/explorerfleetcap"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -47,6 +48,16 @@ type Config struct {
 	Clock            func() time.Time
 	PollInterval     time.Duration
 	MaxWait          time.Duration
+	// EvidenceVisibility decides, at delivery, whether the subscriber
+	// pulling an event may see an exact evidence reference that carries a
+	// visibility expression (#562).
+	//
+	// The same seam as fleet.DispatchConfig.EvidenceVisibility — one type,
+	// defined once in evidencelabels — and the same semantics: optional, and
+	// nil means no subscriber may see labelled evidence, so labelled
+	// references are withheld from every delivered envelope while unlabelled
+	// ones are delivered unchanged.
+	EvidenceVisibility evidencelabels.Visibility
 }
 
 type Service struct {
@@ -60,6 +71,9 @@ type Service struct {
 	poll        time.Duration
 	maxWait     time.Duration
 	reconcile   explorerfleetcap.Capability
+	// evidenceVisibility is asked under the subscriber's context at
+	// delivery, never under the publisher's at publish.
+	evidenceVisibility evidencelabels.Visibility
 }
 
 func New(config Config) (*Service, error) {
@@ -112,7 +126,7 @@ func newService(
 		backend: config.Backend, resolver: config.Resolver, generations: config.GenerationReader,
 		leases: config.LeaseValidator, auditor: config.Auditor, cursors: codec,
 		now: config.Clock, poll: config.PollInterval, maxWait: config.MaxWait,
-		reconcile: capability,
+		reconcile: capability, evidenceVisibility: config.EvidenceVisibility,
 	}, nil
 }
 
@@ -518,11 +532,14 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 			if event.Sequence < next {
 				return Page{}, shoal.NewError(shoal.ErrorInternal, "event backend returned an invalid sequence")
 			}
-			allowed, authErr := s.authorizeDelivery(ctx, subscription, event, decision)
+			_, allowed, authErr := s.authorizeDelivery(ctx, subscription, event, decision)
 			if authErr != nil {
 				return Page{}, authErr
 			}
 			if allowed {
+				// The stored event, not a projection of it: the final gate
+				// below re-authorizes on the complete authorization join and
+				// projects once, for the subscriber as it is then.
 				page = append(page, cloneEvent(event))
 			}
 			next = event.Sequence + 1
@@ -542,13 +559,13 @@ func (s *Service) Pull(ctx context.Context, request PullRequest) (Page, error) {
 			}
 			authorizedPage := page[:0]
 			for _, event := range page {
-				allowed, authErr := s.authorizeDelivery(
+				delivered, allowed, authErr := s.authorizeDelivery(
 					ctx, freshSubscription, event, freshDecision)
 				if authErr != nil {
 					return Page{}, authErr
 				}
 				if allowed {
-					authorizedPage = append(authorizedPage, event)
+					authorizedPage = append(authorizedPage, delivered)
 				}
 			}
 			page = authorizedPage
@@ -694,38 +711,165 @@ func nilDependency(value any) bool {
 	}
 }
 
+// authorizeDelivery is the one gate every subscriber-facing read of an
+// envelope passes through — live delivery, resume from a cursor, and the
+// long-poll wait all go through Pull, and Pull delivers nothing that this has
+// not returned. It answers whether the subscriber may receive the event and,
+// if so, the event as that subscriber may see it.
+//
+// Authorization runs on the stored event's complete authorization join; the
+// label check then projects it (#562). The (domain, source, policy, object)
+// authorization is not a label check — evidence visibility is not consulted
+// by it — so a subscriber authorized on the action's own tuple would
+// otherwise receive citation identifiers, offsets, node and edge IDs and
+// label expressions for evidence drawn from sources whose labels it does not
+// hold.
 func (s *Service) authorizeDelivery(
 	ctx context.Context, subscription Subscription, event Event, decision auth.Decision,
-) (bool, error) {
+) (Event, bool, error) {
 	now := s.now().UTC()
 	fresh, guard, err := s.authorize(
 		ctx, auth.OperationSubscriptionCreate, event.Evidence, now)
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) || shoal.IsErrorCode(err, shoal.ErrorNotFound) {
-			return false, nil
+			return Event{}, false, nil
 		}
-		return false, err
+		return Event{}, false, err
 	}
 	fingerprint, err := auth.AuthorizationFingerprint(fresh)
 	if err != nil {
-		return false, err
+		return Event{}, false, err
 	}
 	if fresh.Subject() != decision.Subject() ||
 		fingerprint != subscription.AuthorizationFingerprint {
-		return false, shoal.NewError(shoal.ErrorUnavailable, "subscription authorization changed")
+		return Event{}, false, shoal.NewError(shoal.ErrorUnavailable, "subscription authorization changed")
 	}
 	if err := s.leases.ValidateDelivery(
 		ctx, subscription.AgentID, subscription.AgentGeneration,
 	); err != nil {
-		return false, err
+		return Event{}, false, err
 	}
 	if !matchesFilter(subscription.Filter, event) {
-		return false, nil
+		return Event{}, false, nil
+	}
+	delivered, err := s.readableEvent(ctx, event)
+	if err != nil {
+		return Event{}, false, err
 	}
 	if err := guard.Check(ctx); err != nil {
-		return false, err
+		return Event{}, false, err
 	}
-	return true, nil
+	return delivered, true, nil
+}
+
+// readableEvent returns the event as the subscriber behind ctx may see it:
+// every exact evidence reference whose labels the subscriber does not hold is
+// removed whole — identifiers, anchor, citation and label expression — along
+// with any authorization join entry that points at it (#562).
+//
+// The decision is evidencelabels.Filter, the same one the dispatch read paths
+// use (#369), so the stream and Status/Pull/TeamActions cannot answer the
+// same question differently. No count of what was withheld is added anywhere
+// (#398), so a partial evidence list is not a completeness claim.
+//
+// event is not modified: it may be the durable record's own value, and the
+// durable record stays complete for the same reason the action record does.
+func (s *Service) readableEvent(ctx context.Context, event Event) (Event, error) {
+	consumed, consumedVisibility, consumedWithheld, err := s.readableEvidenceGroup(
+		ctx, event.ConsumedEvidence, event.ConsumedEvidenceVisibility)
+	if err != nil {
+		return Event{}, err
+	}
+	cited, citedVisibility, citedWithheld, err := s.readableEvidenceGroup(
+		ctx, event.CitedEvidence, event.CitedEvidenceVisibility)
+	if err != nil {
+		return Event{}, err
+	}
+	if !consumedWithheld && !citedWithheld {
+		return event, nil
+	}
+	result := cloneEvent(event)
+	result.ConsumedEvidence = cloneEvidenceReferences(consumed)
+	result.ConsumedEvidenceVisibility = cloneVisibilityGroup(consumedVisibility)
+	result.CitedEvidence = cloneEvidenceReferences(cited)
+	result.CitedEvidenceVisibility = cloneVisibilityGroup(citedVisibility)
+	join := make([]Evidence, 0, len(result.Evidence))
+	for _, item := range result.Evidence {
+		// An entry naming a withheld reference names material in a source
+		// the subscriber may not see — its object ID was chosen from that
+		// reference's own identifiers — so it goes with the reference.
+		if item.Reference != nil &&
+			!containsReference(*item.Reference, consumed, cited) {
+			continue
+		}
+		join = append(join, item)
+	}
+	result.Evidence = join
+	return result, nil
+}
+
+type labelledReference struct {
+	reference  interaction.EvidenceReference
+	visibility []string
+}
+
+func (s *Service) readableEvidenceGroup(
+	ctx context.Context,
+	references []interaction.EvidenceReference, visibility [][]string,
+) ([]interaction.EvidenceReference, [][]string, bool, error) {
+	if len(references) == 0 {
+		return references, visibility, false, nil
+	}
+	if len(visibility) != 0 && len(visibility) != len(references) {
+		// normalizeEvent refuses this at publish; a stored event that
+		// carries it is corrupt, and guessing an alignment could hand a
+		// reference the wrong label.
+		return nil, nil, false, shoal.NewError(
+			shoal.ErrorInternal,
+			"stored event evidence visibility does not align with its references")
+	}
+	labelled := make([]labelledReference, len(references))
+	for i := range references {
+		labelled[i].reference = references[i]
+		if len(visibility) != 0 {
+			labelled[i].visibility = visibility[i]
+		}
+	}
+	kept, withheld, err := evidencelabels.Filter(
+		ctx, s.evidenceVisibility, labelled,
+		func(value labelledReference) []string { return value.visibility })
+	if err != nil || !withheld {
+		return references, visibility, false, err
+	}
+	if len(kept) == 0 {
+		return nil, nil, true, nil
+	}
+	keptReferences := make([]interaction.EvidenceReference, len(kept))
+	keptVisibility := make([][]string, len(kept))
+	for i, value := range kept {
+		keptReferences[i] = value.reference
+		keptVisibility[i] = value.visibility
+	}
+	// The visibility group's shape must not outlive what it described. A
+	// group whose every remaining entry is empty is returned as nil — the
+	// exact shape of an event that never carried labelled evidence —
+	// because a non-nil array of empty entries would itself say "a labelled
+	// reference was here and was withheld" (#398).
+	return keptReferences, canonicalVisibilityGroup(keptVisibility), true, nil
+}
+
+func containsReference(
+	reference interaction.EvidenceReference,
+	groups ...[]interaction.EvidenceReference,
+) bool {
+	for _, group := range groups {
+		for _, candidate := range group {
+			if reflect.DeepEqual(reference, candidate) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Service) authorize(

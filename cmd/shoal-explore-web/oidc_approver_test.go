@@ -588,7 +588,7 @@ func TestApproverMappingDigestIsSemantic(t *testing.T) {
 			t.Fatal(err)
 		}
 		mapping, err := parseApproverMapping(
-			raw, issuer.server.URL, []string{testAudience})
+			raw, issuer.server.URL, []string{testAudience}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -3544,32 +3545,16 @@ func withinScope(permitted [][]byte, scope []byte) bool {
 func (s *DispatchService) readableRecord(
 	ctx context.Context, record ActionRecord,
 ) (ActionRecord, error) {
-	if len(record.Evidence) == 0 {
-		return record, nil
+	// The rule itself lives in evidencelabels.Filter, shared with fleet
+	// event delivery (#562), so the dispatch reads and the event stream
+	// cannot answer the same question differently.
+	readable, withheld, err := evidencelabels.Filter(
+		ctx, s.evidenceVisibility, record.Evidence,
+		func(reference EvidenceRef) []string { return reference.Visibility })
+	if err != nil {
+		return ActionRecord{}, err
 	}
-	readable := make([]EvidenceRef, 0, len(record.Evidence))
-	for _, reference := range record.Evidence {
-		if len(reference.Visibility) == 0 {
-			readable = append(readable, reference)
-			continue
-		}
-		if s.evidenceVisibility == nil {
-			// Nothing can evaluate the label, so nothing may be shown it.
-			continue
-		}
-		visible, err := s.evidenceVisibility.VisibleToReader(
-			ctx, reference.Visibility)
-		if err != nil {
-			// The question failing is not a false answer. Returning the error
-			// keeps a transient fault from reading as a redaction, which
-			// would look identical to a permanent one.
-			return ActionRecord{}, err
-		}
-		if visible {
-			readable = append(readable, reference)
-		}
-	}
-	if len(readable) == len(record.Evidence) {
+	if !withheld {
 		return record, nil
 	}
 	redacted := cloneActionRecord(record)

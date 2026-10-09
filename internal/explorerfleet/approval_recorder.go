@@ -167,6 +167,15 @@ func approvalQueryDigest(audit fleet.ApprovalAudit) string {
 	}
 	writeActionField(digest, []byte(audit.Provenance.MatchedValue))
 	writeActionField(digest, audit.Provenance.MappingDigest[:])
+	// The stable identity claim path (#526), only when present, so every
+	// provenance without one digests exactly as before.
+	if len(audit.Provenance.IdentityClaimPath) > 0 {
+		writeActionField(digest, []byte("identity-claim"))
+		writeActionField(digest, []byte(strconv.Itoa(len(audit.Provenance.IdentityClaimPath))))
+		for _, segment := range audit.Provenance.IdentityClaimPath {
+			writeActionField(digest, []byte(segment))
+		}
+	}
 	return interaction.Digest(
 		query + ":provenance:" + hex.EncodeToString(digest.Sum(nil)))
 }

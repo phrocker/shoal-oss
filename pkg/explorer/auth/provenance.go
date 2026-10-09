@@ -43,18 +43,26 @@ const (
 // carried, and the mapping digest pins the exact mapping in force when the
 // decision was minted. A consumer that must refuse once the mapping changes
 // compares MappingDigest with the digest now in force.
+//
+// IdentityClaimPath is set when the principal's identity was derived from an
+// operator-configured stable identity claim rather than from sub (#526). It
+// names the claim path; Subject still holds the token's raw sub, so the
+// record says both which claim named the principal and which per-client
+// subject the token carried. It is empty for every decision minted from sub.
 type GrantProvenance struct {
-	Issuer        string
-	Subject       string
-	ClaimPath     []string
-	MatchedValue  string
-	MappingDigest Digest
+	Issuer            string
+	Subject           string
+	ClaimPath         []string
+	MatchedValue      string
+	MappingDigest     Digest
+	IdentityClaimPath []string
 }
 
 // Set reports whether any provenance is present.
 func (p GrantProvenance) Set() bool {
 	return p.Issuer != "" || p.Subject != "" || len(p.ClaimPath) > 0 ||
-		p.MatchedValue != "" || p.MappingDigest != (Digest{})
+		p.MatchedValue != "" || p.MappingDigest != (Digest{}) ||
+		len(p.IdentityClaimPath) > 0
 }
 
 // Validate requires a set provenance to be complete and bounded. An empty
@@ -87,12 +95,24 @@ func (p GrantProvenance) Validate() error {
 	if p.MappingDigest == (Digest{}) {
 		return invalid("mapping digest")
 	}
+	// Optional: absent for a principal named by sub.
+	if len(p.IdentityClaimPath) > MaxGrantClaimPathSegments {
+		return invalid("identity claim path")
+	}
+	for _, segment := range p.IdentityClaimPath {
+		if !validProvenanceText(segment) {
+			return invalid("identity claim path")
+		}
+	}
 	return nil
 }
 
 // Clone returns an independent copy.
 func (p GrantProvenance) Clone() GrantProvenance {
 	p.ClaimPath = append([]string(nil), p.ClaimPath...)
+	if p.IdentityClaimPath != nil {
+		p.IdentityClaimPath = append([]string(nil), p.IdentityClaimPath...)
+	}
 	return p
 }
 
@@ -106,6 +126,14 @@ func (p GrantProvenance) Equal(other GrantProvenance) bool {
 	}
 	for index := range p.ClaimPath {
 		if p.ClaimPath[index] != other.ClaimPath[index] {
+			return false
+		}
+	}
+	if len(p.IdentityClaimPath) != len(other.IdentityClaimPath) {
+		return false
+	}
+	for index := range p.IdentityClaimPath {
+		if p.IdentityClaimPath[index] != other.IdentityClaimPath[index] {
 			return false
 		}
 	}
@@ -146,4 +174,16 @@ func (e *digestEncoder) grantProvenance(p GrantProvenance) {
 	}
 	e.text(p.MatchedValue)
 	e.bytes(p.MappingDigest[:])
+	// The identity claim path (#526) is appended only when present, behind
+	// its own marker, so a provenance minted from sub keeps the fingerprint
+	// it had before the field existed. The marker is 4: each marker in the
+	// fingerprint names one section, and 1 (ontology), 2 (provenance) and 3
+	// (the executor binding, #557) are taken.
+	if len(p.IdentityClaimPath) > 0 {
+		e.uint64(4)
+		e.uint64(uint64(len(p.IdentityClaimPath)))
+		for _, segment := range p.IdentityClaimPath {
+			e.text(segment)
+		}
+	}
 }

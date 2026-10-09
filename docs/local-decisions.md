@@ -432,7 +432,8 @@ remain their own controls. #397 provides a reusable accumulator but does not sto
 training examples or make probabilities into attributable risk contributions.
 
 The external-executor completion path landed in #394. Shared/private deployments
-must account for #369 (fleet evidence visibility), #398 (absent versus foreign
+must account for #369 and #562 (fleet evidence visibility on dispatch reads and
+event delivery), #398 (absent versus foreign
 principal disclosure), and #370 (descriptor scope). #385 supplies effect/egress
 classification and #388 supplies pre-call admission for managed external actions.
 A public-repository, read-only local showcase can proceed without claiming those

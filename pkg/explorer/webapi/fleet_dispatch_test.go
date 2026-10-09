@@ -890,4 +890,42 @@ func TestFleetDispatchErrorMarksEveryIndeterminateJoin(t *testing.T) {
 			}
 		})
 	}
+	// The identity scheme moved (#526). Its arm sits above the approver
+	// mapping's and the generic conflict arm. Nothing was written — the
+	// request stays as it was and can only expire — so it is a clean 409,
+	// never marked, in every form; and it keeps its own sentinel, even when
+	// joined with a mapping move it would otherwise be read as.
+	for _, probe := range []struct {
+		name string
+		err  error
+	}{
+		{"identity scheme moved", fleet.ErrIdentitySchemeMoved},
+		{"identity scheme moved, as the service raises it", shoal.WrapError(
+			shoal.ErrorConflict,
+			"the request was made under an identity scheme that is no longer in force",
+			fleet.ErrIdentitySchemeMoved)},
+		{"identity scheme moved, joined", errors.Join(
+			errors.New("context"), fleet.ErrIdentitySchemeMoved)},
+		{"identity scheme moved, joined with a mapping move", errors.Join(
+			fleet.ErrApproverMappingMoved, fleet.ErrIdentitySchemeMoved)},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			mapped := fleetApprovalError(probe.err)
+			if explorer.IsIndeterminateCommit(mapped) {
+				t.Fatal("a moved identity scheme is marked indeterminate; " +
+					"nothing was committed")
+			}
+			if got := primaryErrorCode(mapped); got != shoal.ErrorConflict {
+				t.Fatalf("code = %q, want conflict", got)
+			}
+			if !errors.Is(mapped, fleet.ErrIdentitySchemeMoved) {
+				t.Fatal("the mapped error lost its sentinel")
+			}
+			// The arm that answered is the scheme's: the transport message
+			// names the scheme, not the mapping or a generic conflict.
+			if !strings.Contains(mapped.Error(), "identity scheme") {
+				t.Fatalf("answered by another arm: %v", mapped)
+			}
+		})
+	}
 }

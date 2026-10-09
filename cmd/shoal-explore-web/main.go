@@ -338,6 +338,20 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Operator file (shoal.approvers/v1) mapping OIDC humans to the "+
 			"approver role on an audience of its own; without it no token "+
 			"may approve. Environment fallback SHOAL_OIDC_APPROVER_MAPPING_FILE")
+	oidcIdentityClaim := flags.String(
+		"oidc-identity-claim", "",
+		"Stable identity claim (#526) as a JSON array of path segments, such "+
+			"as '[\"oid\"]'. Requesters and approvers are then named "+
+			"oidcid:<iss>#<tag>#<value> on both branches; the approver mapping must "+
+			"restate it as identity_claim. Environment fallback "+
+			"SHOAL_OIDC_IDENTITY_CLAIM")
+	oidcIdentitySchemeMigrate := flags.String(
+		"oidc-identity-scheme-migrate", "",
+		"One-shot identity scheme switch: the digest (64 hex digits, as the "+
+			"startup refusal prints it) of the scheme recorded for -oidc-issuer "+
+			"that this rollout replaces. Startup proceeds only if the recorded "+
+			"scheme is that one, or already this replica's. Without it a "+
+			"replica whose scheme differs from the recorded one refuses to start")
 	oidcTokenEndpoint := flags.String(
 		"oidc-token-endpoint", "",
 		"Token endpoint override for browser login; otherwise read from "+
@@ -467,6 +481,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		approverMappingFile: firstNonEmpty(
 			*oidcApproverMappingFile,
 			os.Getenv("SHOAL_OIDC_APPROVER_MAPPING_FILE")),
+		identityClaim: firstNonEmpty(
+			*oidcIdentityClaim, os.Getenv("SHOAL_OIDC_IDENTITY_CLAIM")),
 	}, legacyEntraConfig{
 		tenantID: firstNonEmpty(
 			*entraTenant, os.Getenv("SHOAL_ENTRA_TENANT")),
@@ -532,20 +548,37 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// The approver mapping in force. Zero when none is configured; the
 	// approval service pins every decision to it.
 	var approverMapping auth.Digest
+	// The identity scheme the OIDC authenticator mints under (#526); nil
+	// for any other authenticator.
+	var identityScheme *identitySchemeConfig
 	if oidcAuthenticator, ok := authenticator.(*oidcAuthenticator); ok {
 		// An approver mapping needs an issuer that states public subject
-		// identifiers only; refuse to start otherwise, including when
-		// discovery cannot be read.
+		// identifiers only, unless a stable identity claim is configured;
+		// refuse to start otherwise, including when discovery cannot be
+		// read.
 		if err := oidcAuthenticator.verifyApproverDiscovery(ctx); err != nil {
 			listener.Close()
 			return fmt.Errorf(
 				"refusing to serve %s with -oidc-approver-mapping-file: the "+
-					"issuer's discovery must state subject_types_supported "+
+					"issuer's discovery must be readable and, without "+
+					"-oidc-identity-claim, state subject_types_supported "+
 					"[\"public\"] only (pairwise subjects, as Entra issues, "+
 					"would let one human approve their own request): %w",
 				listener.Addr(), err)
 		}
 		approverMapping = oidcAuthenticator.approverMappingDigest()
+		migrateFrom, err := parseIdentitySchemeMigrate(
+			strings.TrimSpace(*oidcIdentitySchemeMigrate))
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		scheme := oidcAuthenticator.identityScheme()
+		identityScheme = &identitySchemeConfig{
+			scheme: scheme, migrateFrom: migrateFrom,
+		}
+		fmt.Fprintf(output, "OIDC identity scheme for %s: %s\n",
+			scheme.issuer, coordination.Digest(scheme.digest))
 		browserAuth, err = oidcAuthenticator.browserAuthConfig(ctx)
 		if err != nil {
 			listener.Close()
@@ -577,6 +610,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		approverMapping: func(context.Context) (auth.Digest, error) {
 			return approverMapping, nil
 		},
+		identityScheme: identityScheme,
 
 		executorAttestation: attestationTrust,
 
@@ -1025,6 +1059,10 @@ type serviceConfig struct {
 	// approverMapping returns the operator approver mapping digest in force
 	// (#451), or the zero digest. Nil means none.
 	approverMapping func(context.Context) (auth.Digest, error)
+	// identityScheme is the OIDC identity scheme in force (#526), recorded
+	// in, or checked against, the coordination store before anything is
+	// served. Nil for an authenticator that is not OIDC.
+	identityScheme *identitySchemeConfig
 }
 
 // openedService is the constructed workspace service together with what the
@@ -1091,6 +1129,15 @@ func openService(
 			return closed, err
 		}
 		corpus := embedded.Explorer
+		// Before anything else reads or writes: a replica naming principals
+		// under another identity scheme than the one recorded refuses to
+		// start (#526).
+		if err := stampIdentityScheme(
+			ctx, embedded.Runtime.EmbeddedEngine(), runtimeConfig.CoordinationTable,
+			config.identityScheme); err != nil {
+			embedded.Close()
+			return closed, err
+		}
 		// The policy catalog is durable and lives in its own directory, not a
 		// subdirectory of the corpus: the corpus engine treats every
 		// subdirectory as a table, so nesting the store there would corrupt
@@ -1331,6 +1378,9 @@ func openService(
 			// The operator approver mapping in force; decisions and
 			// materializations are pinned to it.
 			ApproverMapping: config.approverMapping,
+			// How principals are named (#526); the zero value is the
+			// sub-derived scheme every host ran before.
+			IdentityScheme: config.identityScheme.approvals(),
 		})
 		if err != nil {
 			store.Close()

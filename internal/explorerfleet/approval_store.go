@@ -9,6 +9,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
@@ -141,6 +142,9 @@ func (s *ApprovalStore) ApplyApproval(
 	case readErr == nil && current.Version != mutation.ExpectedVersion:
 		return fleet.ApprovalRecord{}, fleet.ErrApprovalConflict
 	case readErr == nil:
+		if err := refuseRewrittenApproval(current, canonical); err != nil {
+			return fleet.ApprovalRecord{}, err
+		}
 		intentGuard.Mode = guard.ModeMutate
 		intentGuard.ExpectedEpoch = head.Epoch
 		intentGuard.ExpectedDigest = head.LogicalDigest
@@ -201,6 +205,110 @@ func (s *ApprovalStore) ApplyApproval(
 		return fleet.ApprovalRecord{}, fleet.ErrApprovalConflict
 	}
 	return stored, nil
+}
+
+// refuseRewrittenApproval is the approval record's counterpart of
+// refuseRewrittenIdentity (#461), and exists for the same reason: the version
+// compare-and-set stops two concurrent writers, not one writer that reads
+// version N and writes N+1 with a field it should never have touched. The
+// service builds every transition by cloning the stored record, so nothing
+// rewrites these today; this makes that a property of the store rather than
+// of the absence of an assignment.
+//
+// Creation-time state, immutable from the first write:
+//
+//   - ID, and Request in its entirety: the request is the exact record that
+//     materializes, and it carries the requester's subject, actor, client and
+//     delegation chain, which are who the approver is judged independent of.
+//     refuseRewrittenIdentity names the field for the identity and scope
+//     fields; anything else in the request is caught by the full comparison.
+//   - RequestDigest, PolicyGeneration: what the approver reviews and names.
+//   - RequestedAt, ExpiresAt: the window. Moving ExpiresAt would extend the
+//     time an approval may become work.
+//   - IdentityScheme (#526): the scheme the requester was named under. It is
+//     what makes the requester comparable with an approver at all; a write
+//     that changed it could make a pre-switch request decidable under the
+//     new scheme.
+//
+// Set-once state, immutable once written: the decision (Verdict, the
+// approver fields, DecidedAt, the decision request and correlation IDs, the
+// mapping digest and provenance), because an approval is judged on who gave
+// it; and MaterializedAt, because the action is built from it.
+//
+// State, Version, UpdatedAt and the first writes of the set-once fields are
+// the transitions themselves and are not listed.
+//
+// ErrorInternal, as refuseRewrittenIdentity's is: only a service that rewrote
+// its own record reaches it, and it must be distinguishable from Validate.
+func refuseRewrittenApproval(current, next fleet.ApprovalRecord) error {
+	switch {
+	case !bytes.Equal(current.ID, next.ID):
+		return rewrittenApproval("ID")
+	case current.IdentityScheme != next.IdentityScheme:
+		return rewrittenApproval("identity scheme")
+	}
+	// The request before its digest and generation: Validate binds both to
+	// the request, so a rewritten request arrives with them rewritten too,
+	// and the refusal should name what was rewritten.
+	if err := refuseRewrittenIdentity(current.Request, next.Request); err != nil {
+		// Restated as the approval's, naming the request field.
+		message := err.Error()
+		var invariant *shoal.Error
+		if errors.As(err, &invariant) {
+			message = strings.TrimPrefix(invariant.Message, "fleet action ")
+		}
+		return shoal.WrapError(
+			shoal.ErrorInternal, "fleet approval request "+message, err)
+	}
+	if !reflect.DeepEqual(current.Request, next.Request) {
+		return rewrittenApproval("request")
+	}
+	switch {
+	case !bytes.Equal(current.RequestDigest, next.RequestDigest):
+		return rewrittenApproval("request digest")
+	case current.PolicyGeneration != next.PolicyGeneration:
+		return rewrittenApproval("policy generation")
+	case !current.RequestedAt.Equal(next.RequestedAt):
+		return rewrittenApproval("request time")
+	case !current.ExpiresAt.Equal(next.ExpiresAt):
+		return rewrittenApproval("expiry")
+	}
+	if current.Verdict != "" {
+		switch {
+		case current.Verdict != next.Verdict:
+			return rewrittenApproval("verdict")
+		case current.ApproverSubject != next.ApproverSubject:
+			return rewrittenApproval("approver subject")
+		case current.ApproverActor != next.ApproverActor:
+			return rewrittenApproval("approver actor")
+		case current.ApproverClientID != next.ApproverClientID:
+			return rewrittenApproval("approver client ID")
+		case current.ApproverFingerprint != next.ApproverFingerprint:
+			return rewrittenApproval("approver fingerprint")
+		case current.ApproverPolicyGeneration != next.ApproverPolicyGeneration:
+			return rewrittenApproval("approver policy generation")
+		case !current.DecidedAt.Equal(next.DecidedAt):
+			return rewrittenApproval("decision time")
+		case current.DecisionRequestID != next.DecisionRequestID:
+			return rewrittenApproval("decision request ID")
+		case current.DecisionCorrelationID != next.DecisionCorrelationID:
+			return rewrittenApproval("decision correlation ID")
+		case current.ApproverMappingDigest != next.ApproverMappingDigest:
+			return rewrittenApproval("approver mapping digest")
+		case !current.ApproverProvenance.Equal(next.ApproverProvenance):
+			return rewrittenApproval("approver provenance")
+		}
+	}
+	if !current.MaterializedAt.IsZero() &&
+		!current.MaterializedAt.Equal(next.MaterializedAt) {
+		return rewrittenApproval("materialization time")
+	}
+	return nil
+}
+
+func rewrittenApproval(field string) error {
+	return shoal.NewError(
+		shoal.ErrorInternal, "fleet approval "+field+" is immutable")
 }
 
 func (s *ApprovalStore) ScanApprovals(
