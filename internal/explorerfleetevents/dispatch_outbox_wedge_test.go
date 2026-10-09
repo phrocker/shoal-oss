@@ -33,6 +33,14 @@ type droppingPublisher struct {
 	published map[string]int
 }
 
+// MayPublishActionEvent delegates, so the fixture does not get to decide
+// the question under test.
+func (p *droppingPublisher) MayPublishActionEvent(
+	ctx context.Context, kind string, record fleet.ActionRecord,
+) (bool, error) {
+	return p.inner.MayPublishActionEvent(ctx, kind, record)
+}
+
 func (p *droppingPublisher) PublishActionEvent(
 	ctx context.Context, kind string, record fleet.ActionRecord,
 ) error {
@@ -166,6 +174,56 @@ func TestAStrandedTransitionDoesNotBlockAnotherPrincipalsClaim(t *testing.T) {
 	}
 	_ = queued
 
+	// The predicate the reconciler now asks, exercised against the real
+	// publisher and this real row before anything claims it.
+	//
+	// It is what makes the skip a decision rather than an inference from an
+	// error code, and the distinction matters for a specific reason:
+	// classifying on ErrorUnauthorized made correctness depend on where
+	// #398's concealment turns a denial into ObjectNotFound. A visibility
+	// denial arriving as not-found would have blocked the caller's own
+	// transition again, and treating not-found as a skip would have
+	// swallowed a row that was genuinely absent. Asked as a question neither
+	// ambiguity exists: the row came out of the outbox, so it exists, and
+	// both codes mean only that this caller has no standing on the object.
+	for _, probe := range []struct {
+		name string
+		ctx  context.Context
+		want bool
+	}{
+		{"the transition's own author", enqueuer, true},
+		// A false answer, not an error, which is the whole point.
+		{"a different principal", worker, false},
+		// The guard the per-kind rule was providing, and the one thing a
+		// later relaxation could quietly widen: same scopes, so it can see
+		// the action, and no operation that publishes this kind.
+		{"a read-only caller with visibility",
+			bind("owner", "actor", "request", auth.OperationRetrieve), false},
+	} {
+		may, err := real.MayPublishActionEvent(
+			probe.ctx, "action.enqueued", stored)
+		if err != nil {
+			t.Fatalf("%s: the question failed instead of answering: %v",
+				probe.name, err)
+		}
+		if may != probe.want {
+			t.Fatalf("%s: MayPublishActionEvent = %v, want %v",
+				probe.name, may, probe.want)
+		}
+	}
+	// An unanswerable question is an error, never a skip. A kind the
+	// authorization table does not recognise cannot be judged, and skipping
+	// it would leave a row pending that nothing will ever deliver.
+	if _, err := real.MayPublishActionEvent(
+		enqueuer, "action.invented", stored); err == nil {
+		t.Fatal("an unrecognised kind answered instead of erroring, so a " +
+			"row nothing can classify would be skipped forever")
+	}
+	// And asking must not publish: the enqueued row is still pending below.
+	if publisher.published["action.enqueued"] != 0 {
+		t.Fatal("asking whether a row may be published published it")
+	}
+
 	// Now a worker that is not the enqueuer claims it. Its own transition is
 	// publishable by it; the stranded action.enqueued row is not — it carries
 	// the enqueuer's authority, and the publisher's gates are per-kind.
@@ -261,6 +319,16 @@ func bytes32(b byte) []byte {
 type refusingPublisher struct {
 	inner *ActionEventPublisher
 	kind  string
+}
+
+// MayPublishActionEvent delegates. The refusal under test is a *publish*
+// failure of the caller's own transition, which is never asked about — so
+// answering truthfully here keeps the test about the own-row rule rather
+// than about the predicate.
+func (p *refusingPublisher) MayPublishActionEvent(
+	ctx context.Context, kind string, record fleet.ActionRecord,
+) (bool, error) {
+	return p.inner.MayPublishActionEvent(ctx, kind, record)
 }
 
 func (p *refusingPublisher) PublishActionEvent(

@@ -528,6 +528,12 @@ type events struct{}
 
 func (events) PublishActionEvent(context.Context, string, fleet.ActionRecord) error { return nil }
 
+func (events) MayPublishActionEvent(
+	context.Context, string, fleet.ActionRecord,
+) (bool, error) {
+	return true, nil
+}
+
 // memoryStore keeps descriptors in ID order, so a listing is a binary search
 // and the many-hidden-descriptors test stays fast.
 type memoryStore struct {

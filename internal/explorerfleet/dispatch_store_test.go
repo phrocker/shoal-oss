@@ -623,6 +623,12 @@ func (r *controlledIntegratedActionRecorder) RecordAction(
 
 type integratedEvents struct{}
 
+func (integratedEvents) MayPublishActionEvent(
+	context.Context, string, fleet.ActionRecord,
+) (bool, error) {
+	return true, nil
+}
+
 func (integratedEvents) PublishActionEvent(context.Context, string, fleet.ActionRecord) error {
 	return nil
 }

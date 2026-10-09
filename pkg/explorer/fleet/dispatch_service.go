@@ -2303,11 +2303,11 @@ func (s *DispatchService) ReconcileActionTransitions(
 // that had just performed an irreversible external effect to reconcile an
 // outcome that needed no reconciling.
 //
-// So a refusal on a row that is not this caller's own is not an error here.
-// It means the row belongs to another principal's authority and will drain
-// when that principal next reconciles. The caller's own transition is still
-// an error, which is what ErrActionCommitted is for: that one it does need
-// to know about.
+// So a row that is not this caller's own and that it is not entitled to
+// publish is not an error here. It belongs to another principal's authority
+// and will drain when that principal next reconciles. The caller's own
+// transition is still an error, which is what ErrActionCommitted is for:
+// that one it does need to know about.
 //
 // ownKind and ownVersion name the caller's own transition, or are zero for a
 // reconcile that is not publishing anything of its own (an operator draining
@@ -2323,24 +2323,30 @@ func (s *DispatchService) reconcileActionTransitions(
 			return err
 		}
 		for _, transition := range page.Transitions {
-			if err := s.events.PublishActionEvent(
-				ctx, transition.Kind, transition.Record); err != nil {
-				own := ownKind != "" &&
-					transition.Kind == ownKind &&
-					transition.Record.Version == ownVersion
-				// Skipped, not swallowed: the row stays pending, so the
-				// principal whose authority it carries still delivers it.
-				//
-				// Unauthorized only. An evidence-visibility denial inside
-				// fleetevents reaches AuthorizeObject, which under #398
-				// answers ObjectNotFound — and skipping on that would hide a
-				// row that is genuinely absent rather than merely foreign.
-				// If that case turns out to be reachable here, the answer is
-				// for the publisher to say whether this caller may publish a
-				// row, not for this function to infer it from an error code.
-				if !own && shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+			own := ownKind != "" &&
+				transition.Kind == ownKind &&
+				transition.Record.Version == ownVersion
+			// Asked, not inferred. A row this caller may not publish is
+			// skipped and stays pending, so the principal whose authority it
+			// carries still delivers it — but the caller's own transition is
+			// never skipped, because there is nobody else to drain that one
+			// and a committed write whose event never published is exactly
+			// what ErrActionCommitted reports.
+			//
+			// An error from the question is not a skip. Only a false answer
+			// is.
+			if !own {
+				may, err := s.events.MayPublishActionEvent(
+					ctx, transition.Kind, transition.Record)
+				if err != nil {
+					return err
+				}
+				if !may {
 					continue
 				}
+			}
+			if err := s.events.PublishActionEvent(
+				ctx, transition.Kind, transition.Record); err != nil {
 				return err
 			}
 			if err := s.outbox.CompleteActionTransition(

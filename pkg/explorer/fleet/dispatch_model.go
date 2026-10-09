@@ -1035,6 +1035,24 @@ type ActionRecorder interface {
 
 type ActionEventPublisher interface {
 	PublishActionEvent(context.Context, string, ActionRecord) error
+	// MayPublishActionEvent reports whether this caller is entitled to
+	// publish this transition, evaluated with the same identity and standing
+	// gates PublishActionEvent applies.
+	//
+	// It exists so that skipping a row the caller may not publish is a
+	// decision rather than an inference from an error code (#480 item 3).
+	// The alternative was to skip on ErrorUnauthorized, which makes
+	// correctness depend on where #398's concealment turns a refusal into
+	// ObjectNotFound: a visibility denial arriving as not-found would block
+	// the caller's own transition again, and treating not-found as a skip
+	// would swallow a row that is genuinely absent.
+	//
+	// A false answer means "not mine" — the row stays pending for the
+	// principal whose authority it carries. An error means the question
+	// could not be answered, which is not the same thing and is never a
+	// skip.
+	MayPublishActionEvent(
+		context.Context, string, ActionRecord) (bool, error)
 }
 
 type ActionTransitionPage struct {
