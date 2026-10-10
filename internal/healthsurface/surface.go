@@ -32,8 +32,12 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/phrocker/shoal-oss/internal/promtext"
 )
 
 // The health surface is deliberately a second listener rather than two more
@@ -58,6 +62,10 @@ import (
 // fixed string; neither consults the corpus, the policy catalog, the
 // authenticator, or the request. An unauthenticated prober learns that a Shoal
 // workspace process is up, which the open TCP port already tells it.
+//
+// The one optional route, /metrics, exists only when the host supplies a
+// Config.Metrics writer, and that writer carries the disclosure obligation for
+// what it emits (see Config).
 
 // healthState is the readiness bit shared between the serving path and the
 // health handler. It is false until the workspace is actually serving and
@@ -70,9 +78,48 @@ type State struct {
 func (s *State) MarkReady()    { s.ready.Store(true) }
 func (s *State) MarkDraining() { s.ready.Store(false) }
 
+// MetricsWriter renders Prometheus text exposition samples into the builder.
+//
+// It is the same shape as roleops.MetricsWriter, and an alias of the unnamed
+// function type, so a roleops.MetricsWriter value is assignable here without a
+// conversion and one producer can serve both surfaces. It is called once per
+// scrape, concurrently with every other scrape and with whatever updates the
+// values it reads, so it must be safe for that. Escape label values with
+// promtext.
+type MetricsWriter = func(*strings.Builder)
+
+// Config is the optional part of the surface.
+//
+// The zero value is the surface as it always was: two routes, and every other
+// path a 404.
+type Config struct {
+	// Metrics, when set, is served as GET /metrics on the health listener.
+	//
+	// Whatever it writes is answered to anyone who can reach the health port,
+	// unauthenticated — the same audience as the probes. It must therefore
+	// carry operational counts only: no payload, identity, corpus or policy
+	// content. Once this is set, the surface's no-disclosure property is the
+	// producer's to keep.
+	Metrics MetricsWriter
+}
+
 // newHealthHandler builds the health mux. Any path other than the two routes
 // is a 404 from the mux, so the surface cannot grow by accident.
 func NewHandler(state *State) http.Handler {
+	return NewHandlerWithConfig(state, Config{})
+}
+
+// NewHandlerWithConfig is NewHandler with the optional routes config names.
+// /metrics exists only when config.Metrics is set; otherwise the path is a 404
+// like any other unregistered one.
+func NewHandlerWithConfig(state *State, config Config) http.Handler {
+	return newHandler(state, config, nil)
+}
+
+// newHandler takes the shutdown signal separately because only Start has one:
+// a handler mounted on a caller's own server is never told that server is
+// closing, and relies on the request context alone.
+func newHandler(state *State, config Config, closing <-chan struct{}) http.Handler {
 	mux := http.NewServeMux()
 	// Liveness answers for the process, not the workspace. It stays 200 while
 	// draining: a pod that is shedding traffic on purpose must not be killed
@@ -89,7 +136,80 @@ func NewHandler(state *State) http.Handler {
 		}
 		writeHealth(writer, http.StatusOK, "ready")
 	})
+	if config.Metrics != nil {
+		// "GET /metrics" also matches HEAD; every other method is a 405 with
+		// an Allow header from the mux, as for the probe routes.
+		mux.Handle("GET /metrics", metricsHandler{write: config.Metrics, closing: closing})
+	}
 	return mux
+}
+
+// metricsHandler serves one scrape.
+//
+// Three properties differ from roleops' /metrics, each deliberately:
+//
+//   - It answers GET and HEAD only. roleops accepts any method.
+//   - It is marked no-store. A cached scrape is a stale reading that looks
+//     current.
+//   - A panicking writer is a 500 with a fixed body. roleops lets the panic
+//     reach net/http, which keeps the server alive but aborts the connection,
+//     so the scraper sees a reset rather than a status it can alert on.
+//
+// The body is rendered completely before anything is written, so a writer
+// that panics part-way never leaves a truncated exposition behind a 200.
+//
+// The writer also runs off the request goroutine, so that it cannot hold the
+// listener's graceful close: a scrape still inside its writer when shutdown
+// begins is answered 503 and its connection released, rather than keeping
+// Drain waiting until its deadline. The writer itself is not interrupted — a
+// function of a builder cannot be — and finishes into a buffer nobody reads.
+type metricsHandler struct {
+	write   MetricsWriter
+	closing <-chan struct{}
+}
+
+type metricsResult struct {
+	body     string
+	panicked bool
+}
+
+func (h metricsHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	rendered := make(chan metricsResult, 1)
+	go func() {
+		result := metricsResult{panicked: true}
+		defer func() {
+			// recover only stops the panic. Its value is not reported: the
+			// body is fixed, and the surface discloses nothing it was not
+			// built to.
+			_ = recover()
+			rendered <- result
+		}()
+		var builder strings.Builder
+		h.write(&builder)
+		result = metricsResult{body: builder.String()}
+	}()
+
+	select {
+	case result := <-rendered:
+		if result.panicked {
+			writeMetricsFailure(writer, http.StatusInternalServerError, "metrics unavailable")
+			return
+		}
+		writer.Header().Set("Content-Type", promtext.ContentType)
+		writer.Header().Set("Cache-Control", "no-store")
+		writer.Header().Set("X-Content-Type-Options", "nosniff")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(result.body))
+	case <-h.closing:
+		writeMetricsFailure(writer, http.StatusServiceUnavailable, "shutting down")
+	case <-request.Context().Done():
+		// The scraper is gone; there is no one to answer.
+	}
+}
+
+func writeMetricsFailure(writer http.ResponseWriter, status int, body string) {
+	writer.Header().Set("Cache-Control", "no-store")
+	writeHealth(writer, status, body)
 }
 
 func writeHealth(writer http.ResponseWriter, status int, body string) {
@@ -122,14 +242,27 @@ type Server struct {
 // workspace listener does not have that property, because it is bound early so
 // an address the workspace may not serve is refused before the corpus opens.
 func Start(address string, state *State) (*Server, error) {
+	return StartWithConfig(address, state, Config{})
+}
+
+// StartWithConfig is Start with the optional routes config names. The serve
+// loop and the shutdown ordering are Start's exactly.
+func StartWithConfig(address string, state *State, config Config) (*Server, error) {
 	listener, err := ListenTCP("tcp", address)
 	if err != nil {
 		return nil, err
 	}
+	// closing is closed by net/http as soon as Shutdown is called, through
+	// RegisterOnShutdown, so a scrape blocked in its writer lets go of its
+	// connection instead of holding the graceful close. Shutdown itself is
+	// unchanged. net/http runs the hook on every Shutdown call, hence the
+	// Once.
+	closing := make(chan struct{})
+	var closeOnce sync.Once
 	health := &Server{
 		listener: listener,
 		server: &http.Server{
-			Handler:           NewHandler(state),
+			Handler:           newHandler(state, config, closing),
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      10 * time.Second,
@@ -137,6 +270,7 @@ func Start(address string, state *State) (*Server, error) {
 		},
 		done: make(chan struct{}),
 	}
+	health.server.RegisterOnShutdown(func() { closeOnce.Do(func() { close(closing) }) })
 	go func() {
 		defer close(health.done)
 		err := health.server.Serve(listener)

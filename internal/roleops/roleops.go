@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/phrocker/shoal-oss/internal/promtext"
 )
 
 type Dependency struct {
@@ -102,7 +104,7 @@ func Handler(dependencies *Dependencies, writeMetrics MetricsWriter) http.Handle
 		}{Ready: status == http.StatusOK, Dependencies: dependenciesSnapshot(dependencies)})
 	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.Header().Set("Content-Type", promtext.ContentType)
 		var b strings.Builder
 		b.WriteString("# HELP shoal_dependency_ready Whether an operational dependency is ready.\n")
 		b.WriteString("# TYPE shoal_dependency_ready gauge\n")
@@ -111,7 +113,7 @@ func Handler(dependencies *Dependencies, writeMetrics MetricsWriter) http.Handle
 			if dependency.Ready {
 				value = 1
 			}
-			fmt.Fprintf(&b, "shoal_dependency_ready{name=%q} %d\n", dependency.Name, value)
+			fmt.Fprintf(&b, "shoal_dependency_ready{%s} %d\n", promtext.Label("name", dependency.Name), value)
 		}
 		if writeMetrics != nil {
 			writeMetrics(&b)
