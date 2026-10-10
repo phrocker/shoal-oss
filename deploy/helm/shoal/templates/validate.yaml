@@ -281,30 +281,22 @@
 {{- if not $explorer.chat.model -}}
 {{- fail "explorer.chat.model is required when explorer.chat.provider is set" -}}
 {{- end -}}
-{{- $chatURL := trim $explorer.chat.baseURL -}}
-{{- if not (include "shoal.urlIsAbsolute" $chatURL) -}}
-{{- fail "explorer.chat.baseURL must be an absolute http(s) URL with a host" -}}
-{{- end -}}
-{{- $chatLoopback := include "shoal.urlIsLoopback" $chatURL -}}
-{{- if and (include "shoal.urlIsPlaintext" $chatURL) (not $chatLoopback) -}}
-{{- fail "explorer.chat.baseURL must use HTTPS unless the host is loopback" -}}
-{{- end -}}
-{{- if not $chatLoopback -}}
+{{- /* Parsed, not prefix-matched (#423): "http://localhost.example" starts
+       with "http://localhost" and is remote, so a prefix test skipped the
+       credential requirement for it. */ -}}
+{{- $chatURL := trim (toString (default "" $explorer.chat.baseURL)) -}}
+{{- include "shoal.explorerProviderURL" (dict "name" "explorer.chat.baseURL" "value" $chatURL) -}}
+{{- if not (include "shoal.urlIsLoopback" $chatURL) -}}
 {{- if not $explorer.chat.credentialSecretName -}}
 {{- fail (printf "explorer.chat.credentialSecretName is required for a remote chat base URL (%q): the workspace reads %s at request time, and nothing projects it into the pod without a Secret" $explorer.chat.baseURL $explorer.chat.apiKeyEnv) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if has $explorer.embedding.provider (list "ollama" "openai" "voyage") -}}
-{{- $embeddingURL := trim $explorer.embedding.baseURL -}}
+{{- $embeddingURL := trim (toString (default "" $explorer.embedding.baseURL)) -}}
 {{- /* Voyage supplies its own default URL when the value is empty. */ -}}
 {{- if or $embeddingURL (ne $explorer.embedding.provider "voyage") -}}
-{{- if not (include "shoal.urlIsAbsolute" $embeddingURL) -}}
-{{- fail "explorer.embedding.baseURL must be an absolute http(s) URL with a host" -}}
-{{- end -}}
-{{- if and (include "shoal.urlIsPlaintext" $embeddingURL) (not (include "shoal.urlIsLoopback" $embeddingURL)) -}}
-{{- fail "explorer.embedding.baseURL must use HTTPS unless the host is loopback" -}}
-{{- end -}}
+{{- include "shoal.explorerProviderURL" (dict "name" "explorer.embedding.baseURL" "value" $embeddingURL) -}}
 {{- end -}}
 {{- end -}}
 {{- if and $explorer.embedding.provider (has $explorer.embedding.provider (list "openai" "voyage")) -}}
@@ -1329,7 +1321,9 @@
 {{- fail (printf "%s.target.idempotencyRetention (%q) must exceed timing.operationTimeout + 5s: an action whose deadline outlives the target's deduplication window cannot be performed under the key's guarantee, so nothing would ever be claimable" $key (toString $target.idempotencyRetention)) -}}
 {{- end -}}
 {{- end -}}
-{{- range $bound := list (list "maxInFlight" 1 64) (list "pullLimit" 1 256) (list "maxResponseBytes" 1 1048576) (list "healthPort" 1 65535) -}}
+{{- /* healthPort starts at 1024, not 1 (#423): the pod runs as uid 65532 with
+       all capabilities dropped and cannot bind a privileged port. */ -}}
+{{- range $bound := list (list "maxInFlight" 1 64) (list "pullLimit" 1 256) (list "maxResponseBytes" 1 1048576) (list "healthPort" 1024 65535) -}}
 {{- $field := index $bound 0 -}}
 {{- $value := include "shoal.effectsGatewayWhole" (dict "name" (printf "%s.%s" $key $field) "value" (index $gateway $field)) -}}
 {{- if or (not $value) (lt (int64 $value) (int64 (index $bound 1))) (gt (int64 $value) (int64 (index $bound 2))) -}}
@@ -1483,7 +1477,14 @@
 {{- end -}}
 {{- end -}}
 
-{{- range $role, $fields := dict "writeTier" (list "grpcPort" "metricsPort") "tserver" (list "thriftPort" "metricsPort") "compactor" (list "thriftPort" "metricsPort") -}}
+{{- /* Bind ports for the storage-tier pods (#423). Every one of them runs as uid
+       65532 with all capabilities dropped, as the explorer and the gateways
+       do, so a privileged port renders a pod that cannot bind and restarts
+       forever. Only the ports a container binds are checked: a Service port
+       is the cluster's to choose. The read fleet binds readFleet.listen, not
+       readFleet.servicePort (which only names the container port), so its
+       listen address is the one checked. */ -}}
+{{- range $role, $fields := dict "writeTier" (list "grpcPort" "metricsPort") "tserver" (list "thriftPort" "metricsPort") "compactor" (list "thriftPort" "metricsPort") "readFleet" (list "metricsPort") -}}
 {{- if eq (include (printf "shoal.%sEnabled" $role) $) "true" -}}
 {{- range $field := $fields -}}
 {{- $port := int (index (index $.Values $role) $field) -}}
@@ -1491,6 +1492,13 @@
 {{- fail (printf "%s.%s must be 1024 or above (got %d): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $role $field $port) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (include "shoal.readFleetEnabled" .) "true" -}}
+{{- $readListen := trim (toString (default "" .Values.readFleet.listen)) -}}
+{{- $readListenPort := regexFind "[0-9]+$" (regexFind ":[0-9]+$" $readListen) -}}
+{{- if and $readListenPort (lt (int $readListenPort) 1024) -}}
+{{- fail (printf "readFleet.listen must bind a port of 1024 or above (got %q): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $readListen) -}}
 {{- end -}}
 {{- end -}}
 

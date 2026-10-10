@@ -181,12 +181,38 @@ and nothing else; it does not restrict which models may be called.
 {{- join "," $models -}}
 {{- end -}}
 
+{{- /*
+The explorer's host allow-list, trimmed and comma-joined for -allowed-host (#423).
+
+One definition, used by the guard in validate.yaml and by the argument in the
+StatefulSet, so the two cannot disagree about what an entry is. The gate matches
+an authority exactly, so every entry the chart passes must be one it can match:
+
+- A blank-after-trim entry is refused rather than dropped. The operator meant a
+  host there, and rendering a shorter list than they wrote is the partial
+  failure where one ingress name answers 421 while its neighbours work.
+- A comma inside an entry is refused. The entries are joined into one argument
+  that the binary splits on commas, so "a.test, " would arrive as "a.test" plus
+  a blank the binary drops quietly — the same shortened list, reached around
+  the blank check — and "a.test,b.test" is two entries written as one.
+- Whitespace inside an entry is refused. The binary trims each piece but keeps
+  interior space, and no Host header carries a space, so the entry matches
+  nothing.
+
+Emits the empty string for an empty list, which is what the guard tests.
+*/ -}}
 {{- define "shoal.explorerAllowedHosts" -}}
 {{- $hosts := list -}}
-{{- range .Values.explorer.allowedHosts -}}
-{{- $host := trim . -}}
+{{- range (default (list) .Values.explorer.allowedHosts) -}}
+{{- $host := trim (toString (default "" .)) -}}
 {{- if not $host -}}
 {{- fail "explorer.allowedHosts contains a blank-after-trim element: give every intended host a non-blank authority rather than silently shortening the allow-list" -}}
+{{- end -}}
+{{- if contains "," $host -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which holds a comma: entries are comma-joined into one -allowed-host argument that the workspace splits on commas, so this one entry becomes several and a blank piece is dropped silently. Give each authority its own list entry" $host) -}}
+{{- end -}}
+{{- if regexMatch `\p{Zs}` $host -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which holds whitespace inside the authority: the workspace matches the Host header exactly and no Host header carries a space, so every request for it is refused with 421" $host) -}}
 {{- end -}}
 {{- $hosts = append $hosts $host -}}
 {{- end -}}
@@ -357,6 +383,44 @@ true
 {{- if or (eq $host "localhost") (eq $host "::1")
           (eq $host "0:0:0:0:0:0:0:1") (regexMatch $v4 $host) -}}
 true
+{{- end -}}
+{{- end -}}
+
+{{- /*
+An explorer model-provider base URL (explorer.chat.baseURL,
+explorer.embedding.baseURL), refused here exactly where the workspace refuses
+it at startup (#423). Takes a dict of name (the values key) and value.
+
+pkg/model validates every provider the explorer offers (Ollama, the
+OpenAI-compatible client, Voyage) the same way, after trimming: an absolute
+http(s) URL with a host; no userinfo, query or fragment; a path of nothing or
+"/"; and plaintext only to a loopback host. The provider appends its own API
+path, so a base such as https://api.example.test/v1 is refused by the binary,
+and a chart that approved it would render a pod that exits at startup.
+
+A bare "?" or "#" with nothing after it is refused here as well. The
+OpenAI-compatible and Voyage clients refuse both; Ollama tolerates them. That
+is a false refusal of a URL nobody means to write, which is the safe
+direction for a guard to be wrong in.
+*/ -}}
+{{- define "shoal.explorerProviderURL" -}}
+{{- $name := .name -}}
+{{- $value := trim (toString (default "" .value)) -}}
+{{- if not (include "shoal.urlIsAbsolute" $value) -}}
+{{- fail (printf "%s must be an absolute http(s) URL with a host (got %q)" $name $value) -}}
+{{- end -}}
+{{- $parsed := urlParse $value -}}
+{{- if $parsed.userinfo -}}
+{{- fail (printf "%s must not carry userinfo (got %q): the workspace refuses a provider URL with credentials in it at startup. Put the credential in a Secret and name it in credentialSecretName" $name $value) -}}
+{{- end -}}
+{{- if or $parsed.query $parsed.fragment (contains "?" $value) (contains "#" $value) -}}
+{{- fail (printf "%s must not carry a query or fragment (got %q): the workspace refuses either at startup" $name $value) -}}
+{{- end -}}
+{{- if not (has $parsed.path (list "" "/")) -}}
+{{- fail (printf "%s must be the provider's root, with no path (got %q): the workspace appends the provider's own API path and refuses a base URL that already has one at startup" $name $value) -}}
+{{- end -}}
+{{- if and (include "shoal.urlIsPlaintext" $value) (not (include "shoal.urlIsLoopback" $value)) -}}
+{{- fail (printf "%s must use HTTPS unless the host is loopback (got %q): the workspace refuses plaintext HTTP to any other host at startup" $name $value) -}}
 {{- end -}}
 {{- end -}}
 

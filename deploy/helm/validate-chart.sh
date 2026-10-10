@@ -360,7 +360,7 @@ if [ -n "$repository" ] &&
     # explorer case names a storage class and a chat credential, so the
     # optional fields it quotes are rendered too.
     reference_chart="$reference/deploy/helm/shoal"
-    explorer_parsed=(--set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage)
+    explorer_parsed=(--set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage)
     for profile in explorer llm-gateway; do
       if [ "$profile" = explorer ]; then
         overrides=("${valid_explorer[@]}" "${explorer_parsed[@]}")
@@ -449,7 +449,7 @@ refuses "claim mapped to no values"     "${explorer_base[@]}" --set explorer.aut
 refuses "no allowed hosts"              "${explorer_base[@]}" --set explorer.allowedHosts=null
 refuses "more than one replica"         "${explorer_base[@]}" --set explorer.replicas=2
 refuses "mosaic budget with no window"  "${explorer_base[@]}" --set explorer.disclosure.mosaic.maxDomains=3,explorer.disclosure.mosaic.window=
-refuses "remote chat with no credential" "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1
+refuses "remote chat with no credential" "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test
 refuses "chat provider with no model"   "${explorer_base[@]}" --set explorer.chat.provider=ollama,explorer.chat.baseURL=http://localhost:11434
 refuses "voyage with no credential"     "${explorer_base[@]}" --set explorer.embedding.provider=voyage,explorer.embedding.model=v3
 refuses "ask executor not allowlisted"  "${explorer_base[@]}" --set explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434
@@ -473,7 +473,7 @@ refuses "placeholder fleet value"       "${explorer_base[@]}" --set 'explorer.au
 
 note "== valid configurations still render =="
 renders "loopback chat needs no credential" "${explorer_base[@]}" --set explorer.chat.provider=ollama,explorer.chat.model=llama3,explorer.chat.baseURL=http://localhost:11434
-renders "remote chat with a credential"     "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1,explorer.chat.credentialSecretName=chat
+renders "remote chat with a credential"     "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test,explorer.chat.credentialSecretName=chat
 renders "mosaic budget enabled"             "${explorer_base[@]}" --set explorer.disclosure.mosaic.maxDomains=3
 renders "withholding concealed"             "${explorer_base[@]}" --set explorer.disclosure.concealWithholding=true
 renders "ask executor wired"                "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434
@@ -492,6 +492,28 @@ for field in containerPort healthPort; do
 done
 renders "a privileged explorer Service port is not a bind port" "${explorer_base[@]}" --set explorer.servicePort=80
 renders "disabled explorer bind ports are ignored" --set explorer.containerPort=80,explorer.healthPort=443
+# A comma inside one entry splits it in the binary, and a blank piece is then
+# dropped there silently: the shortened list the blank check refuses, reached
+# around it. Whitespace inside an authority matches no Host header.
+# (--set-json is applied before --set, so it could not override the base's
+# list; an escaped comma keeps the separator inside one --set entry.)
+refuses_citing "which holds a comma" "a trailing comma inside one entry" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test\, }'
+refuses_citing "which holds a comma" "two authorities written as one entry" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test\,other.example.test}'
+refuses_citing "which holds whitespace inside the authority" "a space inside an authority" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal .example.test}'
+refuses_citing "explorer.allowedHosts contains a blank-after-trim element" "a null entry beside a valid host" "${explorer_base[@]}" --set 'explorer.allowedHosts[1]=null'
+assert_renders "an authority with a port is kept as written" '^ +- "-allowed-host=shoal\.example\.test:8443"$' "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test:8443}'
+
+# The read fleet binds readFleet.listen and readFleet.metricsPort; its
+# servicePort only names the container port.
+read_base=(-f "$chart/values-distributed.yaml")
+for port in 80 443 1023; do
+  refuses_citing "readFleet.metricsPort must be 1024 or above" "readFleet metricsPort=$port" "${read_base[@]}" --set "readFleet.metricsPort=$port"
+  refuses_citing "readFleet.listen must bind a port of 1024 or above" "readFleet listen :$port" "${read_base[@]}" --set "readFleet.listen=:$port"
+done
+refuses_citing "readFleet.listen must bind a port of 1024 or above" "readFleet listen on an address" "${read_base[@]}" --set "readFleet.listen=0.0.0.0:443"
+renders "readFleet metricsPort at the unprivileged boundary" "${read_base[@]}" --set readFleet.metricsPort=1024
+renders "readFleet listen at the unprivileged boundary" "${read_base[@]}" --set readFleet.listen=:1024,readFleet.servicePort=1024
+renders "disabled readFleet bind ports are ignored" "${read_base[@]}" --set readFleet.enabled=false,readFleet.metricsPort=80,readFleet.listen=:80
 
 for role in writeTier tserver compactor; do
   fields=(thriftPort metricsPort)
@@ -534,6 +556,23 @@ done
 for provider in ollama openai voyage; do
   renders "remote HTTPS $provider embedding with a credential" "${embedding_base[@]}" --set "explorer.embedding.provider=$provider,explorer.embedding.baseURL=https://models.example.test,explorer.embedding.credentialSecretName=embedding"
 done
+# What pkg/model refuses beyond the scheme and host: userinfo, a query, a
+# fragment, and any path but the root, for every provider the explorer offers.
+for url in 'https://user:pass@models.example.test' 'https://models.example.test/?x=1' 'https://models.example.test?' 'https://models.example.test/#top' 'https://models.example.test#' 'https://models.example.test/v1' 'http://localhost:11434/api'; do
+  case "$url" in
+    *@*) expected="must not carry userinfo" ;;
+    *\?*|*\#*) expected="must not carry a query or fragment" ;;
+    *) expected="must be the provider's root, with no path" ;;
+  esac
+  for provider in ollama openai; do
+    refuses_citing "explorer.chat.baseURL $expected" "a $provider chat URL $url" "${chat_base[@]}" --set "explorer.chat.provider=$provider,explorer.chat.baseURL=$url,explorer.chat.credentialSecretName=chat"
+  done
+  for provider in ollama openai voyage; do
+    refuses_citing "explorer.embedding.baseURL $expected" "a $provider embedding URL $url" "${embedding_base[@]}" --set "explorer.embedding.provider=$provider,explorer.embedding.baseURL=$url,explorer.embedding.credentialSecretName=embedding"
+  done
+done
+renders "a provider root with a trailing slash" "${chat_base[@]}" --set explorer.chat.provider=openai,explorer.chat.baseURL=https://models.example.test/,explorer.chat.credentialSecretName=chat
+renders "a provider URL with surrounding space, which the workspace trims" "${embedding_base[@]}" --set 'explorer.embedding.baseURL= http://localhost:11434 '
 renders "Voyage retains its built-in URL default" "${embedding_base[@]}" --set explorer.embedding.provider=voyage,explorer.embedding.baseURL=,explorer.embedding.credentialSecretName=embedding
 renders "fake embedding ignores provider URLs" "${embedding_base[@]}" --set explorer.embedding.provider=fake,explorer.embedding.baseURL=https://
 renders "lexical embedding ignores provider URLs" "${embedding_base[@]}" --set explorer.embedding.provider=lexical,explorer.embedding.baseURL=https://
@@ -1008,7 +1047,7 @@ explorer_scalars_quoted() {
     printf '%s\n' "$stray" | head -3 | sed 's/^/      /'
   fi
 }
-explorer_scalars_quoted "${explorer_base[@]}" --set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage
+explorer_scalars_quoted "${explorer_base[@]}" --set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage
 # The contrasts. A non-ASCII character that is not a line break still renders,
 # in a value rendered bare and in one the explorer now quotes.
 assert_renders "a non-ASCII data directory still renders" '^ +mountPath: /var/lib/données$' -f "$chart/values.yaml" --set-string 'writeTier.dataDir=/var/lib/données'
@@ -1151,7 +1190,7 @@ refuses_citing "compactor.tls.secretName must be a Secret name" "a brace in the 
 refuses_citing "objectStorage.credentialsSecretName must be a Secret name" "an upper-case Secret name" -f "$chart/values.yaml" --set-string objectStorage.credentialsSecretName=Shoal
 refuses_citing "writeTier.tls.secretName must be a Secret name" "a write-tier TLS Secret that is not a name" -f "$chart/values.yaml" --set writeTier.tls.enabled=true --set-string 'writeTier.tls.secretName=tls #'
 refuses_citing "readFleet.tls.secretName must be a Secret name" "a read-fleet TLS Secret that is not a name" -f "$chart/values-distributed.yaml" --set readFleet.tls.enabled=true --set-string 'readFleet.tls.secretName=tls: x'
-refuses_citing "explorer.chat.credentialSecretName must be a Secret name" "a chat credential Secret that is not a name" "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1 --set-string 'explorer.chat.credentialSecretName=Chat Key'
+refuses_citing "explorer.chat.credentialSecretName must be a Secret name" "a chat credential Secret that is not a name" "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test --set-string 'explorer.chat.credentialSecretName=Chat Key'
 refuses_citing "image.pullPolicy must be one of Always, IfNotPresent or Never" "an unknown pull policy" -f "$chart/values.yaml" --set-string image.pullPolicy=Sometimes
 refuses_citing "explorer.image.pullPolicy must be one of Always, IfNotPresent or Never" "an unknown explorer pull policy" "${explorer_base[@]}" --set-string explorer.image.pullPolicy=always
 refuses_citing "explorer.service.type must be one of ClusterIP, NodePort, LoadBalancer or ExternalName" "an unknown Service type" "${explorer_base[@]}" --set-string explorer.service.type=Internal
@@ -3016,6 +3055,11 @@ refuses_citing "must exceed operationTimeout + 5s + planeTimeout" "a lease insid
 renders "the same lease with renewal" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.operationTimeout=4m,effectsGateways[0].timing.renew=true'
 refuses_citing "must be a Go duration" "a duration Go would not parse" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.operationTimeout=3 minutes'
 refuses_citing "maxInFlight must be 1 to 64" "too many claims in flight" "${effects_gateway_base[@]}" --set 'effectsGateways[0].maxInFlight=65'
+# The pod runs as uid 65532 with every capability dropped (#423).
+for port in 80 443 1023; do
+  refuses_citing "healthPort must be 1024 to 65535" "a privileged health port $port" "${effects_gateway_base[@]}" --set "effectsGateways[0].healthPort=$port"
+done
+renders "a health port at the unprivileged boundary" "${effects_gateway_base[@]}" --set 'effectsGateways[0].healthPort=1024'
 refuses_citing "must be a boolean" "renew written as a word" "${effects_gateway_base[@]}" --set-string 'effectsGateways[0].timing.renew=yes'
 refuses_citing "networkPolicy.targetCIDRs is required" "a NetworkPolicy with no target CIDRs" "${effects_gateway_base[@]}" --set 'effectsGateways[0].networkPolicy.enabled=true'
 refuses_citing "over the 24 the stem budget allows" "a name over the stem budget" "${effects_gateway_base[@]}" --set 'effectsGateways[0].name=abcdefghijklmnopqrstuvwxy'

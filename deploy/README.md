@@ -112,13 +112,18 @@ or answer nothing. Authentication is a required decision with one valid value
 on any non-loopback listener and a pod behind a Service must bind one.
 `explorer.allowedHosts` is required, because an empty allow-list answers every
 request with `421`. Each authority is trimmed; a blank-after-trim entry is
-refused even beside valid hosts. Explorer chat and network embedding URLs must
-be absolute HTTP(S) URLs with a host; plaintext HTTP is allowed only for
-loopback hosts, not names such as `localhost.example`. Voyage retains its
-built-in URL default when none is supplied. Explorer, embed (`writeTier`),
-tserver and compactor bind ports must be at least 1024, since their containers
-run as uid 65532 with all capabilities dropped; this does not restrict a
-separate Service port. `explorer.replicas` above one is refused: the corpus,
+refused even beside valid hosts, and so is an entry holding a comma or interior
+whitespace, since the gate matches each authority exactly. Explorer chat and
+network embedding URLs must be absolute HTTP(S) URLs with a host and no
+userinfo, query, fragment or path beyond `/` (the provider appends its own API
+path, so `https://api.example.test/v1` is refused at startup and here);
+plaintext HTTP is allowed only for loopback hosts, not names such as
+`localhost.example`. Voyage retains its built-in URL default when none is
+supplied. Explorer, embed (`writeTier`), read fleet (`readFleet.listen` and
+`readFleet.metricsPort`), tserver, compactor and effects gateway bind ports must
+be at least 1024, since their containers run as uid 65532 with all capabilities
+dropped; this does not restrict a separate Service port. `explorer.replicas`
+above one is refused: the corpus,
 workspace settings and durable policy catalog share one state root on a
 ReadWriteOnce volume, with no coordination protocol between two processes over
 it. A remote chat or embedding provider without a credential Secret is refused,
