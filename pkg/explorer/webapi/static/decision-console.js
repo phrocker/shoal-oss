@@ -50,11 +50,10 @@
 
   function newKey() {
     const bytes = new Uint8Array(18);
-    if (window.crypto && window.crypto.getRandomValues) {
-      window.crypto.getRandomValues(bytes);
-    } else {
-      for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+    if (!window.crypto || !window.crypto.getRandomValues) {
+      throw new Error("this browser cannot create an idempotency key safely");
     }
+    window.crypto.getRandomValues(bytes);
     let value = "";
     for (const byte of bytes) value += String.fromCharCode(byte);
     return btoa(value).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
