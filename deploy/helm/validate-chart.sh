@@ -23,6 +23,19 @@
 # run that checked less than it looks like says so.
 set -euo pipefail
 
+# Hermetic: no cluster, ever, unless asked for. An ambient kubeconfig (the
+# operator's own, or a CI runner's) can point at a real cluster, and Helm
+# contacts it from `helm install --dry-run=client` and every server dry run.
+# The chart's lookup calls read from it too. So the script's own kubeconfig
+# is a path that does not exist, and the HELM_KUBE* overrides are cleared.
+# Only the opt-in lookup section reaches a cluster, by passing
+# --kubeconfig "$SHOAL_LOOKUP_KUBECONFIG" explicitly, and it accepts only a
+# kind or k3d context.
+hermetic_kubeconfig=/nonexistent/shoal-validate-chart
+export KUBECONFIG="$hermetic_kubeconfig"
+unset HELM_KUBECONTEXT HELM_KUBEAPISERVER HELM_KUBETOKEN HELM_KUBEASGROUPS \
+  HELM_KUBEASUSER HELM_KUBECAFILE HELM_KUBETLS_SERVER_NAME HELM_KUBEINSECURE_SKIP_TLS_VERIFY
+
 chart="$(cd "$(dirname "${BASH_SOURCE[0]}")/shoal" && pwd)"
 failures=0
 
@@ -257,6 +270,36 @@ command -v helm >/dev/null 2>&1 || { printf 'FAIL  helm is required\n'; exit 1; 
 if ! python3 -c 'import yaml' 2>/dev/null; then
   fail "python3 with PyYAML is required: the rendered-object checks parse Helm output"
   note "  install it with: python3 -m pip install pyyaml"
+fi
+
+note "== hermetic: no cluster is reachable =="
+# The guard above, checked rather than trusted: with no lookup cluster asked
+# for, Helm must see no context and the nonexistent kubeconfig. If either
+# fails, every later dry run may have reached whatever the environment points
+# at, so the run stops here.
+if [ -z "${SHOAL_LOOKUP_KUBECONFIG:-}" ]; then
+  # helm env reports the HELM_KUBE* settings but not the kubeconfig path, so
+  # the path is checked in the environment Helm inherits.
+  if [ -n "$(helm env HELM_KUBECONTEXT)" ] || [ -n "$(helm env HELM_KUBEAPISERVER)" ] ||
+    [ -n "$(helm env HELM_KUBETOKEN)" ] || [ -n "$(helm env HELM_KUBEASGROUPS)" ] ||
+    [ "${KUBECONFIG:-}" != "$hermetic_kubeconfig" ] || [ -e "$hermetic_kubeconfig" ]; then
+    printf 'FAIL  the run is not hermetic: KUBECONFIG=%s, helm sees context %q and API server %q\n' \
+      "${KUBECONFIG:-}" "$(helm env HELM_KUBECONTEXT)" "$(helm env HELM_KUBEAPISERVER)"
+    exit 1
+  fi
+else
+  # The lookup section creates a namespace and a Deployment, so it is held to
+  # a throwaway local cluster: the kubeconfig's current context must be a kind
+  # or k3d one. A production kubeconfig named here by mistake is refused
+  # before anything touches it.
+  lookup_context="$(kubectl --kubeconfig "$SHOAL_LOOKUP_KUBECONFIG" config current-context 2>/dev/null || true)"
+  case "$lookup_context" in
+    kind-* | k3d-*) note "  lookup cluster: $lookup_context" ;;
+    *)
+      printf 'FAIL  SHOAL_LOOKUP_KUBECONFIG must name a kind or k3d cluster (current context %q): the lookup section creates objects in it\n' "$lookup_context"
+      exit 1
+      ;;
+  esac
 fi
 
 note "== lint =="
