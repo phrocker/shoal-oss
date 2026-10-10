@@ -419,6 +419,29 @@ for document in after:
                 for d in before if (d or {}).get("kind") == "Deployment"
                 for c in d["spec"]["template"]["spec"]["containers"]):
             arguments.remove(acknowledgement)
+
+
+def gateway_pod_metadata(documents):
+    """The llm gateway Deployment's pod template metadata, or None."""
+    for document in documents:
+        if (document or {}).get("kind") == "Deployment" and document["metadata"].get(
+            "labels", {}
+        ).get("app.kubernetes.io/component") == "llm-gateway":
+            return document["spec"]["template"]["metadata"]
+    return None
+
+
+# The one meaning change this comparison is told about: #425 added scrape
+# annotations naming /metrics on the gateway's health port. They are set aside
+# only while the baseline has none, so once that change is on the baseline the
+# comparison is exact again and this branch does nothing.
+old, new = gateway_pod_metadata(before), gateway_pod_metadata(after)
+if old is not None and new is not None and "annotations" not in old:
+    annotations = new.get("annotations") or {}
+    for key in [k for k in annotations if k.startswith("prometheus.io/")]:
+        del annotations[key]
+    if annotations == {}:
+        new.pop("annotations", None)
 raise SystemExit(0 if before == after else 1)
 PARSED
       then
@@ -900,6 +923,24 @@ assert_renders "both ceilings on separate references" "\-fleet-external-egress-e
 # dispatches the external work.
 assert_renders "the ask executor beside a gateway" "\-fleet-external-executor-refs=deploy\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
 assert_renders "and the ask binding survives it" "\-fleet-ask-executor-ref=ask\"$" "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask,deploy}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434 --set 'explorer.fleet.externalExecutorRefs={deploy}'
+
+note "== the llm gateway's metrics are on its health port =="
+# #425: the counters are served at /metrics on the -health-address listener,
+# not on a listener of their own. The scrape annotation follows healthPort
+# rather than naming a fixed number, and nothing renders a separate metrics
+# flag, container port or Service port: a second port would be a second
+# unauthenticated surface, and publishing it on the Service would make it
+# routable in-cluster for no reason. The end-to-end check below asserts the
+# annotation names the port -health-address actually serves.
+assert_renders "the scrape annotation names the health port" '^ +prometheus\.io/port: "8101"$' "${llm_gateway_base[@]}"
+assert_renders "the scrape annotation follows a moved health port" '^ +prometheus\.io/port: "9101"$' "${llm_gateway_base[@]}" --set llmGateway.healthPort=9101
+assert_renders "the scrape annotation names /metrics" '^ +prometheus\.io/path: "/metrics"$' "${llm_gateway_base[@]}"
+# The base renders the traffic listener as TLS (#424); the health port stays
+# plaintext, so the scrape must too. A prometheus.io/scheme: https here would
+# have every scrape fail the handshake against a plaintext listener.
+assert_absent "the scrape is not told to use TLS against the plaintext health port" 'prometheus\.io/scheme' "${llm_gateway_base[@]}"
+assert_renders "a plaintext traffic listener scrapes the same health port" '^ +prometheus\.io/port: "8101"$' "${llm_gateway_base[@]}" --set llmGateway.tls.enabled=false,llmGateway.tls.secretName=
+assert_absent "no separate metrics listener is rendered" '(metrics-address|metricsPort|name: "?metrics"?$|targetPort: "?metrics"?$)' "${llm_gateway_base[@]}" --show-only templates/llm-gateway-deployment.yaml --show-only templates/llm-gateway-service.yaml
 
 note "== a gateway value cannot carry a character that changes what the pod is given =="
 # Every string the gateway pod is rendered from is a quoted scalar now, and a
@@ -1876,6 +1917,9 @@ note "== the llm gateway is wired end to end =="
 #   -listen names the port the container declares as http and the Service
 #   targets, or the Service routes to a port nothing serves;
 #   the Service does not publish the health port, which is unauthenticated;
+#   the scrape annotations name /metrics on the port -health-address serves,
+#   which is where the gateway's counters are (#425) — an annotation naming
+#   the traffic port is scraped with a pod-IP Host and answered 421 forever;
 #   the Service's selector actually matches the pod template's labels, or the
 #   Service has no endpoints at all and nothing above matters.
 #
@@ -1980,6 +2024,22 @@ for flag, name in (("-health-address", "health"), ("-listen", listener)):
         problems.append(
             f"{flag} serves {port} but the {name} port is {declared[name]}"
         )
+
+annotations = template["metadata"].get("annotations") or {}
+health_port = served("-health-address")
+if (
+    annotations.get("prometheus.io/scrape") != "true"
+    or annotations.get("prometheus.io/path") != "/metrics"
+    or health_port is None
+    or annotations.get("prometheus.io/port") != health_port
+):
+    problems.append(
+        "the scrape annotations %r do not name /metrics on the health port %s"
+        % (
+            {k: v for k, v in annotations.items() if k.startswith("prometheus.io/")},
+            health_port,
+        )
+    )
 
 if not services:
     problems.append("no llm-gateway Service was rendered")

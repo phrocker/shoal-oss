@@ -23,6 +23,7 @@ Read anything below about obligations with that in mind.
 - [Kubernetes: the Helm chart](#kubernetes-the-helm-chart)
 - [The render-time refusals](#the-render-time-refusals)
 - [Orchestrator probes: the health surface](#orchestrator-probes-the-health-surface)
+- [Metrics: what to alert on](#metrics-what-to-alert-on)
 - [Stateless, and not a singleton](#stateless-and-not-a-singleton)
 - [Secrets: two credentials, both required](#secrets-two-credentials-both-required)
 - [A rotating credential: the projected ServiceAccount token](#a-rotating-credential-the-projected-serviceaccount-token)
@@ -69,7 +70,7 @@ from a production incident to `helm template`.
 | `-listen` | OpenAI-compatible listen address, for example `0.0.0.0:8100`. Plaintext only on loopback; see [Listener transport](#listener-transport-tls-or-plaintext-on-loopback). |
 | `-tls-cert-file`, `-tls-key-file` | PEM certificate chain and key the listener serves TLS with. Both or neither, checked at startup, and re-read per handshake so a rotated certificate is served without a restart. |
 | `-allow-plaintext-listener` | Accept plaintext on a non-loopback `-listen`, for a mesh sidecar that terminates mTLS. Off by default; refused beside the TLS flags. |
-| `-health-address` | Separate probe listener serving `GET /healthz` and `GET /readyz`. |
+| `-health-address` | Separate plaintext probe listener serving `GET /healthz`, `GET /readyz` and `GET /metrics`. See [Metrics](#metrics-what-to-alert-on). |
 | `-allowed-host` | Comma-separated exact-match external authorities — the same gate as the Explorer's. |
 | `-admission-url` | Base URL of the Explorer's authenticated API. A path prefix is allowed (the admission routes are joined onto it); user info, a query or a fragment is refused at startup. See below. |
 | `-allow-plaintext-admission` | Accept a remote `http://` `-admission-url`. Off by default, and the admission hop only. |
@@ -386,9 +387,11 @@ inferred. It opens the listener only. It does not relax `-upstream-base-url`, an
 `-allow-plaintext-admission` does not cover the listener.
 
 The health surface (`-health-address`) stays plaintext. It answers `/healthz`,
-`/readyz` and, once the gateway supplies one, `/metrics`; it carries no prompt,
-is not published by the Service, and is addressed by a kubelet that would have
-to be configured to trust the certificate.
+`/readyz` and `/metrics` (see [Metrics](#metrics-what-to-alert-on)); it carries
+no prompt, is not published by the Service, and is addressed by a kubelet — and
+a scraper — that would have to be configured to trust the certificate. The
+chart's scrape annotations therefore name the plaintext health port and set no
+`prometheus.io/scheme`.
 
 ### In the chart
 
@@ -543,6 +546,7 @@ Explorer's does:
 | --- | --- |
 | `GET /healthz` | The process is up. Stays `200` throughout a drain. |
 | `GET /readyz` | The gateway is serving. `503` before it serves and from the moment shutdown begins. |
+| `GET /metrics` | Prometheus text: the gateway's refusals and failures by closed reason. See [Metrics](#metrics-what-to-alert-on). |
 
 The split is what makes a rollout safe. Readiness drops **before** the listener
 stops accepting, so the endpoints controller removes the pod from the Service
@@ -563,15 +567,94 @@ so a startup probe would only postpone the first readiness check.
 The Service publishes the traffic port only. The probe surface exists for the
 kubelet, which reaches the pod directly; publishing it would make an
 unauthenticated endpoint routable in-cluster for no reason, and it is the one
-endpoint on the pod that answers without passing through admission.
+endpoint on the pod that answers without passing through admission. A scraper
+reaches it the way the kubelet does, by pod IP, through the
+`prometheus.io/scrape`, `prometheus.io/port` (the health port) and
+`prometheus.io/path: /metrics` annotations on the pod template — the same
+convention as the effects gateway.
 
 `validate-chart.sh` asserts all of this end to end rather than in parts — the
 probes address the health port, `-health-address` is passed and names the port
-the probes and the container agree on, `-listen` names the port the Service
-targets, the Service does not publish the health port, and its selector
-actually matches the pod's labels. Asserting only that the probes *name* a
+the probes and the container agree on, the scrape annotations name `/metrics`
+on that same port, `-listen` names the port the Service targets, the Service
+does not publish the health port, and its selector actually matches the pod's
+labels. Asserting only that the probes *name* a
 health port once passed a chart whose probes addressed a port nothing was
 listening on.
+
+## Metrics: what to alert on
+
+A gateway failing closed because the decision plane is unreachable is a total
+outage for every caller behind it, and before #425 it looked, from every signal
+the chart exposes, exactly like a policy tightening: both pass every probe, and
+telling them apart meant reading the logs of every replica. `GET /metrics` on
+the health listener makes the difference scrapeable.
+
+The health port is unauthenticated, so what it carries is deliberately narrow:
+counts of the gateway's own refusals and failures, each by a reason drawn from
+a closed set fixed in the binary. Nothing that meters tenant workload or caller
+behaviour — no total of calls, no count of allowed or forwarded calls, no bytes
+or tokens, nothing in flight, no count of callers hanging up — and no label
+derived from a request: no model, reference, compartment, policy, principal,
+document or error text. Every series is present at zero from the first scrape.
+A caller that hangs up mid-call is counted nowhere, so a client with a short
+timeout cannot raise the outage signal. Workload and hang-up counts are a
+follow-up for an authenticated surface.
+
+| Family | `reason` | Meaning |
+| --- | --- | --- |
+| `shoal_llm_gateway_infrastructural_denials_total` | `plane_unreachable` | No answer from the plane: transport failure, timeout, or a 502/503/504 with no structured error body — what whatever fronts the plane answers when it is gone. |
+| | `plane_credential_rejected` | The plane answered 401/403 to the **gateway's own** admission token. The caller was never adjudicated. |
+| | `plane_reported_unavailable` | The plane itself answered a structured `503` (`code: unavailable`): it is up and refusing to admit right now. The whole-store rollout conditions — an unmigrated admission, an occupied reserved span — answer this, and an operator clears them on the Explorer, not in the network. |
+| | `plane_error_status` | Any other non-2xx from the plane, including a 502/504 that carries the plane's own error code. |
+| | `plane_answer_unusable` | A 200 the gateway cannot act on: an unknown outcome, an unusable token, or a token naming another claim or expiring inside the report window. |
+| | `admission_credential_unavailable` | The gateway's **own** admission token could not be read, or was empty or held a line break. Nothing was sent to the plane. |
+| | `grant_window_exhausted` | The grant arrived with too little lease left to make the call and still report it — a slow plane. |
+| | `identity_unavailable` | The gateway could not generate an admission identity. Since Go 1.24 `crypto/rand` cannot fail this way, so this stays at zero; it is kept so the refusal path that exists is counted under its own name. |
+| `shoal_llm_gateway_policy_refusals_total` | `denied` | The plane denied the call. A policy outcome, not an outage. |
+| | `obligation_unsatisfiable` | The plane allowed the call with an obligation the gateway cannot meet. |
+| `shoal_llm_gateway_upstream_failures_total` | `credential_unavailable` | A configured provider credential could not be read. |
+| | `unreachable` | The provider could not be reached. |
+| | `error_status` | The provider answered outside 2xx. This **includes provider `429`s**, so a rate-limited account shows here; the caller receives the provider's status and `Retry-After` unchanged. |
+| | `response_truncated` | The provider's response stopped part-way. |
+| `shoal_llm_gateway_report_failures_total` | the five `plane_*` reasons and `admission_credential_unavailable` | A report the plane did not acknowledge. Each leaves a grant outstanding on the plane, and this is the only signal of it outside the plane itself. |
+
+What to alert on:
+
+- **Fail-closed outage** — page on any sustained infrastructural denial:
+  `sum by (reason) (rate(shoal_llm_gateway_infrastructural_denials_total[5m])) > 0`
+  for a few minutes. Every one of these is a call that policy did not refuse
+  and that did not happen. The reason says where to look: `plane_unreachable`
+  is the Explorer or the network to it, `plane_reported_unavailable` is a
+  condition on the Explorer an operator must clear, `plane_credential_rejected`
+  and `admission_credential_unavailable` are the gateway's admission token
+  (`llmGateway.admission.*`) — rejected by the plane, or not readable on the
+  pod — and `grant_window_exhausted` is a plane too slow for the configured
+  lease.
+- **Unreported grants** — alert on
+  `rate(shoal_llm_gateway_report_failures_total[5m]) > 0`. The call's effect
+  happened or was refused, and the plane does not know which.
+- **Provider trouble** — `rate(shoal_llm_gateway_upstream_failures_total[5m])`
+  by reason, with `credential_unavailable` worth a page of its own: it is a
+  mounted file the pod cannot read, and it refuses every admitted call.
+  `error_status` moves with provider rate limiting (`429`) as well as provider
+  errors, so alert on its rate against a threshold tuned to the account rather than on any nonzero value.
+- **Policy change** — `shoal_llm_gateway_policy_refusals_total` is not an
+  outage signal, and should not page. A step change in it with no matching
+  infrastructural denials is what a policy tightening looks like; the reverse
+  is an outage. That distinction is the point of the two families.
+
+**Readiness does not follow these counters**, deliberately. A gateway failing
+closed is doing what it was built to do, and every replica shares the same
+plane: marking them not-ready would empty the Service at once, replacing a
+structured, retryable `503 plane_unavailable` with a connection failure that
+tells the caller nothing, and no reroute or restart brings the plane back.
+`/readyz` stays `200`; the outage is an alert on the counter.
+
+The caller-facing answer is unchanged and still distinguishes the two: a policy
+denial is `403` `denied`, which a client must not retry, and every
+infrastructural denial is the same fixed `503` `plane_unavailable`, which it
+should. The reason is in the metric and the log, never in the response.
 
 ## Stateless, and not a singleton
 
@@ -954,17 +1037,6 @@ denial nobody can explain.
 
 Gaps in the flag contract, recorded rather than worked around.
 
-- **No metrics or observability listener.** There is no `-metrics-address`, so
-  there is nothing to scrape and nothing for the chart to annotate with
-  `prometheus.io/port` — which the storage tier and read fleet both have. Issue
-  #390 requires that an operator be able to tell an infrastructural denial (the
-  decision plane unreachable) from a policy denial. Without a metrics surface
-  that distinction exists only in logs the gateway is also forbidden from filling
-  with payload content. The health surface the gateway already runs can now
-  serve `GET /metrics` on the `-health-address` listener when the binary
-  supplies a writer (`healthsurface.Config.Metrics`), so the outcome metrics
-  #425 asks for can be exposed there. The gateway does not supply one yet, and
-  until it does `/metrics` there is a `404`.
 - **The listener does not verify clients.** It serves TLS but asks for no
   client certificate. Callers are not authenticated by the transport, which is
   why the Host gate and admission exist. There is no `-tls-client-ca`, unlike

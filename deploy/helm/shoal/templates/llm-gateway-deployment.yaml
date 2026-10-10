@@ -68,6 +68,19 @@ spec:
       labels:
         {{- include "shoal.llmGatewaySelectorLabels" . | nindent 8 }}
         app.kubernetes.io/part-of: shoal-platform
+      # /metrics is served on the health port (#425), as on the effects
+      # gateway: a scraper reaches the pod directly, as the kubelet does, so
+      # the Service still publishes the traffic port only. The health port is
+      # plaintext whether or not llmGateway.tls is on (#424 moved only the
+      # traffic listener to TLS), so no scrape scheme is set and a scrape is
+      # plain HTTP, like the probes. The counters there
+      # are the gateway's own refusals and failures by closed reason, and
+      # nothing that meters tenant workload, because that port is
+      # unauthenticated.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $gateway.healthPort | quote }}
+        prometheus.io/path: "/metrics"
     spec:
       # Every setting is an argument on this pod spec rather than a ConfigMap,
       # as on the explorer. A changed argument changes the pod template and

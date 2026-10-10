@@ -60,6 +60,7 @@ type proxy struct {
 	client       *http.Client
 	credential   func() (string, error)
 	allowedHosts []string
+	metrics      *proxyMetrics
 	// models the operator has named. Empty means every model is reported as a
 	// marker, which keeps caller text out of the declaration by default.
 	models map[string]struct{}
@@ -179,9 +180,10 @@ func (p *proxy) admitAndForward(writer http.ResponseWriter, request *http.Reques
 		p.refuse(writer, http.StatusBadRequest, "invalid_request", err.Error())
 		return nil
 	}
-	identity, err := newCallerIdentity()
+	identity, err := mintCallerIdentity()
 	if err != nil {
 		// No identity means no admission, and no admission means no call.
+		p.countInfrastructural(infraIdentityUnavailable)
 		p.refuse(writer, http.StatusServiceUnavailable, "plane_unavailable",
 			"the decision plane could not be consulted")
 		return nil
@@ -196,6 +198,7 @@ func (p *proxy) admitAndForward(writer http.ResponseWriter, request *http.Reques
 		// a refusal that explains itself is an authorization oracle over
 		// whatever it names.
 		p.log("admission denied request_id=%s", identity.RequestID)
+		p.countPolicy(policyDenied)
 		p.refuse(writer, http.StatusForbidden, "denied",
 			"the decision plane denied this call")
 		return nil
@@ -204,11 +207,13 @@ func (p *proxy) admitAndForward(writer http.ResponseWriter, request *http.Reques
 		// "denied" will not retry; one told "unavailable" should. The operator
 		// needs the same distinction to tell an outage from a policy change.
 		p.log("admission unavailable request_id=%s: %v", identity.RequestID, err)
+		p.countAdmissionFailure(request, err)
 		p.refuse(writer, http.StatusServiceUnavailable, "plane_unavailable",
 			"the decision plane could not be consulted")
 		return nil
 	case err != nil:
 		p.log("admission failed request_id=%s: %v", identity.RequestID, err)
+		p.countAdmissionFailure(request, err)
 		p.refuse(writer, http.StatusServiceUnavailable, "plane_unavailable",
 			"the decision plane could not be consulted")
 		return nil
@@ -225,6 +230,7 @@ func (p *proxy) admitAndForward(writer http.ResponseWriter, request *http.Reques
 		// operator needs, and nothing about what was being withheld.
 		p.log("obligation unsatisfiable request_id=%s withheld=%d class=%s",
 			identity.RequestID, len(granted.Withhold), applied.refusal)
+		p.countPolicy(policyObligationUnsatisfiable)
 		p.reportFailure(request.Context(), granted.token, identity, "obligation_unsatisfiable")
 		p.refuse(writer, http.StatusForbidden, "obligation_unsatisfiable",
 			"the call cannot be made within the obligations returned")
@@ -269,6 +275,7 @@ func (p *proxy) forward(
 		budget := granted.token.ExpiresAt.Sub(p.clock()) - minimumReportWindow
 		if budget <= 0 {
 			p.log("grant window exhausted request_id=%s", identity.RequestID)
+			p.countInfrastructural(infraGrantWindowExhausted)
 			p.reportFailure(ctx, granted.token, identity, "grant_window_exhausted")
 			p.refuse(writer, http.StatusServiceUnavailable, "plane_unavailable",
 				"the decision plane could not be consulted")
@@ -283,6 +290,7 @@ func (p *proxy) forward(
 	upstreamRequest, err := http.NewRequestWithContext(
 		ctx, http.MethodPost, endpoint.String(), bytes.NewReader(outbound))
 	if err != nil {
+		p.countUpstreamFailure(request, upstreamUnreachable)
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_unreachable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")
@@ -306,6 +314,7 @@ func (p *proxy) forward(
 	switch {
 	case err != nil &&
 		!(errors.Is(err, ErrNoCredential) && isLoopback(p.upstream.Hostname())):
+		p.countUpstream(upstreamCredentialUnavailable)
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_credential_unavailable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")
@@ -320,6 +329,7 @@ func (p *proxy) forward(
 
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
+		p.countUpstreamFailure(request, upstreamUnreachable)
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_unreachable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")
@@ -355,6 +365,15 @@ func (p *proxy) forward(
 		// what made 3xx reachable as a terminal status, so this is a
 		// consequence of that fix rather than an independent oversight.
 		failure = "upstream_error"
+	}
+	// A failure only. A completed call is not counted: the health listener
+	// these counters are served on is unauthenticated, and a count of
+	// successful calls there is a usage meter (see metrics.go).
+	switch failure {
+	case "response_truncated":
+		p.countUpstreamFailure(request, upstreamResponseTruncated)
+	case "upstream_error":
+		p.countUpstream(upstreamErrorStatus)
 	}
 	// Reported by completions, after this returns: see there for why.
 	return &forwarded{
@@ -435,6 +454,7 @@ func (p *proxy) reportOutcome(
 	defer cancel()
 	if err := p.admission.report(
 		ctx, token, identity, outcome, failure, effected, p.clock()); err != nil {
+		p.countReportFailure(err)
 		// An unreported grant is the gap the report closes, so this is said out
 		// loud. The plane already shows it as outstanding; the operator should
 		// not have to find it there to learn the proxy could not report.
@@ -449,6 +469,7 @@ func (p *proxy) reportFailure(
 	defer cancel()
 	if err := p.admission.report(
 		ctx, token, identity, nil, code, nil, p.clock()); err != nil {
+		p.countReportFailure(err)
 		p.log("report failed request_id=%s: %v", identity.RequestID, err)
 	}
 }
@@ -516,7 +537,8 @@ func newProxy(
 		admission: admission, upstream: parsed,
 		client:     newHTTPClient(timeout),
 		credential: credential, allowedHosts: allowedHosts,
-		models: declaredModels(models),
-		clock:  clock, log: log,
+		metrics: &proxyMetrics{},
+		models:  declaredModels(models),
+		clock:   clock, log: log,
 	}, nil
 }

@@ -73,6 +73,10 @@ func newCallerIdentity() (callerIdentity, error) {
 	}, nil
 }
 
+// mintCallerIdentity is what the proxy calls. A variable so a test can reach
+// the identity_unavailable refusal, which crypto/rand otherwise never takes.
+var mintCallerIdentity = newCallerIdentity
+
 // chatRequest is the subset of the OpenAI-compatible body the proxy reads.
 //
 // Unknown fields are preserved, not rejected. The proxy is a pass-through for

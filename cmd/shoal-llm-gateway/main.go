@@ -82,8 +82,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"a name it controls to the loopback listener and spend the "+
 			"operator's upstream credential on a call nobody made")
 	healthAddress := flags.String("health-address", "",
-		"Optional separate listener serving GET /healthz and GET /readyz for "+
-			"orchestrator probes. Empty disables it. It is a second listener "+
+		"Optional separate listener serving GET /healthz, GET /readyz and GET /metrics for "+
+			"orchestrator probes and scrapers. Empty disables it. It is a second listener "+
 			"because the request surface answers only the completions route "+
 			"and a probe must not be mistaken for a call")
 	allowPlaintextAdmission := flags.Bool("allow-plaintext-admission", false,
@@ -320,7 +320,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	state := &healthsurface.State{}
 	health := (*healthsurface.Server)(nil)
 	if address := strings.TrimSpace(*healthAddress); address != "" {
-		health, err = healthsurface.Start(address, state)
+		health, err = healthsurface.StartWithConfig(address, state, governed.healthConfig())
 		if err != nil {
 			listener.Close()
 			return fmt.Errorf("listen on %s: %w", address, err)

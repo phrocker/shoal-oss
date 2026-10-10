@@ -46,11 +46,15 @@ type fakePlane struct {
 	// returned a fixed one, which made it unable to express the swapped-token
 	// case at all. A probe that is specifically about the token's shape turns
 	// this off, so the fixture does not repair the value under test.
-	echoTokenID bool
-	status      int
-	requests    []admissionapi.Request
-	reports     []admissionapi.Report
-	server      *httptest.Server
+	echoTokenID  bool
+	status       int
+	reportStatus int
+	// errorBody, when set, is written with a non-200 status, as the plane's
+	// own structured error answers are.
+	errorBody string
+	requests  []admissionapi.Request
+	reports   []admissionapi.Report
+	server    *httptest.Server
 }
 
 func newFakePlane(t *testing.T, outcome admissionapi.Outcome, withhold []string) *fakePlane {
@@ -66,7 +70,11 @@ func newFakePlane(t *testing.T, outcome admissionapi.Outcome, withhold []string)
 	plane.server = httptest.NewServer(http.HandlerFunc(
 		func(writer http.ResponseWriter, request *http.Request) {
 			if plane.status != http.StatusOK {
+				if plane.errorBody != "" {
+					writer.Header().Set("Content-Type", "application/json")
+				}
 				writer.WriteHeader(plane.status)
+				_, _ = io.WriteString(writer, plane.errorBody)
 				return
 			}
 			raw, _ := io.ReadAll(request.Body)
@@ -89,6 +97,10 @@ func newFakePlane(t *testing.T, outcome admissionapi.Outcome, withhold []string)
 				}
 				_ = json.NewEncoder(writer).Encode(body)
 			case strings.HasSuffix(request.URL.Path, "/report"):
+				if plane.reportStatus != 0 {
+					writer.WriteHeader(plane.reportStatus)
+					return
+				}
 				var decoded admissionapi.Report
 				_ = json.Unmarshal(raw, &decoded)
 				plane.reports = append(plane.reports, decoded)
