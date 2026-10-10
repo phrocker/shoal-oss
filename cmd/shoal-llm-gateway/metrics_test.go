@@ -289,6 +289,18 @@ func TestEachFailureClassIsCountedUnderItsOwnReason(t *testing.T) {
 			want: map[string]uint64{infraFamily + "grant_window_exhausted": 1},
 		},
 		{
+			name: "no admission identity",
+			setup: func(t *testing.T, _ *fakePlane, _ *fakeUpstream, _ *proxy) {
+				restore := mintCallerIdentity
+				t.Cleanup(func() { mintCallerIdentity = restore })
+				mintCallerIdentity = func() (callerIdentity, error) {
+					return callerIdentity{}, errors.New("entropy unavailable")
+				}
+			},
+			wantStatus: http.StatusServiceUnavailable, wantCode: "plane_unavailable",
+			want: map[string]uint64{infraFamily + "identity_unavailable": 1},
+		},
+		{
 			name:      "a caller that hangs up during admission is not an outage",
 			cancelled: true,
 			want:      map[string]uint64{abandonFamily + "admission": 1},

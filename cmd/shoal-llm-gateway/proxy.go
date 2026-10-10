@@ -180,7 +180,7 @@ func (p *proxy) admitAndForward(writer http.ResponseWriter, request *http.Reques
 		p.refuse(writer, http.StatusBadRequest, "invalid_request", err.Error())
 		return nil
 	}
-	identity, err := newCallerIdentity()
+	identity, err := mintCallerIdentity()
 	if err != nil {
 		// No identity means no admission, and no admission means no call.
 		p.countInfrastructural(infraIdentityUnavailable)
