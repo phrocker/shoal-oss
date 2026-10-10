@@ -2857,7 +2857,8 @@ refuses_citing "share the executorRef" "two entries on one executor reference" "
 refuses_citing "share the agentID" "two entries on one descriptor" "${two_gateways[@]}" --set 'effectsGateways[1].agentID=c3RyaXBlLWdhdGV3YXk'
 refuses_citing "share the ServiceAccount" "an entry naming another's chart-created account" "${two_gateways[@]}" --set 'effectsGateways[1].serviceAccountName=shoal-gw-stripe'
 refuses_citing "share the ServiceAccount" "two entries naming one existing account" "${two_gateways[@]}" --set 'effectsGateways[0].serviceAccountName=gateways,effectsGateways[1].serviceAccountName=gateways'
-refuses_citing "share the unrecorded.existingClaim" "two entries on one existing claim" "${two_gateways[@]}" --set 'effectsGateways[0].unrecorded.storage=existingClaim,effectsGateways[0].unrecorded.existingClaim=log,effectsGateways[1].unrecorded.storage=existingClaim,effectsGateways[1].unrecorded.existingClaim=log'
+refuses_citing "share the unrecorded claim" "an existing claim naming another entry's created claim" "${two_gateways[@]}" --set 'effectsGateways[1].unrecorded.storage=existingClaim,effectsGateways[1].unrecorded.existingClaim=shoal-gw-stripe-unrecorded'
+refuses_citing "share the unrecorded claim" "two entries on one existing claim" "${two_gateways[@]}" --set 'effectsGateways[0].unrecorded.storage=existingClaim,effectsGateways[0].unrecorded.existingClaim=log,effectsGateways[1].unrecorded.storage=existingClaim,effectsGateways[1].unrecorded.existingClaim=log'
 renders "a disabled entry may keep a running entry's identity" "${two_gateways[@]}" --set 'effectsGateways[1].executorRef=stripe,effectsGateways[1].enabled=false'
 
 note "== effects gateway: the explorer in this release mints its credential =="

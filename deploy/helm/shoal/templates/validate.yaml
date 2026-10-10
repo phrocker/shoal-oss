@@ -1086,11 +1086,15 @@
        other holds, and with separate claims the log's lock never sees the
        second. The ServiceAccount compared is the effective one, so a
        serviceAccountName that names another entry's chart-created account
-       is caught too. */ -}}
+       is caught too. So is the claim: the effective one, the chart-created
+       <stem>-gw-<name>-unrecorded or an existingClaim, under one key, so an
+       existingClaim naming another entry's created claim is refused. */ -}}
 {{- $account := default (include "shoal.effectsGatewayName" (dict "root" $ "gateway" $gateway)) $gateway.serviceAccountName -}}
 {{- $identities := dict "executorRef" (toString $gateway.executorRef) "agentID" (toString $gateway.agentID) "ServiceAccount" $account -}}
 {{- if eq (toString $unrecorded.storage) "existingClaim" -}}
-{{- $_ := set $identities "unrecorded.existingClaim" (toString $unrecorded.existingClaim) -}}
+{{- $_ := set $identities "unrecorded claim" (toString $unrecorded.existingClaim) -}}
+{{- else if eq (toString $unrecorded.storage) "persistentVolumeClaim" -}}
+{{- $_ := set $identities "unrecorded claim" (printf "%s-unrecorded" (include "shoal.effectsGatewayName" (dict "root" $ "gateway" $gateway))) -}}
 {{- end -}}
 {{- range $what, $value := $identities -}}
 {{- $seenKey := printf "%s=%s" $what $value -}}

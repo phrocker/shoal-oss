@@ -783,7 +783,8 @@ new pod mounts the claim. A surge would put two pods on one ReadWriteOnce log.
 
 **One principal per entry.** Two enabled entries may not share an
 `executorRef`, an `agentID`, an effective ServiceAccount (a defaulted
-`<stem>-gw-<name>` included) or an `existingClaim`. Each of those makes two
+`<stem>-gw-<name>` included) or an unrecorded claim (an `existingClaim` that
+names another entry's chart-created `<stem>-gw-<name>-unrecorded` included). Each of those makes two
 workers on one executor principal (#514), and with separate claims no lock
 notices the second.
 
