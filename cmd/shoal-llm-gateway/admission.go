@@ -277,12 +277,34 @@ func answerLost(err error) bool {
 		!errors.Is(err, context.DeadlineExceeded)
 }
 
+// planeFault is an ErrPlaneUnreachable that also carries the closed reason it
+// is counted under (see metrics.go). The reason is decided here, where the
+// error's structure is still visible, so nothing downstream classifies by
+// matching error text.
+type planeFault struct {
+	reason infraReason
+	err    error
+}
+
+func (f *planeFault) Error() string { return f.err.Error() }
+func (f *planeFault) Unwrap() error { return f.err }
+
+func newPlaneFault(reason infraReason, err error) error {
+	return &planeFault{reason: reason, err: err}
+}
+
 // planeError folds every way of not getting an answer into
 // ErrPlaneUnreachable.
 func planeError(route string, err error) error {
 	var status *admissionapi.HTTPError
 	if !errors.As(err, &status) {
-		return fmt.Errorf("%w: %v", ErrPlaneUnreachable, err)
+		reason := infraPlaneUnreachable
+		var protocol *admissionapi.ProtocolError
+		if errors.As(err, &protocol) {
+			// The plane answered and the answer could not be acted on.
+			reason = infraPlaneAnswerUnusable
+		}
+		return newPlaneFault(reason, fmt.Errorf("%w: %v", ErrPlaneUnreachable, err))
 	}
 	switch status.Status {
 	case http.StatusForbidden, http.StatusUnauthorized:
@@ -290,14 +312,23 @@ func planeError(route string, err error) error {
 		// a denial of the proxy, not of the caller, and it is reported as
 		// unreachable rather than as a policy denial on the call: the caller's
 		// request was never adjudicated.
-		return fmt.Errorf("%w: proxy credential rejected", ErrPlaneUnreachable)
+		return newPlaneFault(infraPlaneCredentialRejected,
+			fmt.Errorf("%w: proxy credential rejected", ErrPlaneUnreachable))
 	default:
+		// A 502, 503 or 504 is what a proxy or load balancer in front of the
+		// plane answers when the plane is not there, so it is counted as the
+		// plane being unreachable rather than as the plane erring.
+		reason := infraPlaneErrorStatus
+		switch status.Status {
+		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			reason = infraPlaneUnreachable
+		}
 		// The plane's message is deliberately not included. A plane error can
 		// carry detail the caller is not entitled to, and this error reaches a
 		// caller-facing response.
-		return fmt.Errorf(
+		return newPlaneFault(reason, fmt.Errorf(
 			"%w: admission %s returned %d",
-			ErrPlaneUnreachable, route, status.Status)
+			ErrPlaneUnreachable, route, status.Status))
 	}
 }
 

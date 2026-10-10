@@ -523,7 +523,6 @@ func TestADrainingProxyWaitsOutTheCallsItAdmitted(t *testing.T) {
 	drain = func(
 		ctx context.Context, state *healthsurface.State,
 		workspace healthsurface.GracefulServer, health *healthsurface.Server,
-		additional ...healthsurface.GracefulServer,
 	) error {
 		deadline, ok := ctx.Deadline()
 		if !ok {
@@ -531,7 +530,7 @@ func TestADrainingProxyWaitsOutTheCallsItAdmitted(t *testing.T) {
 		} else {
 			windows <- time.Until(deadline)
 		}
-		return restoreDrain(ctx, state, workspace, health, additional...)
+		return restoreDrain(ctx, state, workspace, health)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1072,13 +1071,12 @@ func TestReadinessIsNeverFlippedBackAfterShutdownBegins(t *testing.T) {
 	drain = func(
 		ctx context.Context, state *healthsurface.State,
 		workspace healthsurface.GracefulServer, health *healthsurface.Server,
-		additional ...healthsurface.GracefulServer,
 	) error {
 		recorder := httptest.NewRecorder()
 		healthsurface.NewHandler(state).ServeHTTP(
 			recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 		readyAtEntry = append(readyAtEntry, recorder.Code == http.StatusOK)
-		return restoreDrain(ctx, state, workspace, health, additional...)
+		return restoreDrain(ctx, state, workspace, health)
 	}
 
 	// Cancelled before run() is called, so the watcher observes a closed

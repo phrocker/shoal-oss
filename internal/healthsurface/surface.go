@@ -325,23 +325,12 @@ type GracefulServer interface {
 // is still answering probes. Shutting the workspace down first would close the
 // door on in-flight work that was routed during the gap.
 //
-// Additional surfaces close after the workspace, and the health surface closes
-// last so its not-ready answer stays available for as long as there is a process
-// to ask.
-func Drain(
-	ctx context.Context,
-	state *State,
-	workspace GracefulServer,
-	health *Server,
-	additional ...GracefulServer,
-) error {
+// The health surface closes last, after the workspace has finished its
+// graceful close, so the not-ready answer stays available for as long as there
+// is a process to ask.
+func Drain(ctx context.Context, state *State, workspace GracefulServer, health *Server) error {
 	state.MarkDraining()
 	closeErr := workspace.Shutdown(ctx)
-	for _, server := range additional {
-		if serverErr := server.Shutdown(ctx); closeErr == nil {
-			closeErr = serverErr
-		}
-	}
 	if healthErr := health.Shutdown(ctx); closeErr == nil {
 		closeErr = healthErr
 	}
