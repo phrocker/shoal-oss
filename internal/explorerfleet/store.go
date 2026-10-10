@@ -373,6 +373,44 @@ func descriptorWinner(value []byte) []byte {
 // message belonged to a different store. A defaulted subject would have let
 // the next store added here inherit the same mislabel silently, so the
 // parameter has no default and the compiler names every call site.
+// maxCommittedReadAttempts bounds the re-read a committed-value lag takes.
+//
+// The lag is a window, not a state: the guard head is already at the epoch,
+// and the committed cell for it lands independently. Re-reading is what
+// closes it, and the bound makes a pathological case an error rather than a
+// spin. Eight to match maxApprovalAttempts, which bounds the same shape one
+// layer up.
+const maxCommittedReadAttempts = 8
+
+// committedValueNotVisible is the answer when an entity's guard head is
+// non-nil but the committed cell for that head's epoch is not visible to this
+// read yet.
+//
+// Not not-found. The head proves the object exists, so absence is no longer a
+// possible answer, and answering not-found reports a live object as absent —
+// which is #633: a claim or extend advances the action's epoch, a reader's
+// head read sees epoch N, the committed read at N has not landed, and the
+// gateway treated the resulting 404 as definite (first Complete attempt →
+// effect_observed → re-claim). Roughly 6 transients in 60 runs of the
+// gateway's crash test, clearing on retry with the clock frozen.
+//
+// Not Internal either. The condition is a visibility lag between the guard
+// head and the committed cell, not corruption, and it resolves on its own.
+// The agent read keeps Internal (store.go, "committed agent head has no
+// matching durable value") because it was never a 404 and so never carried
+// this harm; changing it is a separate decision with no evidence behind it.
+//
+// Plain Unavailable, built with NewError rather than wrapped: writeError sets
+// Shoal-Commit-Outcome: indeterminate only when explorer.IsIndeterminateCommit
+// reports true, and that marker is for a *write* that may have landed. This is
+// a read-side lag, so a bare 503 is the honest answer and nothing in the error
+// chain should be able to trip that predicate.
+func committedValueNotVisible(subject string) error {
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		subject+" is not yet readable at its committed epoch")
+}
+
 func publicError(subject string, err error) error {
 	switch {
 	case err == nil:

@@ -124,19 +124,48 @@ func (s *DispatchStore) readAction(
 	if err := dispatchID(id); err != nil {
 		return fleet.ActionRecord{}, nil, err
 	}
-	head, _, err := s.runtime.ReadEntity(ctx, dispatchEntity(id))
-	if err != nil {
-		if errors.Is(err, guard.ErrNotFound) || errors.Is(err, transaction.ErrNotFound) {
+	// Head and committed cell are read together, and re-read while the cell
+	// for the head's epoch is not visible yet (#633).
+	//
+	// dispatchEntity and dispatchRow are both keyed on id alone, so a non-nil
+	// head proves this row exists: a missing committed cell is a window, never
+	// absence. Answering not-found there reported a live action as absent, and
+	// the effects gateway treats that as definite on its first Complete
+	// attempt. Answering a new error instead is not the fix either — the lag
+	// already has a mechanism one layer up (fleet.materializeRead, which
+	// classifies it as "look again shortly" and is retried by
+	// ApprovalService.Request), and that mechanism keys on the error's
+	// identity, so changing the identity silently disabled it.
+	//
+	// So the lag is closed here, where the epoch is known, and escapes only
+	// as the bounded-exhaustion case below. The head is re-read too: if a
+	// concurrent claim or extend advanced the epoch again, the newer head is
+	// the one whose cell we want.
+	var head *guard.Head
+	var value []byte
+	for attempt := 0; ; attempt++ {
+		var err error
+		head, _, err = s.runtime.ReadEntity(ctx, dispatchEntity(id))
+		if err != nil {
+			if errors.Is(err, guard.ErrNotFound) ||
+				errors.Is(err, transaction.ErrNotFound) {
+				return fleet.ActionRecord{}, nil, fleet.ErrActionNotFound
+			}
+			return fleet.ActionRecord{}, nil, publicError("action", err)
+		}
+		if head == nil {
 			return fleet.ActionRecord{}, nil, fleet.ErrActionNotFound
 		}
-		return fleet.ActionRecord{}, nil, publicError("action", err)
-	}
-	if head == nil {
-		return fleet.ActionRecord{}, nil, fleet.ErrActionNotFound
-	}
-	value, err := s.readCommittedAction(ctx, dispatchRow(id), head.Epoch)
-	if err != nil {
-		return fleet.ActionRecord{}, nil, publicError("action", err)
+		value, err = s.readCommittedAction(ctx, dispatchRow(id), head.Epoch)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, transaction.ErrNotFound) {
+			return fleet.ActionRecord{}, nil, publicError("action", err)
+		}
+		if attempt == maxCommittedReadAttempts-1 {
+			return fleet.ActionRecord{}, nil, committedValueNotVisible("action")
+		}
 	}
 	record, err := decodeAction(value)
 	if err != nil {
@@ -516,6 +545,23 @@ func (s *DispatchStore) readTransition(
 		return storedTransition{}, nil, publicError("action", err)
 	}
 	if !ok {
+		// Deliberately still not-found, unlike the action and approval reads
+		// above and in ApprovalStore, which answer Unavailable here (#633).
+		//
+		// This site differs because its keys differ: transitionEntity is keyed
+		// on id alone while transitionRow composes (actionID, version, id). A
+		// caller presenting a real transition id with a mismatched actionID or
+		// version reaches here with a non-nil head, and that is genuine
+		// absence, not a lag. Answering Unavailable would make such a request
+		// retry forever, which is worse than the over-reported absence.
+		//
+		// Two conditions are mixed under this one !ok, and telling them apart
+		// needs one extra read on this already-failed path: scan for the row
+		// at the current committed frontier, then Unavailable if the row
+		// exists and not-found if it does not. Not done because no client
+		// reads transitions today — the effects gateway uses no transition
+		// route — so a lagged not-found costs a human re-query rather than a
+		// wrong decision. That is the fix if one ever depends on it.
 		return storedTransition{}, nil, fleet.ErrActionNotFound
 	}
 	stored, err := decodeTransition(cell.Cell.Value)
