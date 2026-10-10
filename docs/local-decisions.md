@@ -463,6 +463,25 @@ this is not a second product integration or a model-quality benchmark. A package
 boundary test also rejects core dependencies on GitHub clients, showcase packages,
 or Go parser/type-checker packages.
 
+## Explorer decision console
+
+The authenticated Explorer web asset includes a **Decisions** tab for hosts
+that mount the decision HTTP handlers. It can inspect or explicitly invoke a
+registered decision, inspect a frozen request registration, export an
+authorized cohort, read or report an outcome, and read or submit an
+adjudication proposal. Responses are rendered as provenance-bearing JSON and
+the panel states that shadow evidence cannot promote a model or exclude full
+review.
+
+The console is a thin client over the existing authenticated routes:
+`/api/v1/decisions`, `/api/v1/decision-registrations`,
+`/api/v1/dataset-exports`, `/api/v1/outcomes`, and
+`/api/v1/adjudications`. A host must explicitly mount the corresponding
+provider and trusted resolver; the UI does not create authority or make an
+unmounted service appear available. Offline quality, poisoning, calibration,
+influence, and challenger reports remain file-backed evidence until a host
+provides a read-only evidence service for them.
+
 ## Executable learning slice
 
 The [learning-loop extension](local-decision-learning.md) and
