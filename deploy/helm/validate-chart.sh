@@ -391,8 +391,14 @@ if [ -n "$repository" ] &&
       # so that is what is compared, and the one argument it adds, the
       # acknowledgement the binary now requires for a 0.0.0.0 bind, is the
       # only difference allowed. The TLS rendering is asserted on its own below.
+      #
+      # That holds only while the baseline predates #424. Once the baseline has
+      # the TLS listener too (it has since #583 merged, so origin/main compares
+      # against itself), forcing plaintext on one side only compares TLS against
+      # plaintext and always fails. Then the two sides get the same values.
       current=("${overrides[@]}")
-      if [ "$profile" = llm-gateway ]; then
+      if [ "$profile" = llm-gateway ] &&
+        ! grep -qF -- '-allow-plaintext-listener' "$reference_chart/templates/llm-gateway-deployment.yaml"; then
         current+=(--set llmGateway.tls.enabled=false,llmGateway.tls.secretName=)
       fi
       # Both must render, or two identical error messages would compare equal.
