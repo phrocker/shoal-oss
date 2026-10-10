@@ -35,11 +35,16 @@ llmGateway:
   # the caller's work outright, so an unavailable gateway is an outage for
   # everything configured to go through it.
   replicas: 2
+  # Required: the gateway serves TLS by default, and this names the
+  # kubernetes.io/tls Secret (tls.crt, tls.key) it serves — a cert-manager
+  # Certificate's Secret rotates in place without rolling the pod. Clients use
+  # an https:// base URL. For an mTLS mesh that encrypts the hop instead, set
+  # enabled: false; see docs/llm-gateway-deploy.md, Listener transport.
+  tls:
+    enabled: true
+    secretName: ""
   service:
     type: ClusterIP
-    # The gateway does not terminate TLS. Supply a terminating ingress or mesh;
-    # acknowledge that requirement explicitly before exposing a non-ClusterIP.
-    allowPlaintext: false
   # The authority clients send as their OpenAI base URL — usually the port-less
   # Service or ingress name. With none, every request is refused with 421
   # Misdirected Request before admission is even asked.

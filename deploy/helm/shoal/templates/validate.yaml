@@ -446,13 +446,37 @@
 {{- $upstream := $gateway.upstream -}}
 {{- $identity := $gateway.identity -}}
 
-{{- /* The listener stays plaintext behind a terminating ingress or mesh.
-       A public Service must not silently expose the caller's prompt. */ -}}
+{{- /* The listener's transport (#424): the rule the binary applies to every
+       hop it makes, applied to the hop it receives. TLS by default; plaintext
+       only as an explicit choice, because the pod binds 0.0.0.0 and the binary
+       refuses a plaintext non-loopback listener without
+       -allow-plaintext-listener.
+
+       Each acknowledgement is a boolean and nothing else. A quoted "false" is
+       a non-empty string, which a Helm condition reads as true, so accepting
+       one would turn the refusal off with a value that says the opposite. */ -}}
+{{- $tls := default (dict) $gateway.tls -}}
+{{- if not (kindIs "bool" $tls.enabled) -}}
+{{- fail (printf "llmGateway.tls.enabled must be a boolean, true or false (got %q): it decides whether the listener serves TLS or renders -allow-plaintext-listener=true, and a quoted string would read as true in one place and be refused as a flag value in the other" (toString $tls.enabled)) -}}
+{{- end -}}
 {{- if not (kindIs "bool" $gateway.service.allowPlaintext) -}}
-{{- fail "llmGateway.service.allowPlaintext must be a boolean, true or false: only an explicit boolean acknowledgement permits non-ClusterIP exposure of the plaintext listener" -}}
+{{- fail "llmGateway.service.allowPlaintext must be a boolean, true or false: only an explicit boolean acknowledgement permits non-ClusterIP exposure of a plaintext listener" -}}
+{{- end -}}
+{{- $tlsSecret := trim (toString (default "" $tls.secretName)) -}}
+{{- if $tls.enabled -}}
+{{- if not $tlsSecret -}}
+{{- fail "llmGateway.tls.secretName is required while llmGateway.tls.enabled is true: the gateway serves TLS by default (#424), so it needs a kubernetes.io/tls Secret holding tls.crt and tls.key — a cert-manager Certificate's Secret is the usual source, and it rotates in place without rolling the pod. Clients then use an https:// base URL. Where an mTLS mesh sidecar encrypts the hop instead, set llmGateway.tls.enabled=false. See docs/llm-gateway-deploy.md, Upgrading" -}}
+{{- end -}}
+{{- if $gateway.service.allowPlaintext -}}
+{{- fail "llmGateway.service.allowPlaintext is true but llmGateway.tls.enabled is true: the listener serves TLS, so the acknowledgement covers nothing. Remove it; left in place it reads as though the listener were plaintext, and it would start mattering silently the day TLS is turned off" -}}
+{{- end -}}
+{{- else -}}
+{{- if $tlsSecret -}}
+{{- fail (printf "llmGateway.tls.secretName names %q but llmGateway.tls.enabled is false: nothing mounts or reads it, so the manifest shows a certificate the listener does not serve. Remove it, or enable TLS" $tlsSecret) -}}
 {{- end -}}
 {{- if and (ne $gateway.service.type "ClusterIP") (not $gateway.service.allowPlaintext) -}}
-{{- fail (printf "llmGateway.service.type %q exposes a plaintext prompt endpoint outside a ClusterIP: the gateway does not terminate TLS. Use ClusterIP behind a TLS-terminating ingress or mesh, or set llmGateway.service.allowPlaintext=true to explicitly acknowledge exposure with a terminating hop configured separately. This value does not enable TLS, and llmGateway.admission.allowPlaintext does not cover the listener" $gateway.service.type) -}}
+{{- fail (printf "llmGateway.service.type %q exposes a plaintext prompt endpoint outside a ClusterIP: llmGateway.tls.enabled is false, so the listener accepts prompts in the clear. Enable TLS, use ClusterIP behind a TLS-terminating ingress or mesh, or set llmGateway.service.allowPlaintext=true to acknowledge a terminating load balancer configured separately. This value does not enable TLS, and llmGateway.admission.allowPlaintext does not cover the listener" $gateway.service.type) -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* Every string the gateway pod is rendered from reaches it as one quoted
@@ -497,7 +521,8 @@
       "image.repository" $gateway.image.repository
       "image.tag" $gateway.image.tag
       "image.pullPolicy" $gateway.image.pullPolicy
-      "service.type" $gateway.service.type -}}
+      "service.type" $gateway.service.type
+      "tls.secretName" $tls.secretName -}}
 {{- range $setting, $value := $gatewayStrings -}}
 {{- /* Values the templates trim are checked trimmed; the image and service
        fields are rendered as written, so they are checked as written. */ -}}
@@ -825,6 +850,23 @@
        and no pod ever is — a rollout that never completes, with no pod log. */ -}}
 {{- if and $tokenFile $apiKeyFile (eq (dir $tokenFile) (dir $apiKeyFile)) -}}
 {{- fail (printf "llmGateway.admission.tokenFile and llmGateway.upstream.apiKeyFile must not share a directory (both are in %q): each is mounted as its own volume at its own file's directory, and a pod cannot mount two volumes at one path — the API server refuses the pod spec, so the Deployment is created and no pod is ever made from it. Give them separate directories, for example /var/run/secrets/shoal/token and /var/run/secrets/upstream/api-key" (dir $tokenFile)) -}}
+{{- end -}}
+
+{{- /* Neither credential file may land on the listener's TLS mount, under
+       it, or above it. Each is its own volume: one path is two volumes, which
+       the API server refuses, and a nested mount point inside a read-only
+       Secret volume cannot be created. Either way the Deployment is accepted
+       and no pod is ever made from it. */ -}}
+{{- if $tls.enabled -}}
+{{- $tlsDir := include "shoal.llmGatewayTLSDir" . -}}
+{{- range $setting, $file := dict "admission.tokenFile" $tokenFile "upstream.apiKeyFile" $apiKeyFile -}}
+{{- if $file -}}
+{{- $fileDir := dir $file -}}
+{{- if or (eq $fileDir $tlsDir) (hasPrefix (printf "%s/" $tlsDir) $fileDir) (hasPrefix (printf "%s/" $fileDir) $tlsDir) -}}
+{{- fail (printf "llmGateway.%s is in %q, which overlaps %q, where the chart mounts the listener's TLS Secret: two volumes cannot share a mount path or nest inside a read-only one, so the API server refuses the pod and no pod is ever made. Put the file in another directory" $setting $fileDir $tlsDir) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* The request timeout against the lease.

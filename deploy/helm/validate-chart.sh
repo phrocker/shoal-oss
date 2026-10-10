@@ -77,6 +77,7 @@ valid_llm_gateway=(
   --set llmGateway.identity.action=complete
   --set llmGateway.identity.sourceID=c291cmNl
   --set llmGateway.identity.policyID=cG9saWN5
+  --set llmGateway.tls.secretName=shoal-llm-gateway-tls
 )
 llm_gateway_base=(-f "$chart/values-llm-gateway.yaml" "${valid_llm_gateway[@]}")
 
@@ -366,13 +367,33 @@ if [ -n "$repository" ] &&
       else
         overrides=("${valid_llm_gateway[@]}")
       fi
+      # The gateway's listener serves TLS by default since #424, which is a
+      # change of meaning on purpose. Its plaintext mode is the old behaviour,
+      # so that is what is compared, and the one argument it adds, the
+      # acknowledgement the binary now requires for a 0.0.0.0 bind, is the
+      # only difference allowed. The TLS rendering is asserted on its own below.
+      current=("${overrides[@]}")
+      if [ "$profile" = llm-gateway ]; then
+        current+=(--set llmGateway.tls.enabled=false,llmGateway.tls.secretName=)
+      fi
       # Both must render, or two identical error messages would compare equal.
       if ! helm template shoal "$reference_chart" -f "$reference_chart/values-$profile.yaml" "${overrides[@]}" > "$reference/before" 2>&1 ||
-        ! helm template shoal "$chart" -f "$chart/values-$profile.yaml" "${overrides[@]}" > "$reference/after" 2>&1; then
+        ! helm template shoal "$chart" -f "$chart/values-$profile.yaml" "${current[@]}" > "$reference/after" 2>&1; then
         fail "values-$profile.yaml, filled in, does not render on both $baseline and this tree, so it cannot be compared"
       elif ! python3 - "$reference/before" "$reference/after" <<'PARSED'
 import sys, yaml
 before, after = (list(yaml.safe_load_all(open(path))) for path in sys.argv[1:])
+acknowledgement = "-allow-plaintext-listener=true"
+for document in after:
+    if (document or {}).get("kind") != "Deployment":
+        continue
+    for container in document["spec"]["template"]["spec"]["containers"]:
+        arguments = container.get("args") or []
+        if acknowledgement in arguments and not any(
+                acknowledgement in (c.get("args") or [])
+                for d in before if (d or {}).get("kind") == "Deployment"
+                for c in d["spec"]["template"]["spec"]["containers"]):
+            arguments.remove(acknowledgement)
 raise SystemExit(0 if before == after else 1)
 PARSED
       then
@@ -769,7 +790,7 @@ gateway_scalars_quoted() {
   stray=$(printf '%s\n' "$rendered" | grep -E '^ +- -' || true)
   stray+=$'\n'$(printf '%s\n' "$rendered" |
     grep -E '^ +(- )?(name|key|secretName|mountPath|audience|path|image|imagePullPolicy|serviceAccountName|type): [^"]' |
-    grep -vE ': (shoal-llm-gateway|RollingUpdate|RuntimeDefault|http|health|admission-token|upstream-api-key|/readyz|/healthz)$' || true)
+    grep -vE ': (shoal-llm-gateway|RollingUpdate|RuntimeDefault|http|https|health|admission-token|upstream-api-key|listener-tls|/readyz|/healthz)$' || true)
   stray=$(printf '%s\n' "$stray" | sed '/^$/d')
   if [ -n "$stray" ]; then
     fail "an unquoted value in the gateway Deployment: $description"
@@ -1364,21 +1385,63 @@ refuses "the env form still needs a Secret"  "${llm_gateway_base[@]}" --set llmG
 refuses "the env form still needs a variable" "${llm_gateway_base[@]}" --set llmGateway.admission.tokenEnv=
 
 note "== the transport acknowledgement, and the one hop that has none =="
-# The listener acknowledgement is separate from the admission hop and must be
-# a boolean: a quoted "false" is truthy in a Helm condition.
-assert_renders "the default internal gateway Service" 'type: "ClusterIP"' "${llm_gateway_base[@]}"
+# The listener (#424). The binary applies its outbound rule to the hop it
+# receives: TLS, or plaintext on loopback only. The pod binds 0.0.0.0, so the
+# chart renders either the key pair or the acknowledgement, never both and
+# never neither; the wiring check below holds it to that.
+plaintext_listener=(--set llmGateway.tls.enabled=false,llmGateway.tls.secretName=)
+assert_renders "TLS by default: the certificate"     '"-tls-cert-file=/etc/shoal-llm-gateway/tls/tls.crt"' "${llm_gateway_base[@]}"
+assert_renders "TLS by default: the key"             '"-tls-key-file=/etc/shoal-llm-gateway/tls/tls.key"' "${llm_gateway_base[@]}"
+assert_renders "TLS by default: no acknowledgement"  '"-allow-plaintext-listener=false"' "${llm_gateway_base[@]}"
+assert_renders "TLS by default: the key pair's Secret" '^ +secretName: "shoal-llm-gateway-tls"$' "${llm_gateway_base[@]}"
+assert_renders "TLS by default: the port says https" '^ +- name: https$' "${llm_gateway_base[@]}"
+refuses_citing "llmGateway.tls.secretName is required" "TLS with no Secret" "${llm_gateway_base[@]}" --set llmGateway.tls.secretName=
+refuses_citing "llmGateway.tls.secretName is required" "TLS with a blank Secret" "${llm_gateway_base[@]}" --set-string 'llmGateway.tls.secretName=  '
+refuses_citing "llmGateway.tls.secretName is required" "the shipped profile with everything but the Secret" -f "$chart/values-llm-gateway.yaml" "${valid_llm_gateway[@]}" --set llmGateway.tls.secretName=
+for value in true false; do
+  refuses_citing "llmGateway.tls.enabled must be a boolean" "a string tls.enabled ($value)" "${llm_gateway_base[@]}" --set-string llmGateway.tls.enabled="$value"
+done
+refuses_citing "llmGateway.tls.enabled must be a boolean" "a null tls.enabled" "${llm_gateway_base[@]}" --set llmGateway.tls.enabled=null
+refuses_citing "llmGateway.tls.enabled must be a boolean" "a null tls block" "${llm_gateway_base[@]}" --set llmGateway.tls=null
+refuses_citing "holds a control character" "a newline in the TLS Secret" "${llm_gateway_base[@]}" --set-string 'llmGateway.tls.secretName=gw-tls
+injected'
+# A TLS listener may be exposed: the transport is the process's own.
+for service_type in LoadBalancer NodePort; do
+  assert_renders "a TLS $service_type gateway" "type: \"$service_type\"" "${llm_gateway_base[@]}" --set llmGateway.service.type="$service_type"
+done
+refuses_citing "the acknowledgement covers nothing" "the exposure acknowledgement beside TLS" "${llm_gateway_base[@]}" --set llmGateway.service.allowPlaintext=true
+# The credential files cannot land on the key pair's mount, under it or above
+# it. The near miss renders: a directory that only shares a name prefix.
+refuses_citing "where the chart mounts the listener's TLS Secret" "a token file on the TLS mount" "${token_file_base[@]}" --set llmGateway.admission.tokenFile=/etc/shoal-llm-gateway/tls/token
+refuses_citing "where the chart mounts the listener's TLS Secret" "a token file above the TLS mount" "${token_file_base[@]}" --set llmGateway.admission.tokenFile=/etc/shoal-llm-gateway/token
+refuses_citing "where the chart mounts the listener's TLS Secret" "a key file under the TLS mount" "${llm_gateway_base[@]}" --set llmGateway.upstream.apiKeyFile=/etc/shoal-llm-gateway/tls/upstream/api-key
+renders "a token file beside the TLS mount" "${token_file_base[@]}" --set llmGateway.admission.tokenFile=/etc/shoal-llm-gateway-token/token
+renders "a plaintext listener's token file may use that directory" "${token_file_base[@]}" "${plaintext_listener[@]}" --set llmGateway.admission.tokenFile=/etc/shoal-llm-gateway/tls/token
+
+# Plaintext is a choice the values file makes, and the acknowledgement reaches
+# the process: without it the binary refuses the 0.0.0.0 bind and the pod
+# crash-loops, which is the mismatch -allow-plaintext-admission was added for.
+assert_renders "plaintext renders the acknowledgement" '"-allow-plaintext-listener=true"' "${llm_gateway_base[@]}" "${plaintext_listener[@]}"
+assert_absent "plaintext mounts no key pair" 'listener-tls|-tls-cert-file|-tls-key-file' "${llm_gateway_base[@]}" "${plaintext_listener[@]}"
+assert_renders "plaintext: the port says http" '^ +- name: http$' "${llm_gateway_base[@]}" "${plaintext_listener[@]}"
+refuses_citing "nothing mounts or reads it" "a TLS Secret with TLS off" "${llm_gateway_base[@]}" --set llmGateway.tls.enabled=false
+
+# And a plaintext listener stays inside the cluster unless a terminating load
+# balancer is acknowledged. That acknowledgement is separate from the admission
+# hop and must be a boolean: a quoted "false" is truthy in a Helm condition.
+assert_renders "the default internal gateway Service" 'type: "ClusterIP"' "${llm_gateway_base[@]}" "${plaintext_listener[@]}"
 for service_type in LoadBalancer NodePort ExternalName; do
-  refuses_citing "exposes a plaintext prompt endpoint" "an unacknowledged $service_type gateway" "${llm_gateway_base[@]}" --set llmGateway.service.type="$service_type"
+  refuses_citing "exposes a plaintext prompt endpoint" "an unacknowledged plaintext $service_type gateway" "${llm_gateway_base[@]}" "${plaintext_listener[@]}" --set llmGateway.service.type="$service_type"
 done
 for service_type in LoadBalancer NodePort; do
-  assert_renders "an acknowledged $service_type gateway" "type: \"$service_type\"" "${llm_gateway_base[@]}" --set llmGateway.service.type="$service_type",llmGateway.service.allowPlaintext=true
+  assert_renders "an acknowledged plaintext $service_type gateway" "type: \"$service_type\"" "${llm_gateway_base[@]}" "${plaintext_listener[@]}" --set llmGateway.service.type="$service_type",llmGateway.service.allowPlaintext=true
 done
-refuses_citing "exposes a plaintext prompt endpoint" "an explicitly unacknowledged public gateway" "${llm_gateway_base[@]}" --set llmGateway.service.type=LoadBalancer,llmGateway.service.allowPlaintext=false
-refuses_citing "exposes a plaintext prompt endpoint" "admission acknowledgement does not cover the listener" "${llm_gateway_base[@]}" --set llmGateway.service.type=LoadBalancer,llmGateway.admission.allowPlaintext=true
+refuses_citing "exposes a plaintext prompt endpoint" "an explicitly unacknowledged public gateway" "${llm_gateway_base[@]}" "${plaintext_listener[@]}" --set llmGateway.service.type=LoadBalancer,llmGateway.service.allowPlaintext=false
+refuses_citing "exposes a plaintext prompt endpoint" "admission acknowledgement does not cover the listener" "${llm_gateway_base[@]}" "${plaintext_listener[@]}" --set llmGateway.service.type=LoadBalancer,llmGateway.admission.allowPlaintext=true
 for acknowledgement in true false yes; do
-  refuses_citing "llmGateway.service.allowPlaintext must be a boolean" "a string listener acknowledgement ($acknowledgement)" "${llm_gateway_base[@]}" --set llmGateway.service.type=LoadBalancer --set-string llmGateway.service.allowPlaintext="$acknowledgement"
+  refuses_citing "llmGateway.service.allowPlaintext must be a boolean" "a string exposure acknowledgement ($acknowledgement)" "${llm_gateway_base[@]}" "${plaintext_listener[@]}" --set llmGateway.service.type=LoadBalancer --set-string llmGateway.service.allowPlaintext="$acknowledgement"
 done
-refuses_citing "llmGateway.service.allowPlaintext must be a boolean" "a null listener acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.service.allowPlaintext=null
+refuses_citing "llmGateway.service.allowPlaintext must be a boolean" "a null exposure acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.service.allowPlaintext=null
 renders "a disabled gateway does not guard listener exposure" -f "$chart/values.yaml" --set llmGateway.enabled=false,llmGateway.service.type=LoadBalancer
 # The acknowledgement is a flag now, because it was a values key that reached
 # nothing: the binary refuses a remote http:// admission URL without it, so the
@@ -1392,7 +1455,7 @@ refuses "a non-boolean plaintext acknowledgement" "${llm_gateway_base[@]}" --set
 # nothing about it. allowPlaintext must not open this one.
 refuses "a plaintext remote upstream" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://api.example.test/v1
 refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the admission acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://api.example.test/v1,llmGateway.admission.allowPlaintext=true
-refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the listener acknowledgement" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://api.example.test/v1,llmGateway.service.allowPlaintext=true
+refuses_citing "is plaintext to a remote provider" "a plaintext remote upstream even with the listener acknowledgements" "${llm_gateway_base[@]}" "${plaintext_listener[@]}" --set llmGateway.upstream.baseURL=http://api.example.test/v1,llmGateway.service.type=LoadBalancer,llmGateway.service.allowPlaintext=true
 renders "a loopback provider over http"     "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://localhost:11434/v1,llmGateway.upstream.credentialSecretName=
 
 note "== the declared model list =="
@@ -1706,8 +1769,12 @@ if deployment is None:
 template = deployment["spec"]["template"]
 container = template["spec"]["containers"][0]
 declared = {port["name"]: port["containerPort"] for port in container["ports"]}
+# The listener port is named for what it speaks, so a mesh does not parse a
+# TLS handshake as an HTTP request.
+listener = "https" if any(
+    argument.startswith("-tls-cert-file=") for argument in container["args"]) else "http"
 
-for name in ("http", "health"):
+for name in (listener, "health"):
     if name not in declared:
         problems.append(f"the container declares no {name} port")
 
@@ -1758,7 +1825,7 @@ def served(flag):
     return values[0] if values else None
 
 
-for flag, name in (("-health-address", "health"), ("-listen", "http")):
+for flag, name in (("-health-address", "health"), ("-listen", listener)):
     port = served(flag)
     if port is None:
         problems.append(
@@ -1774,10 +1841,10 @@ if not services:
 for service in services:
     for port in service["spec"]["ports"]:
         target = port.get("targetPort")
-        if target != "http":
+        if target != listener or port.get("name") != listener:
             problems.append(
-                "Service port %s targets %s rather than the http port"
-                % (port["port"], target)
+                "Service port %s (%s) targets %s rather than the %s port"
+                % (port["port"], port.get("name"), target, listener)
             )
         if "health" in declared and port["port"] == declared["health"]:
             problems.append(
@@ -2041,6 +2108,49 @@ if len(paths) != len(set(paths)):
         f"two volumes are mounted at one path ({paths}), which the API server "
         "refuses: the Deployment is created and no pod ever is"
     )
+# The listener key pair. The chart binds 0.0.0.0, which the binary serves in
+# plaintext only with -allow-plaintext-listener=true and refuses beside TLS,
+# so exactly one of the two must be rendered or the pod exits at startup.
+cert_file = arguments.get("-tls-cert-file")
+key_file = arguments.get("-tls-key-file")
+plaintext = arguments.get("-allow-plaintext-listener")
+if plaintext not in ("true", "false"):
+    problems.append(
+        f"-allow-plaintext-listener is {plaintext!r}: it is a boolean flag, "
+        "rendered explicitly either way")
+if bool(cert_file) != bool(key_file):
+    problems.append("only one of -tls-cert-file and -tls-key-file is rendered")
+if bool(cert_file) == (plaintext == "true"):
+    problems.append(
+        f"-tls-cert-file is {cert_file!r} and -allow-plaintext-listener is "
+        f"{plaintext!r}: the binary refuses a plaintext 0.0.0.0 listener "
+        "without the acknowledgement and the acknowledgement beside TLS")
+if cert_file:
+    expected_volumes.add("listener-tls")
+    mount = mounts.get("listener-tls")
+    volume = volumes.get("listener-tls", {})
+    secret = volume.get("secret") or {}
+    if mount is None:
+        problems.append("-tls-cert-file is rendered with no listener-tls mount")
+    else:
+        mount_path = mount["mountPath"]
+        for path in (cert_file, key_file):
+            if os.path.dirname(path) != mount_path:
+                problems.append(
+                    f"{path} is not in {mount_path}, where the key pair is mounted")
+        if not mount.get("readOnly"):
+            problems.append("the listener-tls mount is writable")
+    if not secret.get("secretName"):
+        problems.append("the listener-tls volume names no Secret")
+    names = sorted(item.get("path") for item in secret.get("items") or [])
+    if names != sorted(os.path.basename(p) for p in (cert_file, key_file or "")):
+        problems.append(
+            f"the key pair is mounted as {names}, not as the files the flags name")
+    mode = secret.get("defaultMode")
+    if mode is None or mode & 0o222 or not mode & 0o040 or fsgroup != run_as_group:
+        problems.append(
+            f"the key pair is mode {mode!r} with fsGroup {fsgroup}: it must be "
+            "group-readable, by the group the process runs as, and not writable")
 unused = sorted(set(volumes) - expected_volumes)
 if unused:
     problems.append(f"volumes nothing reads: {unused}")
@@ -2074,6 +2184,8 @@ wired "both credentials from files"           "${both_files[@]}"
 wired "both credentials from the environment" "${llm_gateway_base[@]}"
 wired "a loopback provider that needs no credential" "${llm_gateway_base[@]}" --set llmGateway.upstream.baseURL=http://localhost:11434/v1,llmGateway.upstream.credentialSecretName=
 wired "an acknowledged plaintext decision plane" "${llm_gateway_base[@]}" --set llmGateway.admission.url=http://shoal-explorer:8098,llmGateway.admission.allowPlaintext=true
+wired "a plaintext listener behind a mesh"      "${llm_gateway_base[@]}" "${plaintext_listener[@]}"
+wired "a plaintext listener with a token file" "${token_file_base[@]}" "${plaintext_listener[@]}"
 
 note "== a map rendered through toYaml cannot carry YAML of its own (#468) =="
 # toYaml was assumed to make whatever it renders safe, and it does not, in two
