@@ -415,7 +415,7 @@
 {{- range $field := list "containerPort" "healthPort" -}}
 {{- $port := int (index $explorer $field) -}}
 {{- if lt $port 1024 -}}
-{{- fail (printf "explorer.%s must be 1024 or above (got %d): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $field $port) -}}
+{{- fail (printf "explorer.%s must be 1024 or above (got %d): the container runs as uid 65532 and drops all capabilities, so it may be unable to bind on runtimes that restrict ports below 1024, and the pod then restarts forever. Use a port of 1024 or above" $field $port) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -1058,11 +1058,14 @@
 {{- fail (printf "llmGateway.%s must be a port between 1 and 65535 (got %v): anything else is not a port the API server will accept, so the object is rejected at install" $field (default 0 (index $gateway $field))) -}}
 {{- end -}}
 {{- end -}}
-{{- /* The pod runs as uid 65532 with every capability dropped, so a privileged
-       port is not a choice the chart can honour on its behalf. */ -}}
+{{- /* The pod runs as uid 65532 with every capability dropped, so it may be
+       unable to bind on runtimes that restrict ports below 1024. Some do not
+       (containerd 2.x and Docker 20.10+ allow unprivileged low ports), so the
+       1024 floor is the chart's policy, not a hard kernel limit: a port that
+       binds on one node and fails on the next is the failure it avoids. */ -}}
 {{- range $field := list "containerPort" "healthPort" -}}
 {{- if lt (int (default 0 (index $gateway $field))) 1024 -}}
-{{- fail (printf "llmGateway.%s must be 1024 or above (got %d): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $field (int (default 0 (index $gateway $field)))) -}}
+{{- fail (printf "llmGateway.%s must be 1024 or above (got %d): the container runs as uid 65532 and drops all capabilities, so it may be unable to bind on runtimes that restrict ports below 1024, and the pod then restarts forever. Use a port of 1024 or above" $field (int (default 0 (index $gateway $field)))) -}}
 {{- end -}}
 {{- end -}}
 
@@ -1322,7 +1325,9 @@
 {{- end -}}
 {{- end -}}
 {{- /* healthPort starts at 1024, not 1 (#423): the pod runs as uid 65532 with
-       all capabilities dropped and cannot bind a privileged port. */ -}}
+       all capabilities dropped, so it may be unable to bind on runtimes that
+       restrict ports below 1024. The floor is a policy, as for the other
+       pods, not a hard limit. */ -}}
 {{- range $bound := list (list "maxInFlight" 1 64) (list "pullLimit" 1 256) (list "maxResponseBytes" 1 1048576) (list "healthPort" 1024 65535) -}}
 {{- $field := index $bound 0 -}}
 {{- $value := include "shoal.effectsGatewayWhole" (dict "name" (printf "%s.%s" $key $field) "value" (index $gateway $field)) -}}
@@ -1479,8 +1484,9 @@
 
 {{- /* Bind ports for the storage-tier pods (#423). Every one of them runs as uid
        65532 with all capabilities dropped, as the explorer and the gateways
-       do, so a privileged port renders a pod that cannot bind and restarts
-       forever. Only the ports a container binds are checked: a Service port
+       do, so it may be unable to bind on runtimes that restrict ports below
+       1024 and would then restart forever. The floor is a policy (see the
+       llmGateway note above), applied the same way here. Only the ports a container binds are checked: a Service port
        is the cluster's to choose. The read fleet binds readFleet.listen, not
        readFleet.servicePort (which only names the container port), so its
        listen address is the one checked. */ -}}
@@ -1489,7 +1495,7 @@
 {{- range $field := $fields -}}
 {{- $port := int (index (index $.Values $role) $field) -}}
 {{- if lt $port 1024 -}}
-{{- fail (printf "%s.%s must be 1024 or above (got %d): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $role $field $port) -}}
+{{- fail (printf "%s.%s must be 1024 or above (got %d): the container runs as uid 65532 and drops all capabilities, so it may be unable to bind on runtimes that restrict ports below 1024, and the pod then restarts forever. Use a port of 1024 or above" $role $field $port) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -1498,7 +1504,7 @@
 {{- $readListen := trim (toString (default "" .Values.readFleet.listen)) -}}
 {{- $readListenPort := regexFind "[0-9]+$" (regexFind ":[0-9]+$" $readListen) -}}
 {{- if and $readListenPort (lt (int $readListenPort) 1024) -}}
-{{- fail (printf "readFleet.listen must bind a port of 1024 or above (got %q): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $readListen) -}}
+{{- fail (printf "readFleet.listen must bind a port of 1024 or above (got %q): the container runs as uid 65532 and drops all capabilities, so it may be unable to bind on runtimes that restrict ports below 1024, and the pod then restarts forever. Use a port of 1024 or above" $readListen) -}}
 {{- end -}}
 {{- end -}}
 

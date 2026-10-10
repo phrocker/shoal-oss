@@ -501,6 +501,27 @@ refuses_citing "which holds a comma" "a trailing comma inside one entry" "${expl
 refuses_citing "which holds a comma" "two authorities written as one entry" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test\,other.example.test}'
 refuses_citing "which holds whitespace inside the authority" "a space inside an authority" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal .example.test}'
 refuses_citing "explorer.allowedHosts contains a blank-after-trim element" "a null entry beside a valid host" "${explorer_base[@]}" --set 'explorer.allowedHosts[1]=null'
+# Entries are authorities as normalizeAuthority reads them. A URL splits at its
+# last colon into host "https" and matches nothing; an unbracketed IPv6 address
+# is refused by the workspace at startup.
+refuses_citing "which holds a \"/\"" "a URL instead of an authority" "${explorer_base[@]}" --set-string 'explorer.allowedHosts[0]=https://shoal.example.test'
+refuses_citing "which holds a \"/\"" "an authority with a path" "${explorer_base[@]}" --set-string 'explorer.allowedHosts[0]=shoal.example.test/'
+for host in '::1' 'fe80::1' 'a:b:c' '::1]'; do
+  refuses_citing "an unbracketed host with more than one colon" "unbracketed $host" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
+for host in ':8443' '.'; do
+  refuses_citing "which has no host" "an empty host in $host" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
+for host in '[foo]' '[foo]:80' '[1:2:3:4:5:6:7:8:9]' '[:::]'; do
+  refuses_citing "whose bracketed host is not an IP address" "brackets around $host" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
+for host in '[::1' '[]:80' 'shoal.example.test:https'; do
+  refuses_citing "which is not an authority the workspace accepts" "malformed $host" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
+for host in '[::1]' '[::1]:8443' '[0:0:0:0:0:0:0:1]' '[fe80::1]:80' '[::]' '[127.0.0.1]' '127.0.0.1:80' 'SHOAL.example.test.' 'localhost'; do
+  escaped=$(printf '%s' "$host" | sed -e 's/[].[]/\\&/g')
+  assert_renders "authority $host renders as written" "^ +- \"-allowed-host=${escaped}\"\$" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
 assert_renders "an authority with a port is kept as written" '^ +- "-allowed-host=shoal\.example\.test:8443"$' "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test:8443}'
 
 # The read fleet binds readFleet.listen and readFleet.metricsPort; its

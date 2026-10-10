@@ -198,11 +198,29 @@ an authority exactly, so every entry the chart passes must be one it can match:
 - Whitespace inside an entry is refused. The binary trims each piece but keeps
   interior space, and no Host header carries a space, so the entry matches
   nothing.
+- An entry must be an authority as normalizeAuthority
+  (pkg/explorer/webapi/hostauthority.go) reads one: host, host:port,
+  [ipv6] or [ipv6]:port. A "/" is refused, because a URL such as
+  "https://shoal.example.test" splits as host "https" with port
+  "//shoal.example.test" and matches nothing. An unbracketed host with more
+  than one colon ("::1") is refused, because the workspace refuses it at
+  startup and the pod exits. An empty host (":8443", or "." once the
+  trailing dot is folded) is refused for the same reason.
+
+  This is slightly stricter than the binary in two places, both of which
+  are false refusals of an authority no client sends: a bracketed host must
+  be an IP literal even when a port follows (net.SplitHostPort does not
+  check it), and a port must be digits (the binary compares it as a string).
+  IPv6 literals with an embedded IPv4 tail (::ffff:192.0.2.1) are refused
+  too, since the pattern below covers the hex forms only.
 
 Emits the empty string for an empty list, which is what the guard tests.
 */ -}}
 {{- define "shoal.explorerAllowedHosts" -}}
 {{- $hosts := list -}}
+{{- $octet := "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])" -}}
+{{- $v4 := printf "^%s(\\.%s){3}$" $octet $octet -}}
+{{- $v6 := replace "H" "[0-9a-fA-F]{1,4}" "^((H:){7}H|(H:){1,7}:|(H:){1,6}:H|(H:){1,5}(:H){1,2}|(H:){1,4}(:H){1,3}|(H:){1,3}(:H){1,4}|(H:){1,2}(:H){1,5}|H:(:H){1,6}|:((:H){1,7}|:))$" -}}
 {{- range (default (list) .Values.explorer.allowedHosts) -}}
 {{- $host := trim (toString (default "" .)) -}}
 {{- if not $host -}}
@@ -213,6 +231,25 @@ Emits the empty string for an empty list, which is what the guard tests.
 {{- end -}}
 {{- if regexMatch `\p{Zs}` $host -}}
 {{- fail (printf "explorer.allowedHosts contains %q, which holds whitespace inside the authority: the workspace matches the Host header exactly and no Host header carries a space, so every request for it is refused with 421" $host) -}}
+{{- end -}}
+{{- if contains "/" $host -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which holds a \"/\": an entry is an authority (host or host:port, as the Host header carries it), not a URL. The workspace would split it at the last colon and match nothing, so every request for it is refused with 421" $host) -}}
+{{- end -}}
+{{- $bracketed := `^\[([^\[\]]+)\](:[0-9]*)?$` -}}
+{{- $plain := `^([^\[\]:]*)(:[0-9]*)?$` -}}
+{{- if regexMatch $bracketed $host -}}
+{{- $inner := regexReplaceAll $bracketed $host "${1}" -}}
+{{- if not (or (regexMatch $v6 $inner) (regexMatch $v4 $inner)) -}}
+{{- fail (printf "explorer.allowedHosts contains %q, whose bracketed host is not an IP address: brackets hold an IPv6 literal such as [::1], optionally followed by :port" $host) -}}
+{{- end -}}
+{{- else if regexMatch $plain $host -}}
+{{- if not (trimSuffix "." (regexReplaceAll $plain $host "${1}")) -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which has no host: the workspace refuses an authority with an empty host at startup" $host) -}}
+{{- end -}}
+{{- else if regexMatch `^[^\[\]]*:[^\[\]]*:` $host -}}
+{{- fail (printf "explorer.allowedHosts contains %q, an unbracketed host with more than one colon: the workspace refuses it at startup and the pod exits. Write an IPv6 address in brackets, as [::1] or [::1]:8443" $host) -}}
+{{- else -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which is not an authority the workspace accepts: write host, host:port, [ipv6] or [ipv6]:port, with a numeric port" $host) -}}
 {{- end -}}
 {{- $hosts = append $hosts $host -}}
 {{- end -}}
