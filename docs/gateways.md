@@ -6,7 +6,7 @@ reached by a separate gateway, built in this order:
 | gateway | governs | principal | state |
 | --- | --- | --- | --- |
 | LLM gateway | what an agent *discloses* to a model | agent or application | built: `cmd/shoal-llm-gateway`, `docs/llm-gateway-deploy.md` |
-| Effects gateway | what an agent *does* to an external system | agent, through dispatch | designed: #391, `docs/gateway-proxy-design.md`; blocked |
+| Effects gateway | what an agent *does* to an external system | agent, through dispatch | built (HTTP): `cmd/shoal-gateway`, `docs/effects-gateway-deploy.md`; design in #391 and `docs/gateway-proxy-design.md` |
 | Session gateway | what Shoal *learns* from what humans do | human operator | proposed: an extension under #401 (#447–#449) |
 
 The first two enforce. The third improves what they enforce: it turns human
@@ -207,13 +207,17 @@ the same reason.
 1. **LLM gateway.** Built. Open: #424 (plaintext listener), #425 (denials an
    operator can monitor). Withhold obligations apply to caller-attributed
    content (#426, `docs/llm-gateway-deploy.md`).
-2. **Effects gateway, HTTP.** Blocked on #435 (worker never receives input),
-   #436 (no external-effect executor ceiling), #437 (claimant must be
-   enqueuer), #438 (nowhere to record a lost-fence ambiguity) and #430 (claims
-   cannot be extended), and on the decision the design doc requires about
-   heartbeats moving the descriptor generation ("The second blocker: every
-   heartbeat invalidates every claim"), which has no issue of its own. Then
-   #391. Approval as an admission outcome lands before the gateway enforces any
+2. **Effects gateway, HTTP.** Built (#391): `cmd/shoal-gateway`, its image
+   and the chart's `effectsGateways:`, tested end to end as a binary. Every
+   blocker is closed: #435 (worker never received input), #436 (no
+   external-effect executor ceiling), #437 (claimant had to be the enqueuer),
+   #438 and #484 (nowhere to record a lost-fence ambiguity), #430 (claims
+   could not be extended), #480 (nothing could hold `OperationExecute`) and
+   #486 (a heartbeat moved the descriptor generation). Open, and not
+   blocking: #363 (reaping claims a dead gateway left), #633 (a live agent
+   briefly reads as not found under concurrent writes), #638 (image CI hits
+   Docker Hub's rate limit) and #630 (declassification is not audited).
+   Approval as an admission outcome lands before the gateway enforces any
    effect that requires it.
 3. **Core extension contracts.** Collector registration and authority, extractor
    identity, runtime attestation, SDK, import boundary test. Rides on #403, #418

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phrocker/shoal-oss/internal/executorattest"
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
@@ -54,6 +55,9 @@ type approvalHarness struct {
 	// executors is the configured executor references; nil means "local"
 	// alone.
 	executors configuredFleetExecutors
+	// attestation is the executor attestation trust the service is opened
+	// with (-fleet-executor-attestation); nil means none.
+	attestation *executorattest.Trust
 }
 
 func newApprovalHarness(t *testing.T) *approvalHarness {
@@ -95,11 +99,12 @@ func (h *approvalHarness) tryOpen() error {
 		backend: "embedded", data: filepath.Join(h.root, "corpus"),
 		policyDir: filepath.Join(h.root, "policy"),
 		resolver:  h.authority.Resolver(), clock: h.now,
-		executors:         h.configuredExecutors(),
-		generationReader:  h.reader,
-		wrapApprovalStore: h.wrap,
-		approverMapping:   h.mapping,
-		identityScheme:    h.scheme,
+		executors:           h.configuredExecutors(),
+		generationReader:    h.reader,
+		wrapApprovalStore:   h.wrap,
+		approverMapping:     h.mapping,
+		identityScheme:      h.scheme,
+		executorAttestation: h.attestation,
 	})
 	if err != nil {
 		return err
