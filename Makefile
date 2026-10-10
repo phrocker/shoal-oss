@@ -25,6 +25,7 @@ THRIFT_IDL            := internal/thrift/idl
 THRIFT_OUT            := internal/thrift/gen
 THRIFT_PACKAGE_PREFIX := github.com/phrocker/shoal-oss/internal/thrift/gen/
 IMAGE                 ?= shoal-embed:dev
+GATEWAY_IMAGE         ?= shoal-gateway:dev
 VERSION               ?= dev
 REVISION              ?= $(shell git rev-parse HEAD)
 CREATED               ?= $(shell git show -s --format=%cI HEAD)
@@ -223,6 +224,22 @@ container-build:
 container-smoke:
 	IMAGE=$(IMAGE) VERSION=$(VERSION) REVISION=$(REVISION) CREATED=$(CREATED) \
 	  bash test/container/shoal-embed-smoke.sh
+
+# The effects gateway image (#391), which the chart's effectsGateways entries run.
+.PHONY: gateway-container-build
+gateway-container-build:
+	docker build \
+	  --file Dockerfile.shoal-gateway \
+	  --build-arg VERSION=$(VERSION) \
+	  --build-arg REVISION=$(REVISION) \
+	  --build-arg CREATED=$(CREATED) \
+	  --tag $(GATEWAY_IMAGE) \
+	  .
+
+.PHONY: gateway-container-smoke
+gateway-container-smoke:
+	IMAGE=$(GATEWAY_IMAGE) VERSION=$(VERSION) REVISION=$(REVISION) CREATED=$(CREATED) \
+	  bash test/container/shoal-gateway-smoke.sh
 
 .PHONY: capi
 capi:

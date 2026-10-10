@@ -1030,6 +1030,310 @@
 {{- end -}}
 {{- end -}}
 
+{{- /* The effects gateways (#391).
+
+       Each entry is checked as it renders: merged over effectsGatewayDefaults
+       by the same helper the templates use. The refusals are the binary's
+       startup refusals moved to render time, plus the deployment rules the
+       binary cannot see — one replica, the grace period, the unrecorded
+       log's volume. A gateway the binary refuses is a pod in CrashLoopBackOff;
+       a gateway with the wrong grace period or an emptyDir log is worse, a pod
+       that works until a rollout or a reschedule strands an effect. */ -}}
+{{- $gatewayNames := dict -}}
+{{- $gatewayIdentities := dict -}}
+{{- $enabledGatewayNames := list -}}
+{{- $fleet := .Values.explorer.fleet -}}
+{{- range $gateway := fromJsonArray (include "shoal.effectsGateways" .) -}}
+{{- $key := printf "effectsGateways[%v]" $gateway._index -}}
+{{- $name := toString (default "" $gateway.name) -}}
+{{- if not (kindIs "bool" $gateway.enabled) -}}
+{{- fail (printf "%s.enabled must be a boolean, true or false (got %v)" $key $gateway.enabled) -}}
+{{- end -}}
+{{- /* Names are checked on every entry, enabled or not, so enabling one
+       later cannot collide with a name already in use. */ -}}
+{{- if not (regexMatch "^[a-z]([-a-z0-9]*[a-z0-9])?$" $name) -}}
+{{- fail (printf "%s.name must be a DNS label — lower-case letters, digits and '-', starting with a letter (got %q): it names the gateway's Deployment, ServiceAccount, ConfigMap, claim and NetworkPolicy" $key $name) -}}
+{{- end -}}
+{{- if gt (len $name) 24 -}}
+{{- fail (printf "%s.name %q is %d characters, over the 24 the stem budget allows: objects are named <stem>-gw-<name> and the claim <stem>-gw-<name>-unrecorded, which must fit Kubernetes' 63" $key $name (len $name)) -}}
+{{- end -}}
+{{- if hasKey $gatewayNames $name -}}
+{{- fail (printf "%s.name %q is also the name of effectsGateways[%v]: two entries with one name render one set of objects, and the second overwrites the first's Deployment, credential and unrecorded log" $key $name (index $gatewayNames $name)) -}}
+{{- end -}}
+{{- $_ := set $gatewayNames $name $gateway._index -}}
+{{- if $gateway.enabled -}}
+{{- $enabledGatewayNames = append $enabledGatewayNames $name -}}
+{{- $dispatch := $gateway.dispatch -}}
+{{- $target := $gateway.target -}}
+{{- $timing := $gateway.timing -}}
+{{- $unrecorded := $gateway.unrecorded -}}
+
+{{- /* At most one replica (#391). Two would share one executor principal,
+       so each could re-claim, and evict from the claim history, what the
+       other holds (#514), over one unrecorded log whose lock refuses the
+       second process. Re-registration semantics for more than one worker
+       per surface are unsettled, so the chart allows one, or zero to stop
+       the gateway (to acknowledge its log, or before a rename). Checked as
+       written: int of 1.5 is 1. */ -}}
+{{- if not (has (toString $gateway.replicas) (list "0" "1")) -}}
+{{- fail (printf "%s.replicas must be 0 or 1 (got %v): the effects gateway runs at most one replica per surface. A second replica would share the executor principal and the unrecorded log, whose lock refuses it — and two workers on one surface can evict each other's claims (#514). To stop the gateway, set replicas: 0 and upgrade; a kubectl scale is reverted by the next helm upgrade" $key $gateway.replicas) -}}
+{{- end -}}
+
+{{- /* One principal, one log, one worker. Two enabled entries that share an
+       executor reference, a descriptor, a ServiceAccount (the subject the
+       executor credential is minted for) or an operator-owned claim are two
+       workers on one principal (#514): each can re-claim and evict what the
+       other holds, and with separate claims the log's lock never sees the
+       second. The ServiceAccount compared is the effective one, so a
+       serviceAccountName that names another entry's chart-created account
+       is caught too. So is the claim: the effective one, the chart-created
+       <stem>-gw-<name>-unrecorded or an existingClaim, under one key, so an
+       existingClaim naming another entry's created claim is refused. */ -}}
+{{- $account := default (include "shoal.effectsGatewayName" (dict "root" $ "gateway" $gateway)) $gateway.serviceAccountName -}}
+{{- $identities := dict "executorRef" (toString $gateway.executorRef) "agentID" (toString $gateway.agentID) "ServiceAccount" $account -}}
+{{- if eq (toString $unrecorded.storage) "existingClaim" -}}
+{{- $_ := set $identities "unrecorded claim" (toString $unrecorded.existingClaim) -}}
+{{- else if eq (toString $unrecorded.storage) "persistentVolumeClaim" -}}
+{{- $_ := set $identities "unrecorded claim" (printf "%s-unrecorded" (include "shoal.effectsGatewayName" (dict "root" $ "gateway" $gateway))) -}}
+{{- end -}}
+{{- range $what, $value := $identities -}}
+{{- $seenKey := printf "%s=%s" $what $value -}}
+{{- if hasKey $gatewayIdentities $seenKey -}}
+{{- fail (printf "%s and effectsGateways[%v] share the %s %q: two enabled entries on one identity are two workers on one executor principal, which can evict each other's claims (#514), and with separate unrecorded logs no lock stops the second. Give each surface its own executor reference, descriptor, ServiceAccount and claim" $key (index $gatewayIdentities $seenKey) $what $value) -}}
+{{- end -}}
+{{- $_ := set $gatewayIdentities $seenKey $gateway._index -}}
+{{- end -}}
+
+{{- range $flag := list "dispatch.allowPlaintext" "target.allowPrivate" "timing.renew" "unrecorded.acceptLossOfUnrecordedReports" "networkPolicy.enabled" -}}
+{{- $parts := splitList "." $flag -}}
+{{- $value := index (index $gateway (first $parts)) (last $parts) -}}
+{{- if not (kindIs "bool" $value) -}}
+{{- fail (printf "%s.%s must be a boolean, true or false (got %v): it is rendered into a flag or a template decision verbatim" $key $flag $value) -}}
+{{- end -}}
+{{- end -}}
+
+{{- range $field := list "image.repository" "image.tag" "agentID" "capability" "surfaceName" "executorRef" "dispatch.url" "target.baseURL" "target.authHeader" -}}
+{{- $parts := splitList "." $field -}}
+{{- $value := index $gateway (first $parts) -}}
+{{- if gt (len $parts) 1 -}}
+{{- $value = index $value (last $parts) -}}
+{{- end -}}
+{{- if not (trim (toString (default "" $value))) -}}
+{{- fail (printf "%s.%s is required: see effectsGatewayDefaults in values.yaml and docs/effects-gateway-deploy.md" $key $field) -}}
+{{- end -}}
+{{- if ne (toString $value) (trim (toString $value)) -}}
+{{- fail (printf "%s.%s must not have leading or trailing whitespace (got %q): it is rendered as written, and the binary compares it byte for byte" $key $field (toString $value)) -}}
+{{- end -}}
+{{- end -}}
+{{- include "shoal.requireShape" (dict "name" (printf "%s.image.pullPolicy" $key) "value" $gateway.image.pullPolicy "what" "one of Always, IfNotPresent or Never" "pattern" `^(Always|IfNotPresent|Never)$` "why" "the API server accepts no other value") -}}
+
+{{- /* The descriptor identity, held to the binary's rules. */ -}}
+{{- $agentID := toString $gateway.agentID -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9_-]+$" $agentID)) (eq (mod (len $agentID) 4) 1) -}}
+{{- fail (printf "%s.agentID must be unpadded base64url (got %q): it is the encoded descriptor ID, not a display name, and the binary refuses anything else at startup" $key $agentID) -}}
+{{- end -}}
+{{- range $field := list "capability" "surfaceName" -}}
+{{- if gt (len (toString (index $gateway $field))) 128 -}}
+{{- fail (printf "%s.%s must be at most 128 bytes, the fleet name limit" $key $field) -}}
+{{- end -}}
+{{- end -}}
+{{- /* executorref.ValidExecutorRef. */ -}}
+{{- $executorRef := toString $gateway.executorRef -}}
+{{- if or (gt (len $executorRef) 1024) (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._:/@-]*$" $executorRef)) -}}
+{{- fail (printf "%s.executorRef must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ and be at most 1024 bytes (got %q): executorref.ValidExecutorRef, which the binary, the fleet and the explorer all apply" $key $executorRef) -}}
+{{- end -}}
+
+{{- /* The dispatch hop. */ -}}
+{{- $dispatchURL := toString $dispatch.url -}}
+{{- if not (include "shoal.urlIsAbsolute" $dispatchURL) -}}
+{{- fail (printf "%s.dispatch.url must be an absolute http:// or https:// URL with a host (got %q)" $key $dispatchURL) -}}
+{{- end -}}
+{{- if and (include "shoal.urlIsPlaintext" $dispatchURL) (not (include "shoal.urlIsLoopback" $dispatchURL)) (not $dispatch.allowPlaintext) -}}
+{{- fail (printf "%s.dispatch.url %q is plaintext to a remote explorer: the executor token, every action's input and every completion cross the network in the clear. Use https://, or set dispatch.allowPlaintext: true where a mesh authenticates the hop" $key $dispatchURL) -}}
+{{- end -}}
+{{- if eq $dispatch.tokenSource "projected" -}}
+{{- if not (trim (toString (default "" $dispatch.tokenAudience))) -}}
+{{- fail (printf "%s.dispatch.tokenAudience is required with tokenSource: projected: a token with no audience is issued for the cluster's API server, and the explorer's executor branch accepts only its mapping's audience, so every pull would be a 401" $key) -}}
+{{- end -}}
+{{- $expiry := include "shoal.effectsGatewayWhole" (dict "name" (printf "%s.dispatch.tokenExpirationSeconds" $key) "value" $dispatch.tokenExpirationSeconds) -}}
+{{- if or (not $expiry) (lt (int64 $expiry) 600) -}}
+{{- fail (printf "%s.dispatch.tokenExpirationSeconds must be at least 600 (got %v), the API server's floor for a token projection: below it the pod spec is invalid and no pod is created" $key $dispatch.tokenExpirationSeconds) -}}
+{{- end -}}
+{{- if $dispatch.credentialSecretName -}}
+{{- fail (printf "%s.dispatch.credentialSecretName (%q) is set with tokenSource: projected, which reads no Secret: the credential presented would be the projected token, not this one. Clear it, or use tokenSource: secret" $key (toString $dispatch.credentialSecretName)) -}}
+{{- end -}}
+{{- else if eq $dispatch.tokenSource "secret" -}}
+{{- if or (not $dispatch.credentialSecretName) (not $dispatch.credentialSecretKey) -}}
+{{- fail (printf "%s.dispatch.credentialSecretName and credentialSecretKey are required with tokenSource: secret: they are the volume the token file is mounted from" $key) -}}
+{{- end -}}
+{{- else -}}
+{{- fail (printf "%s.dispatch.tokenSource must be projected or secret (got %q)" $key (toString $dispatch.tokenSource)) -}}
+{{- end -}}
+
+{{- /* The target hop: no plaintext opt-out, as in the binary. */ -}}
+{{- $targetURL := toString $target.baseURL -}}
+{{- $parsedTarget := urlParse $targetURL -}}
+{{- $loopbackTarget := include "shoal.urlIsLoopback" $targetURL -}}
+{{- if not (include "shoal.urlIsAbsolute" $targetURL) -}}
+{{- fail (printf "%s.target.baseURL must be an absolute https:// URL with a host, or http:// to loopback (got %q)" $key $targetURL) -}}
+{{- end -}}
+{{- if and (include "shoal.urlIsPlaintext" $targetURL) (not $loopbackTarget) -}}
+{{- fail (printf "%s.target.baseURL %q is plaintext to a remote surface: the request carries the target credential. There is no opt-out; use https://, or a loopback sidecar" $key $targetURL) -}}
+{{- end -}}
+{{- if or $parsedTarget.userinfo $parsedTarget.query $parsedTarget.fragment (contains "?" $targetURL) (contains "#" $targetURL) -}}
+{{- fail (printf "%s.target.baseURL must carry no userinfo, query or fragment (got %q): the credential comes from target.credentialSecretName, and the binary refuses the rest" $key $targetURL) -}}
+{{- end -}}
+{{- if and $loopbackTarget (not $target.allowPrivate) -}}
+{{- fail (printf "%s.target.baseURL %q addresses loopback, which the gateway's dialer refuses unless target.allowPrivate is true" $key $targetURL) -}}
+{{- end -}}
+{{- if and (not $loopbackTarget) (not $target.credentialSecretName) -}}
+{{- fail (printf "%s.target.credentialSecretName is required for a remote target (%q): the binary accepts no credential only for loopback" $key $targetURL) -}}
+{{- end -}}
+{{- if and $target.credentialSecretName (not $target.credentialSecretKey) -}}
+{{- fail (printf "%s.target.credentialSecretKey is required when a target Secret is named" $key) -}}
+{{- end -}}
+{{- $attestation := $gateway.attestation -}}
+{{- if and $attestation.secretName (or (not $attestation.statementKey) (not $attestation.keyKey)) -}}
+{{- fail (printf "%s.attestation.statementKey and keyKey are required when attestation.secretName is set" $key) -}}
+{{- end -}}
+
+{{- /* The route table: a list, rendered with toJson. The binary decodes it
+       strictly; the chart checks only what decides other flags. */ -}}
+{{- if or (not (kindIs "slice" $gateway.routes)) (not $gateway.routes) -}}
+{{- fail (printf "%s.routes needs at least one route: an action with no route is never performed, and the binary refuses an empty table" $key) -}}
+{{- end -}}
+{{- range $index, $route := $gateway.routes -}}
+{{- if not (kindIs "map" $route) -}}
+{{- fail (printf "%s.routes[%d] must be a route object" $key $index) -}}
+{{- end -}}
+{{- /* Effects are derived from the target (DerivedEffects): {external} for
+       loopback, {external, egresses-content} otherwise, and the binary
+       refuses a route declaring anything else, in either direction. */ -}}
+{{- $derived := ternary (list "external") (list "egresses-content" "external") (eq $loopbackTarget "true") -}}
+{{- $declared := list -}}
+{{- range (ternary (get $route "effects") (list) (kindIs "slice" (get $route "effects"))) -}}
+{{- $declared = append $declared (toString .) -}}
+{{- end -}}
+{{- if ne (toJson (sortAlpha (uniq $declared))) (toJson $derived) -}}
+{{- fail (printf "%s.routes[%d] effects %s do not match the derived %s: a route's effects are a property of where the request goes (%s), and the binary refuses a different set in either direction" $key $index (toJson $declared) (toJson $derived) (ternary "a loopback target" "a remote target" (eq $loopbackTarget "true"))) -}}
+{{- end -}}
+{{- end -}}
+{{- $requiresKey := include "shoal.effectsGatewayRequiresKey" $gateway -}}
+{{- if and $requiresKey (not $target.idempotencyHeader) -}}
+{{- fail (printf "%s.target.idempotencyHeader is required: a route uses idempotency \"key\", which sends the action's ExecutorKey in it" $key) -}}
+{{- end -}}
+{{- if and (not $requiresKey) (or $target.idempotencyHeader $target.idempotencyRetention) -}}
+{{- fail (printf "%s.target.idempotencyHeader and idempotencyRetention are refused when no route uses idempotency \"key\": the binary refuses them at startup" $key) -}}
+{{- end -}}
+{{- if and $target.idempotencyHeader (eq (lower (toString $target.idempotencyHeader)) (lower (toString $target.authHeader))) -}}
+{{- fail (printf "%s.target.idempotencyHeader must differ from target.authHeader" $key) -}}
+{{- end -}}
+
+{{- /* The lease arithmetic (docs/effects-gateway-deploy.md, Lease
+       arithmetic). Each is a startup refusal in the binary. */ -}}
+{{- $lease := int64 (include "shoal.durationMillis" (dict "name" (printf "%s.timing.claimLease" $key) "value" $timing.claimLease)) -}}
+{{- $operation := int64 (include "shoal.durationMillis" (dict "name" (printf "%s.timing.operationTimeout" $key) "value" $timing.operationTimeout)) -}}
+{{- $plane := int64 (include "shoal.durationMillis" (dict "name" (printf "%s.timing.planeTimeout" $key) "value" $timing.planeTimeout)) -}}
+{{- $_ := include "shoal.durationMillis" (dict "name" (printf "%s.pullInterval" $key) "value" $gateway.pullInterval) -}}
+{{- if or (le $lease 0) (gt $lease 300000) -}}
+{{- fail (printf "%s.timing.claimLease must be positive and at most 5m, MaxActionClaimTTL (got %q): the explorer refuses a longer claim rather than shortening it" $key (toString $timing.claimLease)) -}}
+{{- end -}}
+{{- if or (le $operation 0) (le $plane 0) -}}
+{{- fail (printf "%s.timing.operationTimeout and planeTimeout must be positive" $key) -}}
+{{- end -}}
+{{- if gt (mul $plane 4) $lease -}}
+{{- fail (printf "%s.timing.planeTimeout (%q) must be at most a quarter of timing.claimLease (%q), so one failed extension can be retried before L/2 is overdue" $key (toString $timing.planeTimeout) (toString $timing.claimLease)) -}}
+{{- end -}}
+{{- if and (not $timing.renew) (le $lease (add $operation 5000 $plane)) -}}
+{{- fail (printf "%s.timing.claimLease (%q) must exceed operationTimeout + 5s + planeTimeout without timing.renew: the lease bounds the claim, the request and the report together. Shorten the timeout, or set timing.renew: true" $key (toString $timing.claimLease)) -}}
+{{- end -}}
+{{- if $requiresKey -}}
+{{- $retention := int64 (include "shoal.durationMillis" (dict "name" (printf "%s.target.idempotencyRetention" $key) "value" (default "" $target.idempotencyRetention))) -}}
+{{- if le $retention (add $operation 5000) -}}
+{{- fail (printf "%s.target.idempotencyRetention (%q) must exceed timing.operationTimeout + 5s: an action whose deadline outlives the target's deduplication window cannot be performed under the key's guarantee, so nothing would ever be claimable" $key (toString $target.idempotencyRetention)) -}}
+{{- end -}}
+{{- end -}}
+{{- range $bound := list (list "maxInFlight" 1 64) (list "pullLimit" 1 256) (list "maxResponseBytes" 1 1048576) (list "healthPort" 1 65535) -}}
+{{- $field := index $bound 0 -}}
+{{- $value := include "shoal.effectsGatewayWhole" (dict "name" (printf "%s.%s" $key $field) "value" (index $gateway $field)) -}}
+{{- if or (not $value) (lt (int64 $value) (int64 (index $bound 1))) (gt (int64 $value) (int64 (index $bound 2))) -}}
+{{- fail (printf "%s.%s must be %v to %v (got %v)" $key $field (index $bound 1) (index $bound 2) (index $gateway $field)) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* The grace period is computed (shoal.effectsGatewayGraceSeconds), and an
+       operator's value may only raise it. Below the formula, the kubelet
+       SIGKILLs a draining worker that has performed an effect and not yet
+       reported it. */ -}}
+{{- $graceMinimum := int64 (include "shoal.effectsGatewayGraceSeconds" (dict "name" $key "operationTimeout" $timing.operationTimeout "planeTimeout" $timing.planeTimeout)) -}}
+{{- $graceOverride := include "shoal.effectsGatewayWhole" (dict "name" (printf "%s.terminationGracePeriodSeconds" $key) "value" $gateway.terminationGracePeriodSeconds) -}}
+{{- if and $graceOverride (lt (int64 $graceOverride) $graceMinimum) -}}
+{{- fail (printf "%s.terminationGracePeriodSeconds (%v) is below %d, what `shoal-gateway grace-period -operation-timeout %v -plane-timeout %v` requires: the drain covers the request in flight, its completion and two fallback reports, and a SIGKILL inside that strands an effect that happened. Leave it empty and the chart sets the minimum" $key $graceOverride $graceMinimum $timing.operationTimeout $timing.planeTimeout) -}}
+{{- end -}}
+
+{{- /* The unrecorded log's volume. */ -}}
+{{- if eq $unrecorded.storage "persistentVolumeClaim" -}}
+{{- include "shoal.requireShape" (dict "name" (printf "%s.unrecorded.size" $key) "value" $unrecorded.size "what" "a Kubernetes quantity such as 64Mi" "pattern" `^([0-9]+(\.[0-9]*)?|\.[0-9]+)(Ki|Mi|Gi|Ti|Pi|Ei|[kMGTPE])?$` "why" "it is the claim's storage request") -}}
+{{- if not $unrecorded.size -}}
+{{- fail (printf "%s.unrecorded.size is required with storage: persistentVolumeClaim" $key) -}}
+{{- end -}}
+{{- else if eq $unrecorded.storage "existingClaim" -}}
+{{- if not $unrecorded.existingClaim -}}
+{{- fail (printf "%s.unrecorded.existingClaim is required with storage: existingClaim" $key) -}}
+{{- end -}}
+{{- else if eq $unrecorded.storage "emptyDir" -}}
+{{- if not $unrecorded.acceptLossOfUnrecordedReports -}}
+{{- fail (printf "%s.unrecorded.storage is emptyDir, which deletes the unrecorded log with the pod: the log holds the only record of effects the explorer refused, did not find or could not confirm (#514), so a reschedule loses them silently. Use persistentVolumeClaim (the default) or existingClaim, or set unrecorded.acceptLossOfUnrecordedReports: true to accept the loss" $key) -}}
+{{- end -}}
+{{- else -}}
+{{- fail (printf "%s.unrecorded.storage must be persistentVolumeClaim, existingClaim or emptyDir (got %q)" $key (toString $unrecorded.storage)) -}}
+{{- end -}}
+
+{{- /* The NetworkPolicy matches addresses; a remote target needs its CIDRs,
+       or the policy refuses every request to it. */ -}}
+{{- if and $gateway.networkPolicy.enabled (not $loopbackTarget) (not $gateway.networkPolicy.targetCIDRs) -}}
+{{- fail (printf "%s.networkPolicy.targetCIDRs is required with networkPolicy.enabled and a remote target: a NetworkPolicy matches addresses, not names, so with none listed every request to %q is dropped" $key $targetURL) -}}
+{{- end -}}
+
+{{- /* With the explorer in this release, its configuration must admit the
+       gateway: the reference in the external list its derived effects need
+       ({external} for loopback, {external, egresses-content} otherwise).
+       Anywhere else the descriptor cannot register and the gateway refuses
+       its start. */ -}}
+{{- if eq (include "shoal.explorerEnabled" $) "true" -}}
+{{- $list := ternary "externalExecutorRefs" "externalEgressExecutorRefs" (eq $loopbackTarget "true") -}}
+{{- if not (has $executorRef (default (list) (index $fleet $list))) -}}
+{{- fail (printf "%s.executorRef %q is not in explorer.fleet.%s: a %s target's derived effects are %s, and the explorer binds that ceiling only to references in that list, so the gateway's descriptor cannot register" $key $executorRef $list (ternary "loopback" "remote" (eq $loopbackTarget "true")) (ternary "{external}" "{external, egresses-content}" (eq $loopbackTarget "true"))) -}}
+{{- end -}}
+{{- /* And the credential must be one the explorer mints for this reference:
+       a projected token on the mapping's audience, whose subject — the
+       pod's ServiceAccount in this namespace — the mapping binds to this
+       entry's executorRef. Either mismatch is a gateway that passes its
+       probes and gets 401 or not_found on every pull. A Secret-sourced
+       token is opaque to the chart and is not checked. */ -}}
+{{- if eq (toString $dispatch.tokenSource) "projected" -}}
+{{- $mapping := default (dict) $.Values.explorer.auth.oidc.executorMapping -}}
+{{- if not $mapping -}}
+{{- fail (printf "%s needs explorer.auth.oidc.executorMapping: the explorer in this release grants execute only through the executor mapping, so without one the gateway's token is refused on every pull" $key) -}}
+{{- end -}}
+{{- if ne (toString $dispatch.tokenAudience) (toString (get $mapping "audience")) -}}
+{{- fail (printf "%s.dispatch.tokenAudience %q is not the executor mapping's audience %q: the explorer accepts an executor token only on that audience, so every pull would be a 401" $key (toString $dispatch.tokenAudience) (toString (get $mapping "audience"))) -}}
+{{- end -}}
+{{- $subject := printf "system:serviceaccount:%s:%s" $.Release.Namespace $account -}}
+{{- $mappedRef := "" -}}
+{{- range $executor := (default (list) (get $mapping "executors")) -}}
+{{- if and (kindIs "map" $executor) (eq (toString (get $executor "subject")) $subject) -}}
+{{- $mappedRef = toString (get $executor "executor_ref") -}}
+{{- end -}}
+{{- end -}}
+{{- if ne $mappedRef $executorRef -}}
+{{- fail (printf "%s: the executor mapping %s, but this gateway's executorRef is %q: the explorer mints the projected token for the reference its subject maps to, so every pull and claim would answer not_found. Map %q to %q in explorer.auth.oidc.executorMapping.executors" $key (ternary (printf "does not name the gateway's subject %q" $subject) (printf "maps %q to %q" $subject $mappedRef) (eq $mappedRef "")) $executorRef $subject $executorRef) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* No value may carry a line break (#468).
 
        Most of the storage tier's values are rendered as bare YAML scalars —
@@ -1178,4 +1482,47 @@
 {{- end -}}
 {{- range $check := $checks -}}
 {{- include "shoal.requireShape" $check -}}
+{{- end -}}
+
+{{- /* A live gateway the values no longer name (#391).
+
+       An entry's name is its identity: it names the Deployment and the
+       unrecorded log's claim. Renaming or deleting a running entry makes
+       Helm delete the old Deployment while it creates the new one, so the
+       old pod drains while the new pod claims on the same executor
+       reference — two workers on one principal (#514) — and the old log is
+       left behind on a claim nothing mounts. So a Deployment of this
+       release's effects gateways (selected by component and instance) that
+       no enabled entry names, and that still has replicas, is refused. Set
+       its replicas to 0 and upgrade first; then rename or remove it.
+
+       lookup asks the API server. Under `helm template`, `helm install
+       --dry-run` (client) and `helm lint` it returns nothing, so this guard
+       is silent there and fires only on a real install or upgrade (or
+       --dry-run=server). */ -}}
+{{- $liveDeployments := lookup "apps/v1" "Deployment" .Release.Namespace "" -}}
+{{- range $live := (default (list) (get (default (dict) $liveDeployments) "items")) -}}
+{{- $labels := default (dict) $live.metadata.labels -}}
+{{- $podLabels := default (dict) (dig "spec" "selector" "matchLabels" (dict) $live) -}}
+{{- if and (eq (toString (get $podLabels "app.kubernetes.io/component")) "effects-gateway") (eq (toString (get $podLabels "app.kubernetes.io/instance")) $.Release.Name) -}}
+{{- $liveName := toString (get $podLabels "shoal.effects-gateway/name") -}}
+{{- $running := or (gt (int64 (default 0 $live.spec.replicas)) 0) (gt (int64 (default 0 (dig "status" "replicas" 0 $live))) 0) -}}
+{{- if and $running (not (has $liveName $enabledGatewayNames)) -}}
+{{- fail (printf "the effects gateway Deployment %s (entry %q) is running, and no enabled entry in effectsGateways names it any more: an entry's name is its identity, so renaming or removing a running entry overlaps the old pod's drain with the new pod's claims on one executor reference (#514) and orphans its unrecorded log. Set that entry's replicas: 0 and upgrade, acknowledge or migrate its log (docs/effects-gateway-deploy.md, Renaming an entry), and only then rename or remove it" $live.metadata.name $liveName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* The effects gateways' shape, refused last so a line break in an entry
+       is refused by the walk above, in its words. The helper that merges the
+       entries skips anything that is not a map, so without this a string or
+       a list entry would render nothing and report success. */ -}}
+{{- $effectsGateways := default (list) .Values.effectsGateways -}}
+{{- if not (kindIs "slice" $effectsGateways) -}}
+{{- fail "effectsGateways must be a list of gateway entries, one per operational surface (see docs/effects-gateway-deploy.md, In the chart)" -}}
+{{- end -}}
+{{- range $index, $entry := $effectsGateways -}}
+{{- if not (kindIs "map" $entry) -}}
+{{- fail (printf "effectsGateways[%d] must be a map holding one gateway's settings (got %v)" $index $entry) -}}
+{{- end -}}
 {{- end -}}

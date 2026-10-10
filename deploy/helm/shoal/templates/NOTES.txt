@@ -1,0 +1,4 @@
+{{- /* The text lives in a named template (_effects-gateway.tpl) so
+       validate-chart.sh can render it with `helm template`, which needs no
+       cluster; NOTES.txt itself is rendered only by install and upgrade. */ -}}
+{{- include "shoal.effectsGatewayNotes" . -}}
