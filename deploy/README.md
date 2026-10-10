@@ -136,8 +136,9 @@ off by default and not derived from `mode`.
 
 ```bash
 cp deploy/helm/shoal/values-llm-gateway.yaml my-llm-gateway-values.yaml
-# fill in allowedHosts, admission.url and credential, upstream.baseURL and
-# credential, and the six identity fields, then:
+# fill in allowedHosts, tls.secretName (a kubernetes.io/tls Secret; the
+# listener serves TLS by default), admission.url and credential,
+# upstream.baseURL and credential, and the six identity fields, then:
 helm upgrade --install shoal deploy/helm/shoal -f my-llm-gateway-values.yaml \
   --set llmGateway.image.repository=ghcr.io/YOUR_ORG/shoal-llm-gateway \
   --set llmGateway.image.tag=TAG

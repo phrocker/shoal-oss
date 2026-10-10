@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### The LLM gateway's listener serves TLS (#424)
+
+`shoal-llm-gateway` refused to send a prompt to a remote provider over
+plaintext but accepted the same prompt over plaintext on any address. The
+listener now follows the rule the process applies to the hops it makes: TLS
+anywhere, plaintext on loopback only.
+
+- `-tls-cert-file` and `-tls-key-file` serve TLS, both or neither. A missing
+  file, a malformed certificate or a key that is not the certificate's is
+  refused at startup. The pair is re-read on every handshake, so a rotated
+  cert-manager Secret is served without a restart; a pair caught halfway
+  through a rotation keeps the previous one serving.
+- A plaintext listener on a non-loopback address is refused at startup unless
+  `-allow-plaintext-listener` acknowledges a mesh sidecar that terminates mTLS.
+  It opens the listener only, not the provider hop.
+- The chart serves TLS by default from `llmGateway.tls.secretName`, a
+  `kubernetes.io/tls` Secret, and names the port `https`. `tls.enabled: false`
+  renders the acknowledgement instead. A non-ClusterIP Service with a plaintext
+  listener is refused unless `llmGateway.service.allowPlaintext: true`
+  acknowledges a terminating load balancer.
+
+**Upgrade action required for every chart deployment of the LLM gateway.** An
+existing values file stops rendering with `llmGateway.tls.secretName is
+required`. Either name a TLS Secret and move callers to `https://`, or set
+`llmGateway.tls.enabled: false` behind an mTLS mesh. A gateway run outside the
+chart with a non-loopback `-listen` and neither TLS nor the acknowledgement now
+exits at startup. See "Upgrading" in `docs/llm-gateway-deploy.md`.
+
 ### A non-sub subject claim has its own identity namespace (#546)
 
 `-oidc-subject-claim X` (any claim but `sub`) used to name principals

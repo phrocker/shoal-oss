@@ -19,7 +19,7 @@ Read anything below about obligations with that in mind.
 - [Why it is a separate process](#why-it-is-a-separate-process)
 - [The flag contract](#the-flag-contract)
 - [Withhold obligations and attribution](#withhold-obligations-and-attribution)
-- [Listener transport: require a terminating hop](#listener-transport-require-a-terminating-hop)
+- [Listener transport: TLS, or plaintext on loopback](#listener-transport-tls-or-plaintext-on-loopback)
 - [Kubernetes: the Helm chart](#kubernetes-the-helm-chart)
 - [The render-time refusals](#the-render-time-refusals)
 - [Orchestrator probes: the health surface](#orchestrator-probes-the-health-surface)
@@ -66,7 +66,9 @@ from a production incident to `helm template`.
 
 | Flag | Purpose |
 | --- | --- |
-| `-listen` | OpenAI-compatible listen address, for example `0.0.0.0:8100`. |
+| `-listen` | OpenAI-compatible listen address, for example `0.0.0.0:8100`. Plaintext only on loopback; see [Listener transport](#listener-transport-tls-or-plaintext-on-loopback). |
+| `-tls-cert-file`, `-tls-key-file` | PEM certificate chain and key the listener serves TLS with. Both or neither, checked at startup, and re-read per handshake so a rotated certificate is served without a restart. |
+| `-allow-plaintext-listener` | Accept plaintext on a non-loopback `-listen`, for a mesh sidecar that terminates mTLS. Off by default; refused beside the TLS flags. |
 | `-health-address` | Separate probe listener serving `GET /healthz` and `GET /readyz`. |
 | `-allowed-host` | Comma-separated exact-match external authorities — the same gate as the Explorer's. |
 | `-admission-url` | Base URL of the Explorer's authenticated API. A path prefix is allowed (the admission routes are joined onto it); user info, a query or a fragment is refused at startup. See below. |
@@ -337,34 +339,105 @@ authenticating the hop to the Explorer says nothing about the hop to a third
 party. A remote `http://` upstream is refused by the chart at render and by the
 binary at startup, with no way to accept it.
 
-## Listener transport: require a terminating hop
+## Listener transport: TLS, or plaintext on loopback
 
-The gateway **does not terminate TLS**. Its `-listen` endpoint accepts plaintext
-HTTP, including prompts; outside loopback development, deploy it behind a
-TLS-terminating ingress, sidecar or mTLS mesh. Certificate provisioning and
-rotation belong to that terminating hop, not to this process.
+The gateway refuses to send a prompt to a remote provider over plaintext, and
+since #424 it applies the same rule to the request it receives: **TLS anywhere,
+plaintext on loopback only.** Before, the listener had no rule at all, so the
+request the process refused to *make* in the clear was one it would *accept* in
+the clear, carrying the same prompt.
 
-The chart defaults to `llmGateway.service.type: ClusterIP`. It refuses any other
-Service type, including `LoadBalancer` and `NodePort`, unless the values file
-explicitly acknowledges the plaintext listener:
+| Listener | What the binary does |
+| --- | --- |
+| `-tls-cert-file` and `-tls-key-file` | Serves TLS (1.2 or later) on any address. |
+| plaintext on a loopback address | Serves, as before. The default `-listen 127.0.0.1:8100` needs no flag. |
+| plaintext anywhere else | **Refused at startup**, unless `-allow-plaintext-listener` is set. |
+
+The loopback test is applied to the address the kernel actually bound, not the
+string passed: `0.0.0.0:8100` and `:8100` are not loopback, and `localhost` is
+only if it resolved there.
+
+These are refused at startup rather than discovered per handshake:
+
+- only one of `-tls-cert-file` and `-tls-key-file`;
+- a file that cannot be read, or a certificate that is not PEM;
+- a key that is not the certificate's (`private key does not match public key`);
+- `-allow-plaintext-listener` beside the TLS flags, where it covers nothing and
+  would read as though the listener were plaintext.
+
+**The key pair is reloaded, not captured.** Both files are re-read on every
+handshake, and a changed pair is adopted once it parses and matches. A
+cert-manager `Certificate` reissues on a timer and the kubelet rewrites a
+mounted Secret in place, so a renewed certificate is served without restarting
+the pod, for the same reason the credential `-file` forms are read per request.
+A changed pair that does not parse or does not match is not adopted and the
+previous one keeps serving, which is what makes a rotation caught halfway (the
+certificate read before the kubelet's symlink swap and the key after it) a
+non-event. The refusal is logged once per distinct pair. If the files stay
+broken, the old certificate is served until it expires and clients start
+refusing it, so that log line is worth alerting on.
+
+`-allow-plaintext-listener` is the one exception, shaped like
+`-allow-plaintext-admission`. It is for a pod whose mesh sidecar terminates
+mTLS and forwards to the container in plaintext. The container still has to
+bind a non-loopback address for the sidecar to reach it, and the process cannot
+see whether a sidecar is there, so relying on one is stated rather than
+inferred. It opens the listener only. It does not relax `-upstream-base-url`, and
+`-allow-plaintext-admission` does not cover the listener.
+
+The health surface (`-health-address`) stays plaintext. It answers `/healthz`,
+`/readyz` and, once the gateway supplies one, `/metrics`; it carries no prompt,
+is not published by the Service, and is addressed by a kubelet that would have
+to be configured to trust the certificate.
+
+### In the chart
+
+The chart serves TLS by default. `llmGateway.tls.secretName` names a
+`kubernetes.io/tls` Secret, whose `tls.crt` and `tls.key` are mounted read-only
+at `/etc/shoal-llm-gateway/tls` (mode 0440, readable through `fsGroup`) and
+passed as the two flags. The container and Service ports are named `https`, so
+a mesh does not parse the handshake as an HTTP request. Clients use an
+`https://` base URL and must trust the certificate's issuer. The name they dial
+still has to be in `allowedHosts`, and it should also be in the certificate.
 
 ```yaml
 llmGateway:
-  service:
-    type: LoadBalancer
-    allowPlaintext: true
+  tls:
+    enabled: true
+    secretName: shoal-llm-gateway-tls   # e.g. a cert-manager Certificate's Secret
 ```
 
-This is an acknowledgement, **not TLS configuration**. Configure the terminating
-hop separately before exposing the Service. It must protect callers' prompts
-in transit; if TLS ends at an ingress or load balancer, secure its backend hop
-with a mesh or keep that plaintext hop confined to a trusted network. The chart
-neither installs nor verifies that protection. ClusterIP limits exposure but
-does not encrypt pod-network traffic, so it still needs that deployment decision.
+With `tls.enabled: true` the Service may be any type, because the transport is
+the process's own.
 
-`service.allowPlaintext` must be a boolean and defaults to `false`. It is separate
-from `admission.allowPlaintext`: neither acknowledgement covers the other's hop,
-and neither permits a remote plaintext upstream provider.
+`tls.enabled: false` is the plaintext choice, made in the values file. The pod
+binds `0.0.0.0`, so the chart then renders `-allow-plaintext-listener=true`.
+Without it the binary would refuse to start. Use it only where an mTLS mesh
+sidecar encrypts and authenticates the hop. The chart cannot see whether one
+does. ClusterIP does not encrypt pod-network traffic.
+
+A plaintext listener stays inside the cluster unless you say otherwise. A
+non-ClusterIP Service type with `tls.enabled: false` is refused unless
+`llmGateway.service.allowPlaintext: true` acknowledges a TLS-terminating load
+balancer or ingress in front of it:
+
+```yaml
+llmGateway:
+  tls:
+    enabled: false
+  service:
+    type: LoadBalancer
+    allowPlaintext: true   # TLS terminates at the load balancer, configured separately
+```
+
+That acknowledgement configures no TLS, and the chart neither installs nor
+verifies the terminating hop. The hop from the load balancer to the pod is
+still plaintext, so keep it on a trusted network or behind the mesh.
+`service.allowPlaintext` beside `tls.enabled: true` covers nothing and is
+refused.
+
+`tls.enabled` and `service.allowPlaintext` must be booleans. A quoted `"false"`
+is a non-empty string, which a Helm condition reads as true.
 
 ## Kubernetes: the Helm chart
 
@@ -411,8 +484,12 @@ is confirmed to fail.
 
 | Setting | Why the chart will not render without it |
 | --- | --- |
-| a non-ClusterIP `llmGateway.service.type` without `service.allowPlaintext: true` | The listener is plaintext and carries prompts. Configure a terminating hop separately and explicitly acknowledge the exposure; the chart does not enable TLS. |
-| a non-boolean `llmGateway.service.allowPlaintext` | Only a boolean acknowledgement is accepted; a quoted `"false"` must not bypass the exposure guard. |
+| `llmGateway.tls.secretName`, while `tls.enabled` (the default) | The listener serves TLS and needs a `kubernetes.io/tls` Secret to serve. Set `tls.enabled: false` only where an mTLS mesh encrypts the hop. |
+| `tls.secretName` with `tls.enabled: false` | Nothing mounts or reads it, so the manifest shows a certificate the listener does not serve. |
+| a non-ClusterIP `llmGateway.service.type` with `tls.enabled: false` and no `service.allowPlaintext: true` | A plaintext listener carrying prompts would be exposed outside the cluster. The acknowledgement is for a terminating load balancer configured separately; it enables no TLS. |
+| `service.allowPlaintext: true` with `tls.enabled: true` | The listener serves TLS, so the acknowledgement covers nothing, and it would start mattering silently the day TLS is turned off. |
+| a non-boolean `tls.enabled` or `service.allowPlaintext` | A quoted `"false"` is truthy in a Helm condition, so it would read as the opposite of what it says. |
+| a credential file on, under or above `/etc/shoal-llm-gateway/tls` while TLS is on | That is where the key pair is mounted. Two volumes cannot share a mount path or nest inside a read-only one, so the API server refuses the pod. |
 | `llmGateway.admission.url` | A gateway that cannot ask must deny. With no decision plane every request behind it is refused while the pod stays healthy. It must also be an absolute `http://` or `https://` URL: a bare host is a transport error on every admission. |
 | a plaintext `admission.url` to a non-loopback host | Over `http://` the bearer token crosses the network in the clear, and so does the verdict — anything on the path can rewrite a deny into an allow, which removes the enforcement plane while everything still looks healthy. `admission.allowPlaintext: true` accepts it where a mesh already authenticates the hop. |
 | `llmGateway.admission.tokenEnv`, `credentialSecretName`, `credentialSecretKey` | The Explorer's API is authenticated in every deployment this chart can render, so an admission request with no bearer token is a 401 — every time. The gateway then denies every call. Required **in the environment-variable form**; the file form requires other things instead, below. |
@@ -591,6 +668,11 @@ llmGateway:
     tag: TAG
   replicas: 2
   allowedHosts: [llm.internal.example.test]
+  # The listener serves TLS by default (#424). A kubernetes.io/tls Secret, for
+  # example a cert-manager Certificate's for llm.internal.example.test; it is
+  # re-read on renewal without rolling the pod. Clients use https://.
+  tls:
+    secretName: shoal-llm-gateway-tls
   # The token's subject is this account. Required for the projected form, and
   # not created by the chart.
   serviceAccountName: shoal-llm-gateway
@@ -769,6 +851,31 @@ created and no pod is ever made from it.
 
 ## Upgrading
 
+**To a TLS listener (#424).** The chart now serves the gateway's listener over
+TLS by default, and an existing values file stops rendering with
+`llmGateway.tls.secretName is required`. Nothing is rolled until you choose
+one of these:
+
+- **Serve TLS** (recommended). Create a `kubernetes.io/tls` Secret for the name
+  clients dial, for example with a cert-manager `Certificate`, and set
+  `llmGateway.tls.secretName`. Then move every caller's base URL from `http://`
+  to `https://` and make sure it trusts the issuer. The Service and container
+  ports are renamed from `http` to `https`, so update anything that selects the
+  port by name (a mesh `DestinationRule`, a `ServiceMonitor`, an `Ingress`
+  backend, which must now speak HTTPS to the pod). Callers still on `http://`
+  get `400 Client sent an HTTP request to an HTTPS server` and nothing is
+  admitted for them. To avoid a gap, run the TLS gateway under a separate
+  release until callers have moved.
+- **Keep plaintext behind an mTLS mesh.** Set `llmGateway.tls.enabled: false`.
+  The chart renders `-allow-plaintext-listener=true`, which the binary now needs
+  for a `0.0.0.0` bind. Nothing else changes for callers. A non-ClusterIP
+  Service additionally needs `llmGateway.service.allowPlaintext: true`.
+
+Outside the chart, a gateway started with a non-loopback `-listen` and neither
+the TLS flags nor `-allow-plaintext-listener` now exits at startup with
+`-listen ... is not a loopback address`. The default `127.0.0.1:8100` is
+unaffected.
+
 **From the LLM proxy.** This component was `shoal-llm-proxy`, under the chart
 key `llmProxy`. Moving to the gateway changes four things, and the chart can
 catch only the first:
@@ -858,10 +965,12 @@ Gaps in the flag contract, recorded rather than worked around.
   supplies a writer (`healthsurface.Config.Metrics`), so the outcome metrics
   #425 asks for can be exposed there. The gateway does not supply one yet, and
   until it does `/metrics` there is a `404`.
-- **TLS termination is external by contract.** The gateway listener remains
-  plaintext behind a terminating hop; non-ClusterIP Service exposure requires
-  `llmGateway.service.allowPlaintext: true`. See
-  [Listener transport](#listener-transport-require-a-terminating-hop).
+- **The listener does not verify clients.** It serves TLS but asks for no
+  client certificate. Callers are not authenticated by the transport, which is
+  why the Host gate and admission exist. There is no `-tls-client-ca`, unlike
+  `shoal-tserver`.
+- **No unix-socket listener.** Plaintext is allowed on loopback only, and
+  `-listen` is always TCP. A sidecar that wants a socket has to use loopback.
 - **No quiesce delay.** `readFleet` has `-quiesce-delay`; the gateway does not.
   Readiness drops and the listener stops accepting in the same breath, so
   requests arriving in the few seconds before the endpoints controller removes

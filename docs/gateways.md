@@ -204,7 +204,8 @@ the same reason.
 
 ## Order
 
-1. **LLM gateway.** Built. Open: #424 (plaintext listener), #425 (denials an
+1. **LLM gateway.** Built. The listener serves TLS, or plaintext on loopback
+   only (#424). Open: #425 (denials an
    operator can monitor). Withhold obligations apply to caller-attributed
    content (#426, `docs/llm-gateway-deploy.md`).
 2. **Effects gateway, HTTP.** Built (#391): `cmd/shoal-gateway`, its image
