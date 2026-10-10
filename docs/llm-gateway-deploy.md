@@ -821,7 +821,11 @@ Gaps in the flag contract, recorded rather than worked around.
   #390 requires that an operator be able to tell an infrastructural denial (the
   decision plane unreachable) from a policy denial. Without a metrics surface
   that distinction exists only in logs the gateway is also forbidden from filling
-  with payload content.
+  with payload content. The health surface the gateway already runs can now
+  serve `GET /metrics` on the `-health-address` listener when the binary
+  supplies a writer (`healthsurface.Config.Metrics`), so the outcome metrics
+  #425 asks for can be exposed there. The gateway does not supply one yet, and
+  until it does `/metrics` there is a `404`.
 - **No TLS flags for the gateway's own listener.** `writeTier`, `readFleet`,
   `tserver` and `compactor` all take `tls.enabled`/`secretName`. The gateway
   cannot, so it is plaintext behind an ingress or a mesh. The Explorer has the

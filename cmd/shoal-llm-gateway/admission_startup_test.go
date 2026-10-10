@@ -66,6 +66,10 @@ func TestTheGatewayDoesNotLinkTheDecisionPlane(t *testing.T) {
 		// the gateway and the provider read different values. It holds no
 		// policy and no corpus.
 		module + "internal/strictjson": true,
+		// The Prometheus text-format content type and label escaping the
+		// health surface's optional /metrics route uses. Standard-library
+		// only (strings); it holds no policy, no corpus and no state.
+		module + "internal/promtext": true,
 	}
 	sawAPI := false
 	for _, dependency := range strings.Fields(string(output)) {

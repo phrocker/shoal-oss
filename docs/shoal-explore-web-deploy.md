@@ -959,6 +959,15 @@ where the workspace port may not be bound discloses nothing beyond the fact
 that a Shoal process is listening — which the open socket already says. Any
 other path is a `404`; the surface is two routes and cannot grow by accident.
 
+The shared health surface (`internal/healthsurface`) can also serve
+`GET /metrics` (Prometheus text format, `no-store`, GET/HEAD only) on this same
+listener, but only when the binary supplies a metrics writer through
+`healthsurface.Config`. The Explorer does not supply one yet, so `/metrics` is
+a `404` here today. A writer that is supplied answers to the same
+unauthenticated audience as the probes, so it may carry operational counts
+only. A writer that panics answers `500`, and a scrape in flight when shutdown
+begins is answered `503` rather than holding the drain.
+
 The split between the two routes is what makes a rolling update safe.
 Readiness drops **before** the workspace stops accepting, so the endpoints
 controller removes the pod from the Service while it is still finishing
