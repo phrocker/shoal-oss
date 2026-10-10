@@ -284,7 +284,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
 	}
-	if err := transport.admit(listener.Addr(), tlsConfig); err != nil {
+	if err := transport.admit(*listen, listener.Addr(), tlsConfig); err != nil {
 		listener.Close()
 		return err
 	}

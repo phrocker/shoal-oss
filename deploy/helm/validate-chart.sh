@@ -1416,6 +1416,8 @@ refuses_citing "where the chart mounts the listener's TLS Secret" "a token file 
 refuses_citing "where the chart mounts the listener's TLS Secret" "a token file above the TLS mount" "${token_file_base[@]}" --set llmGateway.admission.tokenFile=/etc/shoal-llm-gateway/token
 refuses_citing "where the chart mounts the listener's TLS Secret" "a key file under the TLS mount" "${llm_gateway_base[@]}" --set llmGateway.upstream.apiKeyFile=/etc/shoal-llm-gateway/tls/upstream/api-key
 renders "a token file beside the TLS mount" "${token_file_base[@]}" --set llmGateway.admission.tokenFile=/etc/shoal-llm-gateway-token/token
+renders "a token file in a sibling that extends the TLS directory's name" "${token_file_base[@]}" --set llmGateway.admission.tokenFile=/etc/shoal-llm-gateway/tlsx/token
+renders "a token file in a sibling whose name the TLS directory extends" "${token_file_base[@]}" --set llmGateway.admission.tokenFile=/etc/shoal-llm-gateway/t/token
 renders "a plaintext listener's token file may use that directory" "${token_file_base[@]}" "${plaintext_listener[@]}" --set llmGateway.admission.tokenFile=/etc/shoal-llm-gateway/tls/token
 
 # Plaintext is a choice the values file makes, and the acknowledgement reaches

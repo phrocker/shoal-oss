@@ -101,18 +101,19 @@ func (o listenerOptions) config(logf func(string, ...any)) (*tls.Config, error) 
 // the one requested. A wildcard (":8100", "0.0.0.0:8100") or a host name is
 // judged by what it resolved to, so "localhost" is loopback only if the kernel
 // bound it there.
-func (o listenerOptions) admit(address net.Addr, tlsConfig *tls.Config) error {
+func (o listenerOptions) admit(requested string, address net.Addr, tlsConfig *tls.Config) error {
 	if tlsConfig != nil || *o.allowPlaintext {
 		return nil
 	}
 	if tcp, ok := address.(*net.TCPAddr); ok && tcp.IP.IsLoopback() {
 		return nil
 	}
-	return fmt.Errorf("-listen %s is not a loopback address, and a plaintext "+
-		"listener there accepts prompts in the clear — the request this gateway "+
-		"refuses to send to a remote provider. Serve TLS with -tls-cert-file and "+
-		"-tls-key-file, or set -allow-plaintext-listener where a mesh sidecar "+
-		"already encrypts and authenticates the hop", address)
+	return fmt.Errorf("-listen %s bound %s, which is not a loopback address, and "+
+		"a plaintext listener there accepts prompts in the clear — the request "+
+		"this gateway refuses to send to a remote provider. Serve TLS with "+
+		"-tls-cert-file and -tls-key-file, or set -allow-plaintext-listener where "+
+		"a mesh sidecar already encrypts and authenticates the hop",
+		requested, address)
 }
 
 // listenerScheme names the transport in the startup line, so a log reader is

@@ -117,24 +117,31 @@ func startGateway(t *testing.T, wrap func(net.Listener) net.Listener, args ...st
 		return listener, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- run(ctx, args, io.Discard) }()
+	// Closed rather than sent on, so the cleanup can wait for an exit the
+	// test body has already observed. A receive in both places hung the
+	// whole suite whenever a mutant made run() refuse after binding.
+	finished := make(chan struct{})
+	var exit error
+	go func() {
+		defer close(finished)
+		exit = run(ctx, args, io.Discard)
+	}()
 	t.Cleanup(func() {
 		cancel()
-		<-done
+		<-finished
 	})
 	select {
 	case address := <-bound:
 		// Bound is not yet admitted: the transport check runs on the bound
 		// address, so give a refusal the chance to arrive first.
 		select {
-		case err := <-done:
-			t.Fatalf("the gateway bound and then exited: %v", err)
+		case <-finished:
+			t.Fatalf("the gateway bound and then exited: %v", exit)
 		case <-time.After(100 * time.Millisecond):
 		}
 		return address
-	case err := <-done:
-		t.Fatalf("the gateway exited before binding: %v", err)
+	case <-finished:
+		t.Fatalf("the gateway exited before binding: %v", exit)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the gateway never bound a listener")
 	}
