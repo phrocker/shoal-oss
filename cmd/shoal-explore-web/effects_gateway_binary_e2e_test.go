@@ -1102,11 +1102,24 @@ func binaryUnreachablePlane(t *testing.T) {
 // enqueue is not retried: an indeterminate answer from the explorer here is
 // the defect this scenario exists to show (#641).
 func binaryEnqueueWhilePulling(t *testing.T) {
-	// 4 runs in 50 failed under -race, GOMAXPROCS=2 and a full CPU load: the
-	// enqueue is answered an indeterminate 503 ("fleet action outcome
-	// requires reconciliation"), which would break CI. Re-enable once the
-	// fix lands.
-	t.Skip("#641: an enqueue racing an executor's pulls answers an indeterminate 503; re-enable after #635")
+	// This scenario was added skipped, because 4 runs in 50 failed under
+	// -race, GOMAXPROCS=2 and a full CPU load: the enqueue was answered an
+	// indeterminate 503 ("fleet action outcome requires reconciliation").
+	//
+	// #635 closed a committed-value window in the store — a non-nil guard
+	// head at epoch N whose committed cell at N was not visible yet, which a
+	// concurrent claim or extend opens. MayPublishActionEvent reads the
+	// action, and reconcileActionTransitions returns an error from that
+	// question rather than skipping it ("an error from the question is not a
+	// skip"), so the window surfaced as the enqueuer's own ErrActionCommitted
+	// over a row that was not even its own. #641 was #633 arriving on the
+	// write path.
+	//
+	// Re-measured on #635 at -count=50, -race, GOMAXPROCS=2 and four busy
+	// cores: 0 failures. Against the 8% baseline that is p ≈ 0.015, so it is
+	// strong evidence and not proof — if this flakes again, the remaining
+	// suspect is that same unskipped error-from-the-question path, and the
+	// narrow fix is to treat a transient there as a skip (#641).
 	w := newBinaryWorld(t, binaryOptions{})
 	gateway := w.startGateway("gateway", gatewayFlags{dir: filepath.Join(t.TempDir(), "unrecorded")})
 	deadline := time.Now().Add(binaryRecovery)
