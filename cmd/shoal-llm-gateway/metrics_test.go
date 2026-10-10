@@ -51,8 +51,9 @@ var allowedFamilies = map[string]struct {
 	values []string
 }{
 	"shoal_llm_gateway_infrastructural_denials_total": {"reason", []string{
-		"plane_unreachable", "plane_credential_rejected", "plane_error_status",
-		"plane_answer_unusable", "grant_window_exhausted", "identity_unavailable",
+		"plane_unreachable", "plane_credential_rejected", "plane_reported_unavailable",
+		"plane_error_status", "plane_answer_unusable", "admission_credential_unavailable",
+		"grant_window_exhausted", "identity_unavailable",
 	}},
 	"shoal_llm_gateway_policy_refusals_total": {"reason", []string{
 		"denied", "obligation_unsatisfiable",
@@ -60,12 +61,9 @@ var allowedFamilies = map[string]struct {
 	"shoal_llm_gateway_upstream_failures_total": {"reason", []string{
 		"credential_unavailable", "unreachable", "error_status", "response_truncated",
 	}},
-	"shoal_llm_gateway_caller_abandoned_total": {"stage", []string{
-		"admission", "upstream", "response",
-	}},
 	"shoal_llm_gateway_report_failures_total": {"reason", []string{
-		"plane_unreachable", "plane_credential_rejected", "plane_error_status",
-		"plane_answer_unusable",
+		"plane_unreachable", "plane_credential_rejected", "plane_reported_unavailable",
+		"plane_error_status", "plane_answer_unusable", "admission_credential_unavailable",
 	}},
 }
 
@@ -162,7 +160,6 @@ const (
 	infraFamily    = "shoal_llm_gateway_infrastructural_denials_total/"
 	policyFamily   = "shoal_llm_gateway_policy_refusals_total/"
 	upstreamFamily = "shoal_llm_gateway_upstream_failures_total/"
-	abandonFamily  = "shoal_llm_gateway_caller_abandoned_total/"
 	reportFamily   = "shoal_llm_gateway_report_failures_total/"
 )
 
@@ -257,6 +254,52 @@ func TestEachFailureClassIsCountedUnderItsOwnReason(t *testing.T) {
 			want: map[string]uint64{infraFamily + "plane_credential_rejected": 1},
 		},
 		{
+			name: "a 503 the plane wrote itself is the plane answering, not an outage",
+			setup: func(_ *testing.T, plane *fakePlane, _ *fakeUpstream, _ *proxy) {
+				// As pkg/explorer/webapi answers ErrAdmissionUnmigrated and
+				// ErrAdmissionSpanOccupied: a structured body with a code.
+				plane.status = http.StatusServiceUnavailable
+				plane.errorBody = `{"code":"unavailable","message":"admission requires migration"}`
+			},
+			wantStatus: http.StatusServiceUnavailable, wantCode: "plane_unavailable",
+			want: map[string]uint64{infraFamily + "plane_reported_unavailable": 1},
+		},
+		{
+			name: "a coded 502 is an error status, not unreachable",
+			setup: func(_ *testing.T, plane *fakePlane, _ *fakeUpstream, _ *proxy) {
+				plane.status = http.StatusBadGateway
+				plane.errorBody = `{"code":"internal","message":"x"}`
+			},
+			wantStatus: http.StatusServiceUnavailable, wantCode: "plane_unavailable",
+			want: map[string]uint64{infraFamily + "plane_error_status": 1},
+		},
+		{
+			name: "an unreadable admission token file",
+			setup: func(t *testing.T, plane *fakePlane, _ *fakeUpstream, governed *proxy) {
+				// The real file reader, over a file it cannot read: a
+				// directory where the token should be.
+				governed.admission.credential = credentialFromFile(t.TempDir())
+			},
+			wantStatus: http.StatusServiceUnavailable, wantCode: "plane_unavailable",
+			want: map[string]uint64{infraFamily + "admission_credential_unavailable": 1},
+		},
+		{
+			name: "an empty admission token",
+			setup: func(_ *testing.T, _ *fakePlane, _ *fakeUpstream, governed *proxy) {
+				governed.admission.credential = func() (string, error) { return "", nil }
+			},
+			wantStatus: http.StatusServiceUnavailable, wantCode: "plane_unavailable",
+			want: map[string]uint64{infraFamily + "admission_credential_unavailable": 1},
+		},
+		{
+			name: "an admission token holding a line break",
+			setup: func(_ *testing.T, _ *fakePlane, _ *fakeUpstream, governed *proxy) {
+				governed.admission.credential = func() (string, error) { return "tok\r\nX: y", nil }
+			},
+			wantStatus: http.StatusServiceUnavailable, wantCode: "plane_unavailable",
+			want: map[string]uint64{infraFamily + "admission_credential_unavailable": 1},
+		},
+		{
 			name: "a plane 500 is an error status",
 			setup: func(_ *testing.T, plane *fakePlane, _ *fakeUpstream, _ *proxy) {
 				plane.status = http.StatusInternalServerError
@@ -301,9 +344,9 @@ func TestEachFailureClassIsCountedUnderItsOwnReason(t *testing.T) {
 			want: map[string]uint64{infraFamily + "identity_unavailable": 1},
 		},
 		{
-			name:      "a caller that hangs up during admission is not an outage",
+			name:      "a caller that hangs up during admission counts nothing",
 			cancelled: true,
-			want:      map[string]uint64{abandonFamily + "admission": 1},
+			want:      map[string]uint64{},
 		},
 		{
 			name: "an unreadable provider credential",
@@ -492,6 +535,9 @@ func TestMetricsAreServedOnTheHealthListener(t *testing.T) {
 	}
 	planeAddress := closed.Addr().String()
 	_ = closed.Close()
+	// A token, so the denial is the plane being absent and not this pod
+	// lacking its own credential.
+	t.Setenv("SHOAL_ADMISSION_TOKEN", "plane-token")
 
 	restoreListen, restoreHealthListen := listenTCP, healthsurface.ListenTCP
 	t.Cleanup(func() { listenTCP, healthsurface.ListenTCP = restoreListen, restoreHealthListen })

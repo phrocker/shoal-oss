@@ -290,7 +290,7 @@ func (p *proxy) forward(
 	upstreamRequest, err := http.NewRequestWithContext(
 		ctx, http.MethodPost, endpoint.String(), bytes.NewReader(outbound))
 	if err != nil {
-		p.countUpstreamFailure(request, abandonedUpstream, upstreamUnreachable)
+		p.countUpstreamFailure(request, upstreamUnreachable)
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_unreachable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")
@@ -329,7 +329,7 @@ func (p *proxy) forward(
 
 	response, err := p.client.Do(upstreamRequest)
 	if err != nil {
-		p.countUpstreamFailure(request, abandonedUpstream, upstreamUnreachable)
+		p.countUpstreamFailure(request, upstreamUnreachable)
 		p.reportFailure(request.Context(), granted.token, identity, "upstream_unreachable")
 		p.refuse(writer, http.StatusBadGateway, "upstream_unreachable",
 			"the upstream provider could not be reached")
@@ -371,7 +371,7 @@ func (p *proxy) forward(
 	// successful calls there is a usage meter (see metrics.go).
 	switch failure {
 	case "response_truncated":
-		p.countUpstreamFailure(request, abandonedResponse, upstreamResponseTruncated)
+		p.countUpstreamFailure(request, upstreamResponseTruncated)
 	case "upstream_error":
 		p.countUpstream(upstreamErrorStatus)
 	}

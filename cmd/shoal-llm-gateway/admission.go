@@ -111,10 +111,38 @@ func (c *admissionClient) client() (*admissionapi.Client, error) {
 		c.plane, c.broken = admissionapi.NewClient(admissionapi.Config{
 			BaseURL: c.base.String(), HTTPClient: c.http,
 			// Read per request, so a rotating credential file works.
-			Token: func(context.Context) (string, error) { return c.credential() },
+			Token: func(context.Context) (string, error) { return c.bearerToken() },
 		})
 	})
 	return c.plane, c.broken
+}
+
+// admissionCredentialError is the gateway's own admission token being
+// unavailable: unreadable, empty, or holding a line break. It is typed here,
+// inside the token closure, because the public client wraps whatever the
+// closure returns in an untyped error, and an empty token in one with no cause
+// at all. Without the type it is indistinguishable from the plane being down,
+// when the fix is on this pod and not on the plane.
+type admissionCredentialError struct{ err error }
+
+func (e *admissionCredentialError) Error() string {
+	return "admission credential unavailable: " + e.err.Error()
+}
+func (e *admissionCredentialError) Unwrap() error { return e.err }
+
+// bearerToken reads the admission token for one call. The empty and CR/LF
+// checks repeat the client's own, so a token the client would refuse is
+// refused here first, with a type.
+func (c *admissionClient) bearerToken() (string, error) {
+	token, err := c.credential()
+	if err != nil {
+		return "", &admissionCredentialError{err: err}
+	}
+	if token == "" || strings.ContainsAny(token, "\r\n") {
+		return "", &admissionCredentialError{
+			err: errors.New("the token is empty or holds a line break")}
+	}
+	return token, nil
 }
 
 // request asks whether a call may happen.
@@ -300,7 +328,12 @@ func planeError(route string, err error) error {
 	if !errors.As(err, &status) {
 		reason := infraPlaneUnreachable
 		var protocol *admissionapi.ProtocolError
-		if errors.As(err, &protocol) {
+		var credential *admissionCredentialError
+		switch {
+		case errors.As(err, &credential):
+			// Nothing was sent: this pod could not present its own token.
+			reason = infraAdmissionCredentialUnavailable
+		case errors.As(err, &protocol):
 			// The plane answered and the answer could not be acted on.
 			reason = infraPlaneAnswerUnusable
 		}
@@ -315,13 +348,22 @@ func planeError(route string, err error) error {
 		return newPlaneFault(infraPlaneCredentialRejected,
 			fmt.Errorf("%w: proxy credential rejected", ErrPlaneUnreachable))
 	default:
-		// A 502, 503 or 504 is what a proxy or load balancer in front of the
-		// plane answers when the plane is not there, so it is counted as the
-		// plane being unreachable rather than as the plane erring.
+		// A 502, 503 or 504 with no structured error body is what a proxy or
+		// load balancer in front of the plane answers when the plane is not
+		// there, so it is counted as the plane being unreachable. One the plane
+		// wrote itself carries a code, and is the plane answering. A coded 503
+		// is its own refusal to admit right now: the whole-store rollout
+		// conditions (an unmigrated admission, an occupied reserved span)
+		// answer exactly that, and an operator clears them on the plane rather
+		// than in the network.
 		reason := infraPlaneErrorStatus
-		switch status.Status {
-		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		switch {
+		case status.Code == "" && (status.Status == http.StatusBadGateway ||
+			status.Status == http.StatusServiceUnavailable ||
+			status.Status == http.StatusGatewayTimeout):
 			reason = infraPlaneUnreachable
+		case status.Code != "" && status.Status == http.StatusServiceUnavailable:
+			reason = infraPlaneReportedUnavailable
 		}
 		// The plane's message is deliberately not included. A plane error can
 		// carry detail the caller is not entitled to, and this error reaches a

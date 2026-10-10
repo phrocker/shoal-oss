@@ -35,9 +35,10 @@ import (
 //
 // Only the process's own failures and refusals are counted, each by a reason
 // drawn from a closed set fixed in this file. Nothing that measures tenant
-// workload is: no total of calls, no count of allowed or forwarded calls, no
-// bytes or tokens, nothing in flight, and nothing per model, reference,
-// principal, policy or document. A count of successful calls on an
+// workload or caller behaviour is: no total of calls, no count of allowed or
+// forwarded calls, no bytes or tokens, nothing in flight, no count of callers
+// hanging up, and nothing per model, reference, principal, policy or
+// document. A count of successful calls on an
 // unauthenticated port is a usage meter for whoever is behind the gateway; a
 // workload metric belongs behind authentication, as a separate decision.
 //
@@ -60,8 +61,11 @@ const (
 	// caller's request was never adjudicated; this is a gateway credential
 	// problem, not a policy outcome.
 	infraPlaneCredentialRejected
-	// The plane answered a non-2xx status other than 401, 403, 502, 503 or
-	// 504 (the last three count as unreachable).
+	// The plane answered and said it cannot admit now: a 503 carrying the
+	// plane's own error code, as the whole-store rollout conditions answer.
+	// An operator clears it on the plane; nothing is down.
+	infraPlaneReportedUnavailable
+	// Any other non-2xx answer from the plane, including a coded 502 or 504.
 	infraPlaneErrorStatus
 	// The plane answered 200 with something the gateway cannot act on: an
 	// unknown outcome, an unusable token, a token naming another claim, or a
@@ -70,25 +74,34 @@ const (
 	// The grant arrived with too little of its lease left to make the call and
 	// still report it.
 	infraGrantWindowExhausted
-	// The gateway could not generate the identity an admission carries.
+	// The gateway's own admission token could not be read, or was empty or
+	// held a line break. Nothing was sent to the plane.
+	infraAdmissionCredentialUnavailable
+	// The gateway could not generate the identity an admission carries. Since
+	// Go 1.24 crypto/rand.Read does not return an error, so this stays at
+	// zero; it is kept so the refusal path that still exists is counted under
+	// its own name rather than silently, should the source of IDs change.
 	infraIdentityUnavailable
 	infraReasonCount
 )
 
 var infraReasonNames = [infraReasonCount]string{
-	infraPlaneUnreachable:        "plane_unreachable",
-	infraPlaneCredentialRejected: "plane_credential_rejected",
-	infraPlaneErrorStatus:        "plane_error_status",
-	infraPlaneAnswerUnusable:     "plane_answer_unusable",
-	infraGrantWindowExhausted:    "grant_window_exhausted",
-	infraIdentityUnavailable:     "identity_unavailable",
+	infraPlaneUnreachable:               "plane_unreachable",
+	infraPlaneCredentialRejected:        "plane_credential_rejected",
+	infraPlaneReportedUnavailable:       "plane_reported_unavailable",
+	infraPlaneErrorStatus:               "plane_error_status",
+	infraPlaneAnswerUnusable:            "plane_answer_unusable",
+	infraAdmissionCredentialUnavailable: "admission_credential_unavailable",
+	infraGrantWindowExhausted:           "grant_window_exhausted",
+	infraIdentityUnavailable:            "identity_unavailable",
 }
 
 // planeReasons are the infraReasons a call to the plane can fail with, and so
 // the reasons a report failure is counted under.
 var planeReasons = []infraReason{
 	infraPlaneUnreachable, infraPlaneCredentialRejected,
-	infraPlaneErrorStatus, infraPlaneAnswerUnusable,
+	infraPlaneReportedUnavailable, infraPlaneErrorStatus,
+	infraPlaneAnswerUnusable, infraAdmissionCredentialUnavailable,
 }
 
 // policyReason is a refusal that is the plane's answer.
@@ -128,32 +141,12 @@ var upstreamReasonNames = [upstreamReasonCount]string{
 	upstreamResponseTruncated:     "response_truncated",
 }
 
-// abandonStage is where a caller went away. A caller hanging up is not an
-// infrastructural failure and must not be counted as one — otherwise a client
-// with a short timeout inflates the outage signal — but a plane slow enough
-// that callers give up first shows here rather than nowhere.
-type abandonStage int
-
-const (
-	abandonedAdmission abandonStage = iota
-	abandonedUpstream
-	abandonedResponse
-	abandonStageCount
-)
-
-var abandonStageNames = [abandonStageCount]string{
-	abandonedAdmission: "admission",
-	abandonedUpstream:  "upstream",
-	abandonedResponse:  "response",
-}
-
 // proxyMetrics holds the counters. Each is an atomic so a scrape reads them
 // concurrently with the calls that update them.
 type proxyMetrics struct {
 	infrastructural [infraReasonCount]atomic.Uint64
 	policy          [policyReasonCount]atomic.Uint64
 	upstream        [upstreamReasonCount]atomic.Uint64
-	abandoned       [abandonStageCount]atomic.Uint64
 	reportFailures  [infraReasonCount]atomic.Uint64
 }
 
@@ -175,12 +168,6 @@ func (p *proxy) countUpstream(reason upstreamReason) {
 	}
 }
 
-func (p *proxy) countAbandoned(stage abandonStage) {
-	if p.metrics != nil && stage >= 0 && stage < abandonStageCount {
-		p.metrics.abandoned[stage].Add(1)
-	}
-}
-
 func (p *proxy) countReportFailure(err error) {
 	if p.metrics != nil {
 		p.metrics.reportFailures[planeFailureReason(err)].Add(1)
@@ -188,23 +175,23 @@ func (p *proxy) countReportFailure(err error) {
 }
 
 // countAdmissionFailure counts an admission that produced no usable decision.
-// A caller that hung up while the plane was being asked is counted as
-// abandoned instead: its cancelled context is what failed the request, and an
-// outage signal a client timeout can raise is not one an operator can trust.
+//
+// A caller that hung up while the plane was being asked is not counted at all.
+// Its cancelled context is what failed the request, and an outage signal a
+// client timeout can raise is not one an operator can trust. Nor is it counted
+// as a hang-up: how often callers give up is caller behaviour that grows with
+// traffic, which this unauthenticated port does not carry. A count of it is a
+// follow-up for an authenticated surface.
 func (p *proxy) countAdmissionFailure(request *http.Request, err error) {
 	if request.Context().Err() != nil {
-		p.countAbandoned(abandonedAdmission)
 		return
 	}
 	p.countInfrastructural(planeFailureReason(err))
 }
 
 // countUpstreamFailure is countAdmissionFailure for the provider leg.
-func (p *proxy) countUpstreamFailure(
-	request *http.Request, stage abandonStage, reason upstreamReason,
-) {
+func (p *proxy) countUpstreamFailure(request *http.Request, reason upstreamReason) {
 	if request.Context().Err() != nil {
-		p.countAbandoned(stage)
 		return
 	}
 	p.countUpstream(reason)
@@ -251,12 +238,6 @@ func (p *proxy) writeMetrics(builder *strings.Builder) {
 	for reason, name := range upstreamReasonNames {
 		sample(builder, "shoal_llm_gateway_upstream_failures_total",
 			"reason", name, metrics.upstream[reason].Load())
-	}
-	family(builder, "shoal_llm_gateway_caller_abandoned_total",
-		"Calls the caller abandoned before they finished, by stage.")
-	for stage, name := range abandonStageNames {
-		sample(builder, "shoal_llm_gateway_caller_abandoned_total",
-			"stage", name, metrics.abandoned[stage].Load())
 	}
 	family(builder, "shoal_llm_gateway_report_failures_total",
 		"Admission reports the decision plane did not acknowledge; each leaves a grant outstanding.")

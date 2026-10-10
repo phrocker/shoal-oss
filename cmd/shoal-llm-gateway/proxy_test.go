@@ -49,9 +49,12 @@ type fakePlane struct {
 	echoTokenID  bool
 	status       int
 	reportStatus int
-	requests     []admissionapi.Request
-	reports      []admissionapi.Report
-	server       *httptest.Server
+	// errorBody, when set, is written with a non-200 status, as the plane's
+	// own structured error answers are.
+	errorBody string
+	requests  []admissionapi.Request
+	reports   []admissionapi.Report
+	server    *httptest.Server
 }
 
 func newFakePlane(t *testing.T, outcome admissionapi.Outcome, withhold []string) *fakePlane {
@@ -67,7 +70,11 @@ func newFakePlane(t *testing.T, outcome admissionapi.Outcome, withhold []string)
 	plane.server = httptest.NewServer(http.HandlerFunc(
 		func(writer http.ResponseWriter, request *http.Request) {
 			if plane.status != http.StatusOK {
+				if plane.errorBody != "" {
+					writer.Header().Set("Content-Type", "application/json")
+				}
 				writer.WriteHeader(plane.status)
+				_, _ = io.WriteString(writer, plane.errorBody)
 				return
 			}
 			raw, _ := io.ReadAll(request.Body)
