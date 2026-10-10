@@ -267,29 +267,53 @@ func TestASecondSignalIsAHardStop(t *testing.T) {
 	}
 }
 
-// TestADrainThatRunsOutExitsDistinctly: the completion hangs, the drain
-// bound passes on the worker's clock, and the run is abandoned to the
-// unrecorded log; the exit code says so, and the log holds the entry.
+// TestADrainThatRunsOutExitsDistinctly: the request hangs at the target, the
+// drain bound passes on the worker's clock with the run still in flight, and
+// the run is abandoned to the unrecorded log as outcome_unknown; the exit
+// code says so, and the log holds the entry.
+//
+// The run must still be in flight when the bound fires, or this is not the
+// abandon path. The bound (the grace period less the exit margin) is longer
+// than every timer the run arms on the same clock (the attempt's operation
+// timeout, the completion budget, the renewal), so advancing the clock by
+// the bound fires those too, and they race the drain. An earlier version let
+// the target answer and hung the completion: Advance(bound) also expired the
+// completion's budget, and when that goroutine won, the run reported through
+// the ambiguity route (the fake explorer has none), wrote its own
+// effect_observed entry and settled before abandon looked. Abandon then
+// rightly wrote nothing more (a run's own report keeps its real outcome
+// rather than an outcome_unknown in its place), and the test saw
+// effect_observed. So the target holds the request until it is cancelled,
+// and only the drain's own timer is fired: nothing else can move the run
+// before abandon takes it.
 func TestADrainThatRunsOutExitsDistinctly(t *testing.T) {
 	w := newWorld(t)
-	w.explorer.blockComplete = true
+	w.target.hold = true
 	w.explorer.offerAction("act-abandon")
 	clock := newManualClock()
 	run := start(t, w.args(nil), clock)
-	waitFor(t, "the completion", func() bool { return len(w.explorer.completions()) == 1 })
+	select {
+	case <-w.target.entered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the target saw no request")
+	}
 	run.signals <- syscall.SIGTERM
 	bound := effectsgateway.DrainBound(effectsgateway.DefaultOperationTimeout, effectsgateway.DefaultPlaneTimeout)
 	waitFor(t, "the drain's bound", func() bool { return clock.wasAsked(bound) })
-	clock.Advance(bound)
+	clock.Fire(bound)
 	code, ok := run.exit(20 * time.Second)
 	if !ok || code != ExitDrainAbandoned {
 		t.Fatalf("exit %d (exited %v), want %d: %s", code, ok, ExitDrainAbandoned, run.stderr)
+	}
+	if got := w.explorer.completions(); len(got) != 0 {
+		t.Fatalf("an abandoned run completed: %s", got)
 	}
 	stdout := &syncBuffer{}
 	if code := Main([]string{"unrecorded", "list", "-unrecorded-dir", w.dir}, Env{Stdout: stdout}); code != ExitOK {
 		t.Fatalf("list exit %d", code)
 	}
 	if !strings.Contains(stdout.String(), `"outcome":"outcome_unknown"`) ||
+		!strings.Contains(stdout.String(), `"action_id":"`+b64([]byte("act-abandon"))+`"`) ||
 		strings.Count(stdout.String(), "\n") != 1 {
 		t.Fatalf("the abandoned run is not in the log: %s", stdout)
 	}

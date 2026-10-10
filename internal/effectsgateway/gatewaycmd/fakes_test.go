@@ -56,10 +56,9 @@ type fakeExplorer struct {
 	executorRef   string
 	capabilities  []fleet.Capability
 	// offer is the one action the pull page offers until it is claimed.
-	offer         *offeredAction
-	claimed       bool
-	completed     []json.RawMessage
-	blockComplete bool
+	offer     *offeredAction
+	claimed   bool
+	completed []json.RawMessage
 }
 
 type offeredAction struct {
@@ -176,13 +175,9 @@ func (f *fakeExplorer) serve(w http.ResponseWriter, r *http.Request) {
 		reply(http.StatusOK, record)
 	case strings.HasSuffix(r.URL.Path, "/complete"):
 		f.mu.Lock()
-		block, offer := f.blockComplete, f.offer
+		offer := f.offer
 		f.completed = append(f.completed, raw)
 		f.mu.Unlock()
-		if block {
-			<-r.Context().Done()
-			return
-		}
 		var expected uint64
 		var claimID, errorCode string
 		var failed bool
@@ -427,6 +422,7 @@ type manualClock struct {
 
 type manualWaiter struct {
 	at time.Time
+	d  time.Duration
 	ch chan time.Time
 }
 
@@ -447,8 +443,26 @@ func (c *manualClock) After(d time.Duration) <-chan time.Time {
 		ch <- c.now
 		return ch
 	}
-	c.waiters = append(c.waiters, manualWaiter{at: c.now.Add(d), ch: ch})
+	c.waiters = append(c.waiters, manualWaiter{at: c.now.Add(d), d: d, ch: ch})
 	return ch
+}
+
+// Fire releases only the timers asked for exactly d, leaving every other
+// timer pending and the clock's reading where it is. A test uses it to pass
+// one deadline (the drain's bound) without also passing the shorter ones a
+// plain Advance would fire with it, which would race the deadline under test.
+func (c *manualClock) Fire(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.waiters[:0]
+	for _, waiter := range c.waiters {
+		if waiter.d == d {
+			waiter.ch <- waiter.at
+			continue
+		}
+		kept = append(kept, waiter)
+	}
+	c.waiters = kept
 }
 
 func (c *manualClock) Advance(d time.Duration) {
