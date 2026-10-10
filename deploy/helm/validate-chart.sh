@@ -210,6 +210,12 @@ refuses() {
 # the binary actually receive says what the operator asked for — and a list
 # joined into one argument is exactly where a blank element disappears quietly
 # or arrives as an empty name.
+#
+# Every match below reads a here-string, never `printf ... | grep -q`. grep -q
+# exits at the first match, and once the input is larger than the pipe buffer
+# the printf still writing gets SIGPIPE. Under pipefail the pipeline then
+# exits 141, so a match reads as no match: a presence check fails spuriously,
+# and an absence check passes when the pattern is there.
 assert_renders() {
   local description="$1" pattern="$2"; shift 2
   local rendered
@@ -217,7 +223,7 @@ assert_renders() {
     fail "should render but was refused: $description"
     return
   fi
-  if ! printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
+  if ! grep -qE -- "$pattern" <<<"$rendered"; then
     fail "the rendered output does not match /$pattern/: $description"
   fi
 }
@@ -233,9 +239,9 @@ assert_absent() {
     fail "should render but was refused: $description"
     return
   fi
-  if printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
+  if grep -qE -- "$pattern" <<<"$rendered"; then
     fail "the rendered output matches /$pattern/ and must not: $description"
-    printf '%s\n' "$rendered" | grep -E -- "$pattern" | head -3 | sed 's/^/      /'
+    { grep -E -- "$pattern" <<<"$rendered" | head -3 | sed 's/^/      /'; } || true
   fi
 }
 
@@ -245,9 +251,9 @@ assert_absent_or_refused() {
   if ! rendered=$(helm template shoal "$chart" "$@" 2>&1); then
     return 0
   fi
-  if printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
+  if grep -qE -- "$pattern" <<<"$rendered"; then
     fail "the rendered output matches /$pattern/ and must not: $description"
-    printf '%s\n' "$rendered" | grep -E -- "$pattern" | head -3 | sed 's/^/      /'
+    { grep -E -- "$pattern" <<<"$rendered" | head -3 | sed 's/^/      /'; } || true
   fi
 }
 
@@ -256,7 +262,7 @@ refuses_citing() {
   local output
   if output="$(helm template shoal "$chart" "$@" 2>&1)"; then
     fail "should be refused but rendered: $description"
-  elif ! printf '%s' "$output" | grep -qF -- "$expected"; then
+  elif ! grep -qF -- "$expected" <<<"$output"; then
     fail "refused, but not by the guard under test: $description"
     # Helm's own YAML errors carry no "execution error", and under pipefail a
     # grep that finds nothing would end the whole run here, silently skipping
@@ -272,6 +278,19 @@ if ! python3 -c 'import yaml' 2>/dev/null; then
   fail "python3 with PyYAML is required: the rendered-object checks parse Helm output"
   note "  install it with: python3 -m pip install pyyaml"
 fi
+
+note "== a match near the start of a large render is still a match =="
+# The assertions' grep reads a here-string (see assert_renders). This pins the
+# property on an input well past any pipe buffer: the form it replaced,
+# printf | grep -q, exits 141 here under pipefail and reads the match as absent.
+large_render="sentinel-near-the-start
+$(head -c 3000000 /dev/zero | tr '\0' 'x' | fold -w 100)"
+grep -qE -- '^sentinel-near-the-start$' <<<"$large_render" ||
+  fail "a presence check misses a match near the start of a 3 MB render"
+if ! grep -qF -- 'sentinel-near-the-start' <<<"$large_render"; then
+  fail "an absence check reports a present match near the start of a 3 MB render as absent"
+fi
+unset large_render
 
 note "== hermetic: no cluster is reachable =="
 # The guard above, checked rather than trusted: with no lookup cluster asked
@@ -912,7 +931,7 @@ gateway_scalars_quoted() {
   stray=$(printf '%s\n' "$stray" | sed '/^$/d')
   if [ -n "$stray" ]; then
     fail "an unquoted value in the gateway Deployment: $description"
-    printf '%s\n' "$stray" | head -3 | sed 's/^/      /'
+    { head -3 <<<"$stray" | sed 's/^/      /'; } || true
   fi
 }
 gateway_scalars_quoted "env-form credentials" "${llm_gateway_base[@]}"
@@ -1065,7 +1084,7 @@ explorer_scalars_quoted() {
   stray=$(printf '%s\n' "$stray" | sed '/^$/d')
   if [ -n "$stray" ]; then
     fail "an unquoted value in the explorer's StatefulSet or Service"
-    printf '%s\n' "$stray" | head -3 | sed 's/^/      /'
+    { head -3 <<<"$stray" | sed 's/^/      /'; } || true
   fi
 }
 explorer_scalars_quoted "${explorer_base[@]}" --set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage
@@ -1097,10 +1116,10 @@ y'
 # accumulo password and the key file, and refusals are printed to CI logs.
 password_refusal=$(helm template shoal "$chart" -f "$chart/values.yaml" --set-string 'readFleet.accumuloPassword=hunter2-secret
 ' 2>&1 || true)
-if printf '%s' "$password_refusal" | grep -qF 'hunter2-secret'; then
+if grep -qF 'hunter2-secret' <<<"$password_refusal"; then
   fail "a refused password is printed in the refusal"
 fi
-if ! printf '%s' "$password_refusal" | grep -qF 'readFleet.accumuloPassword holds'; then
+if ! grep -qF 'readFleet.accumuloPassword holds' <<<"$password_refusal"; then
   fail "a trailing newline in the accumulo password is not refused by the walk"
 fi
 
@@ -2931,13 +2950,13 @@ notes_with() {
   helm template shoal "$notes_probe/shoal" "${effects_gateway_base[@]}" -s templates/zz-notes-probe.yaml "$@" 2>&1
 }
 if notes=$(notes_with --set 'effectsGateways[0].unrecorded.storage=emptyDir,effectsGateways[0].unrecorded.acceptLossOfUnrecordedReports=true'); then
-  printf '%s' "$notes" | grep -qF "WARNING: effects gateway stripe keeps its unrecorded log in an" ||
+  grep -qF "WARNING: effects gateway stripe keeps its unrecorded log in an" <<<"$notes" ||
     fail "an acknowledged emptyDir renders no warning in the install notes"
 else
   fail "should render but was refused: the install notes for an acknowledged emptyDir"
 fi
 if notes=$(notes_with); then
-  printf '%s' "$notes" | grep -qF "WARNING" && fail "the install notes warn about a log that is on a claim"
+  grep -qF "WARNING" <<<"$notes" && fail "the install notes warn about a log that is on a claim"
 else
   fail "should render but was refused: the install notes for the fixture"
 fi
@@ -3168,7 +3187,7 @@ LIVE
   lookup_deployment 1
   if output=$(lookup_install --set 'effectsGateways[0].name=stripe2'); then
     fail "a rename with the old gateway running is accepted by a server dry run"
-  elif ! printf '%s' "$output" | grep -qF "no enabled entry in effectsGateways names it"; then
+  elif ! grep -qF "no enabled entry in effectsGateways names it" <<<"$output"; then
     fail "a rename with the old gateway running is refused, but not by the lookup guard"
     printf '%s\n' "$output" | grep -oE 'execution error.*|Error: .*' | head -1 | cut -c1-200 | sed 's/^/      /' || true
   fi
