@@ -140,3 +140,39 @@ true
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{- /*
+The install notes for the effects gateways, and the loud warning for an
+emptyDir log. A named template, included by NOTES.txt, because NOTES.txt is
+rendered only by install and upgrade, and Helm 3.16 contacts the cluster for
+both even with --dry-run=client: a check of the warning that needs a cluster
+cannot run in CI. validate-chart.sh renders this template through
+`helm template` instead.
+*/ -}}
+{{- define "shoal.effectsGatewayNotes" -}}
+{{- range $gateway := fromJsonArray (include "shoal.effectsGateways" .) }}
+{{- if $gateway.enabled }}
+{{- $name := include "shoal.effectsGatewayName" (dict "root" $ "gateway" $gateway) }}
+Effects gateway {{ $gateway.name }} ({{ $name }}): terminationGracePeriodSeconds {{ include "shoal.effectsGatewayGracePeriod" (dict "name" (printf "effectsGateways[%v]" $gateway._index) "gateway" $gateway) }}, replicas {{ $gateway.replicas }}, Recreate.
+{{- if eq $gateway.unrecorded.storage "emptyDir" }}
+
+  ******************************************************************************
+  WARNING: effects gateway {{ $gateway.name }} keeps its unrecorded log in an
+  emptyDir (unrecorded.storage: emptyDir, acceptLossOfUnrecordedReports: true).
+
+  The log holds the only record of effects the explorer refused, did not find
+  or could not confirm (#514). It is DELETED with the pod: a reschedule, an
+  eviction, a node loss or an upgrade loses every report in it, and nothing
+  else in the system remembers those effects happened.
+
+  Use unrecorded.storage: persistentVolumeClaim (the default) in any
+  deployment whose effects matter.
+  ******************************************************************************
+{{- else if eq $gateway.unrecorded.storage "persistentVolumeClaim" }}
+  The unrecorded log's claim {{ $name }}-unrecorded is kept on uninstall
+  (helm.sh/resource-policy: keep). Delete it by hand once
+  `shoal-gateway unrecorded list` shows it empty.
+{{- end }}
+{{- end }}
+{{- end -}}
+{{- end -}}

@@ -2623,13 +2623,35 @@ effects_check emptydir "an acknowledged emptyDir" "${effects_gateway_base[@]}" -
 assert_renders "an existing claim is mounted" '^ +claimName: "stripe-log"$' "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=existingClaim,effectsGateways[0].unrecorded.existingClaim=stripe-log'
 refuses_citing "existingClaim is required" "an existing claim with no name" "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=existingClaim'
 refuses_citing "unrecorded.storage must be" "an unknown storage kind" "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=hostPath'
-# The warning an operator sees at install, which `helm template` does not show.
-if notes=$(helm install --dry-run=client shoal "$chart" "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=emptyDir,effectsGateways[0].unrecorded.acceptLossOfUnrecordedReports=true' 2>&1); then
+# The warning an operator sees at install. NOTES.txt is rendered only by
+# install and upgrade, and Helm contacts the cluster for both even with
+# --dry-run=client, so a CI runner with no cluster cannot render it. Its text
+# is the named template shoal.effectsGatewayNotes, which NOTES.txt includes and
+# nothing else does; a copy of the chart gains one manifest that renders it as
+# a quoted scalar, which `helm template` can show with no cluster at all. The
+# NOTES.txt half is pinned as well: it must still be that one include.
+notes_probe="$(mktemp -d)"
+cp -R "$chart" "$notes_probe/shoal"
+cat > "$notes_probe/shoal/templates/zz-notes-probe.yaml" <<'PROBE'
+notes: {{ include "shoal.effectsGatewayNotes" . | quote }}
+PROBE
+notes_with() {
+  helm template shoal "$notes_probe/shoal" "${effects_gateway_base[@]}" -s templates/zz-notes-probe.yaml "$@" 2>&1
+}
+if notes=$(notes_with --set 'effectsGateways[0].unrecorded.storage=emptyDir,effectsGateways[0].unrecorded.acceptLossOfUnrecordedReports=true'); then
   printf '%s' "$notes" | grep -qF "WARNING: effects gateway stripe keeps its unrecorded log in an" ||
-    fail "an acknowledged emptyDir installs without the warning in NOTES"
+    fail "an acknowledged emptyDir renders no warning in the install notes"
 else
-  fail "should install (dry run) but was refused: an acknowledged emptyDir"
+  fail "should render but was refused: the install notes for an acknowledged emptyDir"
 fi
+if notes=$(notes_with); then
+  printf '%s' "$notes" | grep -qF "WARNING" && fail "the install notes warn about a log that is on a claim"
+else
+  fail "should render but was refused: the install notes for the fixture"
+fi
+grep -qF '{{- include "shoal.effectsGatewayNotes" . -}}' "$chart/templates/NOTES.txt" ||
+  fail "NOTES.txt no longer includes shoal.effectsGatewayNotes, so the checked text is not what an install prints"
+rm -rf "$notes_probe"
 
 note "== effects gateway: the grace period is the binary's =="
 # The chart computes terminationGracePeriodSeconds from the timeouts rather
