@@ -83,8 +83,7 @@
 
 {{- /* An empty allow-list refuses every request with 421, because the resolved
        listen address of a pod is an authority no real client sends. */ -}}
-{{- $allowedHosts := list -}}
-{{- range $explorer.allowedHosts }}{{- if trim . }}{{- $allowedHosts = append $allowedHosts (trim .) }}{{- end }}{{- end -}}
+{{- $allowedHosts := include "shoal.explorerAllowedHosts" . -}}
 {{- if not $allowedHosts -}}
 {{- fail "explorer.allowedHosts needs at least one non-blank value: the workspace binds a non-loopback address in a pod, and with no allow-list every request is refused with 421 Misdirected Request. List the external authority clients actually send (usually the port-less ingress name)" -}}
 {{- end -}}
@@ -282,10 +281,22 @@
 {{- if not $explorer.chat.model -}}
 {{- fail "explorer.chat.model is required when explorer.chat.provider is set" -}}
 {{- end -}}
-{{- if and (not (hasPrefix "http://127.0.0.1" $explorer.chat.baseURL)) (not (hasPrefix "http://localhost" $explorer.chat.baseURL)) -}}
+{{- /* Parsed, not prefix-matched (#423): "http://localhost.example" starts
+       with "http://localhost" and is remote, so a prefix test skipped the
+       credential requirement for it. */ -}}
+{{- $chatURL := trim (toString (default "" $explorer.chat.baseURL)) -}}
+{{- include "shoal.explorerProviderURL" (dict "name" "explorer.chat.baseURL" "value" $chatURL) -}}
+{{- if not (include "shoal.urlIsLoopback" $chatURL) -}}
 {{- if not $explorer.chat.credentialSecretName -}}
 {{- fail (printf "explorer.chat.credentialSecretName is required for a remote chat base URL (%q): the workspace reads %s at request time, and nothing projects it into the pod without a Secret" $explorer.chat.baseURL $explorer.chat.apiKeyEnv) -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if has $explorer.embedding.provider (list "ollama" "openai" "voyage") -}}
+{{- $embeddingURL := trim (toString (default "" $explorer.embedding.baseURL)) -}}
+{{- /* Voyage supplies its own default URL when the value is empty. */ -}}
+{{- if or $embeddingURL (ne $explorer.embedding.provider "voyage") -}}
+{{- include "shoal.explorerProviderURL" (dict "name" "explorer.embedding.baseURL" "value" $embeddingURL) -}}
 {{- end -}}
 {{- end -}}
 {{- if and $explorer.embedding.provider (has $explorer.embedding.provider (list "openai" "voyage")) -}}
@@ -400,6 +411,12 @@
 {{- /* Two listeners on one port silently means one of them is not serving. */ -}}
 {{- if eq (int $explorer.containerPort) (int $explorer.healthPort) -}}
 {{- fail "explorer.healthPort must differ from explorer.containerPort: they are two listeners and cannot share a port" -}}
+{{- end -}}
+{{- range $field := list "containerPort" "healthPort" -}}
+{{- $port := int (index $explorer $field) -}}
+{{- if lt $port 1024 -}}
+{{- fail (printf "explorer.%s must be 1024 or above (got %d): the container runs as uid 65532 and drops all capabilities, so it may be unable to bind on runtimes that restrict ports below 1024, and the pod then restarts forever. Use a port of 1024 or above" $field $port) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -1041,11 +1058,14 @@
 {{- fail (printf "llmGateway.%s must be a port between 1 and 65535 (got %v): anything else is not a port the API server will accept, so the object is rejected at install" $field (default 0 (index $gateway $field))) -}}
 {{- end -}}
 {{- end -}}
-{{- /* The pod runs as uid 65532 with every capability dropped, so a privileged
-       port is not a choice the chart can honour on its behalf. */ -}}
+{{- /* The pod runs as uid 65532 with every capability dropped, so it may be
+       unable to bind on runtimes that restrict ports below 1024. Some do not
+       (containerd 2.x and Docker 20.10+ allow unprivileged low ports), so the
+       1024 floor is the chart's policy, not a hard kernel limit: a port that
+       binds on one node and fails on the next is the failure it avoids. */ -}}
 {{- range $field := list "containerPort" "healthPort" -}}
 {{- if lt (int (default 0 (index $gateway $field))) 1024 -}}
-{{- fail (printf "llmGateway.%s must be 1024 or above (got %d): the container runs as uid 65532 with all capabilities dropped, so it cannot bind a privileged port — the bind fails and the pod restarts forever" $field (int (default 0 (index $gateway $field)))) -}}
+{{- fail (printf "llmGateway.%s must be 1024 or above (got %d): the container runs as uid 65532 and drops all capabilities, so it may be unable to bind on runtimes that restrict ports below 1024, and the pod then restarts forever. Use a port of 1024 or above" $field (int (default 0 (index $gateway $field)))) -}}
 {{- end -}}
 {{- end -}}
 
@@ -1304,7 +1324,11 @@
 {{- fail (printf "%s.target.idempotencyRetention (%q) must exceed timing.operationTimeout + 5s: an action whose deadline outlives the target's deduplication window cannot be performed under the key's guarantee, so nothing would ever be claimable" $key (toString $target.idempotencyRetention)) -}}
 {{- end -}}
 {{- end -}}
-{{- range $bound := list (list "maxInFlight" 1 64) (list "pullLimit" 1 256) (list "maxResponseBytes" 1 1048576) (list "healthPort" 1 65535) -}}
+{{- /* healthPort starts at 1024, not 1 (#423): the pod runs as uid 65532 with
+       all capabilities dropped, so it may be unable to bind on runtimes that
+       restrict ports below 1024. The floor is a policy, as for the other
+       pods, not a hard limit. */ -}}
+{{- range $bound := list (list "maxInFlight" 1 64) (list "pullLimit" 1 256) (list "maxResponseBytes" 1 1048576) (list "healthPort" 1024 65535) -}}
 {{- $field := index $bound 0 -}}
 {{- $value := include "shoal.effectsGatewayWhole" (dict "name" (printf "%s.%s" $key $field) "value" (index $gateway $field)) -}}
 {{- if or (not $value) (lt (int64 $value) (int64 (index $bound 1))) (gt (int64 $value) (int64 (index $bound 2))) -}}
@@ -1455,6 +1479,32 @@
 {{- range $key, $value := .Values -}}
 {{- if not (has $key (list "global" "llmProxy")) -}}
 {{- include "shoal.refuseLineBreaks" (dict "path" $key "value" $value "multiline" $lineBreakMultiline "trimmed" $lineBreakTrimmed) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Bind ports for the storage-tier pods (#423). Every one of them runs as uid
+       65532 with all capabilities dropped, as the explorer and the gateways
+       do, so it may be unable to bind on runtimes that restrict ports below
+       1024 and would then restart forever. The floor is a policy (see the
+       llmGateway note above), applied the same way here. Only the ports a container binds are checked: a Service port
+       is the cluster's to choose. The read fleet binds readFleet.listen, not
+       readFleet.servicePort (which only names the container port), so its
+       listen address is the one checked. */ -}}
+{{- range $role, $fields := dict "writeTier" (list "grpcPort" "metricsPort") "tserver" (list "thriftPort" "metricsPort") "compactor" (list "thriftPort" "metricsPort") "readFleet" (list "metricsPort") -}}
+{{- if eq (include (printf "shoal.%sEnabled" $role) $) "true" -}}
+{{- range $field := $fields -}}
+{{- $port := int (index (index $.Values $role) $field) -}}
+{{- if lt $port 1024 -}}
+{{- fail (printf "%s.%s must be 1024 or above (got %d): the container runs as uid 65532 and drops all capabilities, so it may be unable to bind on runtimes that restrict ports below 1024, and the pod then restarts forever. Use a port of 1024 or above" $role $field $port) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (include "shoal.readFleetEnabled" .) "true" -}}
+{{- $readListen := trim (toString (default "" .Values.readFleet.listen)) -}}
+{{- $readListenPort := regexFind "[0-9]+$" (regexFind ":[0-9]+$" $readListen) -}}
+{{- if and $readListenPort (lt (int $readListenPort) 1024) -}}
+{{- fail (printf "readFleet.listen must bind a port of 1024 or above (got %q): the container runs as uid 65532 and drops all capabilities, so it may be unable to bind on runtimes that restrict ports below 1024, and the pod then restarts forever. Use a port of 1024 or above" $readListen) -}}
 {{- end -}}
 {{- end -}}
 

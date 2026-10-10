@@ -181,6 +181,81 @@ and nothing else; it does not restrict which models may be called.
 {{- join "," $models -}}
 {{- end -}}
 
+{{- /*
+The explorer's host allow-list, trimmed and comma-joined for -allowed-host (#423).
+
+One definition, used by the guard in validate.yaml and by the argument in the
+StatefulSet, so the two cannot disagree about what an entry is. The gate matches
+an authority exactly, so every entry the chart passes must be one it can match:
+
+- A blank-after-trim entry is refused rather than dropped. The operator meant a
+  host there, and rendering a shorter list than they wrote is the partial
+  failure where one ingress name answers 421 while its neighbours work.
+- A comma inside an entry is refused. The entries are joined into one argument
+  that the binary splits on commas, so "a.test, " would arrive as "a.test" plus
+  a blank the binary drops quietly — the same shortened list, reached around
+  the blank check — and "a.test,b.test" is two entries written as one.
+- Whitespace inside an entry is refused. The binary trims each piece but keeps
+  interior space, and no Host header carries a space, so the entry matches
+  nothing.
+- An entry must be an authority as normalizeAuthority
+  (pkg/explorer/webapi/hostauthority.go) reads one: host, host:port,
+  [ipv6] or [ipv6]:port. A "/" is refused, because a URL such as
+  "https://shoal.example.test" splits as host "https" with port
+  "//shoal.example.test" and matches nothing. An unbracketed host with more
+  than one colon ("::1") is refused, because the workspace refuses it at
+  startup and the pod exits. An empty host (":8443", or "." once the
+  trailing dot is folded) is refused for the same reason.
+
+  This is slightly stricter than the binary in two places, both of which
+  are false refusals of an authority no client sends: a bracketed host must
+  be an IP literal even when a port follows (net.SplitHostPort does not
+  check it), and a port must be digits (the binary compares it as a string).
+  IPv6 literals with an embedded IPv4 tail (::ffff:192.0.2.1) are refused
+  too, since the pattern below covers the hex forms only.
+
+Emits the empty string for an empty list, which is what the guard tests.
+*/ -}}
+{{- define "shoal.explorerAllowedHosts" -}}
+{{- $hosts := list -}}
+{{- $octet := "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])" -}}
+{{- $v4 := printf "^%s(\\.%s){3}$" $octet $octet -}}
+{{- $v6 := replace "H" "[0-9a-fA-F]{1,4}" "^((H:){7}H|(H:){1,7}:|(H:){1,6}:H|(H:){1,5}(:H){1,2}|(H:){1,4}(:H){1,3}|(H:){1,3}(:H){1,4}|(H:){1,2}(:H){1,5}|H:(:H){1,6}|:((:H){1,7}|:))$" -}}
+{{- range (default (list) .Values.explorer.allowedHosts) -}}
+{{- $host := trim (toString (default "" .)) -}}
+{{- if not $host -}}
+{{- fail "explorer.allowedHosts contains a blank-after-trim element: give every intended host a non-blank authority rather than silently shortening the allow-list" -}}
+{{- end -}}
+{{- if contains "," $host -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which holds a comma: entries are comma-joined into one -allowed-host argument that the workspace splits on commas, so this one entry becomes several and a blank piece is dropped silently. Give each authority its own list entry" $host) -}}
+{{- end -}}
+{{- if regexMatch `\p{Zs}` $host -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which holds whitespace inside the authority: the workspace matches the Host header exactly and no Host header carries a space, so every request for it is refused with 421" $host) -}}
+{{- end -}}
+{{- if contains "/" $host -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which holds a \"/\": an entry is an authority (host or host:port, as the Host header carries it), not a URL. The workspace would split it at the last colon and match nothing, so every request for it is refused with 421" $host) -}}
+{{- end -}}
+{{- $bracketed := `^\[([^\[\]]+)\](:[0-9]*)?$` -}}
+{{- $plain := `^([^\[\]:]*)(:[0-9]*)?$` -}}
+{{- if regexMatch $bracketed $host -}}
+{{- $inner := regexReplaceAll $bracketed $host "${1}" -}}
+{{- if not (or (regexMatch $v6 $inner) (regexMatch $v4 $inner)) -}}
+{{- fail (printf "explorer.allowedHosts contains %q, whose bracketed host is not an IP address: brackets hold an IPv6 literal such as [::1], optionally followed by :port" $host) -}}
+{{- end -}}
+{{- else if regexMatch $plain $host -}}
+{{- if not (trimSuffix "." (regexReplaceAll $plain $host "${1}")) -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which has no host: the workspace refuses an authority with an empty host at startup" $host) -}}
+{{- end -}}
+{{- else if regexMatch `^[^\[\]]*:[^\[\]]*:` $host -}}
+{{- fail (printf "explorer.allowedHosts contains %q, an unbracketed host with more than one colon: the workspace refuses it at startup and the pod exits. Write an IPv6 address in brackets, as [::1] or [::1]:8443" $host) -}}
+{{- else -}}
+{{- fail (printf "explorer.allowedHosts contains %q, which is not an authority the workspace accepts: write host, host:port, [ipv6] or [ipv6]:port, with a numeric port" $host) -}}
+{{- end -}}
+{{- $hosts = append $hosts $host -}}
+{{- end -}}
+{{- join "," $hosts -}}
+{{- end -}}
+
 {{- define "shoal.llmGatewayAllowedHosts" -}}
 {{- $hosts := list -}}
 {{- range (default (list) .Values.llmGateway.allowedHosts) -}}
@@ -345,6 +420,44 @@ true
 {{- if or (eq $host "localhost") (eq $host "::1")
           (eq $host "0:0:0:0:0:0:0:1") (regexMatch $v4 $host) -}}
 true
+{{- end -}}
+{{- end -}}
+
+{{- /*
+An explorer model-provider base URL (explorer.chat.baseURL,
+explorer.embedding.baseURL), refused here exactly where the workspace refuses
+it at startup (#423). Takes a dict of name (the values key) and value.
+
+pkg/model validates every provider the explorer offers (Ollama, the
+OpenAI-compatible client, Voyage) the same way, after trimming: an absolute
+http(s) URL with a host; no userinfo, query or fragment; a path of nothing or
+"/"; and plaintext only to a loopback host. The provider appends its own API
+path, so a base such as https://api.example.test/v1 is refused by the binary,
+and a chart that approved it would render a pod that exits at startup.
+
+A bare "?" or "#" with nothing after it is refused here as well. The
+OpenAI-compatible and Voyage clients refuse both; Ollama tolerates them. That
+is a false refusal of a URL nobody means to write, which is the safe
+direction for a guard to be wrong in.
+*/ -}}
+{{- define "shoal.explorerProviderURL" -}}
+{{- $name := .name -}}
+{{- $value := trim (toString (default "" .value)) -}}
+{{- if not (include "shoal.urlIsAbsolute" $value) -}}
+{{- fail (printf "%s must be an absolute http(s) URL with a host (got %q)" $name $value) -}}
+{{- end -}}
+{{- $parsed := urlParse $value -}}
+{{- if $parsed.userinfo -}}
+{{- fail (printf "%s must not carry userinfo (got %q): the workspace refuses a provider URL with credentials in it at startup. Put the credential in a Secret and name it in credentialSecretName" $name $value) -}}
+{{- end -}}
+{{- if or $parsed.query $parsed.fragment (contains "?" $value) (contains "#" $value) -}}
+{{- fail (printf "%s must not carry a query or fragment (got %q): the workspace refuses either at startup" $name $value) -}}
+{{- end -}}
+{{- if not (has $parsed.path (list "" "/")) -}}
+{{- fail (printf "%s must be the provider's root, with no path (got %q): the workspace appends the provider's own API path and refuses a base URL that already has one at startup" $name $value) -}}
+{{- end -}}
+{{- if and (include "shoal.urlIsPlaintext" $value) (not (include "shoal.urlIsLoopback" $value)) -}}
+{{- fail (printf "%s must use HTTPS unless the host is loopback (got %q): the workspace refuses plaintext HTTP to any other host at startup" $name $value) -}}
 {{- end -}}
 {{- end -}}
 

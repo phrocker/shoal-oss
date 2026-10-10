@@ -111,8 +111,26 @@ or answer nothing. Authentication is a required decision with one valid value
 (`explorer.auth.mode: oidc`); `-dev-auth` is not offered, because it is refused
 on any non-loopback listener and a pod behind a Service must bind one.
 `explorer.allowedHosts` is required, because an empty allow-list answers every
-request with `421`. `explorer.replicas` above one is refused: the corpus,
-workspace settings and durable policy catalog share one state root on a
+request with `421`. Each authority is trimmed; a blank-after-trim entry is
+refused even beside valid hosts, and so is an entry holding a comma or interior
+whitespace, since the gate matches each authority exactly. Each entry must be
+an authority (`host`, `host:port`, `[ipv6]` or `[ipv6]:port`): a URL such as
+`https://shoal.example.test` is refused, since it matches nothing, and so is an
+unbracketed IPv6 address such as `::1`, which the workspace refuses at
+startup. Write `[::1]` or `[::1]:8443` instead. Explorer chat and
+network embedding URLs must be absolute HTTP(S) URLs with a host and no
+userinfo, query, fragment or path beyond `/` (the provider appends its own API
+path, so `https://api.example.test/v1` is refused at startup and here);
+plaintext HTTP is allowed only for loopback hosts, not names such as
+`localhost.example`. Voyage retains its built-in URL default when none is
+supplied. Explorer, embed (`writeTier`), read fleet (`readFleet.listen` and
+`readFleet.metricsPort`), tserver, compactor and effects gateway bind ports must
+be at least 1024. Their containers run as uid 65532 with all capabilities
+dropped, so they may be unable to bind on runtimes that restrict ports below
+1024; some runtimes (containerd 2.x, Docker 20.10+) allow unprivileged low
+ports, so the floor is the chart's policy rather than a hard limit. Use a port
+of 1024 or above. This does not restrict a separate Service port.
+`explorer.replicas` above one is refused: the corpus, workspace settings and durable policy catalog share one state root on a
 ReadWriteOnce volume, with no coordination protocol between two processes over
 it. A remote chat or embedding provider without a credential Secret is refused,
 and so is an ask executor reference the allow-list does not name.

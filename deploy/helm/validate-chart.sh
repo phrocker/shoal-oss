@@ -210,6 +210,12 @@ refuses() {
 # the binary actually receive says what the operator asked for — and a list
 # joined into one argument is exactly where a blank element disappears quietly
 # or arrives as an empty name.
+#
+# Every match below reads a here-string, never `printf ... | grep -q`. grep -q
+# exits at the first match, and once the input is larger than the pipe buffer
+# the printf still writing gets SIGPIPE. Under pipefail the pipeline then
+# exits 141, so a match reads as no match: a presence check fails spuriously,
+# and an absence check passes when the pattern is there.
 assert_renders() {
   local description="$1" pattern="$2"; shift 2
   local rendered
@@ -217,7 +223,7 @@ assert_renders() {
     fail "should render but was refused: $description"
     return
   fi
-  if ! printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
+  if ! grep -qE -- "$pattern" <<<"$rendered"; then
     fail "the rendered output does not match /$pattern/: $description"
   fi
 }
@@ -233,9 +239,9 @@ assert_absent() {
     fail "should render but was refused: $description"
     return
   fi
-  if printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
+  if grep -qE -- "$pattern" <<<"$rendered"; then
     fail "the rendered output matches /$pattern/ and must not: $description"
-    printf '%s\n' "$rendered" | grep -E -- "$pattern" | head -3 | sed 's/^/      /'
+    { grep -E -- "$pattern" <<<"$rendered" | head -3 | sed 's/^/      /'; } || true
   fi
 }
 
@@ -245,9 +251,9 @@ assert_absent_or_refused() {
   if ! rendered=$(helm template shoal "$chart" "$@" 2>&1); then
     return 0
   fi
-  if printf '%s\n' "$rendered" | grep -qE -- "$pattern"; then
+  if grep -qE -- "$pattern" <<<"$rendered"; then
     fail "the rendered output matches /$pattern/ and must not: $description"
-    printf '%s\n' "$rendered" | grep -E -- "$pattern" | head -3 | sed 's/^/      /'
+    { grep -E -- "$pattern" <<<"$rendered" | head -3 | sed 's/^/      /'; } || true
   fi
 }
 
@@ -256,7 +262,7 @@ refuses_citing() {
   local output
   if output="$(helm template shoal "$chart" "$@" 2>&1)"; then
     fail "should be refused but rendered: $description"
-  elif ! printf '%s' "$output" | grep -qF -- "$expected"; then
+  elif ! grep -qF -- "$expected" <<<"$output"; then
     fail "refused, but not by the guard under test: $description"
     # Helm's own YAML errors carry no "execution error", and under pipefail a
     # grep that finds nothing would end the whole run here, silently skipping
@@ -272,6 +278,19 @@ if ! python3 -c 'import yaml' 2>/dev/null; then
   fail "python3 with PyYAML is required: the rendered-object checks parse Helm output"
   note "  install it with: python3 -m pip install pyyaml"
 fi
+
+note "== a match near the start of a large render is still a match =="
+# The assertions' grep reads a here-string (see assert_renders). This pins the
+# property on an input well past any pipe buffer: the form it replaced,
+# printf | grep -q, exits 141 here under pipefail and reads the match as absent.
+large_render="sentinel-near-the-start
+$(head -c 3000000 /dev/zero | tr '\0' 'x' | fold -w 100)"
+grep -qE -- '^sentinel-near-the-start$' <<<"$large_render" ||
+  fail "a presence check misses a match near the start of a 3 MB render"
+if ! grep -qF -- 'sentinel-near-the-start' <<<"$large_render"; then
+  fail "an absence check reports a present match near the start of a 3 MB render as absent"
+fi
+unset large_render
 
 note "== hermetic: no cluster is reachable =="
 # The guard above, checked rather than trusted: with no lookup cluster asked
@@ -360,7 +379,7 @@ if [ -n "$repository" ] &&
     # explorer case names a storage class and a chat credential, so the
     # optional fields it quotes are rendered too.
     reference_chart="$reference/deploy/helm/shoal"
-    explorer_parsed=(--set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage)
+    explorer_parsed=(--set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage)
     for profile in explorer llm-gateway; do
       if [ "$profile" = explorer ]; then
         overrides=("${valid_explorer[@]}" "${explorer_parsed[@]}")
@@ -372,8 +391,14 @@ if [ -n "$repository" ] &&
       # so that is what is compared, and the one argument it adds, the
       # acknowledgement the binary now requires for a 0.0.0.0 bind, is the
       # only difference allowed. The TLS rendering is asserted on its own below.
+      #
+      # That holds only while the baseline predates #424. Once the baseline has
+      # the TLS listener too (it has since #583 merged, so origin/main compares
+      # against itself), forcing plaintext on one side only compares TLS against
+      # plaintext and always fails. Then the two sides get the same values.
       current=("${overrides[@]}")
-      if [ "$profile" = llm-gateway ]; then
+      if [ "$profile" = llm-gateway ] &&
+        ! grep -qF -- '-allow-plaintext-listener' "$reference_chart/templates/llm-gateway-deployment.yaml"; then
         current+=(--set llmGateway.tls.enabled=false,llmGateway.tls.secretName=)
       fi
       # Both must render, or two identical error messages would compare equal.
@@ -449,7 +474,7 @@ refuses "claim mapped to no values"     "${explorer_base[@]}" --set explorer.aut
 refuses "no allowed hosts"              "${explorer_base[@]}" --set explorer.allowedHosts=null
 refuses "more than one replica"         "${explorer_base[@]}" --set explorer.replicas=2
 refuses "mosaic budget with no window"  "${explorer_base[@]}" --set explorer.disclosure.mosaic.maxDomains=3,explorer.disclosure.mosaic.window=
-refuses "remote chat with no credential" "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1
+refuses "remote chat with no credential" "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test
 refuses "chat provider with no model"   "${explorer_base[@]}" --set explorer.chat.provider=ollama,explorer.chat.baseURL=http://localhost:11434
 refuses "voyage with no credential"     "${explorer_base[@]}" --set explorer.embedding.provider=voyage,explorer.embedding.model=v3
 refuses "ask executor not allowlisted"  "${explorer_base[@]}" --set explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434
@@ -473,13 +498,131 @@ refuses "placeholder fleet value"       "${explorer_base[@]}" --set 'explorer.au
 
 note "== valid configurations still render =="
 renders "loopback chat needs no credential" "${explorer_base[@]}" --set explorer.chat.provider=ollama,explorer.chat.model=llama3,explorer.chat.baseURL=http://localhost:11434
-renders "remote chat with a credential"     "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1,explorer.chat.credentialSecretName=chat
+renders "remote chat with a credential"     "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test,explorer.chat.credentialSecretName=chat
 renders "mosaic budget enabled"             "${explorer_base[@]}" --set explorer.disclosure.mosaic.maxDomains=3
 renders "withholding concealed"             "${explorer_base[@]}" --set explorer.disclosure.concealWithholding=true
 renders "ask executor wired"                "${explorer_base[@]}" --set 'explorer.fleet.executorRefs={ask}',explorer.fleet.askExecutorRef=ask,explorer.chat.provider=ollama,explorer.chat.model=m,explorer.chat.baseURL=http://localhost:11434
 renders "lexical embedding"                 "${explorer_base[@]}" --set explorer.embedding.provider=lexical,explorer.embedding.dimensions=256
 renders "scaled to zero"                    "${explorer_base[@]}" --set explorer.replicas=0
-renders "values around the blanks are trimmed" "${explorer_base[@]}" --set 'explorer.allowedHosts={ shoal.example.test , }'
+assert_renders "every allowed host is trimmed" '^ +- "-allowed-host=shoal\.example\.test,other\.example\.test"$' "${explorer_base[@]}" --set 'explorer.allowedHosts={ shoal.example.test , other.example.test }'
+
+note "== explorer host, bind port, and provider URL guards (#423) =="
+refuses_citing "explorer.allowedHosts contains a blank-after-trim element" "a blank host beside a valid host" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test, }'
+refuses_citing "explorer.allowedHosts contains a blank-after-trim element" "an empty host beside a valid host" "${explorer_base[@]}" --set 'explorer.allowedHosts={,shoal.example.test}'
+for field in containerPort healthPort; do
+  for port in 80 443 1023; do
+    refuses_citing "explorer.$field must be 1024 or above" "explorer $field=$port" "${explorer_base[@]}" --set "explorer.$field=$port"
+  done
+  renders "explorer $field at the unprivileged boundary" "${explorer_base[@]}" --set "explorer.$field=1024"
+done
+renders "a privileged explorer Service port is not a bind port" "${explorer_base[@]}" --set explorer.servicePort=80
+renders "disabled explorer bind ports are ignored" --set explorer.containerPort=80,explorer.healthPort=443
+# A comma inside one entry splits it in the binary, and a blank piece is then
+# dropped there silently: the shortened list the blank check refuses, reached
+# around it. Whitespace inside an authority matches no Host header.
+# (--set-json is applied before --set, so it could not override the base's
+# list; an escaped comma keeps the separator inside one --set entry.)
+refuses_citing "which holds a comma" "a trailing comma inside one entry" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test\, }'
+refuses_citing "which holds a comma" "two authorities written as one entry" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test\,other.example.test}'
+refuses_citing "which holds whitespace inside the authority" "a space inside an authority" "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal .example.test}'
+refuses_citing "explorer.allowedHosts contains a blank-after-trim element" "a null entry beside a valid host" "${explorer_base[@]}" --set 'explorer.allowedHosts[1]=null'
+# Entries are authorities as normalizeAuthority reads them. A URL splits at its
+# last colon into host "https" and matches nothing; an unbracketed IPv6 address
+# is refused by the workspace at startup.
+refuses_citing "which holds a \"/\"" "a URL instead of an authority" "${explorer_base[@]}" --set-string 'explorer.allowedHosts[0]=https://shoal.example.test'
+refuses_citing "which holds a \"/\"" "an authority with a path" "${explorer_base[@]}" --set-string 'explorer.allowedHosts[0]=shoal.example.test/'
+for host in '::1' 'fe80::1' 'a:b:c' '::1]'; do
+  refuses_citing "an unbracketed host with more than one colon" "unbracketed $host" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
+for host in ':8443' '.'; do
+  refuses_citing "which has no host" "an empty host in $host" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
+for host in '[foo]' '[foo]:80' '[1:2:3:4:5:6:7:8:9]' '[:::]'; do
+  refuses_citing "whose bracketed host is not an IP address" "brackets around $host" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
+for host in '[::1' '[]:80' 'shoal.example.test:https'; do
+  refuses_citing "which is not an authority the workspace accepts" "malformed $host" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
+for host in '[::1]' '[::1]:8443' '[0:0:0:0:0:0:0:1]' '[fe80::1]:80' '[::]' '[127.0.0.1]' '127.0.0.1:80' 'SHOAL.example.test.' 'localhost'; do
+  escaped=$(printf '%s' "$host" | sed -e 's/[].[]/\\&/g')
+  assert_renders "authority $host renders as written" "^ +- \"-allowed-host=${escaped}\"\$" "${explorer_base[@]}" --set-string "explorer.allowedHosts[0]=$host"
+done
+assert_renders "an authority with a port is kept as written" '^ +- "-allowed-host=shoal\.example\.test:8443"$' "${explorer_base[@]}" --set 'explorer.allowedHosts={shoal.example.test:8443}'
+
+# The read fleet binds readFleet.listen and readFleet.metricsPort; its
+# servicePort only names the container port.
+read_base=(-f "$chart/values-distributed.yaml")
+for port in 80 443 1023; do
+  refuses_citing "readFleet.metricsPort must be 1024 or above" "readFleet metricsPort=$port" "${read_base[@]}" --set "readFleet.metricsPort=$port"
+  refuses_citing "readFleet.listen must bind a port of 1024 or above" "readFleet listen :$port" "${read_base[@]}" --set "readFleet.listen=:$port"
+done
+refuses_citing "readFleet.listen must bind a port of 1024 or above" "readFleet listen on an address" "${read_base[@]}" --set "readFleet.listen=0.0.0.0:443"
+renders "readFleet metricsPort at the unprivileged boundary" "${read_base[@]}" --set readFleet.metricsPort=1024
+renders "readFleet listen at the unprivileged boundary" "${read_base[@]}" --set readFleet.listen=:1024,readFleet.servicePort=1024
+renders "disabled readFleet bind ports are ignored" "${read_base[@]}" --set readFleet.enabled=false,readFleet.metricsPort=80,readFleet.listen=:80
+
+for role in writeTier tserver compactor; do
+  fields=(thriftPort metricsPort)
+  role_base=(-f "$chart/values-accumulo.yaml")
+  if [ "$role" = writeTier ]; then
+    fields=(grpcPort metricsPort)
+    role_base=(--set mode=single)
+  fi
+  for field in "${fields[@]}"; do
+    for port in 80 443 1023; do
+      refuses_citing "$role.$field must be 1024 or above" "$role $field=$port" "${role_base[@]}" --set "$role.$field=$port"
+    done
+    renders "$role $field at the unprivileged boundary" "${role_base[@]}" --set "$role.$field=1024"
+    renders "disabled $role $field is ignored" "${role_base[@]}" --set "$role.enabled=false,$role.$field=80"
+  done
+done
+
+chat_base=("${explorer_base[@]}" --set explorer.chat.provider=ollama,explorer.chat.model=m)
+embedding_base=("${explorer_base[@]}" --set explorer.embedding.provider=ollama,explorer.embedding.model=m,explorer.embedding.dimensions=256)
+for url in http://LOCALHOST:11434 HTTP://LOCALHOST:11434 http://127.0.0.2:11434 http://127.255.255.255:11434 'http://[::1]:11434' 'http://[0:0:0:0:0:0:0:1]:11434'; do
+  renders "loopback chat $url needs no credential" "${chat_base[@]}" --set "explorer.chat.baseURL=$url"
+  renders "loopback embedding $url renders" "${embedding_base[@]}" --set "explorer.embedding.baseURL=$url"
+done
+for url in https://localhost.example https://127.example.test; do
+  refuses_citing "explorer.chat.credentialSecretName is required for a remote chat base URL" "a loopback-looking remote chat host $url" "${chat_base[@]}" --set "explorer.chat.baseURL=$url"
+  renders "remote chat $url with a credential" "${chat_base[@]}" --set "explorer.chat.baseURL=$url,explorer.chat.credentialSecretName=chat"
+done
+for url in http://localhost.example http://127.example.test http://127.0.0.256 http://127.1; do
+  refuses_citing "explorer.chat.baseURL must use HTTPS unless the host is loopback" "remote plaintext chat $url" "${chat_base[@]}" --set "explorer.chat.baseURL=$url,explorer.chat.credentialSecretName=chat"
+  refuses_citing "explorer.embedding.baseURL must use HTTPS unless the host is loopback" "remote plaintext embedding $url" "${embedding_base[@]}" --set "explorer.embedding.baseURL=$url"
+done
+for url in '' https:// http:// /relative ftp://localhost; do
+  refuses_citing "explorer.chat.baseURL must be an absolute http(s) URL with a host" "invalid chat URL $url" "${chat_base[@]}" --set "explorer.chat.baseURL=$url,explorer.chat.credentialSecretName=chat"
+  for provider in ollama openai voyage; do
+    # Only Voyage has a built-in URL default.
+    if [ -z "$url" ] && [ "$provider" = voyage ]; then continue; fi
+    refuses_citing "explorer.embedding.baseURL must be an absolute http(s) URL with a host" "invalid $provider embedding URL $url" "${embedding_base[@]}" --set "explorer.embedding.provider=$provider,explorer.embedding.baseURL=$url,explorer.embedding.credentialSecretName=embedding"
+  done
+done
+for provider in ollama openai voyage; do
+  renders "remote HTTPS $provider embedding with a credential" "${embedding_base[@]}" --set "explorer.embedding.provider=$provider,explorer.embedding.baseURL=https://models.example.test,explorer.embedding.credentialSecretName=embedding"
+done
+# What pkg/model refuses beyond the scheme and host: userinfo, a query, a
+# fragment, and any path but the root, for every provider the explorer offers.
+for url in 'https://user:pass@models.example.test' 'https://models.example.test/?x=1' 'https://models.example.test?' 'https://models.example.test/#top' 'https://models.example.test#' 'https://models.example.test/v1' 'http://localhost:11434/api'; do
+  case "$url" in
+    *@*) expected="must not carry userinfo" ;;
+    *\?*|*\#*) expected="must not carry a query or fragment" ;;
+    *) expected="must be the provider's root, with no path" ;;
+  esac
+  for provider in ollama openai; do
+    refuses_citing "explorer.chat.baseURL $expected" "a $provider chat URL $url" "${chat_base[@]}" --set "explorer.chat.provider=$provider,explorer.chat.baseURL=$url,explorer.chat.credentialSecretName=chat"
+  done
+  for provider in ollama openai voyage; do
+    refuses_citing "explorer.embedding.baseURL $expected" "a $provider embedding URL $url" "${embedding_base[@]}" --set "explorer.embedding.provider=$provider,explorer.embedding.baseURL=$url,explorer.embedding.credentialSecretName=embedding"
+  done
+done
+renders "a provider root with a trailing slash" "${chat_base[@]}" --set explorer.chat.provider=openai,explorer.chat.baseURL=https://models.example.test/,explorer.chat.credentialSecretName=chat
+renders "a provider URL with surrounding space, which the workspace trims" "${embedding_base[@]}" --set 'explorer.embedding.baseURL= http://localhost:11434 '
+renders "Voyage retains its built-in URL default" "${embedding_base[@]}" --set explorer.embedding.provider=voyage,explorer.embedding.baseURL=,explorer.embedding.credentialSecretName=embedding
+renders "fake embedding ignores provider URLs" "${embedding_base[@]}" --set explorer.embedding.provider=fake,explorer.embedding.baseURL=https://
+renders "lexical embedding ignores provider URLs" "${embedding_base[@]}" --set explorer.embedding.provider=lexical,explorer.embedding.baseURL=https://
+renders "disabled providers ignore their URLs" "${explorer_base[@]}" --set explorer.chat.baseURL=https://,explorer.embedding.baseURL=https://
 
 note "== the approver mapping and the stable identity claim (#451, #526) =="
 # The mapping is a document the workspace reads from disk, so it is the one
@@ -794,7 +937,7 @@ gateway_scalars_quoted() {
   stray=$(printf '%s\n' "$stray" | sed '/^$/d')
   if [ -n "$stray" ]; then
     fail "an unquoted value in the gateway Deployment: $description"
-    printf '%s\n' "$stray" | head -3 | sed 's/^/      /'
+    { head -3 <<<"$stray" | sed 's/^/      /'; } || true
   fi
 }
 gateway_scalars_quoted "env-form credentials" "${llm_gateway_base[@]}"
@@ -947,10 +1090,10 @@ explorer_scalars_quoted() {
   stray=$(printf '%s\n' "$stray" | sed '/^$/d')
   if [ -n "$stray" ]; then
     fail "an unquoted value in the explorer's StatefulSet or Service"
-    printf '%s\n' "$stray" | head -3 | sed 's/^/      /'
+    { head -3 <<<"$stray" | sed 's/^/      /'; } || true
   fi
 }
-explorer_scalars_quoted "${explorer_base[@]}" --set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage
+explorer_scalars_quoted "${explorer_base[@]}" --set explorer.storageClassName=fast --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test,explorer.chat.credentialSecretName=chat --set explorer.embedding.provider=voyage,explorer.embedding.model=v3,explorer.embedding.credentialSecretName=voyage
 # The contrasts. A non-ASCII character that is not a line break still renders,
 # in a value rendered bare and in one the explorer now quotes.
 assert_renders "a non-ASCII data directory still renders" '^ +mountPath: /var/lib/données$' -f "$chart/values.yaml" --set-string 'writeTier.dataDir=/var/lib/données'
@@ -979,10 +1122,10 @@ y'
 # accumulo password and the key file, and refusals are printed to CI logs.
 password_refusal=$(helm template shoal "$chart" -f "$chart/values.yaml" --set-string 'readFleet.accumuloPassword=hunter2-secret
 ' 2>&1 || true)
-if printf '%s' "$password_refusal" | grep -qF 'hunter2-secret'; then
+if grep -qF 'hunter2-secret' <<<"$password_refusal"; then
   fail "a refused password is printed in the refusal"
 fi
-if ! printf '%s' "$password_refusal" | grep -qF 'readFleet.accumuloPassword holds'; then
+if ! grep -qF 'readFleet.accumuloPassword holds' <<<"$password_refusal"; then
   fail "a trailing newline in the accumulo password is not refused by the walk"
 fi
 
@@ -1093,7 +1236,7 @@ refuses_citing "compactor.tls.secretName must be a Secret name" "a brace in the 
 refuses_citing "objectStorage.credentialsSecretName must be a Secret name" "an upper-case Secret name" -f "$chart/values.yaml" --set-string objectStorage.credentialsSecretName=Shoal
 refuses_citing "writeTier.tls.secretName must be a Secret name" "a write-tier TLS Secret that is not a name" -f "$chart/values.yaml" --set writeTier.tls.enabled=true --set-string 'writeTier.tls.secretName=tls #'
 refuses_citing "readFleet.tls.secretName must be a Secret name" "a read-fleet TLS Secret that is not a name" -f "$chart/values-distributed.yaml" --set readFleet.tls.enabled=true --set-string 'readFleet.tls.secretName=tls: x'
-refuses_citing "explorer.chat.credentialSecretName must be a Secret name" "a chat credential Secret that is not a name" "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test/v1 --set-string 'explorer.chat.credentialSecretName=Chat Key'
+refuses_citing "explorer.chat.credentialSecretName must be a Secret name" "a chat credential Secret that is not a name" "${explorer_base[@]}" --set explorer.chat.provider=openai-compatible,explorer.chat.model=m,explorer.chat.baseURL=https://api.example.test --set-string 'explorer.chat.credentialSecretName=Chat Key'
 refuses_citing "image.pullPolicy must be one of Always, IfNotPresent or Never" "an unknown pull policy" -f "$chart/values.yaml" --set-string image.pullPolicy=Sometimes
 refuses_citing "explorer.image.pullPolicy must be one of Always, IfNotPresent or Never" "an unknown explorer pull policy" "${explorer_base[@]}" --set-string explorer.image.pullPolicy=always
 refuses_citing "explorer.service.type must be one of ClusterIP, NodePort, LoadBalancer or ExternalName" "an unknown Service type" "${explorer_base[@]}" --set-string explorer.service.type=Internal
@@ -2813,13 +2956,13 @@ notes_with() {
   helm template shoal "$notes_probe/shoal" "${effects_gateway_base[@]}" -s templates/zz-notes-probe.yaml "$@" 2>&1
 }
 if notes=$(notes_with --set 'effectsGateways[0].unrecorded.storage=emptyDir,effectsGateways[0].unrecorded.acceptLossOfUnrecordedReports=true'); then
-  printf '%s' "$notes" | grep -qF "WARNING: effects gateway stripe keeps its unrecorded log in an" ||
+  grep -qF "WARNING: effects gateway stripe keeps its unrecorded log in an" <<<"$notes" ||
     fail "an acknowledged emptyDir renders no warning in the install notes"
 else
   fail "should render but was refused: the install notes for an acknowledged emptyDir"
 fi
 if notes=$(notes_with); then
-  printf '%s' "$notes" | grep -qF "WARNING" && fail "the install notes warn about a log that is on a claim"
+  grep -qF "WARNING" <<<"$notes" && fail "the install notes warn about a log that is on a claim"
 else
   fail "should render but was refused: the install notes for the fixture"
 fi
@@ -2958,6 +3101,11 @@ refuses_citing "must exceed operationTimeout + 5s + planeTimeout" "a lease insid
 renders "the same lease with renewal" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.operationTimeout=4m,effectsGateways[0].timing.renew=true'
 refuses_citing "must be a Go duration" "a duration Go would not parse" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.operationTimeout=3 minutes'
 refuses_citing "maxInFlight must be 1 to 64" "too many claims in flight" "${effects_gateway_base[@]}" --set 'effectsGateways[0].maxInFlight=65'
+# The pod runs as uid 65532 with every capability dropped (#423).
+for port in 80 443 1023; do
+  refuses_citing "healthPort must be 1024 to 65535" "a privileged health port $port" "${effects_gateway_base[@]}" --set "effectsGateways[0].healthPort=$port"
+done
+renders "a health port at the unprivileged boundary" "${effects_gateway_base[@]}" --set 'effectsGateways[0].healthPort=1024'
 refuses_citing "must be a boolean" "renew written as a word" "${effects_gateway_base[@]}" --set-string 'effectsGateways[0].timing.renew=yes'
 refuses_citing "networkPolicy.targetCIDRs is required" "a NetworkPolicy with no target CIDRs" "${effects_gateway_base[@]}" --set 'effectsGateways[0].networkPolicy.enabled=true'
 refuses_citing "over the 24 the stem budget allows" "a name over the stem budget" "${effects_gateway_base[@]}" --set 'effectsGateways[0].name=abcdefghijklmnopqrstuvwxy'
@@ -3045,7 +3193,7 @@ LIVE
   lookup_deployment 1
   if output=$(lookup_install --set 'effectsGateways[0].name=stripe2'); then
     fail "a rename with the old gateway running is accepted by a server dry run"
-  elif ! printf '%s' "$output" | grep -qF "no enabled entry in effectsGateways names it"; then
+  elif ! grep -qF "no enabled entry in effectsGateways names it" <<<"$output"; then
     fail "a rename with the old gateway running is refused, but not by the lookup guard"
     printf '%s\n' "$output" | grep -oE 'execution error.*|Error: .*' | head -1 | cut -c1-200 | sed 's/^/      /' || true
   fi
