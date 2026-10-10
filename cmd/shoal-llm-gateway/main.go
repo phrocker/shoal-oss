@@ -69,7 +69,10 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("shoal-llm-gateway", flag.ContinueOnError)
 	flags.SetOutput(output)
 	listen := flags.String("listen", "127.0.0.1:8100",
-		"OpenAI-compatible listen address")
+		"OpenAI-compatible listen address. Plaintext only on loopback; "+
+			"anywhere else it needs -tls-cert-file and -tls-key-file, or "+
+			"-allow-plaintext-listener")
+	transport := listenerFlags(flags)
 	allowedHost := flags.String("allowed-host", "",
 		"Comma-separated exact-match allow-list of external authorities (host "+
 			"or host:port) an inbound Host or :authority must match. No "+
@@ -273,9 +276,17 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if _, err := admission.client(); err != nil {
 		return fmt.Errorf("-admission-url %v", err)
 	}
+	tlsConfig, err := transport.config(logf)
+	if err != nil {
+		return err
+	}
 	listener, err := listenTCP("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listen, err)
+	}
+	if err := transport.admit(*listen, listener.Addr(), tlsConfig); err != nil {
+		listener.Close()
+		return err
 	}
 	// Resolved from the listener, not the requested address: a wildcard bind
 	// resolves to an authority real clients never send, so defaulting to it
@@ -301,7 +312,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		WriteTimeout:      0, // streamed responses have no useful write bound
 		IdleTimeout:       60 * time.Second,
 	}
-	fmt.Fprintf(output, "Shoal LLM gateway listening at http://%s\n", listener.Addr())
+	fmt.Fprintf(output, "Shoal LLM gateway listening at %s://%s\n",
+		listenerScheme(tlsConfig), listener.Addr())
 	fmt.Fprintf(output, "Admitting against %s as %s/%s\n",
 		base.String(), *capability, *action)
 
@@ -351,7 +363,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		defer cancel()
 		shutdownDone <- drain(shutdown, state, server, health)
 	}()
-	err = server.Serve(listener)
+	err = serve(server, listener, tlsConfig)
 	if errors.Is(err, http.ErrServerClosed) {
 		return <-shutdownDone
 	}

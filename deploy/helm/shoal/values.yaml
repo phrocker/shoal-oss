@@ -636,8 +636,30 @@ llmGateway:
     # every opaque identity.
     sourceID: ""
     policyID: ""
+  # The listener's transport (#424). The gateway refuses to send a prompt to
+  # a remote provider over plaintext, so it does not accept one that way
+  # either: TLS by default, from a kubernetes.io/tls Secret.
+  tls:
+    # Serve TLS with -tls-cert-file and -tls-key-file. The pod binds
+    # 0.0.0.0, which is not loopback, so with this false the chart renders
+    # -allow-plaintext-listener=true: that is the explicit acknowledgement
+    # that something else (an mTLS mesh sidecar) encrypts the hop. Nothing in
+    # the chart can see whether one does.
+    enabled: true
+    # Required while enabled: a kubernetes.io/tls Secret with tls.crt and
+    # tls.key, such as a cert-manager Certificate's. It is mounted as a
+    # volume, which the kubelet updates in place on renewal, and the gateway
+    # re-reads the pair on each handshake, so a reissued certificate is served
+    # without rolling the pod. Refused when TLS is off, where nothing reads it.
+    secretName: ""
   service:
     type: ClusterIP
+    # Only with tls.enabled: false. A plaintext listener behind a
+    # non-ClusterIP Service puts a prompt endpoint outside the cluster, so
+    # that is refused unless this acknowledges a TLS-terminating load
+    # balancer or ingress in front of it. It configures no TLS, and with
+    # tls.enabled it covers nothing and is refused.
+    allowPlaintext: false
     annotations: {}
   # Must exceed admission.lease, and validate.yaml refuses the pair when it
   # does not.

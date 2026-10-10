@@ -25,6 +25,11 @@
        leaves it independently, and `env:` with no entries under it is YAML
        null rather than an empty list — which the API server rejects. */ -}}
 {{- $envAdmission := not $tokenFile -}}
+{{- /* The listener's TLS Secret (#424). Mounted whole at one directory the
+       flags and the guard in validate.yaml also take from the helper. */ -}}
+{{- $tls := eq (include "shoal.llmGatewayTLS" .) "true" -}}
+{{- $tlsDir := include "shoal.llmGatewayTLSDir" . -}}
+{{- $mounts := or $tokenFile $apiKeyFile $tls -}}
 {{- $envUpstream := and (not $apiKeyFile) $upstreamSecret -}}
 apiVersion: apps/v1
 # A Deployment, where the explorer is a StatefulSet, and that single difference
@@ -109,8 +114,8 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
-        {{- if or $tokenFile $apiKeyFile }}
-        # fsGroup exists for the credential mounts, and it is not optional there.
+        {{- if $mounts }}
+        # fsGroup exists for the credential and TLS mounts, and it is not optional there.
         #
         # The kubelet writes a projected or Secret volume's files owned by root,
         # and this container runs as uid 65532 with every capability dropped. At
@@ -170,6 +175,17 @@ spec:
           args:
             - {{ printf "-listen=0.0.0.0:%v" ($gateway.containerPort) | quote }}
             - {{ printf "-health-address=0.0.0.0:%v" ($gateway.healthPort) | quote }}
+            # The listener's transport, rendered explicitly either way. The
+            # binary refuses a plaintext listener on 0.0.0.0 without the
+            # acknowledgement, and refuses the acknowledgement beside TLS, so
+            # tls.enabled decides both and they cannot disagree. The pair is
+            # re-read on each handshake: a renewed Secret is served without
+            # rolling the pod.
+            {{- if $tls }}
+            - {{ printf "-tls-cert-file=%s/tls.crt" $tlsDir | quote }}
+            - {{ printf "-tls-key-file=%s/tls.key" $tlsDir | quote }}
+            {{- end }}
+            - {{ printf "-allow-plaintext-listener=%v" (not $tls) | quote }}
             - {{ printf "-allowed-host=%v" (include "shoal.llmGatewayAllowedHosts" .) | quote }}
             - {{ printf "-admission-url=%v" (trim (default "" $gateway.admission.url)) | quote }}
             # Rendered always and explicitly, including =false.
@@ -239,7 +255,7 @@ spec:
                   key: {{ trim (default "" $gateway.upstream.credentialSecretKey) | quote }}
             {{- end }}
           {{- end }}
-          {{- if or $tokenFile $apiKeyFile }}
+          {{- if $mounts }}
           volumeMounts:
             # Each mountPath is the directory of the path in the flag and
             # nothing else, so a flag and its mount are one value. readOnly
@@ -256,9 +272,17 @@ spec:
               mountPath: {{ dir $apiKeyFile | quote }}
               readOnly: true
             {{- end }}
+            {{- if $tls }}
+            - name: listener-tls
+              mountPath: {{ $tlsDir | quote }}
+              readOnly: true
+            {{- end }}
           {{- end }}
           ports:
-            - name: http
+            # Named for what it speaks: a mesh infers the protocol from the
+            # port name, and calling a TLS port http makes it parse the
+            # handshake as a request.
+            - name: {{ ternary "https" "http" $tls }}
               containerPort: {{ $gateway.containerPort }}
             - name: health
               containerPort: {{ $gateway.healthPort }}
@@ -308,7 +332,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-      {{- if or $tokenFile $apiKeyFile }}
+      {{- if $mounts }}
       volumes:
         {{- if $tokenFile }}
         {{- /* The admission token.
@@ -369,6 +393,22 @@ spec:
               "secretName" $upstreamSecret
               "secretKey" (trim (default "" $gateway.upstream.credentialSecretKey))
               "volume" $gateway.upstream.apiKeyVolume) | nindent 8 }}
+        {{- end }}
+        {{- if $tls }}
+        {{- /* The listener's key pair, from a kubernetes.io/tls Secret. 0440
+               for the reason the credential volumes are: root-owned files and
+               a non-root process, readable through fsGroup. The kubelet updates
+               a mounted Secret in place, which is what lets the per-handshake
+               re-read serve a renewed certificate. */}}
+        - name: listener-tls
+          secret:
+            secretName: {{ trim (toString $gateway.tls.secretName) | quote }}
+            defaultMode: 0440
+            items:
+              - key: "tls.crt"
+                path: "tls.crt"
+              - key: "tls.key"
+                path: "tls.key"
         {{- end }}
       {{- end }}
 {{- end }}

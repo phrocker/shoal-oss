@@ -19,8 +19,9 @@ spec:
   # unauthenticated endpoint routable in-cluster for no reason. It is also the
   # one endpoint on this pod that answers without passing through admission, so
   # the fewer things that can reach it, the better.
+  {{- $port := ternary "https" "http" (eq (include "shoal.llmGatewayTLS" .) "true") }}
   ports:
-    - name: http
+    - name: {{ $port }}
       port: {{ .Values.llmGateway.servicePort }}
-      targetPort: http
+      targetPort: {{ $port }}
 {{- end }}

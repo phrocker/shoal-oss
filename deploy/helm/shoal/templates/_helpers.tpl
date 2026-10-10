@@ -192,6 +192,24 @@ and nothing else; it does not restrict which models may be called.
 {{- end -}}
 
 {{- /*
+Where the listener's TLS Secret is mounted. One value for the volumeMount, both
+-tls-*-file flags and the guard that keeps the credential mounts off it, so the
+three cannot name different directories.
+*/ -}}
+{{- define "shoal.llmGatewayTLSDir" -}}
+/etc/shoal-llm-gateway/tls
+{{- end -}}
+
+{{- /*
+Whether the gateway listener serves TLS. validate.yaml refuses anything but a
+boolean, so this only has to survive a tls block that was nulled out.
+*/ -}}
+{{- define "shoal.llmGatewayTLS" -}}
+{{- $tls := default (dict) .Values.llmGateway.tls -}}
+{{- if eq $tls.enabled true }}true{{ end -}}
+{{- end -}}
+
+{{- /*
 One credential volume, for either of the gateway's two -file credentials.
 
 The two break differently — an unreadable admission token denies every call,
