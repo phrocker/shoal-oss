@@ -381,6 +381,7 @@ type recordView struct {
 	Output           json.RawMessage `json:"output"`
 	ClaimID          string          `json:"claim_id"`
 	ClaimFence       uint64          `json:"claim_fence"`
+	ClaimLeaseUntil  time.Time       `json:"claim_lease_until"`
 	CorrelationID    string          `json:"correlation_id"`
 	AmbiguityReports []struct {
 		ClaimFence uint64 `json:"claim_fence"`

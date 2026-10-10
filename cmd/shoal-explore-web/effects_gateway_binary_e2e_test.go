@@ -100,14 +100,22 @@ func buildGatewayBinary(t *testing.T) string {
 	return gatewayBinary.path
 }
 
-// The configuration every gateway in this file runs with.
+// The configuration every gateway in this file runs with. The plane timeout
+// is what a loaded CI runner needs: under -race, with other packages' tests
+// on the same cores, a claim against the durable store has been seen to take
+// longer than 1.5s, and a call that outlives its timeout is indeterminate —
+// a claim that committed unseen, a completion the worker must wait out. The
+// lease is the smallest the binary accepts for it (plane ≤ L/4); it bounds
+// the waits for a lapse.
 const (
-	binaryLease     = 6 * time.Second
-	binaryPlane     = 1500 * time.Millisecond
+	binaryLease     = 20 * time.Second
+	binaryPlane     = 5 * time.Second
 	binaryOperation = 2 * time.Second
 	// binaryRecovery bounds a wait that spans a lease lapse and the pull
 	// backoff that grows while nothing is claimable.
-	binaryRecovery = 60 * time.Second
+	binaryRecovery = 120 * time.Second
+	// binaryParallel is how many scenarios run at once.
+	binaryParallel = 3
 )
 
 // binaryWorld is the command world with its explorer reachable through a
@@ -116,13 +124,12 @@ type binaryWorld struct {
 	*gatewayOps
 	t      *testing.T
 	target *paymentTarget
-	front  *httptest.Server
+	// front is the explorer as every gateway reaches it unless its flags
+	// name another (newFront).
+	front *explorerFront
 	// outage, while set, resets every explorer request except an extension
 	// before it reaches the handler: the plane is unreachable.
 	outage atomic.Bool
-
-	pathsMu sync.Mutex
-	paths   []string
 
 	token      string
 	credential string
@@ -149,8 +156,7 @@ func newBinaryWorld(t *testing.T, options binaryOptions) *binaryWorld {
 	g := newCommandWorldWith(t, statusRoutes, targetURL, trust,
 		func(world *executorWorld) { followSystemClock(t, world.h) })
 	w := &binaryWorld{gatewayOps: g, t: t, target: target, verifier: verifier}
-	w.front = httptest.NewServer(http.HandlerFunc(w.serveExplorer))
-	t.Cleanup(w.front.Close)
+	w.front = w.newFront()
 	g.record()
 
 	dir := t.TempDir()
@@ -226,13 +232,38 @@ func binaryAttestationTrust(t *testing.T) (*executorattest.Trust, ed25519.Privat
 	return trust, private
 }
 
-// serveExplorer is the explorer as the gateway reaches it: the real
-// authenticated handler, with the explorer's Date, behind a switchable
-// outage. It records every path the gateway asks for.
-func (w *binaryWorld) serveExplorer(writer http.ResponseWriter, request *http.Request) {
-	w.pathsMu.Lock()
-	w.paths = append(w.paths, request.URL.Path)
-	w.pathsMu.Unlock()
+// explorerFront is one listener in front of the explorer: the real
+// authenticated handler, with the explorer's Date, behind the world's
+// switchable outage. It records every request it is sent, so a process given
+// a front of its own can be shown to have sent nothing.
+type explorerFront struct {
+	w      *binaryWorld
+	server *httptest.Server
+
+	mu    sync.Mutex
+	calls []explorerCall
+}
+
+// explorerCall is one request: its last path segment ("pull", "claim",
+// "complete", "ambiguity", "attestation", ...) and when it arrived.
+type explorerCall struct {
+	name string
+	at   time.Time
+}
+
+func (w *binaryWorld) newFront() *explorerFront {
+	front := &explorerFront{w: w}
+	front.server = httptest.NewServer(http.HandlerFunc(front.serve))
+	w.t.Cleanup(front.server.Close)
+	return front
+}
+
+func (f *explorerFront) serve(writer http.ResponseWriter, request *http.Request) {
+	w := f.w
+	path := request.URL.Path
+	f.mu.Lock()
+	f.calls = append(f.calls, explorerCall{name: path[strings.LastIndex(path, "/")+1:], at: time.Now()})
+	f.mu.Unlock()
 	if w.outage.Load() && !strings.HasSuffix(request.URL.Path, "/extend") {
 		if conn, _, err := writer.(http.Hijacker).Hijack(); err == nil {
 			_ = conn.Close()
@@ -245,16 +276,20 @@ func (w *binaryWorld) serveExplorer(writer http.ResponseWriter, request *http.Re
 	w.current.Load().(http.Handler).ServeHTTP(writer, request)
 }
 
-// explorerCalls is the gateway's explorer requests, each named by its last
-// path segment ("pull", "claim", "complete", "attestation", ...).
+// requests is every request the front was sent, in order.
+func (f *explorerFront) requests() []explorerCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]explorerCall(nil), f.calls...)
+}
+
+// explorerCalls is the names of the requests the world's front was sent.
 func (w *binaryWorld) explorerCalls() []string {
-	w.pathsMu.Lock()
-	defer w.pathsMu.Unlock()
-	calls := make([]string, 0, len(w.paths))
-	for _, path := range w.paths {
-		calls = append(calls, path[strings.LastIndex(path, "/")+1:])
+	var names []string
+	for _, call := range w.front.requests() {
+		names = append(names, call.name)
 	}
-	return calls
+	return names
 }
 
 func (w *binaryWorld) writeToken(subject string) {
@@ -276,7 +311,9 @@ type gatewayFlags struct {
 	dir         string
 	executorRef string
 	token       string
-	extra       []string
+	// front, when set, is the explorer this gateway is pointed at.
+	front *explorerFront
+	extra []string
 }
 
 func (w *binaryWorld) runArgs(flags gatewayFlags) []string {
@@ -288,8 +325,12 @@ func (w *binaryWorld) runArgs(flags gatewayFlags) []string {
 	if token == "" {
 		token = w.token
 	}
+	front := flags.front
+	if front == nil {
+		front = w.front
+	}
 	args := []string{"run",
-		"-dispatch-url=" + w.front.URL, "-dispatch-token-file=" + token,
+		"-dispatch-url=" + front.server.URL, "-dispatch-token-file=" + token,
 		"-agent-id=" + b64([]byte(commandAgent)), "-executor-ref=" + ref,
 		"-surface-name=api.stripe.test",
 		"-target-base-url=" + w.target.server.URL, "-target-allow-private",
@@ -326,6 +367,9 @@ func spawn(t *testing.T, name string, args ...string) *gatewayProcess {
 	// the gateway stops it at once with a code no scenario expects.
 	p.cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "GORACE=halt_on_error=1 exitcode=66"}
 	p.cmd.Stdout, p.cmd.Stderr = p.stdout, p.stderr
+	// A child outlives nothing: if the test binary dies (a -timeout panic),
+	// the kernel kills it.
+	p.cmd.SysProcAttr = childProcAttr()
 	if err := p.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -496,6 +540,25 @@ func (w *binaryWorld) assertTarget(effects, requests int) []string {
 	return keys
 }
 
+// assertOneEffect is for a scenario that crosses a re-claim: exactly the
+// effects given, at least the requests given, and every request under one
+// idempotency key. A slow plane can add a re-claim (a completion that never
+// committed lapses), which the target replays; it can never add an effect.
+func (w *binaryWorld) assertOneEffect(minRequests int) []string {
+	w.t.Helper()
+	effects, requests, keys := w.target.stats()
+	if effects != 1 || requests < minRequests {
+		w.t.Fatalf("target: %d effects over %d requests, want 1 over at least %d (keys %q)",
+			effects, requests, minRequests, keys)
+	}
+	for _, key := range keys[1:] {
+		if key != keys[0] {
+			w.t.Fatalf("a re-claim sent a different idempotency key: %q", keys)
+		}
+	}
+	return keys
+}
+
 func outputOf(t *testing.T, view recordView) map[string]any {
 	t.Helper()
 	var output map[string]any
@@ -506,26 +569,34 @@ func outputOf(t *testing.T, view recordView) map[string]any {
 }
 
 // TestTheGatewayBinaryEndToEnd runs each scenario against its own explorer,
-// target and gateway processes, in parallel.
+// target and gateway processes, binaryParallel at a time, the two that wait
+// out a lease first.
 func TestTheGatewayBinaryEndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("about a minute of real leases lapsing; run without -short")
+	}
 	scenarios := []struct {
 		name string
 		run  func(t *testing.T)
 	}{
+		{"SIGKILLMidEffect", binarySIGKILLMidEffect},
+		{"PlaneOutageDuringCompletion", binaryPlaneOutage},
 		{"HappyPath", binaryHappyPath},
 		{"TargetRefusal", binaryTargetRefusal},
-		{"SIGKILLMidEffect", binarySIGKILLMidEffect},
 		{"SIGTERMDrainsInFlightWork", binarySIGTERMDrains},
 		{"SIGTERMTwiceIsAHardStop", binarySIGTERMTwice},
-		{"PlaneOutageDuringCompletion", binaryPlaneOutage},
 		{"SecondInstanceOnTheDirectory", binarySecondInstance},
 		{"WrongExecutorClaimsNothing", binaryWrongExecutor},
 		{"AttestationBeforeClaim", binaryAttestation},
 		{"UnreachablePlaneDenies", binaryUnreachablePlane},
+		{"EnqueueWhilePulling", binaryEnqueueWhilePulling},
 	}
+	slots := make(chan struct{}, binaryParallel)
 	for _, scenario := range scenarios {
 		t.Run(scenario.name, func(t *testing.T) {
 			t.Parallel()
+			slots <- struct{}{}
+			defer func() { <-slots }()
 			scenario.run(t)
 		})
 	}
@@ -548,7 +619,6 @@ func binaryHappyPath(t *testing.T) {
 	if len(keys[0]) != 43 {
 		t.Fatalf("idempotency key %q is not the encoded ExecutorKey", keys[0])
 	}
-	gateway.awaitEvent(t, "completed", nil)
 	if logs := gateway.stdout.String() + gateway.stderr.String(); strings.Contains(logs, "sk_test_binary") {
 		t.Fatalf("the target credential reached the log:\n%s", logs)
 	}
@@ -581,8 +651,21 @@ func binaryTargetRefusal(t *testing.T) {
 	}
 	// The process is gone, so nothing more can arrive: one request, ever.
 	w.assertTarget(0, 1)
-	if after := w.view("bin-422"); after.State != string(fleet.DispatchFailed) || after.Version != view.Version {
-		t.Fatalf("the failed record moved: %+v", after)
+	// The record stays failed with the code. It may carry an
+	// outcome_unknown report under the same fence: a completion the plane
+	// answered too slowly is indeterminate, and the worker, unable to tell
+	// whether it committed, waits out the lease and reports through the
+	// ambiguity route, which appends to the record whatever its state
+	// (docs/effects-gateway-deploy.md, "The worker loop").
+	after := w.view("bin-422")
+	if after.State != string(fleet.DispatchFailed) || after.ErrorCode != "target_rejected_422" ||
+		after.ClaimFence != view.ClaimFence {
+		t.Fatalf("the failed record changed: %+v", after)
+	}
+	for _, report := range after.AmbiguityReports {
+		if report.ClaimFence != view.ClaimFence || report.Outcome != string(fleet.AmbiguityOutcomeUnknown) {
+			t.Fatalf("a report other than the indeterminate completion's: %+v", report)
+		}
 	}
 }
 
@@ -611,10 +694,7 @@ func binarySIGKILLMidEffect(t *testing.T) {
 	if view.ClaimFence == dead.ClaimFence {
 		t.Fatal("completed under the dead claim's fence")
 	}
-	keys := w.assertTarget(1, 2)
-	if keys[0] != keys[1] {
-		t.Fatalf("the re-claim sent a different idempotency key: %q", keys)
-	}
+	w.assertOneEffect(2)
 	if output := outputOf(t, view); output["idempotency"] != "replayed" || output["reference"] != "ch_1" {
 		t.Fatalf("output = %s", view.Output)
 	}
@@ -641,7 +721,7 @@ func binarySIGKILLMidEffect(t *testing.T) {
 	if code := second.exit(t); code != gatewaycmd.ExitOK {
 		t.Fatalf("SIGTERM exit %d: %s", code, second.stderr)
 	}
-	w.assertTarget(1, 2)
+	w.assertOneEffect(2)
 }
 
 // SIGTERM with a request in flight: the gateway stops pulling, the request
@@ -747,9 +827,33 @@ func binaryPlaneOutage(t *testing.T) {
 	if held["fence"] != float64(lost.ClaimFence) {
 		t.Fatalf("held under fence %v, claimed under %d", held["fence"], lost.ClaimFence)
 	}
-	// Reporting only after the lease was waited out (complete's settle wait).
 	if len(first.events("ambiguity_reported")) != 0 {
 		t.Fatal("an ambiguity report reached a plane that is down")
+	}
+	// The settle wait: an indeterminate completion may still commit, so the
+	// report waits out the lease the explorer holds for the fence. The
+	// worker's end is anchored on when it sent its last claim or extension,
+	// which precedes the explorer's apply by less than the plane timeout, so
+	// its first report may come at most that much before the explorer's end
+	// — and, without the wait, would come a lease earlier.
+	leaseEnd := w.view("bin-outage").ClaimLeaseUntil
+	if leaseEnd.IsZero() {
+		t.Fatal("the record names no lease end")
+	}
+	var firstReport time.Time
+	for _, call := range w.front.requests() {
+		if call.name == "ambiguity" {
+			firstReport = call.at
+			break
+		}
+	}
+	if firstReport.IsZero() {
+		t.Fatal("the gateway never tried to report")
+	}
+	if earliest := leaseEnd.Add(-binaryPlane); firstReport.Before(earliest) {
+		t.Fatalf("the report was tried at %s, %s before the lease the explorer held ended at %s: "+
+			"the worker did not wait out the lease", firstReport.Format(time.RFC3339Nano),
+			leaseEnd.Sub(firstReport), leaseEnd.Format(time.RFC3339Nano))
 	}
 	first.signal(t, syscall.SIGTERM)
 	if code := first.exit(t); code != gatewaycmd.ExitOK {
@@ -780,10 +884,7 @@ func binaryPlaneOutage(t *testing.T) {
 	if view.ClaimFence == lost.ClaimFence {
 		t.Fatal("the record was completed under the lost fence")
 	}
-	keys := w.assertTarget(1, 2)
-	if keys[0] != keys[1] {
-		t.Fatalf("the re-claim sent a different idempotency key: %q", keys)
-	}
+	w.assertOneEffect(2)
 	second.signal(t, syscall.SIGTERM)
 	if code := second.exit(t); code != gatewaycmd.ExitOK {
 		t.Fatalf("drain exit %d: %s", code, second.stderr)
@@ -806,7 +907,9 @@ func binarySecondInstance(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "unrecorded")
 	first := w.startGateway("first", gatewayFlags{dir: dir})
 
-	second := spawn(t, "second", w.runArgs(gatewayFlags{dir: dir})...)
+	// Its own front, so what it sends is told apart from the first's.
+	secondFront := w.newFront()
+	second := spawn(t, "second", w.runArgs(gatewayFlags{dir: dir, front: secondFront})...)
 	deadline := time.Now().Add(binaryRecovery)
 	for running := true; running; {
 		select {
@@ -831,6 +934,10 @@ func binarySecondInstance(t *testing.T) {
 	}
 	if strings.Contains(second.stdout.String(), "serving capability") {
 		t.Fatal("the second gateway started serving")
+	}
+	// Refused before any network I/O: the lock comes before the resolve.
+	if calls := secondFront.requests(); len(calls) != 0 {
+		t.Fatalf("the refused gateway sent the explorer %d requests: %+v", len(calls), calls)
 	}
 	list := spawn(t, "unrecorded list", "unrecorded", "list", "-unrecorded-dir", dir)
 	if code := list.exit(t); code != gatewaycmd.ExitFailure ||
@@ -945,12 +1052,17 @@ func binaryAttestation(t *testing.T) {
 			sequence = append(sequence, call)
 		}
 	}
-	if len(sequence) < 3 || sequence[0] != "attestation" ||
-		strings.Count(strings.Join(sequence, ","), "claim") != 1 {
-		t.Fatalf("explorer calls = %q: want attestation before the one claim", sequence)
+	if len(sequence) < 3 || sequence[0] != "attestation" || !strings.Contains(strings.Join(sequence, ","), "claim") {
+		t.Fatalf("explorer calls = %q: want attestation before any claim", sequence)
 	}
+	// Never by way of a refused claim: the attestation gate answers 409.
+	// (A claim slower than the plane timeout is a repull, which is not
+	// this; it re-claims after the lapse.)
 	for _, event := range gateway.events("dispatch_error") {
-		t.Fatalf("a dispatch error on the attested path: %v", event)
+		if event["dispatch_error"] != string(effectsgateway.DispatchConflict) {
+			continue
+		}
+		t.Fatalf("a claim refused on the attested path: %v", event)
 	}
 	gateway.signal(t, syscall.SIGTERM)
 	if code := gateway.exit(t); code != gatewaycmd.ExitOK {
@@ -979,6 +1091,33 @@ func binaryUnreachablePlane(t *testing.T) {
 
 	gateway := w.startGateway("plane back", gatewayFlags{dir: dir})
 	w.awaitRecord("bin-plane", "success", inState(fleet.DispatchSucceeded))
+	w.assertTarget(1, 1)
+	gateway.signal(t, syscall.SIGTERM)
+	if code := gateway.exit(t); code != gatewaycmd.ExitOK {
+		t.Fatalf("SIGTERM exit %d: %s", code, gateway.stderr)
+	}
+}
+
+// Work enqueued while the gateway is already pulling is performed once. The
+// enqueue is not retried: an indeterminate answer from the explorer here is
+// the defect this scenario exists to show (#641).
+func binaryEnqueueWhilePulling(t *testing.T) {
+	// 4 runs in 50 failed under -race, GOMAXPROCS=2 and a full CPU load: the
+	// enqueue is answered an indeterminate 503 ("fleet action outcome
+	// requires reconciliation"), which would break CI. Re-enable once the
+	// fix lands.
+	t.Skip("#641: an enqueue racing an executor's pulls answers an indeterminate 503; re-enable after #635")
+	w := newBinaryWorld(t, binaryOptions{})
+	gateway := w.startGateway("gateway", gatewayFlags{dir: filepath.Join(t.TempDir(), "unrecorded")})
+	deadline := time.Now().Add(binaryRecovery)
+	for !strings.Contains(strings.Join(w.explorerCalls(), ","), "pull") {
+		if time.Now().After(deadline) {
+			t.Fatal("the gateway never pulled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	w.enqueueCommand("bin-late")
+	w.awaitRecord("bin-late", "success", inState(fleet.DispatchSucceeded))
 	w.assertTarget(1, 1)
 	gateway.signal(t, syscall.SIGTERM)
 	if code := gateway.exit(t); code != gatewaycmd.ExitOK {

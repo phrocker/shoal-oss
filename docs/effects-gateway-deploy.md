@@ -81,7 +81,8 @@ SIGTERM (exit 4, with the run in the unrecorded log); a plane outage during
 completion, held in the log and cleared by the replay after a restart; a
 second instance refused by the lock; a gateway bound to the wrong executor,
 which claims nothing; attestation presented before the claim; an
-unreachable plane, which refuses the start with nothing sent; and
+unreachable plane, which refuses the start with nothing sent; work enqueued
+while the gateway is already pulling; and
 `unrecorded list` and `ack` through the binary.
 
 ## Configuration
