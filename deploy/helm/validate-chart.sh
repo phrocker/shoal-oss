@@ -115,6 +115,51 @@ effectsGateways:
         reference: {pointer: /id, pattern: "ch_[A-Za-z0-9]+"}
 GATEWAY
 effects_gateway_base=(-f "$effects_fixtures/gateway.yaml")
+# A second, distinct surface beside the first: every identity differs. The
+# identity-sharing cases below each make one of them the same.
+cat > "$effects_fixtures/two-gateways.yaml" <<'GATEWAYS'
+effectsGateways:
+  - name: stripe
+    enabled: true
+    agentID: c3RyaXBlLWdhdGV3YXk
+    surfaceName: stripe
+    executorRef: stripe
+    dispatch: {url: "http://127.0.0.1:1", tokenAudience: shoal-executors}
+    target: {baseURL: "https://api.example.test", credentialSecretName: stripe-api-key}
+    routes:
+      - {action: charge, method: POST, path: /v1/charges, effects: [external, egresses-content], idempotency: natural}
+  - name: ledger
+    enabled: true
+    agentID: bGVkZ2VyLWdhdGV3YXk
+    surfaceName: ledger
+    executorRef: ledger
+    dispatch: {url: "http://127.0.0.1:1", tokenAudience: shoal-executors}
+    target: {baseURL: "https://ledger.example.test", credentialSecretName: ledger-api-key}
+    routes:
+      - {action: post, method: PUT, path: "/v1/entries/{id}", effects: [external, egresses-content], idempotency: natural}
+GATEWAYS
+two_gateways=(-f "$effects_fixtures/two-gateways.yaml")
+# The explorer in the same release, with the executor mapping that binds the
+# fixture's ServiceAccount (release shoal, namespace default) to stripe.
+cat > "$effects_fixtures/explorer-mapping.yaml" <<'MAPPING'
+explorer:
+  fleet:
+    executorRefs: [stripe]
+    externalEgressExecutorRefs: [stripe]
+  auth:
+    oidc:
+      executorMapping:
+        version: shoal.executors/v1
+        issuer: https://oidc.cluster.example.test/id/0123
+        audience: shoal-executors
+        service_assertion:
+          claim: [kubernetes.io, namespace]
+          equals: default
+        executors:
+          - subject: "system:serviceaccount:default:shoal-gw-stripe"
+            executor_ref: stripe
+MAPPING
+explorer_mapping=(-f "$effects_fixtures/explorer-mapping.yaml")
 # A loopback target: a sidecar, admitted with allowPrivate, needing no
 # credential, and whose derived effects are {external} alone.
 loopback_target=(
@@ -2563,10 +2608,13 @@ note "== effects gateway: one replica, stopped before it is started =="
 # half of it a rollout needs: a surge pod would mount the same ReadWriteOnce
 # log while the old pod drains.
 effects_check singleton "the Deployment is one replica, Recreate" "${effects_gateway_base[@]}"
-refuses_citing "replicas must be 1" "two replicas" "${effects_gateway_base[@]}" --set 'effectsGateways[0].replicas=2'
-refuses_citing "replicas must be 1" "zero replicas" "${effects_gateway_base[@]}" --set 'effectsGateways[0].replicas=0'
-refuses_citing "replicas must be 1" "a fractional replica count" "${effects_gateway_base[@]}" --set-json 'effectsGateways[0].replicas=1.5'
-refuses_citing "replicas must be 1" "a replica count written as a word" "${effects_gateway_base[@]}" --set-string 'effectsGateways[0].replicas=one'
+refuses_citing "replicas must be 0 or 1" "two replicas" "${effects_gateway_base[@]}" --set 'effectsGateways[0].replicas=2'
+refuses_citing "replicas must be 0 or 1" "three replicas" "${effects_gateway_base[@]}" --set 'effectsGateways[0].replicas=3'
+# Zero is how the gateway is stopped: to acknowledge its log, or before a
+# rename. kubectl scale would be reverted by the next upgrade.
+assert_renders "zero replicas stops the gateway" '^  replicas: 0$' "${effects_gateway_base[@]}" --set 'effectsGateways[0].replicas=0'
+refuses_citing "replicas must be 0 or 1" "a fractional replica count" "${effects_gateway_base[@]}" --set-json 'effectsGateways[0].replicas=1.5'
+refuses_citing "replicas must be 0 or 1" "a replica count written as a word" "${effects_gateway_base[@]}" --set-string 'effectsGateways[0].replicas=one'
 
 note "== effects gateway: the unrecorded log is on a claim by default =="
 effects_check claim "a ReadWriteOnce claim, kept on uninstall, holds -unrecorded-dir" "${effects_gateway_base[@]}"
@@ -2725,7 +2773,7 @@ refuses_citing "is required" "no executor reference" "${effects_gateway_base[@]}
 # The explorer in the same release must bind the reference with the ceiling the
 # target's derived effects need.
 refuses_citing "is not in explorer.fleet.externalEgressExecutorRefs" "an explorer that does not bind the gateway's reference" "${explorer_base[@]}" "${effects_gateway_base[@]}"
-renders "an explorer that binds it" "${explorer_base[@]}" "${effects_gateway_base[@]}" --set 'explorer.fleet.executorRefs={stripe}' --set 'explorer.fleet.externalEgressExecutorRefs={stripe}'
+renders "an explorer that binds it and maps its subject" "${explorer_base[@]}" "${effects_gateway_base[@]}" "${explorer_mapping[@]}"
 refuses_citing "is not in explorer.fleet.externalExecutorRefs" "a loopback target bound only for egress" "${explorer_base[@]}" "${effects_gateway_base[@]}" --set 'explorer.fleet.executorRefs={stripe}' --set 'explorer.fleet.externalEgressExecutorRefs={stripe}' "${loopback_target[@]}"
 # A line break anywhere in an entry is refused by the walk (#468), and the
 # arguments are quoted besides.
@@ -2733,6 +2781,89 @@ refuses_citing "holds" "a newline in the surface name" "${effects_gateway_base[@
             - -allow-plaintext-dispatch=true'
 refuses_citing "holds" "a newline in a route" "${effects_gateway_base[@]}" --set-string 'effectsGateways[0].routes[0].path=/v1/x
 y'
+
+note "== effects gateway: one principal per worker =="
+# Two enabled entries on one executor reference, descriptor, ServiceAccount or
+# operator-owned claim are two workers on one principal (#514). With separate
+# claims the unrecorded log's lock never sees the second, so the chart is the
+# only place it can be refused.
+renders "two distinct surfaces" "${two_gateways[@]}"
+refuses_citing "share the executorRef" "two entries on one executor reference" "${two_gateways[@]}" --set 'effectsGateways[1].executorRef=stripe'
+refuses_citing "share the agentID" "two entries on one descriptor" "${two_gateways[@]}" --set 'effectsGateways[1].agentID=c3RyaXBlLWdhdGV3YXk'
+refuses_citing "share the ServiceAccount" "an entry naming another's chart-created account" "${two_gateways[@]}" --set 'effectsGateways[1].serviceAccountName=shoal-gw-stripe'
+refuses_citing "share the ServiceAccount" "two entries naming one existing account" "${two_gateways[@]}" --set 'effectsGateways[0].serviceAccountName=gateways,effectsGateways[1].serviceAccountName=gateways'
+refuses_citing "share the unrecorded.existingClaim" "two entries on one existing claim" "${two_gateways[@]}" --set 'effectsGateways[0].unrecorded.storage=existingClaim,effectsGateways[0].unrecorded.existingClaim=log,effectsGateways[1].unrecorded.storage=existingClaim,effectsGateways[1].unrecorded.existingClaim=log'
+renders "a disabled entry may keep a running entry's identity" "${two_gateways[@]}" --set 'effectsGateways[1].executorRef=stripe,effectsGateways[1].enabled=false'
+
+note "== effects gateway: the explorer in this release mints its credential =="
+# The token's audience must be the mapping's, and the projected subject —
+# system:serviceaccount:<namespace>:<account> — must map to this entry's
+# reference. Otherwise the gateway passes its probes and is refused on every
+# pull.
+refuses_citing "is not the executor mapping's audience" "a token audience the mapping does not accept" "${explorer_base[@]}" "${effects_gateway_base[@]}" "${explorer_mapping[@]}" --set 'effectsGateways[0].dispatch.tokenAudience=shoal'
+refuses_citing "does not name the gateway's subject" "a ServiceAccount the mapping does not name" "${explorer_base[@]}" "${effects_gateway_base[@]}" "${explorer_mapping[@]}" --set 'effectsGateways[0].serviceAccountName=other'
+refuses_citing "does not name the gateway's subject" "the subject in another namespace" "${explorer_base[@]}" "${effects_gateway_base[@]}" "${explorer_mapping[@]}" --namespace payments
+refuses_citing 'maps "system:serviceaccount:default:shoal-gw-stripe" to "ledger"' "the subject mapped to another reference" "${explorer_base[@]}" "${effects_gateway_base[@]}" "${explorer_mapping[@]}" --set 'explorer.fleet.executorRefs={stripe,ledger}' --set 'explorer.auth.oidc.executorMapping.executors[0].executor_ref=ledger'
+refuses_citing "needs explorer.auth.oidc.executorMapping" "no executor mapping at all" "${explorer_base[@]}" "${effects_gateway_base[@]}" --set 'explorer.fleet.executorRefs={stripe}' --set 'explorer.fleet.externalEgressExecutorRefs={stripe}'
+renders "a Secret token is not cross-checked" "${explorer_base[@]}" "${effects_gateway_base[@]}" "${explorer_mapping[@]}" --set 'effectsGateways[0].dispatch.tokenSource=secret,effectsGateways[0].dispatch.tokenAudience=,effectsGateways[0].dispatch.credentialSecretName=stripe-dispatch,effectsGateways[0].serviceAccountName=other'
+
+note "== effects gateway: a running entry is not renamed under itself =="
+# The lookup guard reads the release's live Deployments, and lookup returns
+# nothing under helm template, a client dry run and helm lint. So the guard is
+# silent everywhere above, which these assert; it can only be exercised
+# against an API server. Given SHOAL_LOOKUP_KUBECONFIG (a throwaway cluster,
+# e.g. `kind create cluster --kubeconfig ...`), a Deployment shaped like a
+# running gateway is created and `--dry-run=server` must refuse a rename and
+# accept the same release once that Deployment is at zero replicas.
+renders "a rename renders under helm template, where lookup is empty" "${effects_gateway_base[@]}" --set 'effectsGateways[0].name=stripe2'
+if [ -n "${SHOAL_LOOKUP_KUBECONFIG:-}" ]; then
+  lookup_namespace="shoal-lookup-$$"
+  lookup_kubectl=(kubectl --kubeconfig "$SHOAL_LOOKUP_KUBECONFIG")
+  lookup_helm=(helm --kubeconfig "$SHOAL_LOOKUP_KUBECONFIG")
+  "${lookup_kubectl[@]}" create namespace "$lookup_namespace" >/dev/null
+  lookup_deployment() {
+    "${lookup_kubectl[@]}" -n "$lookup_namespace" apply -f - >/dev/null <<LIVE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shoal-gw-stripe
+  # Owned by the release, as an installed gateway's Deployment is, so Helm
+  # would adopt it rather than refuse it for its ownership.
+  labels: {app.kubernetes.io/managed-by: Helm}
+  annotations: {meta.helm.sh/release-name: shoal, meta.helm.sh/release-namespace: $lookup_namespace}
+spec:
+  replicas: $1
+  selector:
+    matchLabels: {app.kubernetes.io/name: shoal-gateway, app.kubernetes.io/instance: shoal, app.kubernetes.io/component: effects-gateway, shoal.effects-gateway/name: stripe}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: shoal-gateway, app.kubernetes.io/instance: shoal, app.kubernetes.io/component: effects-gateway, shoal.effects-gateway/name: stripe}
+    spec:
+      containers: [{name: pause, image: registry.k8s.io/pause:3.9}]
+LIVE
+  }
+  lookup_install() {
+    "${lookup_helm[@]}" install shoal "$chart" -n "$lookup_namespace" --dry-run=server "${effects_gateway_base[@]}" "$@" 2>&1
+  }
+  lookup_deployment 1
+  if output=$(lookup_install --set 'effectsGateways[0].name=stripe2'); then
+    fail "a rename with the old gateway running is accepted by a server dry run"
+  elif ! printf '%s' "$output" | grep -qF "no enabled entry in effectsGateways names it"; then
+    fail "a rename with the old gateway running is refused, but not by the lookup guard"
+    printf '%s\n' "$output" | grep -oE 'execution error.*|Error: .*' | head -1 | cut -c1-200 | sed 's/^/      /' || true
+  fi
+  if output=$(lookup_install --set 'effectsGateways[0].enabled=false'); then
+    fail "disabling a running gateway is accepted by a server dry run"
+  fi
+  lookup_install >/dev/null || fail "the running entry itself is refused by a server dry run"
+  lookup_deployment 0
+  "${lookup_kubectl[@]}" -n "$lookup_namespace" rollout status deployment/shoal-gw-stripe --timeout=60s >/dev/null 2>&1 || true
+  lookup_install --set 'effectsGateways[0].name=stripe2' >/dev/null ||
+    fail "a rename after replicas: 0 is refused by a server dry run"
+  "${lookup_kubectl[@]}" delete namespace "$lookup_namespace" --wait=false >/dev/null
+else
+  note "  skipped: the lookup guard needs an API server (set SHOAL_LOOKUP_KUBECONFIG to a throwaway cluster)"
+fi
 
 note "== effects gateway: the NetworkPolicy =="
 SHOAL_EXPECTED_CIDRS='["203.0.113.0/24"]' effects_check policy "ingress to the health port, egress to DNS, the explorer and the target" "${effects_gateway_base[@]}" --set 'effectsGateways[0].networkPolicy.enabled=true' --set 'effectsGateways[0].networkPolicy.targetCIDRs={203.0.113.0/24}'

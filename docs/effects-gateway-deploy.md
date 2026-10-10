@@ -765,7 +765,7 @@ release's full name cut to 24 characters:
 
 | object | what it is |
 |---|---|
-| Deployment | `replicas: 1`, `strategy: Recreate`, `automountServiceAccountToken: false`, and a computed grace period (below) |
+| Deployment | `replicas: 1` (or 0 to stop it), `strategy: Recreate`, `automountServiceAccountToken: false`, and a computed grace period (below) |
 | ServiceAccount | Created unless `serviceAccountName` names an existing one. It has no token automount. Its subject, `system:serviceaccount:<namespace>:<stem>-gw-<name>`, is what the executor mapping binds to `executorRef`. |
 | ConfigMap `-routes` | The route table as JSON. It reaches `-routes` through the environment, and the pod template carries its checksum, so a changed table rolls the pod. |
 | PersistentVolumeClaim `-unrecorded` | ReadWriteOnce, 64Mi, annotated `helm.sh/resource-policy: keep` |
@@ -774,12 +774,28 @@ release's full name cut to 24 characters:
 There is no Service, no registrar credential and no heartbeat. The gateway
 serves only its probes, and it never asserts its descriptor's liveness (#391).
 
-**One replica, Recreate.** `validate.yaml` refuses any `replicas` other than
-1. A second replica would share the executor principal and the unrecorded log:
-the log's lock refuses the second process, and two workers on one surface can
-evict each other's claims (#514). Recreate means a rollout stops the old pod
-and waits out its drain before the new pod mounts the claim. A surge would put
-two pods on one ReadWriteOnce log.
+**At most one replica, Recreate.** `replicas` is 1, or 0 to stop the gateway;
+`validate.yaml` refuses anything else. A second replica would share the
+executor principal and the unrecorded log: the log's lock refuses the second
+process, and two workers on one surface can evict each other's claims (#514).
+Recreate means a rollout stops the old pod and waits out its drain before the
+new pod mounts the claim. A surge would put two pods on one ReadWriteOnce log.
+
+**One principal per entry.** Two enabled entries may not share an
+`executorRef`, an `agentID`, an effective ServiceAccount (a defaulted
+`<stem>-gw-<name>` included) or an `existingClaim`. Each of those makes two
+workers on one executor principal (#514), and with separate claims no lock
+notices the second.
+
+**The explorer in the same release mints the credential.** When
+`explorer.enabled` is true and an entry's token is projected, the chart also
+refuses:
+- a `dispatch.tokenAudience` other than `explorer.auth.oidc.executorMapping.audience`;
+- a mapping that does not bind the pod's subject,
+  `system:serviceaccount:<release namespace>:<account>`, to the entry's
+  `executorRef`.
+
+A Secret-sourced token is opaque to the chart and is not checked.
 
 **The unrecorded log is on a claim.** `-unrecorded-dir` is
 `/var/lib/shoal-gateway/unrecorded`, a subdirectory of the claim's mount. The
@@ -853,10 +869,10 @@ Every key, with its default, is in `effectsGatewayDefaults` in
 
 | key | default | flag / object | rule |
 |---|---|---|---|
-| `name` | | object names | required. A DNS label, at most 24 characters, unique |
+| `name` | | object names | required. A DNS label, at most 24 characters, unique. The entry's identity: never change it on a running entry (see [Renaming an entry](#renaming-an-entry)) |
 | `enabled` | false | | renders the entry |
 | `image.repository`, `.tag`, `.pullPolicy` | `ghcr.io/example/shoal-gateway`, `dev`, `IfNotPresent` | | |
-| `replicas` | 1 | | must be 1 |
+| `replicas` | 1 | Deployment | 0 or 1 |
 | `agentID` | | `-agent-id` | required, unpadded base64url |
 | `capability` | `effects.http` | `-capability` | |
 | `surfaceName` | | `-surface-name` | required |
@@ -949,10 +965,12 @@ in the same release, also list `stripe` in `explorer.fleet.executorRefs` and
 ### Acknowledging unrecorded reports
 
 `unrecorded ack` refuses while the gateway holds the log's lock, so stop the
-gateway first. Then run the command in a pod that mounts the same claim:
+gateway first: set the entry's `replicas: 0` and `helm upgrade`. (A
+`kubectl scale` works too, but the next `helm upgrade` reverts it, and an
+upgrade run while you are acknowledging would restart the gateway under you.)
+Once the pod is gone, run the command in a pod that mounts the same claim:
 
 ```
-kubectl scale deployment/shoal-gw-stripe --replicas=0
 kubectl run shoal-gw-stripe-ack --rm -it --restart=Never \
   --image=ghcr.io/YOUR_ORG/shoal-gateway:TAG \
   --overrides='{"spec":{"securityContext":{"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532},
@@ -960,11 +978,36 @@ kubectl run shoal-gw-stripe-ack --rm -it --restart=Never \
     "containers":[{"name":"ack","image":"ghcr.io/YOUR_ORG/shoal-gateway:TAG",
       "args":["unrecorded","list","-unrecorded-dir","/var/lib/shoal-gateway/unrecorded"],
       "volumeMounts":[{"name":"u","mountPath":"/var/lib/shoal-gateway"}]}]}}'
-kubectl scale deployment/shoal-gw-stripe --replicas=1
 ```
 
-Replace `list` with `ack ACTION_ID:FENCE` once each report is reconciled. The
-next `helm upgrade` restores the one replica in any case.
+Replace `list` with `ack ACTION_ID:FENCE` once each report is reconciled. Then
+set `replicas: 1` and upgrade again.
+
+### Renaming an entry
+
+An entry's `name` is its identity. It names the Deployment, the ServiceAccount
+(and so the executor credential's subject) and the unrecorded log's claim.
+Renaming a running entry makes Helm delete the old Deployment while it creates
+the new one. The old pod then drains while the new pod claims on the same
+executor reference, which is two workers on one principal (#514). The old log
+is also left on a claim that nothing mounts. Removing a running entry has the
+same problem without the new pod. So do not change a running entry's name.
+When you must:
+
+1. Set the entry's `replicas: 0` and `helm upgrade`. Wait for the pod to
+   terminate; its drain is bounded by the grace period.
+2. Acknowledge the old log (above), or migrate it: copy `unrecorded.jsonl`
+   into the new claim, or point the renamed entry at the old claim with
+   `unrecorded.storage: existingClaim`.
+3. Rename the entry, and re-map the new ServiceAccount subject in the executor
+   mapping (or keep the old account with `serviceAccountName`). Set
+   `replicas: 1` and upgrade.
+
+The chart enforces step 1. On an install or upgrade it looks up the release's
+effects-gateway Deployments, and refuses when one is still running (spec or
+status replicas above zero) and no enabled entry names it. `lookup` returns
+nothing under `helm template`, a client-side `--dry-run` and `helm lint`, so
+those never see this refusal; `helm upgrade --dry-run=server` does.
 
 ## Egress
 

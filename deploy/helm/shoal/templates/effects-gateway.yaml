@@ -24,8 +24,9 @@
 # The gateway's own identity. Its projected token's subject is
 # system:serviceaccount:<namespace>:<this name>, which is the subject the
 # explorer's executor mapping binds to this gateway's executor reference. One
-# account per gateway: two gateways sharing one would be one credential for two
-# surfaces, which the mapping refuses.
+# account per gateway: two gateways on one account would be two workers on one
+# principal (#514). validate.yaml refuses two enabled entries with the same
+# effective account, executor reference, descriptor or existing claim.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -90,10 +91,10 @@ metadata:
     {{- include "shoal.labels" $root | nindent 4 }}
     app.kubernetes.io/component: effects-gateway
 spec:
-  # Exactly one; validate.yaml refuses anything else (#391). Two replicas
-  # would be one executor principal holding claims from two processes, over one
-  # unrecorded log.
-  replicas: 1
+  # One, or zero to stop it; validate.yaml refuses anything else (#391). Two
+  # replicas would be one executor principal holding claims from two
+  # processes, over one unrecorded log.
+  replicas: {{ include "shoal.effectsGatewayWhole" (dict "name" (printf "%s.replicas" $key) "value" $gateway.replicas) }}
   # Recreate, never RollingUpdate: a rollout stops the old pod, waits for it
   # to terminate — its drain included — and only then starts the new one. A
   # surge would put two gateways on one ReadWriteOnce log and one executor

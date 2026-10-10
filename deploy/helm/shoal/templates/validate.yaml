@@ -1040,6 +1040,8 @@
        a gateway with the wrong grace period or an emptyDir log is worse, a pod
        that works until a rollout or a reschedule strands an effect. */ -}}
 {{- $gatewayNames := dict -}}
+{{- $gatewayIdentities := dict -}}
+{{- $enabledGatewayNames := list -}}
 {{- $fleet := .Values.explorer.fleet -}}
 {{- range $gateway := fromJsonArray (include "shoal.effectsGateways" .) -}}
 {{- $key := printf "effectsGateways[%v]" $gateway._index -}}
@@ -1060,19 +1062,42 @@
 {{- end -}}
 {{- $_ := set $gatewayNames $name $gateway._index -}}
 {{- if $gateway.enabled -}}
+{{- $enabledGatewayNames = append $enabledGatewayNames $name -}}
 {{- $dispatch := $gateway.dispatch -}}
 {{- $target := $gateway.target -}}
 {{- $timing := $gateway.timing -}}
 {{- $unrecorded := $gateway.unrecorded -}}
 
-{{- /* One replica (#391). Two would share one executor principal, so each
-       could re-claim, and evict from the claim history, what the other
-       holds (#514), over one unrecorded log whose lock refuses the second
-       process. Re-registration semantics for more than one worker per
-       surface are unsettled, so the chart allows exactly one. Checked as
+{{- /* At most one replica (#391). Two would share one executor principal,
+       so each could re-claim, and evict from the claim history, what the
+       other holds (#514), over one unrecorded log whose lock refuses the
+       second process. Re-registration semantics for more than one worker
+       per surface are unsettled, so the chart allows one, or zero to stop
+       the gateway (to acknowledge its log, or before a rename). Checked as
        written: int of 1.5 is 1. */ -}}
-{{- if ne (toString $gateway.replicas) "1" -}}
-{{- fail (printf "%s.replicas must be 1 (got %v): the effects gateway runs one replica per surface. A second replica would share the executor principal and the unrecorded log, whose lock refuses it — and two workers on one surface can evict each other's claims (#514). To stop the gateway, scale the Deployment to zero with kubectl, or disable the entry" $key $gateway.replicas) -}}
+{{- if not (has (toString $gateway.replicas) (list "0" "1")) -}}
+{{- fail (printf "%s.replicas must be 0 or 1 (got %v): the effects gateway runs at most one replica per surface. A second replica would share the executor principal and the unrecorded log, whose lock refuses it — and two workers on one surface can evict each other's claims (#514). To stop the gateway, set replicas: 0 and upgrade; a kubectl scale is reverted by the next helm upgrade" $key $gateway.replicas) -}}
+{{- end -}}
+
+{{- /* One principal, one log, one worker. Two enabled entries that share an
+       executor reference, a descriptor, a ServiceAccount (the subject the
+       executor credential is minted for) or an operator-owned claim are two
+       workers on one principal (#514): each can re-claim and evict what the
+       other holds, and with separate claims the log's lock never sees the
+       second. The ServiceAccount compared is the effective one, so a
+       serviceAccountName that names another entry's chart-created account
+       is caught too. */ -}}
+{{- $account := default (include "shoal.effectsGatewayName" (dict "root" $ "gateway" $gateway)) $gateway.serviceAccountName -}}
+{{- $identities := dict "executorRef" (toString $gateway.executorRef) "agentID" (toString $gateway.agentID) "ServiceAccount" $account -}}
+{{- if eq (toString $unrecorded.storage) "existingClaim" -}}
+{{- $_ := set $identities "unrecorded.existingClaim" (toString $unrecorded.existingClaim) -}}
+{{- end -}}
+{{- range $what, $value := $identities -}}
+{{- $seenKey := printf "%s=%s" $what $value -}}
+{{- if hasKey $gatewayIdentities $seenKey -}}
+{{- fail (printf "%s and effectsGateways[%v] share the %s %q: two enabled entries on one identity are two workers on one executor principal, which can evict each other's claims (#514), and with separate unrecorded logs no lock stops the second. Give each surface its own executor reference, descriptor, ServiceAccount and claim" $key (index $gatewayIdentities $seenKey) $what $value) -}}
+{{- end -}}
+{{- $_ := set $gatewayIdentities $seenKey $gateway._index -}}
 {{- end -}}
 
 {{- range $flag := list "dispatch.allowPlaintext" "target.allowPrivate" "timing.renew" "unrecorded.acceptLossOfUnrecordedReports" "networkPolicy.enabled" -}}
@@ -1276,6 +1301,31 @@
 {{- if not (has $executorRef (default (list) (index $fleet $list))) -}}
 {{- fail (printf "%s.executorRef %q is not in explorer.fleet.%s: a %s target's derived effects are %s, and the explorer binds that ceiling only to references in that list, so the gateway's descriptor cannot register" $key $executorRef $list (ternary "loopback" "remote" (eq $loopbackTarget "true")) (ternary "{external}" "{external, egresses-content}" (eq $loopbackTarget "true"))) -}}
 {{- end -}}
+{{- /* And the credential must be one the explorer mints for this reference:
+       a projected token on the mapping's audience, whose subject — the
+       pod's ServiceAccount in this namespace — the mapping binds to this
+       entry's executorRef. Either mismatch is a gateway that passes its
+       probes and gets 401 or not_found on every pull. A Secret-sourced
+       token is opaque to the chart and is not checked. */ -}}
+{{- if eq (toString $dispatch.tokenSource) "projected" -}}
+{{- $mapping := default (dict) $.Values.explorer.auth.oidc.executorMapping -}}
+{{- if not $mapping -}}
+{{- fail (printf "%s needs explorer.auth.oidc.executorMapping: the explorer in this release grants execute only through the executor mapping, so without one the gateway's token is refused on every pull" $key) -}}
+{{- end -}}
+{{- if ne (toString $dispatch.tokenAudience) (toString (get $mapping "audience")) -}}
+{{- fail (printf "%s.dispatch.tokenAudience %q is not the executor mapping's audience %q: the explorer accepts an executor token only on that audience, so every pull would be a 401" $key (toString $dispatch.tokenAudience) (toString (get $mapping "audience"))) -}}
+{{- end -}}
+{{- $subject := printf "system:serviceaccount:%s:%s" $.Release.Namespace $account -}}
+{{- $mappedRef := "" -}}
+{{- range $executor := (default (list) (get $mapping "executors")) -}}
+{{- if and (kindIs "map" $executor) (eq (toString (get $executor "subject")) $subject) -}}
+{{- $mappedRef = toString (get $executor "executor_ref") -}}
+{{- end -}}
+{{- end -}}
+{{- if ne $mappedRef $executorRef -}}
+{{- fail (printf "%s: the executor mapping %s, but this gateway's executorRef is %q: the explorer mints the projected token for the reference its subject maps to, so every pull and claim would answer not_found. Map %q to %q in explorer.auth.oidc.executorMapping.executors" $key (ternary (printf "does not name the gateway's subject %q" $subject) (printf "maps %q to %q" $subject $mappedRef) (eq $mappedRef "")) $executorRef $subject $executorRef) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -1428,6 +1478,35 @@
 {{- end -}}
 {{- range $check := $checks -}}
 {{- include "shoal.requireShape" $check -}}
+{{- end -}}
+
+{{- /* A live gateway the values no longer name (#391).
+
+       An entry's name is its identity: it names the Deployment and the
+       unrecorded log's claim. Renaming or deleting a running entry makes
+       Helm delete the old Deployment while it creates the new one, so the
+       old pod drains while the new pod claims on the same executor
+       reference — two workers on one principal (#514) — and the old log is
+       left behind on a claim nothing mounts. So a Deployment of this
+       release's effects gateways (selected by component and instance) that
+       no enabled entry names, and that still has replicas, is refused. Set
+       its replicas to 0 and upgrade first; then rename or remove it.
+
+       lookup asks the API server. Under `helm template`, `helm install
+       --dry-run` (client) and `helm lint` it returns nothing, so this guard
+       is silent there and fires only on a real install or upgrade (or
+       --dry-run=server). */ -}}
+{{- $liveDeployments := lookup "apps/v1" "Deployment" .Release.Namespace "" -}}
+{{- range $live := (default (list) (get (default (dict) $liveDeployments) "items")) -}}
+{{- $labels := default (dict) $live.metadata.labels -}}
+{{- $podLabels := default (dict) (dig "spec" "selector" "matchLabels" (dict) $live) -}}
+{{- if and (eq (toString (get $podLabels "app.kubernetes.io/component")) "effects-gateway") (eq (toString (get $podLabels "app.kubernetes.io/instance")) $.Release.Name) -}}
+{{- $liveName := toString (get $podLabels "shoal.effects-gateway/name") -}}
+{{- $running := or (gt (int64 (default 0 $live.spec.replicas)) 0) (gt (int64 (default 0 (dig "status" "replicas" 0 $live))) 0) -}}
+{{- if and $running (not (has $liveName $enabledGatewayNames)) -}}
+{{- fail (printf "the effects gateway Deployment %s (entry %q) is running, and no enabled entry in effectsGateways names it any more: an entry's name is its identity, so renaming or removing a running entry overlaps the old pod's drain with the new pod's claims on one executor reference (#514) and orphans its unrecorded log. Set that entry's replicas: 0 and upgrade, acknowledge or migrate its log (docs/effects-gateway-deploy.md, Renaming an entry), and only then rename or remove it" $live.metadata.name $liveName) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* The effects gateways' shape, refused last so a line break in an entry
