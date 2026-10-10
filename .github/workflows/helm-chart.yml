@@ -12,11 +12,23 @@ on:
     paths:
       - ".github/workflows/helm-chart.yml"
       - "deploy/helm/**"
+      # The chart computes the effects gateway's grace period from the
+      # binary's formula and checks the two agree, and runs the binary on the
+      # arguments it renders: a change on either side must run this job.
+      - "cmd/shoal-gateway/**"
+      - "internal/effectsgateway/**"
+      - "docs/effects-gateway-deploy.md"
   pull_request:
     branches: [main]
     paths:
       - ".github/workflows/helm-chart.yml"
       - "deploy/helm/**"
+      # The chart computes the effects gateway's grace period from the
+      # binary's formula and checks the two agree, and runs the binary on the
+      # arguments it renders: a change on either side must run this job.
+      - "cmd/shoal-gateway/**"
+      - "internal/effectsgateway/**"
+      - "docs/effects-gateway-deploy.md"
 
 concurrency:
   group: helm-chart-${{ github.ref }}
@@ -47,5 +59,14 @@ jobs:
         # then fails as a ModuleNotFoundError that looks nothing like a chart
         # problem.
         run: python3 -m pip install --disable-pip-version-check 'pyyaml==6.0.2'
+      # validate-chart.sh builds cmd/shoal-gateway to compare the chart's
+      # grace period with `shoal-gateway grace-period` and to run the binary
+      # on the arguments the chart renders.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Validate the chart
+        env:
+          GOWORK: "off"
         run: ./deploy/helm/validate-chart.sh

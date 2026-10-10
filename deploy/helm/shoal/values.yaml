@@ -687,3 +687,193 @@ llmGateway:
   # replaces that default outright rather than merging with it — see
   # llm-gateway-deployment.yaml.
   affinity: {}
+
+# Effects gateways (#391): HTTP Path A workers. Each one pulls actions for one
+# registered descriptor off the explorer's fleet dispatch queue, claims each
+# under a fence, performs one HTTP request against one operational surface, and
+# completes the action. See docs/effects-gateway-deploy.md, "In the chart".
+#
+# A list, one entry per surface, and empty by default: nothing renders unless an
+# entry is present and `enabled`. Each entry is deep-merged over
+# effectsGatewayDefaults below, so an entry names only what differs. (The merge
+# cannot clear a value to empty or false; no default below is one an entry
+# needs to clear.)
+#
+# Each enabled entry renders a Deployment (one replica, Recreate), a
+# ServiceAccount with no token automount, a ConfigMap holding the route table,
+# a PersistentVolumeClaim for the unrecorded log, and optionally a
+# NetworkPolicy. No Service: the gateway serves nothing but its probes.
+#
+#   effectsGateways:
+#     - name: stripe
+#       enabled: true
+#       image: {repository: ghcr.io/YOUR_ORG/shoal-gateway, tag: TAG}
+#       agentID: c3RyaXBlLWdhdGV3YXk
+#       surfaceName: stripe
+#       executorRef: stripe
+#       dispatch: {url: https://shoal-explorer.shoal.svc:8098, tokenAudience: shoal-executors}
+#       target:
+#         baseURL: https://api.stripe.com
+#         credentialSecretName: stripe-api-key
+#         idempotencyHeader: Idempotency-Key
+#         idempotencyRetention: 24h
+#       routes:
+#         - {action: charge, method: POST, path: /v1/charges, effects: [external, egresses-content], idempotency: key}
+effectsGateways: []
+
+effectsGatewayDefaults:
+  # Set true on an entry to render it.
+  enabled: false
+  # Required: the entry's name, a DNS label of at most 24 characters, unique
+  # among the entries. Objects are named <release stem>-gw-<name>.
+  name: ""
+  # The image built by Dockerfile.shoal-gateway.
+  image:
+    repository: ghcr.io/example/shoal-gateway
+    tag: dev
+    pullPolicy: IfNotPresent
+  # Exactly one, and validate.yaml refuses anything else. A second replica
+  # would share one executor principal and one unrecorded log; the log's lock
+  # refuses the second process anyway, and re-registration semantics for more
+  # than one worker per surface are unsettled (#391).
+  replicas: 1
+  # The descriptor this gateway performs work for (-agent-id), as unpadded
+  # base64url: the encoded descriptor ID, not a display name.
+  agentID: ""
+  capability: effects.http
+  # The operator's name for the surface, recorded as an ambiguity report's
+  # target (-surface-name).
+  surfaceName: ""
+  # The executor reference the dispatch credential is minted for and the
+  # descriptor registers (-executor-ref). It must appear in the explorer's
+  # executor mapping with this gateway's ServiceAccount as its subject.
+  executorRef: ""
+  # The ServiceAccount the pod runs as. Empty: the chart creates one named
+  # after the gateway's objects, so the projected token's subject is
+  # system:serviceaccount:<namespace>:<release stem>-gw-<name>. Set it to use an
+  # account that already exists; the chart then creates none.
+  serviceAccountName: ""
+  dispatch:
+    # Required: the explorer's base URL (-dispatch-url). https, or http to
+    # loopback.
+    url: ""
+    # Accept a remote http:// url, for a mesh that authenticates the hop
+    # (-allow-plaintext-dispatch).
+    allowPlaintext: false
+    # Where the executor credential comes from. It is always a file
+    # (-dispatch-token-file), read per call, so a rotated token takes effect
+    # without a restart; the chart never renders the environment form.
+    #
+    #   projected  a projected ServiceAccount token on tokenAudience, the
+    #              intended credential (docs/effects-gateway-deploy.md,
+    #              "Issuing executor credentials").
+    #   secret     credentialSecretName / credentialSecretKey, mounted as the
+    #              file.
+    tokenSource: projected
+    # Required with projected: the executor audience the explorer's mapping
+    # names (explorer.auth.oidc.executorMapping.audience).
+    tokenAudience: ""
+    # At least 600, the API server's floor for a token projection.
+    tokenExpirationSeconds: 3600
+    # Required with secret, refused with projected.
+    credentialSecretName: ""
+    credentialSecretKey: token
+  target:
+    # Required: the operational surface (-target-base-url). https, or http to
+    # loopback; there is no plaintext opt-out. No userinfo, query or fragment.
+    baseURL: ""
+    # Admit private and loopback resolution (-target-allow-private). Required
+    # for a loopback target.
+    allowPrivate: false
+    # The header carrying the credential (-target-auth-header). The Secret's
+    # value is the whole header value, so a bearer token is stored as
+    # "Bearer <token>".
+    authHeader: Authorization
+    # Required unless the target is loopback: the Secret holding the target
+    # credential, mounted as -target-credential-file.
+    credentialSecretName: ""
+    credentialSecretKey: credential
+    # Both required when any route uses idempotency "key", and refused when
+    # none does. The retention must exceed timing.operationTimeout + 5s.
+    idempotencyHeader: ""
+    idempotencyRetention: ""
+  # Required: the route table (-routes), as a list of route objects in the
+  # shape docs/effects-gateway-deploy.md, "Routes", documents. It is rendered
+  # with toJson into a ConfigMap and reaches the binary as -routes; the binary
+  # decodes it strictly and refuses the start on any error. A changed table
+  # rolls the pod.
+  routes: []
+  timing:
+    # L, at most 5m (-claim-lease).
+    claimLease: 4m
+    # T, the bound on one request to the target (-operation-timeout).
+    operationTimeout: 3m
+    # The bound on one call to the explorer, at most L/4 (-plane-timeout).
+    planeTimeout: 10s
+    # Extend the claim every L/2 (-renew). Without it, L must exceed
+    # T + 5s + planeTimeout.
+    renew: false
+  # terminationGracePeriodSeconds is computed from timing.operationTimeout and
+  # timing.planeTimeout with the formula `shoal-gateway grace-period` prints:
+  #   T + max(5s, 3 × planeTimeout) + 2 × 5s + 5s, rounded up to whole seconds
+  # (225 for the defaults). Set this only to give more, never less: a value
+  # below the formula is refused, because SIGKILL mid-drain strands an effect
+  # that happened and was never reported.
+  terminationGracePeriodSeconds: ""
+  maxInFlight: 4
+  pullLimit: 32
+  pullInterval: 2s
+  maxResponseBytes: 65536
+  # Optional. A Secret holding the attestation statement and its
+  # presentation's idempotency key (-attestation-statement-file and
+  # -attestation-key-file). Required by the binary when an action requires
+  # attestation, refused by it when none does.
+  attestation:
+    secretName: ""
+    statementKey: statement
+    keyKey: key
+  # The unrecorded-report log (#514) and the single-replica lock
+  # (-unrecorded-dir). Losing it loses the only record of effects the explorer
+  # refused to record, so it is a PersistentVolumeClaim by default.
+  unrecorded:
+    #   persistentVolumeClaim  a ReadWriteOnce claim the chart renders and
+    #                          annotates helm.sh/resource-policy: keep, so an
+    #                          uninstall leaves the log behind.
+    #   existingClaim          a claim the operator owns (existingClaim).
+    #   emptyDir               UNSAFE: the log dies with the pod. Requires
+    #                          acceptLossOfUnrecordedReports: true.
+    storage: persistentVolumeClaim
+    # The log is bounded at 1 MiB; the claim only needs to hold it.
+    size: 64Mi
+    storageClassName: ""
+    existingClaim: ""
+    acceptLossOfUnrecordedReports: false
+  # The probe and metrics listener (-health-address): /healthz, /readyz and
+  # /metrics.
+  healthPort: 8102
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Optional. Ingress is limited to the health port; egress to DNS, the
+  # explorer and the target CIDRs. NetworkPolicy matches addresses, not names:
+  # an FQDN target is enforced only through the CIDRs given here.
+  networkPolicy:
+    enabled: false
+    explorer:
+      # Empty: this release's explorer pods.
+      podLabels: {}
+      # Empty: this namespace.
+      namespaceLabels: {}
+      # Empty: explorer.containerPort.
+      port: ""
+    # Required with a non-loopback target.
+    targetCIDRs: []
+    # Empty: the target URL's port (443 for https).
+    targetPorts: []

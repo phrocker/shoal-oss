@@ -1,9 +1,9 @@
 # Effects gateway: deployment
 
-> **No chart entry yet.** `cmd/shoal-gateway` runs the gateway (see
-> [Running the gateway](#running-the-gateway)); the chart's
-> `effectsGateways:` entry is PR7 of #391. Until then the binary is deployed
-> by hand, with the requirements that section lists.
+> **Deploying it:** `Dockerfile.shoal-gateway` builds the image, and the
+> chart's `effectsGateways:` list deploys it, one entry per surface. See
+> [In the chart](#in-the-chart). [Running the gateway](#running-the-gateway)
+> is what the chart renders, for a deployment by hand.
 
 This is the HTTP Path A worker from #391: it pulls an action off the fleet
 dispatch queue, claims it under a fence, performs one HTTP request against a
@@ -163,7 +163,8 @@ The command computes it three ways, all from the same function:
 seconds; `run` logs it at start ("terminationGracePeriodSeconds must be at
 least N"); and `/metrics` exports it as
 `shoal_effects_gateway_grace_period_seconds`. Set the pod's
-`terminationGracePeriodSeconds` to at least that figure.
+`terminationGracePeriodSeconds` to at least that figure. The chart computes it
+from the entry's timeouts ([In the chart](#in-the-chart)).
 
 ## Issuing executor credentials
 
@@ -734,6 +735,236 @@ both refuse while a gateway runs on the directory: the running gateway owns the 
 write back an entry acknowledged under it. Stop the gateway (or scale it to
 zero) first. A running gateway's backlog is visible meanwhile on `/metrics`
 and in its `unrecorded` log events.
+
+## In the chart
+
+### The image
+
+`Dockerfile.shoal-gateway` builds `cmd/shoal-gateway` into distroless static,
+from the same digest-pinned base images as `Dockerfile.shoal-embed`. The binary
+is `/usr/local/bin/shoal-gateway` (the entrypoint), it runs as uid/gid 65532,
+and `/var/lib/shoal-gateway` is the unrecorded log's mount point. BuildKit is
+required (`docker buildx`).
+
+```
+make gateway-container-build GATEWAY_IMAGE=ghcr.io/YOUR_ORG/shoal-gateway:TAG
+make gateway-container-smoke                # build, then check user, entrypoint, grace-period
+```
+
+The `shoal-gateway image` workflow builds and smoke-tests it on every change
+that reaches the binary. It publishes nothing: where the image is pushed, and
+where its base images come from (#638), are maintainer decisions.
+
+### What an entry renders
+
+`effectsGateways` is a list, empty by default, with one entry per surface.
+Each entry is deep-merged over `effectsGatewayDefaults`, so it names only what
+differs. Nothing renders unless an entry has `enabled: true`. An enabled entry
+renders these objects, each named `<stem>-gw-<name>`, where the stem is the
+release's full name cut to 24 characters:
+
+| object | what it is |
+|---|---|
+| Deployment | `replicas: 1`, `strategy: Recreate`, `automountServiceAccountToken: false`, and a computed grace period (below) |
+| ServiceAccount | Created unless `serviceAccountName` names an existing one. It has no token automount. Its subject, `system:serviceaccount:<namespace>:<stem>-gw-<name>`, is what the executor mapping binds to `executorRef`. |
+| ConfigMap `-routes` | The route table as JSON. It reaches `-routes` through the environment, and the pod template carries its checksum, so a changed table rolls the pod. |
+| PersistentVolumeClaim `-unrecorded` | ReadWriteOnce, 64Mi, annotated `helm.sh/resource-policy: keep` |
+| NetworkPolicy | Only with `networkPolicy.enabled` |
+
+There is no Service, no registrar credential and no heartbeat. The gateway
+serves only its probes, and it never asserts its descriptor's liveness (#391).
+
+**One replica, Recreate.** `validate.yaml` refuses any `replicas` other than
+1. A second replica would share the executor principal and the unrecorded log:
+the log's lock refuses the second process, and two workers on one surface can
+evict each other's claims (#514). Recreate means a rollout stops the old pod
+and waits out its drain before the new pod mounts the claim. A surge would put
+two pods on one ReadWriteOnce log.
+
+**The unrecorded log is on a claim.** `-unrecorded-dir` is
+`/var/lib/shoal-gateway/unrecorded`, a subdirectory of the claim's mount. The
+claim survives `helm uninstall`. Delete it by hand once `unrecorded list` shows
+it empty. `unrecorded.storage` takes one of:
+- `persistentVolumeClaim`, the default;
+- `existingClaim`, for a claim you own;
+- `emptyDir`, which is refused unless `acceptLossOfUnrecordedReports: true`
+  is also set. Even then, the install's NOTES print a warning. The log dies with
+  the pod, and with it the only record of effects the explorer refused to
+  record.
+
+**The grace period is computed.** The chart sets
+`terminationGracePeriodSeconds` to `T + max(5s, 3 × planeTimeout) + 2 × 5s + 5s`,
+rounded up to whole seconds. This is the figure
+`shoal-gateway grace-period -operation-timeout T -plane-timeout P` prints. An
+entry's `terminationGracePeriodSeconds` can raise it, and a value below it is
+refused.
+
+Computing it, rather than asking for it and checking it, keeps it from going
+stale. A timeout change cannot leave the grace period behind, because there is
+no second value to forget to update. Checking a supplied value would still need
+the formula in the chart, so it would carry the same risk of drift while also
+asking the operator for a number. The template's copy of the formula is kept
+honest by `deploy/helm/validate-chart.sh`. It builds the binary, renders the
+chart for a table of `(T, P)` pairs covering every branch of the formula and
+its rounding, and fails on any difference. The Helm chart workflow runs it on
+any change to `cmd/shoal-gateway`, `internal/effectsgateway` or the chart.
+
+**Credentials are files.** Each one is mounted read-only at mode 0440, with
+`fsGroup: 65532`.
+- The executor token, `-dispatch-token-file`, is either a projected
+  ServiceAccount token on `dispatch.tokenAudience` (the default) or
+  `dispatch.credentialSecretName`.
+- The target credential is `target.credentialSecretName`, mounted as
+  `-target-credential-file`. It is required unless the target is loopback.
+- The attestation statement and key come from `attestation.secretName`
+  (optional), mounted as `-attestation-statement-file` and
+  `-attestation-key-file`.
+
+The chart never renders the environment forms. A file is re-read on each
+call, so a rotated token or an updated Secret takes effect without a restart.
+
+**Probes and metrics.** `-health-address` listens on `healthPort` (8102).
+Liveness is `/healthz` and readiness is `/readyz`. Metrics are `/metrics` on
+the same port, with `prometheus.io/*` pod annotations. Readiness gates nothing,
+since there is no Service, but it is what a rollout waits on, and
+`unrecorded_log_full` shows there.
+
+**Security context.** The pod runs as non-root uid/gid 65532 with the
+`RuntimeDefault` seccomp profile. The container has a read-only root
+filesystem, no privilege escalation and every capability dropped. The only
+writable path is the claim.
+
+**NetworkPolicy** (`networkPolicy.enabled`, off by default):
+- Ingress is allowed to the health port only.
+- Egress is allowed to DNS, to the explorer and to `targetCIDRs`, on the
+  target's port or on `targetPorts`.
+- The explorer defaults to this release's explorer pods on
+  `explorer.containerPort`. Override it with `explorer.podLabels`,
+  `explorer.namespaceLabels` and `explorer.port`.
+- A policy matches addresses, not names. An FQDN target is held only to the
+  CIDRs listed, and a remote target with none listed is refused.
+- The gateway's own dialer refuses link-local and metadata addresses whatever
+  the policy allows.
+
+### Values
+
+Every key, with its default, is in `effectsGatewayDefaults` in
+`deploy/helm/shoal/values.yaml`.
+
+| key | default | flag / object | rule |
+|---|---|---|---|
+| `name` | | object names | required. A DNS label, at most 24 characters, unique |
+| `enabled` | false | | renders the entry |
+| `image.repository`, `.tag`, `.pullPolicy` | `ghcr.io/example/shoal-gateway`, `dev`, `IfNotPresent` | | |
+| `replicas` | 1 | | must be 1 |
+| `agentID` | | `-agent-id` | required, unpadded base64url |
+| `capability` | `effects.http` | `-capability` | |
+| `surfaceName` | | `-surface-name` | required |
+| `executorRef` | | `-executor-ref` | required; `executorref.ValidExecutorRef`. With the explorer in the same release, it must be in `explorer.fleet.externalEgressExecutorRefs` (or `externalExecutorRefs` for a loopback target) |
+| `serviceAccountName` | chart-created | `serviceAccountName` | |
+| `dispatch.url` | | `-dispatch-url` | required. https, or http to loopback |
+| `dispatch.allowPlaintext` | false | `-allow-plaintext-dispatch` | admits a remote http:// explorer |
+| `dispatch.tokenSource` | `projected` | `-dispatch-token-file` | `projected` or `secret` |
+| `dispatch.tokenAudience` | | projected token | required with `projected` |
+| `dispatch.tokenExpirationSeconds` | 3600 | projected token | at least 600 |
+| `dispatch.credentialSecretName`, `.credentialSecretKey` | , `token` | Secret token | required with `secret`, refused with `projected` |
+| `target.baseURL` | | `-target-base-url` | required. https, or http to loopback; no userinfo, query or fragment |
+| `target.allowPrivate` | false | `-target-allow-private` | required for loopback |
+| `target.authHeader` | `Authorization` | `-target-auth-header` | |
+| `target.credentialSecretName`, `.credentialSecretKey` | , `credential` | `-target-credential-file` | required unless loopback |
+| `target.idempotencyHeader`, `.idempotencyRetention` | | `-idempotency-header`, `-idempotency-retention` | required with a `key` route, refused without one; retention > T + 5s |
+| `routes` | `[]` | `-routes` via ConfigMap | required, a list of [routes](#routes) |
+| `timing.claimLease` | 4m | `-claim-lease` | `0 < L ≤ 5m` |
+| `timing.operationTimeout` | 3m | `-operation-timeout` | positive |
+| `timing.planeTimeout` | 10s | `-plane-timeout` | positive, `≤ L/4` |
+| `timing.renew` | false | `-renew` | without it, `L > T + 5s + planeTimeout` |
+| `terminationGracePeriodSeconds` | computed | pod spec | may only raise the computed value |
+| `maxInFlight` | 4 | `-max-in-flight` | 1 to 64 |
+| `pullLimit` | 32 | `-pull-limit` | 1 to 256 |
+| `pullInterval` | 2s | `-pull-interval` | |
+| `maxResponseBytes` | 65536 | `-max-response-bytes` | 1 to 1048576 |
+| `attestation.secretName`, `.statementKey`, `.keyKey` | , `statement`, `key` | `-attestation-*-file` | optional |
+| `unrecorded.storage` | `persistentVolumeClaim` | `-unrecorded-dir` volume | or `existingClaim`, or `emptyDir` with `acceptLossOfUnrecordedReports` |
+| `unrecorded.size`, `.storageClassName`, `.existingClaim` | `64Mi`, , | claim | |
+| `healthPort` | 8102 | `-health-address` | 1 to 65535 |
+| `resources`, `nodeSelector`, `tolerations`, `affinity` | small requests, none | pod spec | |
+| `networkPolicy.*` | disabled | NetworkPolicy | `targetCIDRs` required with a remote target |
+
+Durations are Go literals built from whole numbers and `ms`, `s`, `m` or `h`
+(`90s`, `1m30s`). Every value is rendered as a quoted scalar or as JSON, and a
+line break anywhere in an entry is refused (#468).
+
+### A complete entry
+
+The executor mapping must map this gateway's ServiceAccount
+(`system:serviceaccount:<namespace>:shoal-gw-stripe` for a release named
+`shoal`) to `stripe`. The Secret `stripe-api-key` holds the whole
+`Authorization` value under the key `credential`.
+
+```yaml
+effectsGateways:
+  - name: stripe
+    enabled: true
+    image:
+      repository: ghcr.io/YOUR_ORG/shoal-gateway
+      tag: TAG
+    agentID: c3RyaXBlLWdhdGV3YXk
+    surfaceName: stripe
+    executorRef: stripe
+    dispatch:
+      url: https://shoal-explorer.shoal.svc:8098
+      tokenAudience: shoal-executors
+    target:
+      baseURL: https://api.stripe.com
+      credentialSecretName: stripe-api-key
+      idempotencyHeader: Idempotency-Key
+      idempotencyRetention: 24h
+    timing:
+      claimLease: 60s
+      operationTimeout: 2m
+      planeTimeout: 15s
+      renew: true
+    routes:
+      - action: charge
+        method: POST
+        path: /v1/charges
+        effects: [external, egresses-content]
+        idempotency: key
+        conflict: {status: [400], pointer: /error/type, equals: [idempotency_error]}
+        retryable: [429, 503]
+        reference: {pointer: /id, pattern: "ch_[A-Za-z0-9]+"}
+    networkPolicy:
+      enabled: true
+      explorer:
+        podLabels: {app.kubernetes.io/name: shoal-explore-web}
+        namespaceLabels: {kubernetes.io/metadata.name: shoal}
+      targetCIDRs: [203.0.113.0/24]
+```
+
+The explorer in this example runs in another namespace, `shoal`. When it is
+in the same release, also list `stripe` in `explorer.fleet.executorRefs` and
+`explorer.fleet.externalEgressExecutorRefs`, or the chart refuses the entry.
+`deploy/helm/validate-chart.sh` renders this example.
+
+### Acknowledging unrecorded reports
+
+`unrecorded ack` refuses while the gateway holds the log's lock, so stop the
+gateway first. Then run the command in a pod that mounts the same claim:
+
+```
+kubectl scale deployment/shoal-gw-stripe --replicas=0
+kubectl run shoal-gw-stripe-ack --rm -it --restart=Never \
+  --image=ghcr.io/YOUR_ORG/shoal-gateway:TAG \
+  --overrides='{"spec":{"securityContext":{"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532},
+    "volumes":[{"name":"u","persistentVolumeClaim":{"claimName":"shoal-gw-stripe-unrecorded"}}],
+    "containers":[{"name":"ack","image":"ghcr.io/YOUR_ORG/shoal-gateway:TAG",
+      "args":["unrecorded","list","-unrecorded-dir","/var/lib/shoal-gateway/unrecorded"],
+      "volumeMounts":[{"name":"u","mountPath":"/var/lib/shoal-gateway"}]}]}}'
+kubectl scale deployment/shoal-gw-stripe --replicas=1
+```
+
+Replace `list` with `ack ACTION_ID:FENCE` once each report is reconciled. The
+next `helm upgrade` restores the one replica in any case.
 
 ## Egress
 

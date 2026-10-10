@@ -83,6 +83,45 @@ valid_token_file=(
 )
 token_file_base=("${llm_gateway_base[@]}" "${valid_token_file[@]}")
 
+# A valid effects gateway entry (#391), on the same principle. It is a values
+# file rather than --set flags because the route table is a list of maps. The
+# dispatch URL is loopback so the binary-acceptance check below can run the
+# rendered arguments against it and get as far as the descriptor resolve.
+effects_fixtures="$(mktemp -d)"
+trap 'rm -rf "$effects_fixtures"' EXIT
+cat > "$effects_fixtures/gateway.yaml" <<'GATEWAY'
+effectsGateways:
+  - name: stripe
+    enabled: true
+    agentID: c3RyaXBlLWdhdGV3YXk
+    surfaceName: stripe
+    executorRef: stripe
+    dispatch:
+      url: http://127.0.0.1:1
+      tokenAudience: shoal-executors
+    target:
+      baseURL: https://api.example.test
+      credentialSecretName: stripe-api-key
+      idempotencyHeader: Idempotency-Key
+      idempotencyRetention: 24h
+    routes:
+      - action: charge
+        method: POST
+        path: /v1/accounts/{account}/charges
+        effects: [external, egresses-content]
+        idempotency: key
+        conflict: {status: [400], pointer: /error/type, equals: [idempotency_error]}
+        retryable: [429, 503]
+        reference: {pointer: /id, pattern: "ch_[A-Za-z0-9]+"}
+GATEWAY
+effects_gateway_base=(-f "$effects_fixtures/gateway.yaml")
+# A loopback target: a sidecar, admitted with allowPrivate, needing no
+# credential, and whose derived effects are {external} alone.
+loopback_target=(
+  --set 'effectsGateways[0].target.baseURL=http://127.0.0.1:9000,effectsGateways[0].target.allowPrivate=true,effectsGateways[0].target.credentialSecretName='
+  --set 'effectsGateways[0].routes[0].effects={external}'
+)
+
 renders() {
   local description="$1"; shift
   if ! helm template shoal "$chart" "$@" >/dev/null 2>&1; then
@@ -215,7 +254,7 @@ repository="$(git -C "$chart" rev-parse --show-toplevel 2>/dev/null || true)"
 if [ -n "$repository" ] &&
   git -C "$repository" rev-parse --verify --quiet "$baseline" >/dev/null 2>&1; then
   reference="$(mktemp -d)"
-  trap 'rm -rf "$reference"' EXIT
+  trap 'rm -rf "$reference" "$effects_fixtures"' EXIT
   if git -C "$repository" archive "$baseline" deploy/helm/shoal | tar -x -C "$reference"; then
     for values in values.yaml values-single.yaml values-distributed.yaml values-accumulo.yaml; do
       if ! diff -u \
@@ -277,6 +316,16 @@ if command -v kubeconform >/dev/null 2>&1; then
   # not, so it is a different object shape and needs its own schema pass.
   helm template shoal "$chart" "${token_file_base[@]}" |
     kubeconform -strict -summary - >/dev/null || fail "kubeconform llm gateway with a projected token"
+  # Every object the effects gateway can render: the claim, the NetworkPolicy,
+  # the Secret token source and the attestation volume.
+  helm template shoal "$chart" "${effects_gateway_base[@]}" \
+    --set 'effectsGateways[0].networkPolicy.enabled=true' --set 'effectsGateways[0].networkPolicy.targetCIDRs={203.0.113.0/24}' \
+    --set 'effectsGateways[0].attestation.secretName=stripe-attestation' |
+    kubeconform -strict -summary - >/dev/null || fail "kubeconform effects gateway"
+  helm template shoal "$chart" "${effects_gateway_base[@]}" \
+    --set 'effectsGateways[0].dispatch.tokenSource=secret,effectsGateways[0].dispatch.tokenAudience=,effectsGateways[0].dispatch.credentialSecretName=stripe-dispatch' \
+    --set 'effectsGateways[0].unrecorded.storage=existingClaim,effectsGateways[0].unrecorded.existingClaim=stripe-log' |
+    kubeconform -strict -summary - >/dev/null || fail "kubeconform effects gateway with a Secret token and an existing claim"
 else
   note "  skipped: kubeconform is not on PATH"
 fi
@@ -2334,6 +2383,397 @@ for problem in problems:
 raise SystemExit(1 if problems else 0)
 '; then
   fail "a long release name produces a name Kubernetes will reject (see above)"
+fi
+
+note "== effects gateway (#391): renders, and nothing without an enabled entry =="
+helm lint "$chart" "${effects_gateway_base[@]}" >/dev/null || fail "helm lint with an effects gateway"
+renders "an effects gateway" "${effects_gateway_base[@]}"
+renders "an effects gateway beside the storage tier" -f "$chart/values.yaml" "${effects_gateway_base[@]}"
+assert_absent "a disabled entry renders nothing" 'shoal-gw-' "${effects_gateway_base[@]}" --set 'effectsGateways[0].enabled=false'
+assert_absent "the default values render no gateway" 'effects-gateway' -f "$chart/values.yaml"
+
+# The checks below read the rendered objects. One program, told which check to
+# run, so each property is a separately named failure.
+effects_objects=$(cat <<'OBJECTS'
+import json, os, sys, yaml
+
+check = sys.argv[1]
+documents = [d for d in yaml.safe_load_all(sys.stdin) if d]
+mine = lambda kind: [d for d in documents if d["kind"] == kind and "-gw-" in d["metadata"]["name"]]
+deployments = mine("Deployment")
+problems = []
+if len(deployments) != 1:
+    problems.append(f"expected one gateway Deployment, found {len(deployments)}")
+    print("\n".join(problems)); raise SystemExit(1)
+deployment = deployments[0]
+spec = deployment["spec"]
+pod = spec["template"]["spec"]
+container = pod["containers"][0]
+volumes = {v["name"]: v for v in pod.get("volumes", [])}
+
+if check == "singleton":
+    if spec.get("replicas") != 1:
+        problems.append(f"replicas is {spec.get('replicas')!r}, not 1")
+    if spec.get("strategy") != {"type": "Recreate"}:
+        problems.append(f"strategy is {spec.get('strategy')!r}, not exactly {{type: Recreate}}")
+elif check == "claim":
+    claims = mine("PersistentVolumeClaim")
+    if len(claims) != 1:
+        problems.append(f"expected one unrecorded claim, found {len(claims)}")
+    else:
+        claim = claims[0]
+        if claim["spec"].get("accessModes") != ["ReadWriteOnce"]:
+            problems.append(f"the claim's access modes are {claim['spec'].get('accessModes')!r}")
+        if claim["metadata"].get("annotations", {}).get("helm.sh/resource-policy") != "keep":
+            problems.append("the claim is not kept on uninstall")
+        source = volumes.get("unrecorded", {}).get("persistentVolumeClaim", {})
+        if source.get("claimName") != claim["metadata"]["name"]:
+            problems.append(f"the unrecorded volume is {volumes.get('unrecorded')!r}, not the claim")
+    if any("emptyDir" in v for v in volumes.values()):
+        problems.append("an emptyDir volume is rendered by default")
+    mounts = {m["name"]: m["mountPath"] for m in container.get("volumeMounts", [])}
+    directory = next((a.split("=", 1)[1] for a in container["args"] if a.startswith("-unrecorded-dir=")), "")
+    if not directory.startswith(mounts.get("unrecorded", "/nowhere") + "/"):
+        problems.append(f"-unrecorded-dir={directory} is not on the unrecorded volume ({mounts.get('unrecorded')})")
+elif check == "emptydir":
+    if "emptyDir" not in volumes.get("unrecorded", {}):
+        problems.append("the acknowledged emptyDir is not the unrecorded volume")
+    if mine("PersistentVolumeClaim"):
+        problems.append("a claim is rendered beside the emptyDir")
+elif check == "grace":
+    expected = int(os.environ["SHOAL_EXPECTED_GRACE"])
+    if pod.get("terminationGracePeriodSeconds") != expected:
+        problems.append(f"terminationGracePeriodSeconds is {pod.get('terminationGracePeriodSeconds')!r}, the binary says {expected}")
+elif check == "security":
+    security = pod.get("securityContext", {})
+    for key, want in (("runAsNonRoot", True), ("runAsUser", 65532), ("runAsGroup", 65532)):
+        if security.get(key) != want:
+            problems.append(f"pod securityContext.{key} is {security.get(key)!r}, not {want!r}")
+    if security.get("seccompProfile") != {"type": "RuntimeDefault"}:
+        problems.append("the pod's seccomp profile is not RuntimeDefault")
+    own = container.get("securityContext", {})
+    for key, want in (("runAsNonRoot", True), ("readOnlyRootFilesystem", True), ("allowPrivilegeEscalation", False)):
+        if own.get(key) is not want:
+            problems.append(f"container securityContext.{key} is {own.get(key)!r}, not {want!r}")
+    if own.get("capabilities") != {"drop": ["ALL"]}:
+        problems.append(f"capabilities are {own.get('capabilities')!r}, not exactly drop: [ALL]")
+    if own.get("privileged"):
+        problems.append("the container is privileged")
+    if pod.get("automountServiceAccountToken") is not False:
+        problems.append("the pod automounts a ServiceAccount token")
+    for account in mine("ServiceAccount"):
+        if account.get("automountServiceAccountToken") is not False:
+            problems.append("the ServiceAccount automounts its token")
+    for flag in ("hostNetwork", "hostPID", "hostIPC"):
+        if pod.get(flag):
+            problems.append(f"{flag} is set")
+elif check == "wiring":
+    mounts = {m["name"]: m for m in container.get("volumeMounts", [])}
+    args = container["args"]
+    if args[0] != "run":
+        problems.append(f"the first argument is {args[0]!r}, not run")
+    for name, flag in (("dispatch-token", "-dispatch-token-file"), ("target-credential", "-target-credential-file"),
+                       ("attestation", "-attestation-statement-file"), ("attestation", "-attestation-key-file")):
+        values = [a.split("=", 1)[1] for a in args if a.startswith(flag + "=")]
+        if name not in volumes:
+            if values:
+                problems.append(f"{flag} is passed with no {name} volume")
+            continue
+        if len(values) != 1:
+            problems.append(f"{flag} is passed {len(values)} times with a {name} volume")
+            continue
+        mount = mounts.get(name)
+        if not mount or not mount.get("readOnly") or os.path.dirname(values[0]) != mount["mountPath"]:
+            problems.append(f"{flag}={values[0]} is not in the read-only {name} mount {mount!r}")
+            continue
+        volume = volumes[name]
+        files = [s["serviceAccountToken"]["path"] for s in volume.get("projected", {}).get("sources", [])] + \
+                [item["path"] for item in volume.get("secret", {}).get("items", [])]
+        if os.path.basename(values[0]) not in files:
+            problems.append(f"{flag} names {os.path.basename(values[0])}, which the {name} volume does not hold ({files})")
+    for forbidden in ("-registrar-token", "-heartbeat", "-dispatch-token-env", "-target-credential-env"):
+        if any(a.startswith(forbidden) for a in args):
+            problems.append(f"{forbidden} is rendered")
+    names = {e["name"] for e in container.get("env", [])}
+    if any("REGISTRAR" in n or "TOKEN" in n or "CREDENTIAL" in n for n in names):
+        problems.append(f"a credential is in the environment: {sorted(names)}")
+    routes = [a for a in args if a.startswith("-routes=")]
+    configmaps = {d["metadata"]["name"]: d for d in mine("ConfigMap")}
+    reference = next((e["valueFrom"]["configMapKeyRef"] for e in container.get("env", []) if e["name"] == "SHOAL_GATEWAY_ROUTES"), None)
+    if routes != ["-routes=$(SHOAL_GATEWAY_ROUTES)"] or not reference or reference["name"] not in configmaps:
+        problems.append("the route table does not reach -routes from the ConfigMap")
+    else:
+        table = configmaps[reference["name"]]["data"][reference["key"]]
+        import hashlib
+        if spec["template"]["metadata"]["annotations"].get("checksum/routes") != hashlib.sha256(table.encode()).hexdigest():
+            problems.append("the pod template's checksum is not the route table's")
+    ports = {p["name"]: p["containerPort"] for p in container.get("ports", [])}
+    health = next((a.rsplit(":", 1)[1] for a in args if a.startswith("-health-address=")), None)
+    if str(ports.get("health")) != health:
+        problems.append(f"the health port {ports.get('health')} is not -health-address's {health}")
+    for probe, path in (("livenessProbe", "/healthz"), ("readinessProbe", "/readyz")):
+        get = container.get(probe, {}).get("httpGet", {})
+        if get.get("path") != path or get.get("port") != "health":
+            problems.append(f"{probe} is {get!r}, not {path} on the health port")
+    annotations = spec["template"]["metadata"]["annotations"]
+    if annotations.get("prometheus.io/port") != health or annotations.get("prometheus.io/path") != "/metrics":
+        problems.append("the metrics annotations do not name /metrics on the health port")
+    if mine("Service"):
+        problems.append("a Service is rendered for the gateway, which serves nothing but its probes")
+elif check == "policy":
+    policies = mine("NetworkPolicy")
+    if len(policies) != 1:
+        problems.append(f"expected one NetworkPolicy, found {len(policies)}")
+    else:
+        policy = policies[0]["spec"]
+        if policy.get("policyTypes") != ["Ingress", "Egress"]:
+            problems.append(f"policy types are {policy.get('policyTypes')!r}")
+        if policy.get("podSelector", {}).get("matchLabels") != spec["selector"]["matchLabels"]:
+            problems.append("the policy does not select the gateway's pod")
+        cidrs = [peer["ipBlock"]["cidr"] for rule in policy["egress"] for peer in rule.get("to", []) if "ipBlock" in peer]
+        if cidrs != json.loads(os.environ["SHOAL_EXPECTED_CIDRS"]):
+            problems.append(f"the target CIDRs are {cidrs}")
+        if any(rule.get("to") == [] or ("to" not in rule and any(p.get("port") not in (53,) for p in rule.get("ports", []))) for rule in policy["egress"]):
+            problems.append("an egress rule allows every destination on a port other than DNS")
+        if policy.get("ingress") != [{"ports": [{"port": "health", "protocol": "TCP"}]}]:
+            problems.append(f"ingress is {policy.get('ingress')!r}, not the health port alone")
+else:
+    problems.append(f"unknown check {check}")
+for problem in problems:
+    print("      " + problem)
+raise SystemExit(1 if problems else 0)
+OBJECTS
+)
+effects_check() {
+  local check="$1" description="$2"; shift 2
+  local rendered
+  if ! rendered=$(helm template shoal "$chart" "$@" 2>&1); then
+    fail "should render but was refused: $description"
+    return
+  fi
+  if ! printf '%s\n' "$rendered" | python3 -c "$effects_objects" "$check"; then
+    fail "$description (see above)"
+  fi
+}
+
+note "== effects gateway: one replica, stopped before it is started =="
+# The design's one-replica-per-surface rule (#391). A second replica shares the
+# executor principal and the unrecorded log: the log's lock refuses it, and two
+# workers on one surface can evict each other's claims (#514). Recreate is the
+# half of it a rollout needs: a surge pod would mount the same ReadWriteOnce
+# log while the old pod drains.
+effects_check singleton "the Deployment is one replica, Recreate" "${effects_gateway_base[@]}"
+refuses_citing "replicas must be 1" "two replicas" "${effects_gateway_base[@]}" --set 'effectsGateways[0].replicas=2'
+refuses_citing "replicas must be 1" "zero replicas" "${effects_gateway_base[@]}" --set 'effectsGateways[0].replicas=0'
+refuses_citing "replicas must be 1" "a fractional replica count" "${effects_gateway_base[@]}" --set-json 'effectsGateways[0].replicas=1.5'
+refuses_citing "replicas must be 1" "a replica count written as a word" "${effects_gateway_base[@]}" --set-string 'effectsGateways[0].replicas=one'
+
+note "== effects gateway: the unrecorded log is on a claim by default =="
+effects_check claim "a ReadWriteOnce claim, kept on uninstall, holds -unrecorded-dir" "${effects_gateway_base[@]}"
+refuses_citing "which deletes the unrecorded log with the pod" "an emptyDir without the acknowledgement" "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=emptyDir'
+effects_check emptydir "an acknowledged emptyDir" "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=emptyDir,effectsGateways[0].unrecorded.acceptLossOfUnrecordedReports=true'
+assert_renders "an existing claim is mounted" '^ +claimName: "stripe-log"$' "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=existingClaim,effectsGateways[0].unrecorded.existingClaim=stripe-log'
+refuses_citing "existingClaim is required" "an existing claim with no name" "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=existingClaim'
+refuses_citing "unrecorded.storage must be" "an unknown storage kind" "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=hostPath'
+# The warning an operator sees at install, which `helm template` does not show.
+if notes=$(helm install --dry-run=client shoal "$chart" "${effects_gateway_base[@]}" --set 'effectsGateways[0].unrecorded.storage=emptyDir,effectsGateways[0].unrecorded.acceptLossOfUnrecordedReports=true' 2>&1); then
+  printf '%s' "$notes" | grep -qF "WARNING: effects gateway stripe keeps its unrecorded log in an" ||
+    fail "an acknowledged emptyDir installs without the warning in NOTES"
+else
+  fail "should install (dry run) but was refused: an acknowledged emptyDir"
+fi
+
+note "== effects gateway: the grace period is the binary's =="
+# The chart computes terminationGracePeriodSeconds from the timeouts rather
+# than asking for it, so changing a timeout cannot leave the grace period
+# behind. That is a second copy of GracePeriodSeconds, and this is what keeps
+# it one: each pair is rendered and compared with what the real binary prints
+# for the same pair. The pairs cross every branch of the formula — three plane
+# timeouts below and above the report window, a sub-second remainder that must
+# round up, the largest plane timeout a 5m lease admits, and a long renewing
+# operation. A change to the formula on either side, the Go constants
+# included, fails here.
+gateway_binary="$effects_fixtures/shoal-gateway"
+repository_root="$(cd "$chart/../../.." && pwd)"
+if ! command -v go >/dev/null 2>&1; then
+  fail "go is required: the effects gateway's grace period is compared with the binary's"
+elif ! (cd "$repository_root" && GOWORK=off go build -o "$gateway_binary" ./cmd/shoal-gateway); then
+  fail "cmd/shoal-gateway does not build, so the grace period cannot be compared"
+else
+  for pair in "3m 10s" "10m 15s" "1m 1s" "2m30s 1500ms" "90500ms 2s" "1h 75s" "1s 100ms" "4m 1666ms" "4m 1667ms"; do
+    read -r operation plane <<<"$pair"
+    if ! expected=$("$gateway_binary" grace-period -operation-timeout "$operation" -plane-timeout "$plane"); then
+      fail "shoal-gateway grace-period refused T=$operation P=$plane"
+      continue
+    fi
+    SHOAL_EXPECTED_GRACE="$expected" effects_check grace "the grace period for T=$operation, P=$plane" \
+      "${effects_gateway_base[@]}" --set "effectsGateways[0].timing.renew=true,effectsGateways[0].timing.claimLease=5m,effectsGateways[0].timing.operationTimeout=$operation,effectsGateways[0].timing.planeTimeout=$plane"
+  done
+  # An operator's value can only raise it.
+  SHOAL_EXPECTED_GRACE=400 effects_check grace "a larger grace period is kept" "${effects_gateway_base[@]}" --set 'effectsGateways[0].terminationGracePeriodSeconds=400'
+  SHOAL_EXPECTED_GRACE=225 effects_check grace "the minimum itself is accepted" "${effects_gateway_base[@]}" --set 'effectsGateways[0].terminationGracePeriodSeconds=225'
+  refuses_citing "is below 225" "a grace period one second short" "${effects_gateway_base[@]}" --set 'effectsGateways[0].terminationGracePeriodSeconds=224'
+  refuses_citing "must be a whole, non-negative number" "a fractional grace period" "${effects_gateway_base[@]}" --set-json 'effectsGateways[0].terminationGracePeriodSeconds=300.5'
+fi
+
+note "== effects gateway: non-root, read-only, no capabilities =="
+effects_check security "the pod and container security contexts" "${effects_gateway_base[@]}"
+effects_check security "the security contexts with every optional volume" "${effects_gateway_base[@]}" --set 'effectsGateways[0].attestation.secretName=stripe-attestation,effectsGateways[0].unrecorded.storage=emptyDir,effectsGateways[0].unrecorded.acceptLossOfUnrecordedReports=true'
+
+note "== effects gateway: wiring, probes, and no registrar credential =="
+effects_check wiring "a projected executor token and a target Secret" "${effects_gateway_base[@]}"
+effects_check wiring "a Secret executor token" "${effects_gateway_base[@]}" --set 'effectsGateways[0].dispatch.tokenSource=secret,effectsGateways[0].dispatch.tokenAudience=,effectsGateways[0].dispatch.credentialSecretName=stripe-dispatch'
+effects_check wiring "with attestation" "${effects_gateway_base[@]}" --set 'effectsGateways[0].attestation.secretName=stripe-attestation'
+effects_check wiring "a loopback target with no credential" "${effects_gateway_base[@]}" "${loopback_target[@]}"
+assert_absent "no gateway argument is a bare scalar" '^ +- -' "${effects_gateway_base[@]}" -s templates/effects-gateway.yaml
+
+note "== effects gateway: the binary accepts what the chart renders =="
+# The guards above are the binary's refusals restated; this is the check that
+# they and the binary agree. Each rendered Deployment's arguments are run
+# against the real binary, with the pod's mounts and environment stood in for
+# by local files. Every flag must parse and the unrecorded log must open: the
+# run has to reach the descriptor resolve (which fails, against a closed
+# loopback port) and not stop at exit 2, a flag the binary refuses.
+binary_accepts=$(cat <<'ACCEPTS'
+import os, re, subprocess, sys, tempfile, yaml
+
+binary = sys.argv[1]
+documents = [d for d in yaml.safe_load_all(sys.stdin) if d]
+configmaps = {d["metadata"]["name"]: d["data"] for d in documents if d["kind"] == "ConfigMap"}
+deployment = next(d for d in documents if d["kind"] == "Deployment" and "-gw-" in d["metadata"]["name"])
+container = deployment["spec"]["template"]["spec"]["containers"][0]
+environment = {}
+for entry in container.get("env", []):
+    source = entry.get("valueFrom", {})
+    if "configMapKeyRef" in source:
+        reference = source["configMapKeyRef"]
+        environment[entry["name"]] = configmaps[reference["name"]][reference["key"]]
+    elif source.get("fieldRef", {}).get("fieldPath") == "metadata.name":
+        environment[entry["name"]] = "shoal-gw-stripe-0"
+scratch = tempfile.mkdtemp()
+args = []
+for argument in container["args"]:
+    argument = re.sub(r"\$\((\w+)\)", lambda m: environment[m.group(1)], argument)
+    flag, _, value = argument.partition("=")
+    if value.startswith(("/var/run/shoal/", "/var/lib/shoal-gateway/")):
+        local = os.path.join(scratch, value.lstrip("/"))
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+        if flag != "-unrecorded-dir":
+            with open(local, "w") as handle:
+                handle.write("credential")
+        argument = f"{flag}={local}"
+    if flag == "-health-address":
+        argument = "-health-address=127.0.0.1:0"
+    args.append(argument)
+result = subprocess.run([binary, *args], capture_output=True, text=True, timeout=60)
+if result.returncode != 1 or "resolving descriptor" not in result.stderr:
+    print(f"      exit {result.returncode}: {result.stderr.strip()[:300]}")
+    raise SystemExit(1)
+if not os.path.isdir(os.path.join(scratch, "var/lib/shoal-gateway/unrecorded")):
+    print("      the unrecorded log's directory was not created")
+    raise SystemExit(1)
+ACCEPTS
+)
+accepted() {
+  local description="$1"; shift
+  if [ ! -x "$gateway_binary" ]; then
+    fail "the binary is not built, so the rendered arguments cannot be run: $description"
+    return
+  fi
+  if ! helm template shoal "$chart" "$@" | python3 -c "$binary_accepts" "$gateway_binary"; then
+    fail "the binary refuses the arguments the chart renders: $description (see above)"
+  fi
+}
+accepted "the fixture" "${effects_gateway_base[@]}"
+accepted "a Secret executor token" "${effects_gateway_base[@]}" --set 'effectsGateways[0].dispatch.tokenSource=secret,effectsGateways[0].dispatch.tokenAudience=,effectsGateways[0].dispatch.credentialSecretName=stripe-dispatch'
+accepted "a loopback target with no credential" "${effects_gateway_base[@]}" "${loopback_target[@]}"
+accepted "renewal with a long operation" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.renew=true,effectsGateways[0].timing.claimLease=60s,effectsGateways[0].timing.operationTimeout=10m,effectsGateways[0].timing.planeTimeout=15s,effectsGateways[0].target.idempotencyRetention=48h'
+accepted "the largest response bound" "${effects_gateway_base[@]}" --set 'effectsGateways[0].maxResponseBytes=1048576,effectsGateways[0].maxInFlight=64,effectsGateways[0].pullLimit=256'
+accepted "an acknowledged plaintext explorer" "${effects_gateway_base[@]}" --set 'effectsGateways[0].dispatch.url=http://127.0.0.2:1,effectsGateways[0].dispatch.allowPlaintext=true'
+
+note "== effects gateway guards refuse =="
+refuses_citing "is plaintext to a remote explorer" "a remote http:// explorer" "${effects_gateway_base[@]}" --set 'effectsGateways[0].dispatch.url=http://shoal-explorer:8098'
+refuses_citing "is plaintext to a remote surface" "a remote http:// target" "${effects_gateway_base[@]}" --set 'effectsGateways[0].target.baseURL=http://api.example.test'
+refuses_citing "addresses loopback" "a loopback target without allowPrivate" "${effects_gateway_base[@]}" --set 'effectsGateways[0].target.baseURL=http://127.0.0.1:9000,effectsGateways[0].target.credentialSecretName='
+refuses_citing "no userinfo, query or fragment" "a target URL with a query" "${effects_gateway_base[@]}" --set 'effectsGateways[0].target.baseURL=https://api.example.test/?k=v'
+refuses_citing "credentialSecretName is required for a remote target" "a remote target with no credential" "${effects_gateway_base[@]}" --set 'effectsGateways[0].target.credentialSecretName='
+refuses_citing "tokenAudience is required" "a projected token with no audience" "${effects_gateway_base[@]}" --set 'effectsGateways[0].dispatch.tokenAudience='
+refuses_citing "at least 600" "a projected token below the API server's floor" "${effects_gateway_base[@]}" --set 'effectsGateways[0].dispatch.tokenExpirationSeconds=599'
+refuses_citing "reads no Secret" "a dispatch Secret beside a projected token" "${effects_gateway_base[@]}" --set 'effectsGateways[0].dispatch.credentialSecretName=stale'
+refuses_citing "tokenSource must be" "an unknown token source" "${effects_gateway_base[@]}" --set 'effectsGateways[0].dispatch.tokenSource=env'
+refuses_citing "must be unpadded base64url" "a display name as the agent ID" "${effects_gateway_base[@]}" --set 'effectsGateways[0].agentID=stripe gateway'
+refuses_citing "executorRef must match" "an executor reference outside the charset" "${effects_gateway_base[@]}" --set 'effectsGateways[0].executorRef=stripe ref'
+refuses_citing "routes needs at least one route" "no routes" "${effects_gateway_base[@]}" --set 'effectsGateways[0].routes=null'
+refuses_citing "idempotencyHeader is required" "a key route with no idempotency header" "${effects_gateway_base[@]}" --set 'effectsGateways[0].target.idempotencyHeader='
+refuses_citing "refused when no route uses idempotency" "an idempotency header with no key route" "${effects_gateway_base[@]}" --set 'effectsGateways[0].routes[0].idempotency=unprotected'
+refuses_citing "must exceed timing.operationTimeout + 5s" "a retention inside the operation" "${effects_gateway_base[@]}" --set 'effectsGateways[0].target.idempotencyRetention=3m5s'
+refuses_citing "must differ from target.authHeader" "one header for the key and the credential" "${effects_gateway_base[@]}" --set 'effectsGateways[0].target.idempotencyHeader=authorization'
+refuses_citing "at most 5m" "a lease over MaxActionClaimTTL" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.claimLease=6m'
+refuses_citing "at most a quarter" "a plane timeout over L/4" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.planeTimeout=61s'
+refuses_citing "must exceed operationTimeout + 5s + planeTimeout" "a lease inside the operation without renewal" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.operationTimeout=4m'
+renders "the same lease with renewal" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.operationTimeout=4m,effectsGateways[0].timing.renew=true'
+refuses_citing "must be a Go duration" "a duration Go would not parse" "${effects_gateway_base[@]}" --set 'effectsGateways[0].timing.operationTimeout=3 minutes'
+refuses_citing "maxInFlight must be 1 to 64" "too many claims in flight" "${effects_gateway_base[@]}" --set 'effectsGateways[0].maxInFlight=65'
+refuses_citing "must be a boolean" "renew written as a word" "${effects_gateway_base[@]}" --set-string 'effectsGateways[0].timing.renew=yes'
+refuses_citing "networkPolicy.targetCIDRs is required" "a NetworkPolicy with no target CIDRs" "${effects_gateway_base[@]}" --set 'effectsGateways[0].networkPolicy.enabled=true'
+refuses_citing "over the 24 the stem budget allows" "a name over the stem budget" "${effects_gateway_base[@]}" --set 'effectsGateways[0].name=abcdefghijklmnopqrstuvwxy'
+refuses_citing "must be a DNS label" "an upper-case name" "${effects_gateway_base[@]}" --set 'effectsGateways[0].name=Stripe'
+refuses_citing "is also the name of effectsGateways[0]" "two entries with one name" "${effects_gateway_base[@]}" --set 'effectsGateways[1].name=stripe'
+refuses_citing "do not match the derived" "a remote target's route declaring {external} alone" "${effects_gateway_base[@]}" --set 'effectsGateways[0].routes[0].effects={external}'
+refuses_citing "do not match the derived" "a loopback target's route declaring egress" "${effects_gateway_base[@]}" "${loopback_target[@]}" --set 'effectsGateways[0].routes[0].effects={external,egresses-content}'
+refuses_citing "is required" "no executor reference" "${effects_gateway_base[@]}" --set 'effectsGateways[0].executorRef='
+# The explorer in the same release must bind the reference with the ceiling the
+# target's derived effects need.
+refuses_citing "is not in explorer.fleet.externalEgressExecutorRefs" "an explorer that does not bind the gateway's reference" "${explorer_base[@]}" "${effects_gateway_base[@]}"
+renders "an explorer that binds it" "${explorer_base[@]}" "${effects_gateway_base[@]}" --set 'explorer.fleet.executorRefs={stripe}' --set 'explorer.fleet.externalEgressExecutorRefs={stripe}'
+refuses_citing "is not in explorer.fleet.externalExecutorRefs" "a loopback target bound only for egress" "${explorer_base[@]}" "${effects_gateway_base[@]}" --set 'explorer.fleet.executorRefs={stripe}' --set 'explorer.fleet.externalEgressExecutorRefs={stripe}' "${loopback_target[@]}"
+# A line break anywhere in an entry is refused by the walk (#468), and the
+# arguments are quoted besides.
+refuses_citing "holds" "a newline in the surface name" "${effects_gateway_base[@]}" --set-string 'effectsGateways[0].surfaceName=stripe
+            - -allow-plaintext-dispatch=true'
+refuses_citing "holds" "a newline in a route" "${effects_gateway_base[@]}" --set-string 'effectsGateways[0].routes[0].path=/v1/x
+y'
+
+note "== effects gateway: the NetworkPolicy =="
+SHOAL_EXPECTED_CIDRS='["203.0.113.0/24"]' effects_check policy "ingress to the health port, egress to DNS, the explorer and the target" "${effects_gateway_base[@]}" --set 'effectsGateways[0].networkPolicy.enabled=true' --set 'effectsGateways[0].networkPolicy.targetCIDRs={203.0.113.0/24}'
+assert_renders "the target's port is derived from its URL" '^ +- port: 8443$' "${effects_gateway_base[@]}" --set 'effectsGateways[0].networkPolicy.enabled=true,effectsGateways[0].target.baseURL=https://api.example.test:8443' --set 'effectsGateways[0].networkPolicy.targetCIDRs={203.0.113.0/24}'
+assert_absent "no NetworkPolicy unless asked for" 'kind: NetworkPolicy' "${effects_gateway_base[@]}"
+
+note "== effects gateway: every name fits under a long release =="
+if ! helm template "$long_release" "$chart" "${effects_gateway_base[@]}" --set 'effectsGateways[0].name=abcdefghijklmnopqrstuvwx' | python3 -c '
+import sys, yaml
+problems = [f"{d['"'"'kind'"'"']} {d['"'"'metadata'"'"']['"'"'name'"'"']}" for d in yaml.safe_load_all(sys.stdin)
+            if d and "-gw-" in d["metadata"]["name"] and len(d["metadata"]["name"]) > 63]
+print("\n".join("      " + p for p in problems))
+raise SystemExit(1 if problems else 0)
+'; then
+  fail "a 24-character gateway name under a long release produces a name Kubernetes will reject"
+fi
+
+note "== the effects gateway guide's worked example still installs =="
+effects_guide="$chart/../../../docs/effects-gateway-deploy.md"
+if [ -f "$effects_guide" ]; then
+  python3 - "$effects_guide" > "$effects_fixtures/example.yaml" <<'EXTRACT'
+import re, sys
+
+document = open(sys.argv[1]).read()
+heading = "### A complete entry"
+if heading not in document:
+    raise SystemExit("the guide no longer has a complete entry")
+block = re.search(r"```yaml\n(.*?)```", document[document.index(heading):], re.S)
+if not block:
+    raise SystemExit("the example after that heading is not a yaml block")
+sys.stdout.write(block.group(1))
+EXTRACT
+  if [ -s "$effects_fixtures/example.yaml" ]; then
+    renders "the worked example from docs/effects-gateway-deploy.md" -f "$effects_fixtures/example.yaml"
+    effects_check claim "the worked example keeps its log on a claim" -f "$effects_fixtures/example.yaml"
+    effects_check security "the worked example's security contexts" -f "$effects_fixtures/example.yaml"
+  else
+    fail "could not extract the worked example from docs/effects-gateway-deploy.md"
+  fi
+else
+  fail "docs/effects-gateway-deploy.md is missing: the worked example cannot be checked"
 fi
 
 if [ "$failures" -ne 0 ]; then
