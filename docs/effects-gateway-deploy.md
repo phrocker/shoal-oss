@@ -12,19 +12,36 @@ action. The reference design is `docs/gateway-proxy-design.md`; the slice-1
 design this implements is the last comment on #391. `docs/gateways.md` places
 it among the three gateways.
 
-## Blockers
+## Status
 
-| | what | why the gateway needs it |
+**Delivered (#391).** The worker loop, the `shoal-gateway` binary, its image
+and its chart entry are built, and the binary is tested end to end (below,
+*What exists*). The blockers this design was written against are all closed:
+
+| | what it was | how it was resolved |
 |---|---|---|
-| **#480** | the lifecycle auditor, action recorder and reconciler refuse `OperationExecute`, so the grant cannot be turned on | a worker claims work it did not enqueue; until a principal can hold `OperationExecute` on one descriptor's scope, the only claimant is the enqueuer |
-| **#430** | claim renewal (`POST actions/{id}/extend`) | without it the fenced window is the claim lease, at most five minutes. Landed: `-renew` turns it on |
-| **#484** | the lost-fence ambiguity route (`POST actions/{id}/ambiguity`) | a worker whose claim lapsed mid-effect has nowhere to record what it attempted |
-| **#486** | a heartbeat moves the descriptor generation, so `/complete` and `/ambiguity` answer 404 after one heartbeat | until fixed, the gateway must never register or heartbeat while holding claims |
+| **#480** | the lifecycle auditor, action recorder and reconciler refused `OperationExecute`, so the grant could not be turned on | fixed; the execute grant comes only from the executor mint, bound to one executor ref ([Issuing executor credentials](#issuing-executor-credentials)) |
+| **#430** | claim renewal (`POST actions/{id}/extend`) | landed; `-renew` turns it on |
+| **#484** | the lost-fence ambiguity route (`POST actions/{id}/ambiguity`) | landed; a worker whose claim lapsed mid-effect records what it attempted |
+| **#486** | a heartbeat moved the descriptor generation, so `/complete` and `/ambiguity` answered 404 after one heartbeat | fixed; only `Register` moves the generation |
 
-Both routes now exist, and the dispatch client speaks them (`Extend`,
-`ReportAmbiguity`). It has no heartbeat method, and will not get one: a worker
-cannot truthfully assert a descriptor's liveness, so the gateway never
-heartbeats and carries no registrar credential (#391).
+The dispatch client speaks every route it needs (`Extend`, `ReportAmbiguity`).
+It has no heartbeat method, and will not get one: a worker cannot truthfully
+assert a descriptor's liveness, so the gateway never heartbeats and carries
+no registrar credential (#391).
+
+**What remains**, none of which blocks deploying it:
+
+| | what | effect on the gateway |
+|---|---|---|
+| **#363** | reaping expired claims, and the dispatch retry and dead-letter policy | whoever registers a gateway's descriptor owns its liveness; the gateway never heartbeats, and nothing yet reaps a claim a dead gateway left |
+| **#633** | a concurrent claim or extend write can briefly make a live agent read as not found | a completion answered 404 by it is treated as definite: the worker reports `effect_observed` and the action is re-claimed; a keyed route deduplicates, so the cost is delay, not a second effect |
+| **#638** | the image jobs pull their base images from Docker Hub anonymously and hit its rate limit | CI only; where the image is published, and where its base images come from, are maintainer decisions |
+| **#630** | a label holder's declassification (relabel narrowing, copy-down) is not audited | not the gateway's own: it concerns writes inside the explorer, so an action input built by such a write-down reaches the gateway unflagged |
+
+Out of scope for this slice, as the design says: Path B (a per-caller
+principal), protocols other than HTTP (`effects.ssh`), and more than one
+replica per surface.
 
 ## What exists
 
@@ -50,6 +67,22 @@ enqueuer's. A foreign claimant now has a credential: the executor mapping
 below (#391). `cmd/shoal-explore-web/oidc_executor_e2e_test.go` drives a mapped
 ServiceAccount token from a second issuer through pull, claim, extend and
 complete on the real routes.
+
+The gateway itself is tested end to end in
+`cmd/shoal-explore-web/effects_gateway_binary_e2e_test.go`: the real
+`shoal-gateway` binary, built by the test and run as a child process on the
+system clock, against the explorer in-process (the real handlers, the durable
+embedded stores, the real OIDC authenticator and executor mint) and a target
+that performs one effect per idempotency key. Each scenario asserts the
+target's effect count and the record's state: the happy path; a 422; SIGKILL
+mid-effect, recovered by a restart under the same `ExecutorKey` with one
+effect and the dead fence's completion refused; a SIGTERM drain; a second
+SIGTERM (exit 4, with the run in the unrecorded log); a plane outage during
+completion, held in the log and cleared by the replay after a restart; a
+second instance refused by the lock; a gateway bound to the wrong executor,
+which claims nothing; attestation presented before the claim; an
+unreachable plane, which refuses the start with nothing sent; and
+`unrecorded list` and `ack` through the binary.
 
 ## Configuration
 

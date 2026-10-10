@@ -23,6 +23,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/effectsgateway"
 	"github.com/phrocker/shoal-oss/internal/effectsgateway/gatewaycmd"
+	"github.com/phrocker/shoal-oss/internal/executorattest"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -33,6 +34,19 @@ import (
 // capability whose actions are the route table's, effects as derived from a
 // loopback target, and the gateway's closed output schema.
 func newCommandWorld(t *testing.T, routes string, target *url.URL) *gatewayOps {
+	t.Helper()
+	return newCommandWorldWith(t, routes, target, nil, nil)
+}
+
+// newCommandWorldWith is newCommandWorld with the service opened under an
+// executor attestation trust when attestation is set, as
+// -fleet-executor-attestation opens it, and every action of the gateway's
+// capability then requiring attestation; prepare, when set, runs on the
+// opened world before the descriptor is registered.
+func newCommandWorldWith(
+	t *testing.T, routes string, target *url.URL, attestation *executorattest.Trust,
+	prepare func(*executorWorld),
+) *gatewayOps {
 	t.Helper()
 	executorIssuer := newFakeOIDCIssuer(t)
 	executors, err := newConfiguredFleetExecutors(
@@ -52,6 +66,13 @@ func newCommandWorld(t *testing.T, routes string, target *url.URL) *gatewayOps {
 		}, nil, nil, approverMappingDocument, executors),
 		executorIssuer: executorIssuer,
 	}
+	if prepare != nil {
+		prepare(world)
+	}
+	if attestation != nil {
+		world.h.attestation = attestation
+		world.h.reopen()
+	}
 	table, err := effectsgateway.ParseRoutes([]byte(routes), effectsgateway.DerivedEffects(target))
 	if err != nil {
 		t.Fatal(err)
@@ -62,6 +83,7 @@ func newCommandWorld(t *testing.T, routes string, target *url.URL) *gatewayOps {
 		actions = append(actions, fleet.Action{
 			Name: name, Effects: route.Effects(),
 			InputSchema: route.InputSchema(), OutputSchema: effectsgateway.OutputSchema(),
+			RequiresAttestation: attestation != nil,
 		})
 	}
 	got := world.post(call{token: world.fleetToken("owner", nil)}, "/api/v1/fleet/agents", map[string]any{

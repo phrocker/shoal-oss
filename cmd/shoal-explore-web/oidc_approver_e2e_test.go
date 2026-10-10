@@ -257,8 +257,16 @@ func (w *oidcApprovalWorld) handlerFor(authenticator webapi.Authenticator) http.
 	if err != nil {
 		w.t.Fatal(err)
 	}
-	fleetHandler, err := webapi.NewFleetHandler(
-		h.opened.fleetRegistry, h.opened.fleetDispatch)
+	// As main.go composes it: the presentation route is mounted when the
+	// service was opened with an attestation trust.
+	var fleetHandler http.Handler
+	if h.opened.attestation != nil {
+		fleetHandler, err = webapi.NewFleetHandlerWithAttestation(
+			h.opened.fleetRegistry, h.opened.fleetDispatch, h.opened.attestation)
+	} else {
+		fleetHandler, err = webapi.NewFleetHandler(
+			h.opened.fleetRegistry, h.opened.fleetDispatch)
+	}
 	if err != nil {
 		w.t.Fatal(err)
 	}
