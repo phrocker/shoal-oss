@@ -156,6 +156,7 @@ document, graph and retrieval contracts as storage grows toward Accumulo.
 | Goal | Start here |
 |---|---|
 | Ingest and explore a cited document corpus | [Explorer alpha](#explorer-alpha-ingest-explore-retrieve) |
+| Inspect measured local decisions in the Explorer UI | [Local decisions](docs/local-decisions.md) |
 | Build with the public knowledge contracts | [`pkg/document`](pkg/document) · [`pkg/graph`](pkg/graph) · [`pkg/retrieval`](pkg/retrieval) · [`pkg/ontology`](pkg/ontology) · [`pkg/inference`](pkg/inference) · [`pkg/explorer`](pkg/explorer) |
 | Define grounded generation boundaries | [`docs/inference-contracts.md`](docs/inference-contracts.md) |
 | Run a local database with RFile or Parquet | [Embedded engine](#embedded-engine-standalone-no-zookeeper) |
@@ -254,6 +255,15 @@ machine can reach. Going beyond your own host means configuring OIDC.
 carried across that hop yet. Deployment, auth setup and the startup policy
 backfill are in
 [`docs/shoal-explore-web-deploy.md`](docs/shoal-explore-web-deploy.md).
+
+When a host explicitly mounts the decision providers, the workspace also exposes
+a **Decisions** tab for authenticated receipts, registrations, cohort exports,
+outcomes, and adjudication history. These records support measurable,
+shadow-only local decisions; the UI does not promote or exclude a model. The
+default `shoal-explore-web` host still needs that provider composition, tracked
+in [issue #645](https://github.com/shoal-oss-dos/shoal/issues/645). See
+[`docs/local-decisions.md`](docs/local-decisions.md) for the contracts and
+provenance boundaries.
 
 ### MCP
 
