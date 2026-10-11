@@ -155,12 +155,14 @@ func TestNewFleetHandlerRequiresBothProviders(t *testing.T) {
 }
 
 type stubDispatchProvider struct {
-	ambiguity  fleet.AmbiguityRequest
-	completion fleet.CompletionRequest
-	extend     fleet.ExtendRequest
-	resolver   auth.Resolver
-	enqueued   bool
-	actionID   []byte
+	ambiguity    fleet.AmbiguityRequest
+	completion   fleet.CompletionRequest
+	extend       fleet.ExtendRequest
+	reconciled   []fleet.ReconcileRequest
+	reconcileErr error
+	resolver     auth.Resolver
+	enqueued     bool
+	actionID     []byte
 }
 
 func (p *stubDispatchProvider) Enqueue(ctx context.Context, request fleet.EnqueueRequest) (fleet.ActionRecord, error) {
@@ -205,6 +207,13 @@ func (p *stubDispatchProvider) ExtendClaim(
 ) (fleet.ActionRecord, error) {
 	p.extend = request
 	return fleet.ActionRecord{}, nil
+}
+
+func (p *stubDispatchProvider) ReconcileActionTransitions(
+	_ context.Context, request fleet.ReconcileRequest,
+) error {
+	p.reconciled = append(p.reconciled, request)
+	return p.reconcileErr
 }
 
 func (p *stubDispatchProvider) ReportAmbiguity(
@@ -553,6 +562,161 @@ func TestTheActionWireCarriesReportsButNotTheClaimHistory(t *testing.T) {
 				"every execute-holder in the scope which principals have held "+
 				"this record: %s", absent, encoded)
 		}
+	}
+}
+
+// TestTheReconcileRouteAnswersWithoutDisclosing is #642's remedy half.
+//
+// Before this route the drain existed in the service with nothing able to
+// reach it: no HTTP surface, no CLI, no sweeper. So a row left pending by a
+// caller not entitled to publish it recovered only if its owning principal
+// happened to make another request on that action, and on a quiet action it
+// stranded with no way to clear it short of writing code.
+//
+// What the route must not do is report what it found. A count of rows drained
+// says how much work was outstanding, and naming a row left pending names
+// another principal's action — so the answer is 204 with no body whatever the
+// outcome, which also makes "nothing pending", "not yours to publish" and "no
+// such action" indistinguishable (#398).
+func TestTheReconcileRouteAnswersWithoutDisclosing(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor", AuthorizationDomain: []byte("domain"),
+		AllowedOperations:  []auth.Operation{auth.OperationInvoke},
+		PermittedSourceIDs: [][]byte{[]byte("source")},
+		PermittedPolicyIDs: [][]byte{[]byte("policy")}, PolicyGeneration: 1,
+		AuthenticationExpires: now.Add(time.Hour), RequestID: "request",
+		CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewAuthenticatedHandler(&stubWorkspaceService{},
+		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		authority.Binder(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &stubDispatchProvider{resolver: authority.Resolver()}
+	if err := handler.MountFleetDispatch(provider); err != nil {
+		t.Fatal(err)
+	}
+
+	actionID := []byte{'a', 0, 255}
+	route := "http://example.test/api/v1/fleet/actions/" +
+		base64.RawURLEncoding.EncodeToString(actionID) + "/reconcile"
+	contextWire := fleetRequestContextWire{
+		RequestID: encodeFleetID("request"), ReasonCode: "operator_request",
+		CorrelationID: encodeFleetID("correlation"),
+		Deadline:      now.Add(time.Minute),
+	}
+
+	// Driven as raw JSON so the body is accepted by name: decodeRequest
+	// refuses unknown fields, so a wrong tag would 400 the only correct
+	// client.
+	raw := `{"context":` + mustJSON(t, contextWire) + `}`
+	post := func() *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(
+			http.MethodPost, route, bytes.NewReader([]byte(raw)))
+		request.Host = "example.test"
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	response := post()
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s, want 204", response.Code,
+			response.Body.String())
+	}
+	if body := response.Body.String(); body != "" {
+		t.Fatalf("body = %q, want empty: a count of rows drained reports how "+
+			"much work was outstanding", body)
+	}
+	if len(provider.reconciled) != 1 {
+		t.Fatalf("the provider saw %d reconciles, want 1",
+			len(provider.reconciled))
+	}
+	got := provider.reconciled[0]
+	if !bytes.Equal(got.ID, actionID) {
+		t.Fatalf("action ID = %q, want %q", got.ID, actionID)
+	}
+	// The request context has to arrive, or the drain runs with no deadline
+	// and no provenance while every sibling route carries both.
+	if got.Context.RequestID != "request" ||
+		got.Context.CorrelationID != "correlation" ||
+		got.Context.ReasonCode != "operator_request" ||
+		!got.Context.Deadline.Equal(now.Add(time.Minute)) {
+		t.Fatalf("request context = %+v, want the one posted", got.Context)
+	}
+
+	// An action with nothing pending answers identically. The service returns
+	// nil for an empty outbox and for an action that does not exist alike, so
+	// pinning the route's half of that is what keeps the replies the same.
+	provider.reconciled = nil
+	quiet := post()
+	if quiet.Code != response.Code || quiet.Body.String() != "" {
+		t.Fatalf("a reconcile with nothing to do answered %d/%q, want %d and "+
+			"an empty body — identical to one that drained",
+			quiet.Code, quiet.Body.String(), response.Code)
+	}
+}
+
+// TestTheReconcileRouteSurfacesARefusal pins that a refused drain is still an
+// error rather than a silent 204, which would tell an operator the outbox was
+// clear when it was not.
+func TestTheReconcileRouteSurfacesARefusal(t *testing.T) {
+	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	authority, _ := auth.NewAuthorityWithClock(func() time.Time { return now })
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor", AuthorizationDomain: []byte("domain"),
+		AllowedOperations:  []auth.Operation{auth.OperationInvoke},
+		PermittedSourceIDs: [][]byte{[]byte("source")},
+		PermittedPolicyIDs: [][]byte{[]byte("policy")}, PolicyGeneration: 1,
+		AuthenticationExpires: now.Add(time.Hour), RequestID: "request",
+		CorrelationID: "correlation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewAuthenticatedHandler(&stubWorkspaceService{},
+		AuthenticatorFunc(func(*http.Request) (auth.Decision, error) {
+			return decision, nil
+		}),
+		authority.Binder(), "example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &stubDispatchProvider{
+		resolver:     authority.Resolver(),
+		reconcileErr: shoal.NewError(shoal.ErrorUnauthorized, "nope"),
+	}
+	if err := handler.MountFleetDispatch(provider); err != nil {
+		t.Fatal(err)
+	}
+
+	actionID := []byte{'a', 0, 255}
+	contextWire := fleetRequestContextWire{
+		RequestID: encodeFleetID("request"), ReasonCode: "operator_request",
+		CorrelationID: encodeFleetID("correlation"),
+		Deadline:      now.Add(time.Minute),
+	}
+	request := httptest.NewRequest(http.MethodPost,
+		"http://example.test/api/v1/fleet/actions/"+
+			base64.RawURLEncoding.EncodeToString(actionID)+"/reconcile",
+		bytes.NewReader([]byte(`{"context":`+mustJSON(t, contextWire)+`}`)))
+	request.Host = "example.test"
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s, want 401", response.Code,
+			response.Body.String())
 	}
 }
 

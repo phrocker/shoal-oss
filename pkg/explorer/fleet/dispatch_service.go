@@ -2485,16 +2485,68 @@ func (s *DispatchService) Pull(ctx context.Context, request PullActionsRequest) 
 	return s.readablePage(ctx, result)
 }
 
-// ReconcileActionTransitions publishes and acknowledges every durable pending
-// transition for one action. Callers may use a fresh authorized context after
+// ReconcileActionTransitions publishes and acknowledges the pending
+// transitions for one action that this caller is entitled to publish, and
+// leaves the rest in place. Callers may use a fresh authorized context after
 // the original dispatch request has expired or after process restart.
+//
+// "Entitled" is per row and strict: publisherMatchesTransition requires an
+// exact principal match with the row's claimant or the record's own principal.
+// So this drains a principal's own stranded rows deliberately, rather than
+// waiting for its next request on the action to drain them as a side effect.
+// It is not an operator remedy for somebody else's row, and a row whose owner
+// never returns is not reachable through it.
 func (s *DispatchService) ReconcileActionTransitions(
-	ctx context.Context, actionID []byte,
+	ctx context.Context, request ReconcileRequest,
 ) error {
-	if err := validateOpaque("action ID", actionID, false); err != nil {
+	ctx, cancel := s.deadline(ctx, request.Context)
+	defer cancel()
+	if _, _, err := s.beginReconciler(ctx, request.Context); err != nil {
 		return err
 	}
-	return s.reconcileActionTransitions(ctx, actionID, "", 0)
+	if err := validateOpaque("action ID", request.ID, false); err != nil {
+		return err
+	}
+	return s.reconcileActionTransitions(ctx, request.ID, "", 0)
+}
+
+// beginReconciler admits a caller holding any of the three fleet operations.
+//
+// Widest of the gates, because a row's owner may hold any of them: an
+// enqueuer under dispatch or invoke, a claimant under execute. Narrowing it
+// would refuse one of those groups at the door.
+//
+// What this gate does NOT do is confer authority to publish anything. That is
+// decided per row by publisherMatchesTransition, which requires an exact
+// Subject, Actor, ClientID and OnBehalfOf match with the record's claimant for
+// action.claimed, completed and failed, and with the record's own principal
+// otherwise. So a caller admitted here drains only the rows it already owned,
+// and an operator who is not that principal passes this gate and publishes
+// nothing.
+//
+// An earlier version of this comment claimed the width made "every stranded
+// row reachable by someone" and that the route existed "for the rows nobody
+// else is coming back for". Both were false, and a review caught them: the
+// gate was verified and the outcome was not. A row whose owning principal
+// never returns is reachable by nobody, which is the case #642 describes and
+// which this route does not answer — see the operator-remedy issue it is
+// split into. Stated here because a justification that overstates what a
+// check achieves is worse than no comment at all.
+//
+// Order follows beginClaimant: execute, then invoke, then dispatch, returning
+// the last error so a caller holding none is told what the dispatch gate
+// tells it.
+func (s *DispatchService) beginReconciler(
+	ctx context.Context, request RequestContext,
+) (auth.Decision, time.Time, error) {
+	decision, now, err := s.beginClaimant(ctx, request)
+	if err == nil {
+		return decision, now, nil
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		return auth.Decision{}, time.Time{}, err
+	}
+	return s.begin(ctx, auth.OperationDispatch, request)
 }
 
 // reconcileActionTransitions drains the rows this caller may publish and

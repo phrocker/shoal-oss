@@ -341,6 +341,18 @@ func (r *boundFleetDispatch) ExtendClaim(
 	return r.service.ExtendClaim(ctx, request)
 }
 
+func (r *boundFleetDispatch) ReconcileActionTransitions(
+	ctx context.Context,
+	request fleet.ReconcileRequest,
+) error {
+	bound, err := r.requestContext(ctx, request.Context)
+	if err != nil {
+		return err
+	}
+	request.Context = bound
+	return r.service.ReconcileActionTransitions(ctx, request)
+}
+
 func (r *boundFleetDispatch) ReportAmbiguity(
 	ctx context.Context,
 	request fleet.AmbiguityRequest,

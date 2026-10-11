@@ -718,7 +718,14 @@ func TestDispatchOutboxPreservesTransitionsAndReconcilesAfterDeadline(t *testing
 	}
 	events.err = nil
 	clock = request.Context.Deadline.Add(time.Minute)
-	if err := service.ReconcileActionTransitions(ctx, request.ID); err != nil {
+	// Deadline-independent still: the enqueue's own deadline has passed, and a
+	// reconcile with a *fresh* context drains it anyway. The route now takes a
+	// request context, so "a fresh authorized context after the original
+	// request expired" is what the API asks for rather than what its doc
+	// implied (#642).
+	if err := service.ReconcileActionTransitions(ctx, ReconcileRequest{
+		ID: request.ID, Context: dispatchContext(clock, "request"),
+	}); err != nil {
 		t.Fatalf("deadline-independent reconciliation = %v", err)
 	}
 	if !reflect.DeepEqual(events.kinds, []string{
@@ -783,7 +790,9 @@ func TestDispatchOutboxRetainsEarlierTransitionAfterStateAdvances(t *testing.T) 
 		t.Fatalf("advanced state = %#v, %v", current, err)
 	}
 	events.err = nil
-	if err := service.ReconcileActionTransitions(ctx, queued.ID); err != nil {
+	if err := service.ReconcileActionTransitions(ctx, ReconcileRequest{
+		ID: queued.ID, Context: dispatchContext(now, "request"),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	got := events.kinds[len(events.kinds)-2:]

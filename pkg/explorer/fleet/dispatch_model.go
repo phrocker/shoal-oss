@@ -828,6 +828,18 @@ type ClaimRequest struct {
 	Context RequestContext
 }
 
+// ReconcileRequest is an operator draining an action's pending transition
+// rows when no later request on that action is going to do it.
+//
+// A pending row is left in place by whichever caller was not entitled to
+// publish it, and recovers only when its owning principal next reconciles —
+// an assumption about traffic, not a mechanism. On a quiet action the row
+// strands indefinitely (#642).
+type ReconcileRequest struct {
+	ID      []byte
+	Context RequestContext
+}
+
 type CancelRequest struct {
 	ID              []byte
 	ExpectedVersion uint64

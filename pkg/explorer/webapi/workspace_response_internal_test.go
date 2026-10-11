@@ -98,6 +98,18 @@ func TestWorkspaceSettingsClampAnalyticsAndMarkResponseLoss(t *testing.T) {
 				test.method, test.path)
 		}
 	}
+	// The drain commits — it publishes events and acknowledges outbox rows —
+	// and is still classified as not-may-commit, so it is asserted on its own
+	// rather than folded into the read-only table below. Its 204 carries no
+	// body for the output limit to truncate, and the drain is idempotent, so a
+	// caller that loses the response can simply ask again. Pinned because a
+	// future broadened suffix in requestMayCommit would otherwise sweep it in
+	// silently and start marking a bodiless response indeterminate.
+	if requestMayCommit(
+		http.MethodPost, "/api/v1/fleet/actions/action/reconcile") {
+		t.Fatal("the reconcile route is marked may-commit: its 204 has no " +
+			"body to lose, and it is idempotent")
+	}
 	for _, test := range []struct {
 		method string
 		path   string
@@ -151,6 +163,16 @@ func TestWorkspaceOperationForRequestUsesRouteOperation(t *testing.T) {
 		// registered for the workspace, so the handler is never reached at all.
 		{http.MethodPost, "/api/v1/fleet/actions/action/complete", auth.OperationInvoke, true},
 		{http.MethodPost, "/api/v1/fleet/actions/action/cancel", auth.OperationDispatch, true},
+		// The drain, under the same authority as a cancellation. Unlisted it
+		// is refused as not registered for the workspace before the handler
+		// runs, so it would be unreachable for every workspace-scoped caller —
+		// the door nobody is looking at, which is what this table exists to
+		// keep shut on.
+		//
+		// One operation where the service gate admits three: a workspace-
+		// scoped execute-only claimant is refused here. The mapping comment
+		// says why, and says what that caller loses and does not lose.
+		{http.MethodPost, "/api/v1/fleet/actions/action/reconcile", auth.OperationDispatch, true},
 		// The ambiguity route, under the same authority as the claim and the
 		// completion it sits between. Unlisted, a workspace-scoped worker was
 		// refused before the handler ran.

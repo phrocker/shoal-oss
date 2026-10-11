@@ -31,6 +31,20 @@ type FleetDispatchProvider interface {
 	ExtendClaim(context.Context, fleet.ExtendRequest) (fleet.ActionRecord, error)
 }
 
+// FleetTransitionReconciler is the optional drain. A provider implementing it
+// gets POST /api/v1/fleet/actions/{action}/reconcile; one that does not is
+// mounted exactly as before and that path 404s.
+//
+// Optional rather than part of FleetDispatchProvider because that interface is
+// exported: a required method breaks every downstream implementation at
+// compile time, including ones that would never call an operator route. Same
+// shape, and the same reason, as the metrics reporter the health surface
+// type-asserts — an operator or observability accessor has no business
+// widening the API boundary every provider must satisfy.
+type FleetTransitionReconciler interface {
+	ReconcileActionTransitions(context.Context, fleet.ReconcileRequest) error
+}
+
 // NewFleetDispatchHandler returns the fleet dispatch HTTP surface without
 // adding another authentication boundary. Mount it through
 // Handler.MountAuthenticated at /api/v1/fleet/.
@@ -240,6 +254,49 @@ func mountFleetDispatch(mux *http.ServeMux, provider FleetDispatchProvider) {
 		}
 		writeResponse(w, http.StatusOK, encodeFleetAction(result))
 	})
+	// Draining an action's pending transition rows when no later request on
+	// that action is going to do it (#642).
+	//
+	// A pending row is left in place by whichever caller was not entitled to
+	// publish it and recovers only when its owning principal next reconciles,
+	// which is an assumption about traffic. Before this route the remedy
+	// existed in the service with nothing able to reach it: no HTTP surface,
+	// no CLI, no sweeper.
+	//
+	// 204 with no body, always. The count of rows drained would report how
+	// much work was outstanding, and the identity of a row left pending would
+	// name another principal's action, so neither is answered. That also makes
+	// the replies identical for an action with nothing pending, an action
+	// whose rows this caller may not publish, and an action that does not
+	// exist — a standing refusal must not be distinguishable from absence
+	// (#398).
+	if reconciler, ok := provider.(FleetTransitionReconciler); ok {
+		mux.HandleFunc("POST /api/v1/fleet/actions/{action}/reconcile", func(w http.ResponseWriter, r *http.Request) {
+			actionID, err := decodeWireBytes("action ID", r.PathValue("action"), false)
+			if err != nil {
+				writeError(w, fleetDispatchError(err))
+				return
+			}
+			var wire fleetReconcileWire
+			if err := decodeRequest(w, r, &wire); err != nil {
+				writeError(w, shoal.NewError(shoal.ErrorInvalidArgument, err.Error()))
+				return
+			}
+			contextValue, err := wire.Context.decode()
+			if err != nil {
+				writeError(w, fleetDispatchError(err))
+				return
+			}
+			if err := reconciler.ReconcileActionTransitions(
+				r.Context(), fleet.ReconcileRequest{
+					ID: actionID, Context: contextValue,
+				}); err != nil {
+				writeError(w, fleetDispatchError(err))
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		})
+	}
 	// A worker that lost its fence mid-effect cannot use /complete, which is
 	// gated on the fence it lost. This route records what it attempted without
 	// transitioning the action (#438).
@@ -508,6 +565,14 @@ type fleetExtendWire struct {
 	ClaimFence uint64        `json:"claim_fence,omitempty"`
 	ClaimID    string        `json:"claim_id"`
 	Lease      time.Duration `json:"lease"`
+}
+
+// fleetReconcileWire drains an action's pending transition rows. It carries
+// only a request context: the action is in the path, and there is nothing to
+// select or report, because a row the caller may not publish is left pending
+// rather than named.
+type fleetReconcileWire struct {
+	Context fleetRequestContextWire `json:"context"`
 }
 
 // fleetAmbiguityWire is a lost-fence report.

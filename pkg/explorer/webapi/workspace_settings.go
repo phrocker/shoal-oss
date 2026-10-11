@@ -393,6 +393,31 @@ func workspaceOperationForRequest(
 	case method == http.MethodPost &&
 		strings.HasPrefix(path, "/api/v1/fleet/actions/") &&
 		(strings.HasSuffix(path, "/cancel") ||
+			// Draining the caller's own pending transition rows, under
+			// dispatch like a cancellation: both are levers over an action
+			// rather than steps in performing the work.
+			//
+			// A known limitation, recorded rather than hidden. The service
+			// gate admits execute, invoke or dispatch because a row's owner
+			// may hold any of them, but this mapping can name only one, and
+			// authorizeApplication authorizes that one against the caller. So
+			// a workspace-scoped execute-only claimant — the principal that
+			// owns action.claimed, completed and failed rows — is refused here
+			// before the handler runs. It loses nothing it had: its rows still
+			// drain as a side effect of its next request on the action, which
+			// is how they drained before this route existed. What it does not
+			// get is the deliberate drain.
+			//
+			// Fixing it properly means this table expressing more than one
+			// operation per route, which every route shares; it is a
+			// requirement of the operator-remedy issue rather than something
+			// to half-do here.
+			//
+			// Listing it at all is the point: unlisted,
+			// applyWorkspaceSettings refuses the route as "not registered for
+			// this workspace" before the handler runs, so it would be
+			// invisible to every workspace-scoped caller.
+			strings.HasSuffix(path, "/reconcile") ||
 			strings.HasSuffix(path, "/status")):
 		return auth.OperationDispatch, true
 	// Admission is invoke on all three. Asking whether a call may happen,
@@ -734,7 +759,16 @@ func requestMayCommit(method, path string) bool {
 					// extension actually landed — so it would abandon work it
 					// still holds the fence for.
 					strings.HasSuffix(path, "/extend") ||
-					strings.HasSuffix(path, "/cancel"))) ||
+					strings.HasSuffix(path, "/cancel") ||
+					// "/reconcile" is deliberately absent, like the collector
+					// read route above. It commits — it publishes events and
+					// acknowledges outbox rows — but it answers 204 with no
+					// body, so there is nothing for the output limit to
+					// truncate, and it is idempotent: a retry drains whatever
+					// is still pending and the outbox's own acknowledgement
+					// keeps a row from being republished. A caller that loses
+					// the response can simply ask again (#642).
+					false)) ||
 			// A decision commits; pending and status only read.
 			(strings.HasPrefix(path, "/api/v1/fleet/approvals/") &&
 				strings.HasSuffix(path, "/decide"))

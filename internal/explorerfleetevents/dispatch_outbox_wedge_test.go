@@ -278,7 +278,9 @@ func TestAStrandedTransitionDoesNotBlockAnotherPrincipalsClaim(t *testing.T) {
 	// A reader has the action's scopes and so can see it; it holds no
 	// operation that publishes any lifecycle kind.
 	reader := bind("reader", "reader-actor", "request", auth.OperationRetrieve)
-	readerErr := dispatch.ReconcileActionTransitions(reader, request.ID)
+	readerErr := dispatch.ReconcileActionTransitions(reader, fleet.ReconcileRequest{
+		ID: request.ID, Context: integrationRequestContext(now),
+	})
 	if publisher.published["action.enqueued"] != 0 {
 		t.Fatalf("a caller holding only a read operation delivered the "+
 			"stranded transition (err=%v): skipping a row this caller may "+
@@ -289,7 +291,9 @@ func TestAStrandedTransitionDoesNotBlockAnotherPrincipalsClaim(t *testing.T) {
 	// claimed row's refusal after publishing the enqueued one — partial
 	// progress reported as total failure.
 	if err := dispatch.ReconcileActionTransitions(
-		enqueuer, request.ID); err != nil {
+		enqueuer, fleet.ReconcileRequest{
+			ID: request.ID, Context: integrationRequestContext(now),
+		}); err != nil {
 		t.Fatalf("the enqueuer could not drain its own stranded row: %v", err)
 	}
 	if publisher.published["action.enqueued"] != 1 {
@@ -307,7 +311,9 @@ func TestAStrandedTransitionDoesNotBlockAnotherPrincipalsClaim(t *testing.T) {
 		"enqueuer": enqueuer, "worker": worker,
 	} {
 		if err := dispatch.ReconcileActionTransitions(
-			caller, request.ID); err != nil {
+			caller, fleet.ReconcileRequest{
+				ID: request.ID, Context: integrationRequestContext(now),
+			}); err != nil {
 			t.Fatalf("a drained outbox refused a %s reconcile: %v", name, err)
 		}
 	}
