@@ -80,7 +80,7 @@ providers, it also exposes a **Decisions** tab for receipts, registrations,
 cohort exports, outcomes, and adjudications. These records support measurable
 shadow decisions; the console does not promote or exclude a model. Provider
 wiring for the default host is tracked in
-[issue #645](https://github.com/shoal-oss/shoal/issues/645).
+[issue #645](https://github.com/phrocker/shoal-oss/issues/645).
 
 Every request carries an authorization decision enforced below the transport.
 Unauthenticated requests receive `401`; the service does not guess an identity.
@@ -193,6 +193,10 @@ not as a passing conformance result. See
 - [Adjudication](docs/decision-adjudication.md)
 - [Deployment and effects](docs/effects-gateway-deploy.md)
 - [Embedded engine](docs/shoal-embed-container.md)
+- [Iterator capability registry](docs/iterator-capability-registry.md)
+- [Offline compaction design](docs/offline-compaction-design.md)
+- [Offline compaction runbook](docs/offline-compaction.md)
+- [C ABI and Python compatibility](capi/README.md)
 - [Distributed serving architecture](ARCHITECTURE.md)
 - [Accumulo test harness](test/accumulo/README.md)
 
