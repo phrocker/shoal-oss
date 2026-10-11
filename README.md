@@ -256,14 +256,13 @@ carried across that hop yet. Deployment, auth setup and the startup policy
 backfill are in
 [`docs/shoal-explore-web-deploy.md`](docs/shoal-explore-web-deploy.md).
 
-When a host explicitly mounts the decision providers, the workspace also exposes
-a **Decisions** tab for authenticated receipts, registrations, cohort exports,
-outcomes, and adjudication history. These records support measurable,
-shadow-only local decisions; the UI does not promote or exclude a model. The
-default `shoal-explore-web` host still needs that provider composition, tracked
-in [issue #645](https://github.com/shoal-oss-dos/shoal/issues/645). See
-[`docs/local-decisions.md`](docs/local-decisions.md) for the contracts and
-provenance boundaries.
+With local decision providers configured, the workspace includes a
+**Decisions** tab. It gives authorized users one place to inspect decision
+receipts, registrations, cohort exports, outcomes, and adjudications while a
+local model is measured in shadow mode. The console records evidence for
+review; it does not promote or exclude a model. The provider setup is described
+in [`docs/local-decisions.md`](docs/local-decisions.md), with default-host
+integration tracked in [issue #645](https://github.com/shoal-oss-dos/shoal/issues/645).
 
 ### MCP
 
