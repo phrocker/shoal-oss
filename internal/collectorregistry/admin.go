@@ -114,10 +114,12 @@ type ChangeRecovery struct {
 	Reason        RecoveryReason
 	HeadTimestamp int64
 	HeadSHA256    string
-	// AcknowledgedOverflow is the hex of the highest overflow qualifier
-	// stored when this recovery started its segment, if any: the overflow
-	// entries it accounts for, written by an earlier revocation or stray.
-	AcknowledgedOverflow string `json:",omitempty"`
+	// AcknowledgedOverflowTimestamp is the highest timestamp of any
+	// overflow cell stored when this recovery started its segment (0 for
+	// none): the overflow cells it accounts for, written by an earlier
+	// revocation or stray. Every later registry write, overflow entries
+	// included, is above it.
+	AcknowledgedOverflowTimestamp int64 `json:",omitempty"`
 }
 
 // AdminResult is the outcome of an admin write. Changed reports whether this
@@ -182,10 +184,11 @@ type changeHead struct {
 	// SegmentStart is the sequence of the recovery entry that started the
 	// current segment, 0 when the log never needed one.
 	SegmentStart int64
-	// OverflowAck is the hex of the highest overflow qualifier a recovery
-	// recorded (ChangeRecovery.AcknowledgedOverflow); overflow cells at or
-	// below it are already accounted for and no longer damage.
-	OverflowAck string `json:",omitempty"`
+	// OverflowAck is the overflow timestamp a recovery acknowledged
+	// (ChangeRecovery.AcknowledgedOverflowTimestamp): overflow cells at or
+	// below it are accounted for; any above it, which includes every
+	// overflow entry the registry writes afterwards, is damage.
+	OverflowAck int64 `json:",omitempty"`
 }
 
 func (r *Registry) changeCoordinate(id shoal.ID, qualifier string) allocator.Coordinate {
@@ -238,7 +241,7 @@ func (r *Registry) readHeadState(ctx context.Context, id shoal.ID) (headState, e
 		// One stored cell can be pinned exactly, whatever its bytes.
 		s.pin = allocator.Condition{Coordinate: coord, Value: bytes.Clone(cell.Value), Timestamp: cell.Timestamp, TimestampSet: true}
 	}
-	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.SegmentStart < 0 || head.SegmentStart > head.Sequence || !validOverflowAck(head.OverflowAck) {
+	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.SegmentStart < 0 || head.SegmentStart > head.Sequence || head.OverflowAck < 0 {
 		s.damaged = true
 		return s, nil
 	}
@@ -294,7 +297,7 @@ func (r *Registry) highestEntry(ctx context.Context, id shoal.ID) (highest int64
 			if !strings.HasPrefix(q, entryPrefix) {
 				return highest, true, nil
 			}
-			if n, e := strconv.ParseInt(strings.TrimPrefix(q, entryPrefix), 10, 64); e == nil && n > highest {
+			if n, ok := canonicalSequence(q); ok && n > highest {
 				highest = n
 			}
 		}
@@ -371,12 +374,8 @@ func (r *Registry) entriesBeyond(ctx context.Context, id shoal.ID, state headSta
 		if above, e := r.entryAbove(ctx, id, state.head.Sequence); e != nil || above {
 			return above, e
 		}
-		ack, e := hex.DecodeString(state.head.OverflowAck)
-		if e != nil {
-			return false, ErrUnavailable
-		}
-		overflow, e := r.highestOverflow(ctx, id, ack)
-		return overflow != nil, e
+		above, _, e := r.overflowCells(ctx, id, state.head.OverflowAck)
+		return above, e
 	}
 	if !state.present {
 		return r.entryPresent(ctx, id, 1)
@@ -385,6 +384,21 @@ func (r *Registry) entriesBeyond(ctx context.Context, id shoal.ID, state headSta
 		return false, nil
 	}
 	return r.entryPresent(ctx, id, state.head.Sequence+1)
+}
+
+// canonicalSequence parses an entry qualifier the registry could have
+// written: the prefix and exactly the 20-digit zero-padded form of a
+// positive sequence. Recovery and the readers ignore the same other cells.
+func canonicalSequence(qualifier string) (int64, bool) {
+	digits, ok := strings.CutPrefix(qualifier, entryPrefix)
+	if !ok || len(digits) != 20 {
+		return 0, false
+	}
+	n, e := strconv.ParseInt(digits, 10, 64)
+	if e != nil || n <= 0 || fmt.Sprintf("%020d", n) != digits {
+		return 0, false
+	}
+	return n, true
 }
 
 // entryAbove reports whether any entry with a sequence above sequence is
@@ -410,7 +424,7 @@ func (r *Registry) entryAbove(ctx context.Context, id shoal.ID, sequence int64) 
 			if !strings.HasPrefix(q, entryPrefix) {
 				return false, nil
 			}
-			if n, e := strconv.ParseInt(strings.TrimPrefix(q, entryPrefix), 10, 64); e == nil && n > sequence {
+			if n, ok := canonicalSequence(q); ok && n > sequence {
 				return true, nil
 			}
 		}
@@ -422,38 +436,33 @@ func (r *Registry) entryAbove(ctx context.Context, id shoal.ID, sequence int64) 
 	}
 }
 
-// highestOverflow returns the highest overflow qualifier above after (nil
-// for none), paging until an empty page or a qualifier past the overflow
-// prefix, since a store may apply the scan limit before filtering. The
-// store can scan rows when this is called.
-func (r *Registry) highestOverflow(ctx context.Context, id shoal.ID, after []byte) ([]byte, error) {
+// overflowCells pages through the overflow entries, until an empty page or
+// a qualifier past the overflow prefix (a store may apply the scan limit
+// before filtering). It reports whether any has a timestamp above ack, and
+// the highest timestamp of any. The store can scan rows when this is called.
+func (r *Registry) overflowCells(ctx context.Context, id shoal.ID, ack int64) (bool, int64, error) {
 	scanner := r.config.Backend.(rowScanner)
 	row := r.registrationCoordinate(id).Row
 	start := []byte(overflowPrefix)
-	if len(after) != 0 {
-		start = append(bytes.Clone(after), 0)
-	}
-	var highest []byte
+	above, highest := false, int64(0)
 	for {
 		cells, e := scanner.ScanRowPrefix(ctx, row, []byte(changeFamily), start, bytes.Clone(r.config.Visibility), scanPage)
 		if e != nil {
-			return nil, ErrUnavailable
+			return false, 0, ErrUnavailable
 		}
 		if len(cells) == 0 {
-			return highest, nil
+			return above, highest, nil
 		}
 		for _, cell := range cells {
-			q := cell.Coordinate.Qualifier
-			if !bytes.HasPrefix(q, []byte(overflowPrefix)) {
-				return highest, nil
+			if !bytes.HasPrefix(cell.Coordinate.Qualifier, []byte(overflowPrefix)) {
+				return above, highest, nil
 			}
-			if bytes.Compare(q, after) > 0 && bytes.Compare(q, highest) > 0 {
-				highest = bytes.Clone(q)
-			}
+			above = above || cell.Timestamp > ack
+			highest = max(highest, cell.Timestamp)
 		}
 		next := append(bytes.Clone(cells[len(cells)-1].Coordinate.Qualifier), 0)
 		if bytes.Compare(next, start) <= 0 {
-			return nil, ErrUnavailable
+			return false, 0, ErrUnavailable
 		}
 		start = next
 	}
@@ -561,22 +570,21 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 			return auditWrite{}, e
 		}
 		nextHead = changeHead{CollectorID: id, Sequence: sequence, SegmentStart: sequence}
-		// Account for every overflow entry stored now, so the new segment
-		// reads again; the recovery entry names them.
+		// Account for every overflow cell stored now, by timestamp, so the
+		// new segment reads again; the recovery entry names the bound, and
+		// this write lands above it (below), so every later registry write
+		// does too.
 		if scanned {
-			overflow, e := r.highestOverflow(ctx, id, nil)
+			_, highest, e := r.overflowCells(ctx, id, 0)
 			if e != nil {
 				return auditWrite{}, e
 			}
-			if overflow != nil {
-				// A qualifier longer than the bound is acknowledged by a
-				// bounded value that still sorts above it in practice: its
-				// prefix followed by 0xff bytes.
-				if len(overflow) > shoal.MaxIDBytes {
-					overflow = append(bytes.Clone(overflow[:shoal.MaxIDBytes-8]), bytes.Repeat([]byte{0xff}, 8)...)
-				}
-				nextHead.OverflowAck = hex.EncodeToString(overflow)
-				recovery.AcknowledgedOverflow = nextHead.OverflowAck
+			// A cell at the top of the timestamp space cannot be
+			// acknowledged (nothing can be written above it); it stays
+			// damage, as documented.
+			if highest < maxWriteTimestamp {
+				nextHead.OverflowAck = highest
+				recovery.AcknowledgedOverflowTimestamp = highest
 			}
 		}
 		// The recovery is pinned to the head it judged, so it cannot commit
@@ -603,7 +611,7 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 	// marker above that is caught by ensureVisible after the write.
 	timestamp := int64(maxWriteTimestamp)
 	if head.timestamp < maxWriteTimestamp {
-		timestamp = min(max(r.nanos(), head.timestamp+1, 1), maxWriteTimestamp)
+		timestamp = min(max(r.nanos(), head.timestamp+1, nextHead.OverflowAck+1, 1), maxWriteTimestamp)
 	}
 	change.Sequence = nextHead.Sequence
 	qualifier := r.changeEntryCoordinate(id, change.Sequence).Qualifier
@@ -846,7 +854,7 @@ func validChange(c Change, id shoal.ID) error {
 		case c.Action != ChangeRevoke,
 			c.Recovery.Reason != RecoveryUnreadableHead && c.Recovery.Reason != RecoveryOccupiedSequence && c.Recovery.Reason != RecoveryExhaustedHead,
 			c.Recovery.HeadTimestamp < 0,
-			!validOverflowAck(c.Recovery.AcknowledgedOverflow),
+			c.Recovery.AcknowledgedOverflowTimestamp < 0,
 			!collector.ValidDigest(c.Recovery.HeadSHA256):
 			return invalid()
 		}
@@ -890,15 +898,6 @@ func printableID(id shoal.ID, required bool) bool {
 		}
 	}
 	return true
-}
-
-// validOverflowAck accepts "" or the lowercase hex of an overflow qualifier.
-func validOverflowAck(ack string) bool {
-	if ack == "" {
-		return true
-	}
-	b, e := hex.DecodeString(ack)
-	return e == nil && hex.EncodeToString(b) == ack && bytes.HasPrefix(b, []byte(overflowPrefix)) && len(b) <= shoal.MaxIDBytes
 }
 
 func digestBytes(b []byte) string {

@@ -323,12 +323,21 @@ describe:
 Writes treat the same states as damage. A provisioning fails closed, and a
 revocation recovers above them, so the log reads again.
 
-A recovery also accounts for every overflow entry stored at that moment. Its
-entry names the highest one (`AcknowledgedOverflow`) and the new head carries
-that as an acknowledgement. Only overflow cells above it count as damage
-afterwards. An overflow entry the registry wrote itself is acknowledged only
-by a later recovery that can write a head, so the log stays unavailable while
-the sequences are exhausted, as documented above.
+A recovery also accounts for every overflow cell stored at that moment, by
+timestamp, not by qualifier:
+- its entry records the highest such timestamp
+  (`AcknowledgedOverflowTimestamp`);
+- the new head carries it;
+- the recovery and every later registry write land above it.
+
+So an overflow cell above the acknowledgement is damage. That covers every
+overflow entry the registry writes afterwards, whatever its qualifier sorts
+as. An overflow cell at the top of the timestamp space cannot be acknowledged
+and stays damage.
+
+Only entry qualifiers the registry could have written (the exact 20-digit
+zero-padded form) count as entries, for recovery and readers alike. Other
+cells in the family are ignored consistently.
 
 Residual for stores that apply a scan's limit before filtering by
 visibility: a page holding only another visibility's cells reads as empty,

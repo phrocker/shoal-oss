@@ -4,7 +4,6 @@ package collectorregistry
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"math"
 	"slices"
@@ -1646,12 +1645,81 @@ func TestRevocationAcknowledgesStrayOverflow(t *testing.T) {
 	}
 	revokeRecovers(t, v, v.registry, 2, RecoveryOccupiedSequence)
 	got, e := v.registry.Changes(context.Background(), collectorID, 1, 1)
-	if e != nil || len(got) != 1 || got[0].Recovery == nil || got[0].Recovery.AcknowledgedOverflow != hex.EncodeToString([]byte(overflowPrefix+"x")) {
+	if e != nil || len(got) != 1 || got[0].Recovery == nil || got[0].Recovery.AcknowledgedOverflowTimestamp != 1 {
 		t.Fatalf("recovery entry %+v %v", got, e)
 	}
-	// A further overflow cell above the acknowledged one is damage again.
-	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"y"), 1, []byte("stray"))
+	// A further overflow cell written after the acknowledgement (above its
+	// timestamp) is damage again.
+	head, _ := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
+	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"y"), head.Timestamp+1, []byte("stray"))
 	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("Changes over a new overflow: %v", e)
+	}
+}
+
+// An overflow entry the registry writes after an acknowledgement is always
+// above it, so it is never hidden, whatever its qualifier sorts as.
+func TestAcknowledgementNeverHidesALaterOverflowRevocation(t *testing.T) {
+	v := provisionedEnv(t)
+	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"z"), 1, []byte("stray"))
+	revokeRecovers(t, v, v.registry, 2, RecoveryOccupiedSequence)
+	stray := v.registry.changeEntryCoordinate(collectorID, math.MaxInt64-1)
+	put(t, v, stray, 1, []byte("stray"))
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatalf("revoke into overflow: %v", e)
+	}
+	deleteCell(t, v, stray) // the operator cleans up the high stray
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("Changes hid the overflow revocation: %v", e)
+	}
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("read hid the overflow revocation: %v", e)
+	}
+	// A later revocation can write a head again and acknowledges it.
+	if _, e := v.registry.updateRegistration(context.Background(), collectorID, false, func(row *registrationRow, _ bool) (bool, error) {
+		row.Registration.State = collector.Provisioned
+		return true, nil
+	}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatalf("revoke: %v", e)
+	}
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil {
+		t.Fatalf("Changes after the overflow was acknowledged: %v", e)
+	}
+}
+
+// Only canonical entry qualifiers count, for recovery and readers alike.
+func TestOddEntryQualifiersAreIgnoredConsistently(t *testing.T) {
+	for _, q := range []string{entryPrefix + "0000000000000000000005", entryPrefix + "+9223372036854775807", entryPrefix + "5", entryPrefix + "00000000000000000000"} {
+		if _, ok := canonicalSequence(q); ok {
+			t.Fatalf("%q accepted", q)
+		}
+	}
+	if n, ok := canonicalSequence(entryPrefix + "00000000000000000005"); !ok || n != 5 {
+		t.Fatal("canonical qualifier refused")
+	}
+	v := provisionedEnv(t)
+	put(t, v, v.registry.changeCoordinate(collectorID, entryPrefix+"+9223372036854775807"), 1, []byte("stray"))
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil {
+		t.Fatalf("Changes: %v", e)
+	}
+	highest, _, e := v.registry.highestEntry(context.Background(), collectorID)
+	if e != nil || highest != 1 {
+		t.Fatalf("highest %d %v", highest, e)
+	}
+}
+
+// An overflow stray at a timestamp far above the clock is acknowledged, and
+// the recovery lands above it, so later registry writes do too.
+func TestRecoveryLandsAboveAnAcknowledgedOverflow(t *testing.T) {
+	v := provisionedEnv(t)
+	const far = 5_000_000_000_000_000_000
+	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"x"), far, []byte("stray"))
+	revokeRecovers(t, v, v.registry, 2, RecoveryOccupiedSequence)
+	head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
+	if e != nil || head.Timestamp <= far {
+		t.Fatalf("head at %d, below the acknowledged overflow at %d: %v", head.Timestamp, int64(far), e)
 	}
 }
