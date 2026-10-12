@@ -2,6 +2,8 @@
 package webapi
 
 import (
+	"net/http"
+
 	decisionapi "github.com/phrocker/shoal-oss/pkg/decision/api"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -45,6 +47,18 @@ func (h *Handler) MountDecisionSurface(surface DecisionSurface) error {
 	}
 	if err := surface.validate(); err != nil {
 		return err
+	}
+	for _, route := range []string{
+		DecisionsRoute, RegistrationsRoute, DatasetExportsRoute,
+		OutcomesRoute, AdjudicationsRoute,
+	} {
+		for _, method := range []string{
+			http.MethodPost, http.MethodGet, http.MethodDelete, http.MethodHead,
+		} {
+			if exactMuxPatternRegistered(h.mux, method, route) {
+				return authenticatedMountConflict()
+			}
+		}
 	}
 	if err := h.MountDecisions(surface.Decisions, surface.Resolver); err != nil {
 		return err
