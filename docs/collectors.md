@@ -240,22 +240,47 @@ apply, and refuses to write anything that would not read back as itself. So
 the log never holds an entry its own read API refuses.
 
 **A damaged log never blocks revocation.** Revocation is the emergency
-control. If the log head does not decode, or the entry it would append already
-exists, a provisioning fails closed (`503`), but a revocation, through either
-API, starts a new segment of the log:
-- Its entry carries a recovery marker: `unreadable_head` or
-  `occupied_sequence`, with the damaged head cell's timestamp and the SHA-256
-  of its exact stored bytes.
-- It takes the first free sequence above the damaged head.
-- It is written in the same mutation as the revocation and a new head, and
-  that mutation is pinned to the damaged head's exact cell.
+control. The log is damaged in any of these cases:
+- the head is present but is not a head this registry wrote (any cell count,
+  timestamp or bytes other than one decodable head at its own sequence);
+- the head is absent while entries exist;
+- the entry the head would append is occupied, by any cell, malformed or not.
 
-The revocation stays audited, and the damage stays identifiable after the head
-is replaced. Reads then show the current segment: the HTTP read stops at the
-recovery entry and reports it as `segment_start`. `Registry.Changes` with
-`after = segment_start - 1` reads the segment; older entries are left as they
-are, for forensics. A head that cannot be read at all, because the store
-failed, still fails a revocation, since nothing can be written then either.
+A provisioning then fails closed (`503`). A revocation, through either API,
+starts a new segment of the log, all in one mutation with the revocation:
+- **Its entry** carries a recovery marker: `unreadable_head` or
+  `occupied_sequence`, the damaged head's timestamp (0 when absent or
+  non-positive), and the SHA-256 of its exact stored bytes.
+- **Its sequence** is one above the highest of the head's timestamp, the
+  head's sequence and every stored entry. The row is scanned for the highest
+  entry where the store supports row scans, as the engine and Accumulo stores
+  do. On a store without row scans the registry probes upward in doubling
+  steps, and a stray entry above the probe could then still make a later
+  provisioning fail closed.
+- **A new head** at that sequence records it as `segment_start`. No stored
+  entry lies above the new segment, so later appends proceed normally.
+
+The mutation is serialized by the registration cell's compare-and-set, as
+every logged change is. It is not pinned to the damaged head, which may not
+be pinnable. Only a failure of the store itself fails a revocation, since
+nothing can be written then anyway.
+
+In the one damage state where no sequence above the damage is representable
+(a cell at the largest timestamp or sequence), the recovery entry is written
+under a `change-overflow:` qualifier and the head is left alone. The
+revocation still applies and is still recorded, and the log reads as
+unavailable.
+
+Reads show only the current segment: the HTTP read lists its entries and
+reports `segment_start`, and `Registry.Changes` starts there too. Older
+entries stay stored, for forensics, outside these APIs. After a recovery,
+`change_count` is the newest sequence, not a count of stored entries. An
+absent head over stored entries reads as unavailable, not as an empty log, so
+deleting the head cannot hide history.
+
+**Upgrades.** A build without the log (before slice 5) that provisions or
+revokes leaves the registration ahead of its newest entry. The admin read then
+fails closed (`503`) until the next logged change.
 
 **Coherent reads.** The HTTP read takes the registration between two reads of
 the head that agree (retrying a bounded number of times), and checks that the

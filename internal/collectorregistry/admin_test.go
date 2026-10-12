@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -75,8 +77,8 @@ func (v *env) wrote(t *testing.T, id shoal.ID) bool {
 	if !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
 		t.Fatal(e)
 	}
-	if head, _, e := v.registry.readChangeHead(context.Background(), id); e != nil || head != 0 {
-		t.Fatalf("change log written without a registration: %d %v", head, e)
+	if head, e := v.registry.readChangeHead(context.Background(), id); e != nil || head.Sequence != 0 {
+		t.Fatalf("change log written without a registration: %+v %v", head, e)
 	}
 	return false
 }
@@ -733,5 +735,235 @@ func TestLogInconsistenciesFailClosed(t *testing.T) {
 	}
 	if _, e := w.registry.Changes(context.Background(), collectorID, 1, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("recovery on a provisioning: %v", e)
+	}
+}
+
+// put writes value at coord and timestamp unconditionally (test damage).
+func put(t *testing.T, v *env, coord allocator.Coordinate, timestamp int64, value []byte) {
+	t.Helper()
+	cells, e := v.registry.config.Backend.ReadExact(context.Background(), []allocator.Coordinate{coord})
+	if e != nil {
+		t.Fatal(e)
+	}
+	condition := allocator.Condition{Coordinate: coord, Absent: true}
+	if len(cells) > 0 {
+		condition = allocator.Condition{Coordinate: coord, Value: cells[0].Value, Timestamp: cells[0].Timestamp, TimestampSet: true}
+	}
+	if status, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{condition}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: timestamp, Value: value}}}); e != nil || status != allocator.StatusAccepted {
+		t.Fatal(status, e)
+	}
+}
+
+// deleteHead removes the change-log head.
+func deleteHead(t *testing.T, v *env, id shoal.ID) {
+	t.Helper()
+	coord := v.registry.changeHeadCoordinate(id)
+	cell, e := v.registry.read(context.Background(), coord)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if status, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Value: cell.Value, Timestamp: cell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: cell.Timestamp, Delete: true}}}); e != nil || status != allocator.StatusAccepted {
+		t.Fatal(status, e)
+	}
+}
+
+// revokeRecovers revokes id through the Go API, then checks the recovery
+// entry is the current segment's start at want, and that provisioning
+// appends normally afterwards.
+func revokeRecovers(t *testing.T, v *env, r *Registry, want int64, reason RecoveryReason) {
+	t.Helper()
+	if _, e := r.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatalf("revoke: %v", e)
+	}
+	if reg, _ := r.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
+		t.Fatalf("not revoked: %+v", reg)
+	}
+	view, e := r.AdminRegistration(v.admin(t), collectorID)
+	if e != nil {
+		t.Fatalf("read after recovery: %v", e)
+	}
+	if view.SegmentStart != want || len(view.Changes) != 1 || view.Changes[0].Recovery == nil || view.Changes[0].Recovery.Reason != reason {
+		t.Fatalf("view %+v", view)
+	}
+	if got, e := r.Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil || len(got) != 1 || got[0].Sequence != want {
+		t.Fatalf("Changes reads beyond the current segment: %d %v", len(got), e)
+	}
+	reg, _ := r.Registration(context.Background(), collectorID)
+	result, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), reg.Generation)
+	if e != nil || result.Sequence != want+1 {
+		t.Fatalf("append after recovery: %+v %v", result, e)
+	}
+}
+
+func provisionedEnv(t *testing.T) *env {
+	t.Helper()
+	v := newEnv(t)
+	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1); e != nil {
+		t.Fatal(e)
+	}
+	return v
+}
+
+// Every reachable shape of log damage leaves revocation working, and the
+// log appending normally afterwards (#656 review round 3).
+func TestRevocationRecoversEveryLogDamage(t *testing.T) {
+	t.Run("deleted head over a long log", func(t *testing.T) {
+		v := provisionedEnv(t)
+		for range 35 {
+			if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+				t.Fatal(e)
+			}
+			if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
+				t.Fatal(e)
+			}
+		}
+		deleteHead(t, v, collectorID) // 71 entries remain
+		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+			t.Fatalf("an absent head over entries read as an empty log: %v", e)
+		}
+		if _, e := v.registry.Changes(context.Background(), collectorID, 0, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+			t.Fatalf("Changes over a deleted head: %v", e)
+		}
+		revokeRecovers(t, v, v.registry, 72, RecoveryOccupiedSequence)
+	})
+	t.Run("strays with a gap", func(t *testing.T) {
+		v := provisionedEnv(t)
+		for _, sequence := range []int64{2, 4} {
+			put(t, v, v.registry.changeEntryCoordinate(collectorID, sequence), 1, []byte("stray"))
+		}
+		revokeRecovers(t, v, v.registry, 5, RecoveryOccupiedSequence)
+	})
+	t.Run("malformed stray entry", func(t *testing.T) {
+		v := provisionedEnv(t)
+		put(t, v, v.registry.changeEntryCoordinate(collectorID, 2), 0, []byte("stray"))
+		revokeRecovers(t, v, v.registry, 3, RecoveryOccupiedSequence)
+	})
+	t.Run("garbage head at timestamp 0 with no log", func(t *testing.T) {
+		v := newEnv(t)
+		if _, e := v.registry.updateRegistration(context.Background(), collectorID, true, func(row *registrationRow, _ bool) (bool, error) {
+			*row = registrationRow{Registration: collector.Registration{CollectorID: collectorID, Subject: "tail", ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved, Generation: 1, State: collector.Provisioned}}
+			return true, nil
+		}); e != nil {
+			t.Fatal(e)
+		}
+		put(t, v, v.registry.changeHeadCoordinate(collectorID), 0, []byte("garbage"))
+		revokeRecovers(t, v, v.registry, 1, RecoveryUnreadableHead)
+	})
+	t.Run("garbage head at a huge timestamp", func(t *testing.T) {
+		v := provisionedEnv(t)
+		put(t, v, v.registry.changeHeadCoordinate(collectorID), 1<<62+1, []byte("garbage"))
+		revokeRecovers(t, v, v.registry, 1<<62+2, RecoveryUnreadableHead)
+	})
+	t.Run("no store without a row scan", func(t *testing.T) {
+		v := provisionedEnv(t)
+		for _, sequence := range []int64{2, 3, 4} {
+			put(t, v, v.registry.changeEntryCoordinate(collectorID, sequence), 1, []byte("stray"))
+		}
+		config := v.registry.config
+		config.Backend = &lostAck{inner: v.registry.config.Backend} // no ScanRowPrefix
+		r, e := New(config)
+		if e != nil {
+			t.Fatal(e)
+		}
+		revokeRecovers(t, v, r, 5, RecoveryOccupiedSequence)
+	})
+	t.Run("no representable sequence", func(t *testing.T) {
+		v := provisionedEnv(t)
+		put(t, v, v.registry.changeHeadCoordinate(collectorID), math.MaxInt64, []byte("garbage"))
+		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+			t.Fatalf("revoke: %v", e)
+		}
+		if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
+			t.Fatalf("not revoked: %+v", reg)
+		}
+		// The revocation is recorded under an overflow qualifier, and the
+		// log reads as unavailable rather than as healthy.
+		scanner := v.registry.config.Backend.(rowScanner)
+		cells, e := scanner.ScanRowPrefix(context.Background(), v.registry.registrationCoordinate(collectorID).Row, []byte(changeFamily), []byte(overflowPrefix), nil, 10)
+		var overflow []allocator.Cell
+		for _, cell := range cells {
+			if strings.HasPrefix(string(cell.Coordinate.Qualifier), overflowPrefix) {
+				overflow = append(overflow, cell)
+			}
+		}
+		if e != nil || len(overflow) != 1 {
+			t.Fatalf("overflow entries: %d %v", len(overflow), e)
+		}
+		var c Change
+		if decode(overflow[0].Value, &c) != nil || c.Recovery == nil || c.Action != ChangeRevoke || validChange(c, collectorID) != nil {
+			t.Fatalf("overflow entry %+v", c)
+		}
+		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+			t.Fatalf("read: %v", e)
+		}
+	})
+}
+
+// deleteCell removes the newest cell at coord.
+func deleteCell(t *testing.T, v *env, coord allocator.Coordinate) {
+	t.Helper()
+	cell, e := v.registry.read(context.Background(), coord)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if status, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Value: cell.Value, Timestamp: cell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: cell.Timestamp, Delete: true}}}); e != nil || status != allocator.StatusAccepted {
+		t.Fatal(status, e)
+	}
+}
+
+// With the head and the first entry gone, the log looks empty at sequence 1
+// but later entries exist. Appending there would shadow them: a provisioning
+// fails closed and a revocation recovers above them.
+func TestAbsentHeadOverLaterEntriesIsDamage(t *testing.T) {
+	v := provisionedEnv(t)
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatal(e)
+	}
+	deleteCell(t, v, v.registry.changeHeadCoordinate(collectorID))
+	deleteCell(t, v, v.registry.changeEntryCoordinate(collectorID, 1))
+	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 3); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("provision over hidden entries: %v", e)
+	}
+	if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
+		t.Fatalf("provisioned over hidden entries: %+v", reg)
+	}
+
+	w := provisionedEnv(t)
+	if _, e := w.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := w.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
+		t.Fatal(e)
+	}
+	deleteCell(t, w, w.registry.changeHeadCoordinate(collectorID))
+	deleteCell(t, w, w.registry.changeEntryCoordinate(collectorID, 1))
+	revokeRecovers(t, w, w.registry, 4, RecoveryOccupiedSequence)
+}
+
+// A head naming a segment start whose entry is not a recovery entry is not a
+// log this registry wrote.
+func TestSegmentStartMustBeARecoveryEntry(t *testing.T) {
+	v := provisionedEnv(t)
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatal(e)
+	}
+	entries := v.changes(t, collectorID)
+	forged := entries[1]
+	forged.Sequence = 3
+	value, e := encode(forged)
+	if e != nil {
+		t.Fatal(e)
+	}
+	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 3, SegmentStart: 3})
+	put(t, v, v.registry.changeEntryCoordinate(collectorID, 3), 1, value)
+	put(t, v, v.registry.changeHeadCoordinate(collectorID), 3, head)
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("segment start without recovery: %v", e)
 	}
 }

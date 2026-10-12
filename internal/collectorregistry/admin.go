@@ -8,8 +8,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -127,8 +130,9 @@ type AdminView struct {
 	Changes     []Change
 	ChangeCount int64
 	// SegmentStart is the sequence of the recovery entry that starts the
-	// current segment when it is among Changes, otherwise 0. Changes with
-	// after = SegmentStart-1 reads that segment.
+	// current log segment (0 when the log never needed recovery). Changes
+	// and this view read only that segment. ChangeCount is the newest
+	// sequence, which after a recovery is not a count of stored entries.
 	SegmentStart int64
 }
 
@@ -167,127 +171,240 @@ func (a attribution) record(action ChangeAction) func(registrationRow) (Change, 
 type changeHead struct {
 	CollectorID shoal.ID
 	Sequence    int64
+	// SegmentStart is the sequence of the recovery entry that started the
+	// current segment, 0 when the log never needed one.
+	SegmentStart int64
 }
 
 func (r *Registry) changeCoordinate(id shoal.ID, qualifier string) allocator.Coordinate {
-	return allocator.Coordinate{Row: r.registrationCoordinate(id).Row, Family: []byte("a"), Qualifier: []byte(qualifier), Visibility: bytes.Clone(r.config.Visibility)}
+	return allocator.Coordinate{Row: r.registrationCoordinate(id).Row, Family: []byte(changeFamily), Qualifier: []byte(qualifier), Visibility: bytes.Clone(r.config.Visibility)}
 }
 func (r *Registry) changeHeadCoordinate(id shoal.ID) allocator.Coordinate {
 	return r.changeCoordinate(id, "change-head")
 }
 func (r *Registry) changeEntryCoordinate(id shoal.ID, sequence int64) allocator.Coordinate {
-	return r.changeCoordinate(id, fmt.Sprintf("change:%020d", sequence))
+	return r.changeCoordinate(id, fmt.Sprintf("%s%020d", entryPrefix, sequence))
 }
 
-// readChangeHead returns the latest sequence (0 when the log is empty) and
-// the condition that pins it.
-func (r *Registry) readChangeHead(ctx context.Context, id shoal.ID) (int64, allocator.Condition, error) {
-	sequence, condition, _, e := r.readChangeHeadCell(ctx, id)
-	return sequence, condition, e
+const (
+	changeFamily = "a"
+	entryPrefix  = "change:"
+	// overflowPrefix holds a recovery entry when no sequence above the damage
+	// is representable (see prepareChange).
+	overflowPrefix = "change-overflow:"
+	scanPage       = 1000
+)
+
+// headState is what one raw read of the head found.
+type headState struct {
+	head    changeHead
+	present bool
+	// damaged: present but not exactly a head this registry wrote: more or
+	// fewer than one cell, a non-positive timestamp, or bytes that do not
+	// decode to a head for this collector at its own timestamp.
+	damaged   bool
+	timestamp int64
+	digest    string
+	pin       allocator.Condition
 }
 
-// readChangeHeadCell is readChangeHead that also returns the stored cell.
-// When the cell was read but does not decode, it returns ErrUnavailable with
-// the cell set, so a revocation can pin and replace it (prepareChange); a
-// failed read returns no cell.
-func (r *Registry) readChangeHeadCell(ctx context.Context, id shoal.ID) (int64, allocator.Condition, *allocator.Cell, error) {
+// readHeadState reads the head without interpreting a malformed cell as a
+// store failure: only an error from the store itself is returned as one.
+func (r *Registry) readHeadState(ctx context.Context, id shoal.ID) (headState, error) {
 	coord := r.changeHeadCoordinate(id)
-	cell, e := r.read(ctx, coord)
-	if shoal.IsErrorCode(e, shoal.ErrorNotFound) {
-		return 0, allocator.Condition{Coordinate: coord, Absent: true}, nil, nil
-	}
+	cells, e := r.config.Backend.ReadExact(ctx, []allocator.Coordinate{coord})
 	if e != nil {
-		return 0, allocator.Condition{}, nil, e
+		return headState{}, ErrUnavailable
 	}
-	pin := allocator.Condition{Coordinate: coord, Value: bytes.Clone(cell.Value), Timestamp: cell.Timestamp, TimestampSet: true}
+	if len(cells) == 0 {
+		return headState{pin: allocator.Condition{Coordinate: coord, Absent: true}}, nil
+	}
+	s := headState{present: true, timestamp: max(cells[0].Timestamp, 0), digest: digestBytes(cells[0].Value)}
+	cell := cells[0]
 	var head changeHead
-	if decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.Sequence != cell.Timestamp {
-		return 0, pin, &cell, ErrUnavailable
+	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.Sequence != cell.Timestamp || head.SegmentStart < 0 || head.SegmentStart > head.Sequence {
+		s.damaged = true
+		return s, nil
 	}
-	return head.Sequence, pin, &cell, nil
+	s.head = head
+	s.pin = allocator.Condition{Coordinate: coord, Value: bytes.Clone(cell.Value), Timestamp: cell.Timestamp, TimestampSet: true}
+	return s, nil
 }
 
-// entryPresent reports whether a change entry exists at sequence.
+// readChangeHead returns the head of a healthy log (a zero head when the log
+// is empty) and fails closed on a damaged one.
+func (r *Registry) readChangeHead(ctx context.Context, id shoal.ID) (changeHead, error) {
+	s, e := r.readHeadState(ctx, id)
+	if e != nil {
+		return changeHead{}, e
+	}
+	if s.damaged {
+		return changeHead{}, ErrUnavailable
+	}
+	return s.head, nil
+}
+
+// entryPresent reports whether anything at all is stored at sequence's entry
+// coordinate. A malformed cell is present: only a store error is an error.
 func (r *Registry) entryPresent(ctx context.Context, id shoal.ID, sequence int64) (bool, error) {
-	_, e := r.read(ctx, r.changeEntryCoordinate(id, sequence))
-	if shoal.IsErrorCode(e, shoal.ErrorNotFound) {
-		return false, nil
+	cells, e := r.config.Backend.ReadExact(ctx, []allocator.Coordinate{r.changeEntryCoordinate(id, sequence)})
+	if e != nil {
+		return false, ErrUnavailable
 	}
-	return e == nil, e
+	return len(cells) != 0, nil
 }
 
-// maxRecoveryProbes bounds the search for a free sequence when recovering.
-const maxRecoveryProbes = 64
+type rowScanner interface {
+	ScanRowPrefix(context.Context, []byte, []byte, []byte, []byte, int) ([]allocator.Cell, error)
+}
+
+// highestEntry returns the highest sequence with any cell stored at its entry
+// coordinate, by paging through the log's entry qualifiers, which sort in
+// sequence order. ok is false when the store cannot scan a row.
+func (r *Registry) highestEntry(ctx context.Context, id shoal.ID) (highest int64, ok bool, err error) {
+	scanner, ok := r.config.Backend.(rowScanner)
+	if !ok {
+		return 0, false, nil
+	}
+	row := r.registrationCoordinate(id).Row
+	start := []byte(entryPrefix)
+	for {
+		cells, e := scanner.ScanRowPrefix(ctx, row, []byte(changeFamily), start, bytes.Clone(r.config.Visibility), scanPage)
+		if e != nil {
+			return 0, true, ErrUnavailable
+		}
+		for _, cell := range cells {
+			q := string(cell.Coordinate.Qualifier)
+			if !strings.HasPrefix(q, entryPrefix) {
+				return highest, true, nil
+			}
+			if n, e := strconv.ParseInt(strings.TrimPrefix(q, entryPrefix), 10, 64); e == nil && n > highest {
+				highest = n
+			}
+		}
+		if len(cells) < scanPage {
+			return highest, true, nil
+		}
+		start = append(bytes.Clone(cells[len(cells)-1].Coordinate.Qualifier), 0)
+	}
+}
+
+// anyEntry reports whether the log has any entry, scanning where the store
+// can and checking the first sequence otherwise.
+func (r *Registry) anyEntry(ctx context.Context, id shoal.ID) (bool, error) {
+	highest, ok, e := r.highestEntry(ctx, id)
+	if e != nil || ok {
+		return highest > 0, e
+	}
+	return r.entryPresent(ctx, id, 1)
+}
 
 type auditWrite struct {
 	sequence   int64
+	qualifier  []byte
 	value      []byte
 	conditions []allocator.Condition
 	updates    []allocator.Update
 }
 
 // prepareChange builds the conditions and updates that append next's change
-// entry to id's log.
+// entry to id's log. Every audited write is also a write of the registration
+// cell under its compare-and-set condition (updateRegistrationAudited), so
+// audited writers are serialized by that condition; the head condition only
+// pins what a normal append read.
 //
-// A damaged log never blocks a revocation, the emergency control. When the
-// head does not decode, or the entry it would append already exists, a
-// provisioning fails closed but a revocation starts a new segment: its entry
-// carries a ChangeRecovery naming the head it replaced (timestamp and digest
-// of its exact bytes), takes the first free sequence above both the head's
-// timestamp and its sequence, and is written in the same mutation as the
-// revocation and the new head, pinned to the damaged head's exact cell. A
-// head that cannot be read at all (a store failure) still fails: nothing can
-// be written then anyway.
+// A damaged log never blocks a revocation, the emergency control. The log is
+// damaged when the head is present but not a head this registry wrote, when
+// the head is absent while entries exist, or when the entry it would append
+// is already occupied. A provisioning then fails closed. A revocation starts
+// a new segment:
+//   - its entry carries a ChangeRecovery naming the damaged head (its
+//     timestamp, clamped to 0, and the SHA-256 of its exact bytes, or of
+//     nothing when absent);
+//   - its sequence is one above the highest of the head's timestamp, the
+//     head's sequence and every stored entry (found by scanning the row
+//     where the store can; by probing upward otherwise), so no stored
+//     entry sits above the new segment and later appends proceed normally;
+//   - the new head, written at that sequence, records it as SegmentStart;
+//   - all of it, with the revocation, is one mutation.
+//
+// If no sequence above the damage is representable, the entry is written
+// under an overflow qualifier and the head is left as it is: the revocation
+// still applies and is still recorded, and the log reads as unavailable.
+// Only a failure of the store itself fails a revocation, since then nothing
+// can be written anyway.
 func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registrationRow, record func(registrationRow) (Change, error)) (auditWrite, error) {
 	change, e := record(next)
 	if e != nil {
 		return auditWrite{}, e
 	}
-	previous, headCondition, cell, e := r.readChangeHeadCell(ctx, id)
-	if e != nil && (cell == nil || change.Action != ChangeRevoke) {
+	head, e := r.readHeadState(ctx, id)
+	if e != nil {
 		return auditWrite{}, e
 	}
-	if e != nil {
-		change.Recovery = &ChangeRecovery{Reason: RecoveryUnreadableHead, HeadTimestamp: cell.Timestamp, HeadSHA256: digestBytes(cell.Value)}
-		previous = cell.Timestamp
-	} else if occupied, e := r.entryPresent(ctx, id, previous+1); e != nil {
-		return auditWrite{}, e
-	} else if occupied {
+	reason := RecoveryReason("")
+	switch {
+	case head.damaged:
+		reason = RecoveryUnreadableHead
+	case head.head.Sequence == math.MaxInt64:
+		reason = RecoveryOccupiedSequence
+	default:
+		occupied, e := r.entryPresent(ctx, id, head.head.Sequence+1)
+		if e != nil {
+			return auditWrite{}, e
+		}
+		if !occupied && !head.present {
+			// An absent head over existing entries hides history.
+			if occupied, e = r.anyEntry(ctx, id); e != nil {
+				return auditWrite{}, e
+			}
+		}
+		if occupied {
+			reason = RecoveryOccupiedSequence
+		}
+	}
+	headCell := r.changeHeadCoordinate(id)
+	nextHead := changeHead{CollectorID: id, Sequence: head.head.Sequence + 1, SegmentStart: head.head.SegmentStart}
+	conditions := []allocator.Condition{head.pin}
+	writeHead := true
+	if reason != "" {
 		if change.Action != ChangeRevoke {
 			return auditWrite{}, ErrUnavailable
 		}
-		recovery := &ChangeRecovery{Reason: RecoveryOccupiedSequence, HeadTimestamp: previous}
-		if cell != nil {
-			recovery.HeadTimestamp, recovery.HeadSHA256 = cell.Timestamp, digestBytes(cell.Value)
-		} else {
+		recovery := &ChangeRecovery{Reason: reason, HeadTimestamp: head.timestamp, HeadSHA256: head.digest}
+		if !head.present {
 			recovery.HeadSHA256 = digestBytes(nil)
 		}
 		change.Recovery = recovery
-	}
-	if previous < 0 || previous > 1<<62 {
-		return auditWrite{}, ErrUnavailable
-	}
-	change.Sequence = previous + 1
-	if change.Recovery != nil {
-		for probes := 0; ; probes++ {
-			occupied, e := r.entryPresent(ctx, id, change.Sequence)
-			if e != nil {
-				return auditWrite{}, e
-			}
-			if !occupied {
-				break
-			}
-			if probes == maxRecoveryProbes {
-				return auditWrite{}, ErrUnavailable
-			}
-			change.Sequence++
+		base := max(head.timestamp, head.head.Sequence)
+		highest, scanned, e := r.highestEntry(ctx, id)
+		if e != nil {
+			return auditWrite{}, e
+		}
+		base = max(base, highest)
+		sequence, e := r.freeAbove(ctx, id, base, scanned)
+		if e != nil {
+			return auditWrite{}, e
+		}
+		nextHead = changeHead{CollectorID: id, Sequence: sequence, SegmentStart: sequence}
+		// Serialized by the registration condition; a damaged head cannot
+		// be pinned reliably, and an absent one is pinned by the entries.
+		conditions = nil
+		if sequence <= 0 {
+			writeHead = false
 		}
 	}
+	change.Sequence = nextHead.Sequence
+	qualifier := r.changeEntryCoordinate(id, change.Sequence).Qualifier
 	var attempt [16]byte
 	if _, e := rand.Read(attempt[:]); e != nil {
 		return auditWrite{}, ErrUnavailable
 	}
 	change.Attempt = hex.EncodeToString(attempt[:])
+	if !writeHead {
+		change.Sequence = math.MaxInt64
+		qualifier = []byte(overflowPrefix + change.Attempt)
+	}
 	if validChange(change, id) != nil {
 		return auditWrite{}, invalid()
 	}
@@ -295,33 +412,57 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 	if e != nil {
 		return auditWrite{}, invalid()
 	}
-	head, e := encode(changeHead{CollectorID: id, Sequence: change.Sequence})
+	headValue, e := encode(nextHead)
 	if e != nil {
 		return auditWrite{}, invalid()
 	}
 	// Never write what the readers would refuse: both cells must decode back
 	// to exactly what was meant, under the same rules readChange and
-	// readChangeHead apply.
+	// readHeadState apply.
 	var readBack Change
 	var headBack changeHead
-	if decode(value, &readBack) != nil || validChange(readBack, id) != nil || !reflect.DeepEqual(readBack, change) || decode(head, &headBack) != nil || headBack != (changeHead{CollectorID: id, Sequence: change.Sequence}) {
+	if decode(value, &readBack) != nil || validChange(readBack, id) != nil || !reflect.DeepEqual(readBack, change) || decode(headValue, &headBack) != nil || headBack != nextHead {
 		return auditWrite{}, invalid()
 	}
-	entry := r.changeEntryCoordinate(id, change.Sequence)
-	return auditWrite{
-		sequence:   change.Sequence,
-		value:      value,
-		conditions: []allocator.Condition{headCondition, {Coordinate: entry, Absent: true}},
-		updates: []allocator.Update{
-			{Coordinate: r.changeHeadCoordinate(id), Timestamp: change.Sequence, Value: head},
-			{Coordinate: entry, Timestamp: 1, Value: value},
-		},
-	}, nil
+	entry := r.changeCoordinate(id, string(qualifier))
+	w := auditWrite{sequence: change.Sequence, qualifier: qualifier, value: value, conditions: append(conditions, allocator.Condition{Coordinate: entry, Absent: true}), updates: []allocator.Update{{Coordinate: entry, Timestamp: 1, Value: value}}}
+	if writeHead {
+		w.updates = append(w.updates, allocator.Update{Coordinate: headCell, Timestamp: nextHead.Sequence, Value: headValue})
+	}
+	return w, nil
+}
+
+// freeAbove returns the sequence a recovery entry takes: base+1 when the row
+// was scanned (nothing stored lies above base), otherwise the first free
+// sequence found probing upward in doubling steps. It returns 0 when no such
+// sequence is representable.
+func (r *Registry) freeAbove(ctx context.Context, id shoal.ID, base int64, scanned bool) (int64, error) {
+	if base >= math.MaxInt64-1 {
+		return 0, nil
+	}
+	if scanned {
+		return base + 1, nil
+	}
+	for step := int64(1); ; step *= 2 {
+		if base > math.MaxInt64-1-step {
+			return 0, nil
+		}
+		occupied, e := r.entryPresent(ctx, id, base+step)
+		if e != nil {
+			return 0, e
+		}
+		if !occupied {
+			return base + step, nil
+		}
+		if step > math.MaxInt64/4 {
+			return 0, nil
+		}
+	}
 }
 
 // changeApplied reports whether the entry w would write is the one stored.
 func (r *Registry) changeApplied(ctx context.Context, id shoal.ID, w auditWrite) (bool, error) {
-	cell, e := r.read(ctx, r.changeEntryCoordinate(id, w.sequence))
+	cell, e := r.read(ctx, r.changeCoordinate(id, string(w.qualifier)))
 	if shoal.IsErrorCode(e, shoal.ErrorNotFound) {
 		return false, nil
 	}
@@ -360,7 +501,7 @@ func validChange(c Change, id shoal.ID) error {
 		switch {
 		case c.Action != ChangeRevoke,
 			c.Recovery.Reason != RecoveryUnreadableHead && c.Recovery.Reason != RecoveryOccupiedSequence,
-			c.Recovery.HeadTimestamp < 0, c.Recovery.HeadTimestamp >= c.Sequence,
+			c.Recovery.HeadTimestamp < 0,
 			!collector.ValidDigest(c.Recovery.HeadSHA256):
 			return invalid()
 		}
@@ -430,12 +571,21 @@ func (r *Registry) Changes(ctx context.Context, id shoal.ID, after int64, limit 
 	if shoal.ValidateRequiredID("collector ID", id) != nil || after < 0 || limit <= 0 || limit > MaxChangesPage {
 		return nil, invalid()
 	}
-	head, _, e := r.readChangeHead(ctx, id)
+	head, e := r.readChangeHead(ctx, id)
 	if e != nil {
 		return nil, e
 	}
+	if head.Sequence == 0 {
+		// An absent head over stored entries hides history: fail closed.
+		if hidden, e := r.anyEntry(ctx, id); e != nil || hidden {
+			return nil, ErrUnavailable
+		}
+	}
+	// Only the current segment is readable; entries before its recovery
+	// entry stay stored, for forensics, outside this API.
+	after = max(after, head.SegmentStart-1)
 	var out []Change
-	for sequence := after + 1; sequence <= head && len(out) < limit; sequence++ {
+	for sequence := after + 1; sequence <= head.Sequence && len(out) < limit; sequence++ {
 		c, e := r.readChange(ctx, id, sequence)
 		if e != nil {
 			return nil, e
@@ -541,36 +691,38 @@ func (r *Registry) AdminRevoke(ctx context.Context, id shoal.ID, generation int6
 // coherentRegistration reads id's registration between two reads of its log
 // head that agree, retrying a bounded number of times, so the registration
 // and the head describe the same logged state. A registration outside domain
-// reads as not found before the head is read.
-func (r *Registry) coherentRegistration(ctx context.Context, id shoal.ID, domain []byte) (registrationRow, int64, error) {
+// reads as not found before anything about its log is disclosed.
+func (r *Registry) coherentRegistration(ctx context.Context, id shoal.ID, domain []byte) (registrationRow, changeHead, error) {
 	for range maxCASAttempts {
-		before, pinBefore, e := r.readChangeHead(ctx, id)
+		before, e := r.readHeadState(ctx, id)
 		if e != nil {
-			// Corruption elsewhere in the table is not disclosed across
-			// domains: check the domain first when the head is unreadable.
-			if row, _, readErr := r.readRegistration(ctx, id); readErr != nil {
-				return registrationRow{}, 0, readErr
-			} else if !bytes.Equal(row.Registration.Domain, domain) {
-				return registrationRow{}, 0, auth.ObjectNotFound()
-			}
-			return registrationRow{}, 0, e
+			return registrationRow{}, changeHead{}, e
 		}
 		row, _, e := r.readRegistration(ctx, id)
 		if e != nil {
-			return registrationRow{}, 0, e
+			return registrationRow{}, changeHead{}, e
 		}
 		if !bytes.Equal(row.Registration.Domain, domain) {
-			return registrationRow{}, 0, auth.ObjectNotFound()
+			return registrationRow{}, changeHead{}, auth.ObjectNotFound()
 		}
-		after, pinAfter, e := r.readChangeHead(ctx, id)
+		after, e := r.readHeadState(ctx, id)
 		if e != nil {
-			return registrationRow{}, 0, e
+			return registrationRow{}, changeHead{}, e
 		}
-		if before == after && pinBefore.Timestamp == pinAfter.Timestamp && bytes.Equal(pinBefore.Value, pinAfter.Value) {
-			return row, after, nil
+		if before.present != after.present || before.digest != after.digest || before.timestamp != after.timestamp {
+			continue
 		}
+		if after.damaged {
+			return registrationRow{}, changeHead{}, ErrUnavailable
+		}
+		if !after.present {
+			if hidden, e := r.anyEntry(ctx, id); e != nil || hidden {
+				return registrationRow{}, changeHead{}, ErrUnavailable
+			}
+		}
+		return row, after.head, nil
 	}
-	return registrationRow{}, 0, ErrUnavailable
+	return registrationRow{}, changeHead{}, ErrUnavailable
 }
 
 // AdminRegistration reads a registration in the admin's own authorization
@@ -589,8 +741,8 @@ func (r *Registry) AdminRegistration(ctx context.Context, id shoal.ID) (AdminVie
 	if e != nil {
 		return AdminView{}, e
 	}
-	view := AdminView{Registration: row.Registration, EnrollmentID: currentEnrollment(row), ChangeCount: head}
-	for sequence := head; sequence > 0 && len(view.Changes) < MaxViewChanges; sequence-- {
+	view := AdminView{Registration: row.Registration, EnrollmentID: currentEnrollment(row), ChangeCount: head.Sequence, SegmentStart: head.SegmentStart}
+	for sequence := head.Sequence; sequence > 0 && sequence >= head.SegmentStart && len(view.Changes) < MaxViewChanges; sequence-- {
 		c, e := r.readChange(ctx, id, sequence)
 		if e != nil {
 			return AdminView{}, e
@@ -598,13 +750,11 @@ func (r *Registry) AdminRegistration(ctx context.Context, id shoal.ID) (AdminVie
 		if !bytes.Equal(c.Registration.Domain, row.Registration.Domain) {
 			return AdminView{}, ErrUnavailable
 		}
-		view.Changes = append(view.Changes, c)
-		if c.Recovery != nil {
-			// The start of the current segment; older entries belong to a
-			// log this registry could not append to.
-			view.SegmentStart = c.Sequence
-			break
+		// A recovery entry is exactly the start of the current segment.
+		if (c.Recovery != nil) != (c.Sequence == head.SegmentStart) {
+			return AdminView{}, ErrUnavailable
 		}
+		view.Changes = append(view.Changes, c)
 	}
 	// Coherence: every provisioning and revocation writes the registration
 	// and the head in one mutation, so a registration read between two

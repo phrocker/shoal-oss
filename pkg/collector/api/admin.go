@@ -151,8 +151,9 @@ type RegistrationRecord struct {
 	ChangeCount        int64           `json:"change_count"`
 	Changes            []ChangeSummary `json:"changes"`
 	// SegmentStart is the sequence of the recovery entry that starts the
-	// current log segment when it is among Changes (always the oldest
-	// listed), otherwise absent.
+	// current log segment, absent when the log never needed recovery. Only
+	// that segment is listed. ChangeCount is the newest sequence, which after
+	// a recovery is not a count of stored entries.
 	SegmentStart int64 `json:"segment_start,omitempty"`
 }
 
@@ -296,13 +297,13 @@ func (r RegistrationRecord) Validate() error {
 		if c.validate() != nil || c.Sequence > r.ChangeCount || (i > 0 && c.Sequence >= r.Changes[i-1].Sequence) {
 			return badResponse()
 		}
-		// A recovery entry starts the segment, so it is the oldest listed,
-		// and it is exactly the one SegmentStart names.
-		if (c.Recovery != "") != (r.SegmentStart == c.Sequence) || (c.Recovery != "" && i != len(r.Changes)-1) {
+		// Only the current segment is listed, and its recovery entry is
+		// exactly the one SegmentStart names.
+		if c.Sequence < r.SegmentStart || (c.Recovery != "") != (r.SegmentStart == c.Sequence) {
 			return badResponse()
 		}
 	}
-	if r.SegmentStart < 0 || (r.SegmentStart > 0 && (len(r.Changes) == 0 || r.Changes[len(r.Changes)-1].Sequence != r.SegmentStart)) {
+	if r.SegmentStart < 0 || r.SegmentStart > r.ChangeCount {
 		return badResponse()
 	}
 	return nil
