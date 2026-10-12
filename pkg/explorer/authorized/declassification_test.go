@@ -1065,3 +1065,145 @@ func TestDeclassificationClaimBindingRequiresItsIntent(t *testing.T) {
 		}
 	})
 }
+
+// TestDeclassificationOwnIntentDoesNotAuthorizeTheRegistration pins D1 of
+// the fourth review. In the diverged-catalog state, an outsider who holds
+// only some of the registration's labels can first leave a claim under its
+// own labels (refused as absent, but the claim commits on the base write,
+// #665) and then narrow that claim with a reason. Its own intent authorized
+// it under the claim, not under the registration, so the pre-commit check
+// must still authorize it under the registration and refuse it as absent.
+func TestDeclassificationOwnIntentDoesNotAuthorizeTheRegistration(t *testing.T) {
+	for _, requireReason := range []bool{false, true} {
+		f := newFixture(t)
+		const uri = "file:///declassify/two-step.txt"
+		labelled, err := f.base.Ingest(context.Background(),
+			labelledSource(uri, "labelled before the catalog", "secret&conf"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.clientA.BackfillExistingDocumentsForDevelopment(
+			f.labelIngester(t, "operator", "secret", "conf"), devbackfill.NewCapability()); err != nil {
+			t.Fatal(err)
+		}
+		restored, err := explorer.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = restored.Close() })
+		client := f.declassificationClientOver(t, restored, f.store, requireReason)
+		outsider := withReason(t, f.labelIngester(t, "outsider", "conf"), "r")
+		if _, err := client.Ingest(outsider, labelledSource(uri, "conf", "conf")); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			t.Fatalf("reason=%v step 1 = %v, want not found", requireReason, err)
+		}
+		if _, err := client.Ingest(outsider, labelledSource(uri, "public", "")); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+			t.Fatalf("reason=%v step 2 = %v, want not found", requireReason, err)
+		}
+		current, ok, err := f.store.CurrentRevision(context.Background(), labelled.Document.ID)
+		if err != nil || !ok || current.RevisionID != labelled.Revision.ID {
+			t.Fatalf("reason=%v: the outsider replaced the registration: %+v %v %v",
+				requireReason, current, ok, err)
+		}
+		for _, record := range declassifications(t, f.store) {
+			if record.Phase == authorized.DeclassificationPreCommit {
+				t.Fatalf("reason=%v: refused narrowing has a pre-commit record: %+v", requireReason, record)
+			}
+		}
+	}
+}
+
+// bindCountingStore counts claim-lineage bindings.
+type bindCountingStore struct {
+	authorized.PolicyStore
+	mu    sync.Mutex
+	binds int
+}
+
+func (s *bindCountingStore) BindDeclassificationClaim(
+	ctx context.Context, uri string, version uint64, attemptID shoal.ID,
+) error {
+	s.mu.Lock()
+	s.binds++
+	s.mu.Unlock()
+	return s.PolicyStore.BindDeclassificationClaim(ctx, uri, version, attemptID)
+}
+
+func (s *bindCountingStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.binds
+}
+
+// TestDeclassificationOrdinaryReingestWritesNoLineage pins D2 of the fourth
+// review: once a narrowing has completed, later ordinary ingests of the URI
+// (edits, unchanged re-ingests, added labels) write no lineage binding, so
+// they cannot grow the catalog or fail on it.
+func TestDeclassificationOrdinaryReingestWritesNoLineage(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, inner authorized.PolicyStore) {
+		f := newFixture(t)
+		store := &bindCountingStore{PolicyStore: inner}
+		client := f.declassificationClient(t, store, false)
+		const uri = "file:///declassify/no-lineage.txt"
+		owner := f.labelIngester(t, "owner", "secret", "y")
+		if _, err := client.Ingest(owner, labelledSource(uri, "secret", "secret")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Ingest(owner, labelledSource(uri, "public", "")); err != nil {
+			t.Fatal(err)
+		}
+		if got := store.count(); got != 1 {
+			t.Fatalf("binds after one narrowing = %d, want 1", got)
+		}
+		for _, step := range []explorer.Source{
+			labelledSource(uri, "public, edited", ""),
+			labelledSource(uri, "public, edited", ""),
+			labelledSource(uri, "public, edited again", ""),
+			labelledSource(uri, "now y", "y"),
+			labelledSource(uri, "y, edited", "y"),
+		} {
+			if _, err := client.Ingest(owner, step); err != nil {
+				t.Fatalf("ingest %q: %v", step.Content, err)
+			}
+		}
+		if got := store.count(); got != 1 {
+			t.Fatalf("binds after ordinary re-ingests = %d, want 1", got)
+		}
+	})
+}
+
+// TestDeclassificationReconcilingRetryKeepsLineage pins that a reconciling
+// retry binds its own claim version before it records anything, so when that
+// retry fails too, a further retry still completes the narrowing.
+func TestDeclassificationReconcilingRetryKeepsLineage(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, inner authorized.PolicyStore) {
+		f := newFixture(t)
+		store := &failingDeclassificationStore{
+			PolicyStore: inner, fail: map[int]bool{2: true, 3: true}}
+		client := f.declassificationClient(t, store, true)
+		const uri = "file:///declassify/retry-chain.txt"
+		first, err := client.Ingest(f.labelIngester(t, "owner", "secret"),
+			labelledSource(uri, "secret", "secret"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		public := labelledSource(uri, "public", "")
+		if _, err := client.Ingest(withReason(t, f.labelIngester(t, "owner", "secret"), "r"), public); err == nil {
+			t.Fatal("first pre-commit failure was ignored")
+		}
+		// Different content, so the base applies it and the claim commits
+		// at a new version; only that version's binding can carry lineage.
+		if _, err := client.Ingest(f.labelIngester(t, "retrier-1"),
+			labelledSource(uri, "public, retry 1", "")); err == nil {
+			t.Fatal("second pre-commit failure was ignored")
+		}
+		second, err := client.Ingest(f.labelIngester(t, "retrier-2"),
+			labelledSource(uri, "public, retry 2", ""))
+		if err != nil {
+			t.Fatalf("third attempt = %v, want reconciliation", err)
+		}
+		current, ok, err := inner.CurrentRevision(context.Background(), first.Document.ID)
+		if err != nil || !ok || current.RevisionID != second.Revision.ID {
+			t.Fatalf("current = %+v %v %v", current, ok, err)
+		}
+	})
+}

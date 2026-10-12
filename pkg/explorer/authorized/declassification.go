@@ -111,14 +111,21 @@ package authorized
 //     such a state let an attempt create a claim without passing this
 //     check. The principal is first authorized under the registration it
 //     replaces (NotFound otherwise), and then the reason policy applies,
-//     after the base write and before the registration.
+//     after the base write and before the registration. This holds even
+//     when the ingest recorded its own intent against the claim: that
+//     intent authorized the principal under the claim, not under a
+//     registration it never compared with.
 //   - A narrowing first seen at the pre-commit check, where the claim DOES
 //     descend from a covering intent, is a reconciliation. Claim lineage
 //     works like this: every claim version created by a CAS that followed an
 //     intent is bound to that intent (BindDeclassificationClaim, written
-//     before the base), and a later CAS that records no intent and keeps
-//     every component of the existing claim's rule carries that binding
-//     forward. "Covering" means the same URI, the selected rule keeping
+//     before the base). A later ingest that records no intent and keeps
+//     every component of the replaced claim's rule inherits the replaced
+//     version's binding, but only when its pre-commit check actually
+//     reconciles through it; it then binds its own version before
+//     recording, so a further retry still descends. Ordinary re-ingests
+//     write nothing, and the lineage of a completed narrowing ends at the
+//     next ingest. "Covering" means the same URI, the selected rule keeping
 //     every component of the intent's rule (a retry may be stricter), and
 //     the current registration's rule being exactly one of the intent's
 //     replaced rules. Here the claim already holds the narrow rule while the
@@ -488,7 +495,7 @@ func (c *Client) declassificationCommit(
 	documentID, revisionID shoal.ID,
 	selected AccessRule,
 	attempt *declassificationAttempt,
-	claimVersion uint64,
+	lineage declassificationClaimLineage,
 ) error {
 	current, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
 	if err != nil {
@@ -499,22 +506,30 @@ func (c *Client) declassificationCommit(
 		priorRules = append(priorRules, attempt.priorRules...)
 	}
 	priorRevision := shoal.ID("")
+	// uncovered is a narrowing of the current registration that the
+	// claim-time check neither compared with nor authorized the principal
+	// under. That check authorized every rule in attempt.priorRules.
+	uncovered := false
 	if ok && current.RevisionID != revisionID {
 		priorRevision = current.RevisionID
 		if ruleNarrows(current.Rule, selected) {
+			if attempt == nil || !containsRule(attempt.priorRules, current.Rule) {
+				uncovered = true
+			}
 			priorRules = appendDistinctRule(priorRules, current.Rule)
 		}
 	}
 	if len(priorRules) == 0 {
 		return nil
 	}
-	if attempt == nil {
-		reconciliation, err := c.reconcilesClaimIntent(
-			ctx, sourceURI, claimVersion, selected, current.Rule)
+	if uncovered {
+		reconciled, err := c.reconcileClaimLineage(
+			ctx, sourceURI, lineage, attempt == nil, selected, current.Rule)
 		if err != nil {
 			return err
 		}
-		if reconciliation {
+		switch {
+		case reconciled && attempt == nil:
 			// The claim this ingest holds descends from an earlier
 			// attempt's intent (its claim lineage, not merely some intent
 			// on file), which narrowed exactly this registration and passed
@@ -531,20 +546,25 @@ func (c *Client) declassificationCommit(
 				reason:         declassificationReason(ctx),
 				reconciliation: true,
 			}
-		} else {
+		case reconciled:
+			// This ingest's own intent (reason-checked at claim time)
+			// covers the registration through its lineage.
+		default:
 			// The claim does not descend from an intent covering this
-			// narrowing, so this is its first check: the claim-time check
-			// had nothing to compare with because the catalog and the
-			// base diverged (a current registration for a URI whose base
-			// document is gone, for example a base restored from backup,
-			// or whose claim was created by an attempt that never passed
-			// this check). An intent on file that this claim does not
-			// descend from (a CAS conflict, a failed base write, an old
-			// completed narrowing) never counts. It is
-			// treated as an intent: the principal must be authorized
-			// under the registration it replaces (NotFound otherwise, so
-			// nothing about its labels is disclosed) and the reason policy
-			// applies.
+			// narrowing of the registration, so this is its first check
+			// against it: the claim-time check had nothing to compare
+			// with, because the catalog and the base diverged (a current
+			// registration for a URI whose base document is gone, for
+			// example a base restored from backup), or the claim was
+			// created by an attempt that never passed this check. That
+			// holds whether or not this ingest recorded an intent against
+			// the claim: such an intent authorized the principal under the
+			// claim, not under this registration. An intent on file that
+			// this claim does not descend from (a CAS conflict, a failed
+			// base write, an old completed narrowing) never counts. The
+			// principal must be authorized under the registration it
+			// replaces (NotFound otherwise, so nothing about its labels is
+			// disclosed), and the reason policy applies.
 			allowed, err := ruleAllows(
 				current.Rule, decision, auth.OperationIngest, now)
 			if err != nil {
@@ -553,8 +573,10 @@ func (c *Client) declassificationCommit(
 			if !allowed {
 				return auth.ObjectNotFound()
 			}
-			attempt = &declassificationAttempt{
-				reason: declassificationReason(ctx),
+			if attempt == nil {
+				attempt = &declassificationAttempt{
+					reason: declassificationReason(ctx),
+				}
 			}
 		}
 	}
@@ -568,70 +590,104 @@ func (c *Client) declassificationCommit(
 		attempt, revisionID)
 }
 
-// reconcilesClaimIntent reports whether the source claim version this
-// ingest holds descends from an intent that covers narrowing prior to
-// selected: the intent bound to (sourceURI, claimVersion) (see
-// bindDeclassificationLineage) for the same URI, whose rule selected keeps
-// every component of (a retry may choose a stricter rule), and whose
-// replaced rules include prior exactly. Only such an intent passed the
-// reason policy for this narrowing on this claim's lineage.
-func (c *Client) reconcilesClaimIntent(
-	ctx context.Context,
-	sourceURI string,
-	claimVersion uint64,
-	selected, prior AccessRule,
-) (bool, error) {
-	if claimVersion == 0 {
-		return false, nil
-	}
-	intent, ok, err := c.policyStore.DeclassificationClaimIntent(
-		ctx, sourceURI, claimVersion)
-	if err != nil {
-		return false, policyCatalogReadError(ctx, err)
-	}
-	if !ok || intent.Phase != DeclassificationIntent ||
-		intent.SourceURI != sourceURI || ruleNarrows(intent.Rule, selected) {
-		return false, nil
-	}
-	for _, replaced := range intent.PriorRules {
-		if replaced.equal(prior) {
-			return true, nil
+func containsRule(rules []AccessRule, rule AccessRule) bool {
+	for _, candidate := range rules {
+		if candidate.equal(rule) {
+			return true
 		}
 	}
-	return false, nil
+	return false
 }
 
-// declassificationLineage returns the intent a new claim version must be
-// bound to, if any: this ingest's own intent, or, when this ingest recorded
-// none and its rule keeps every component of the existing claim's rule, the
-// intent the existing claim version is already bound to. So a retry that
-// completes an earlier narrowing (#665) keeps that narrowing's lineage, and a
-// claim created by an attempt with no intent never acquires one.
-func (c *Client) declassificationLineage(
+// declassificationClaimLineage is what an Ingest knows about its claim's
+// descent: the claim version it holds, and the version of the claim it
+// replaced when the replacement recorded no intent and kept every component
+// of that claim's rule (zero otherwise).
+type declassificationClaimLineage struct {
+	version      uint64
+	priorVersion uint64
+}
+
+// reconcileClaimLineage reports whether the claim this ingest holds descends
+// from an intent that covers narrowing prior to selected. Such an intent has
+// the same URI, a rule whose every component selected keeps (a retry may
+// choose a stricter rule), and prior exactly among its replaced rules. Only
+// such an intent passed the reason policy for this narrowing on this claim's
+// lineage.
+//
+// The intent is the one bound to the held claim version. Or, when this ingest
+// recorded no intent (carry is true) and its claim replaced one without
+// dropping a component, it is the one bound to that replaced version; the
+// held version is then bound to it as well, before the narrowing is recorded
+// or registered, so a further retry still descends from it. Lineage is thus
+// carried only by a retry that actually reconciles. An ordinary re-ingest
+// writes nothing, and the lineage of a completed narrowing ends at the next
+// ingest.
+func (c *Client) reconcileClaimLineage(
 	ctx context.Context,
 	sourceURI string,
-	existing *SourcePolicyClaim,
-	selected AccessRule,
-	attempt *declassificationAttempt,
-) (shoal.ID, error) {
-	if attempt != nil {
-		return attempt.id, nil
+	lineage declassificationClaimLineage,
+	carry bool,
+	selected, prior AccessRule,
+) (bool, error) {
+	if covered, err := c.claimIntentCovers(
+		ctx, sourceURI, lineage.version, selected, prior); err != nil || covered != "" {
+		return covered != "", err
 	}
-	// A selected rule that narrows the existing claim always records its own
-	// intent above, so the second test is defensive: lineage is never
-	// carried onto a claim that drops components of the one it replaces.
-	if existing == nil || ruleNarrows(existing.Rule, selected) {
+	if !carry || lineage.priorVersion == 0 {
+		return false, nil
+	}
+	covered, err := c.claimIntentCovers(
+		ctx, sourceURI, lineage.priorVersion, selected, prior)
+	if err != nil || covered == "" {
+		return false, err
+	}
+	if err := c.policyStore.BindDeclassificationClaim(
+		ctx, sourceURI, lineage.version, covered); err != nil {
+		return false, policyCatalogWriteError(ctx, err)
+	}
+	return true, nil
+}
+
+// claimIntentCovers returns the attempt ID of the intent bound to
+// (sourceURI, version) when it covers narrowing prior to selected, or "".
+func (c *Client) claimIntentCovers(
+	ctx context.Context,
+	sourceURI string,
+	version uint64,
+	selected, prior AccessRule,
+) (shoal.ID, error) {
+	if version == 0 {
 		return "", nil
 	}
 	intent, ok, err := c.policyStore.DeclassificationClaimIntent(
-		ctx, sourceURI, existing.Version)
+		ctx, sourceURI, version)
 	if err != nil {
 		return "", policyCatalogReadError(ctx, err)
 	}
-	if !ok {
+	if !ok || intent.Phase != DeclassificationIntent ||
+		intent.SourceURI != sourceURI || ruleNarrows(intent.Rule, selected) ||
+		!containsRule(intent.PriorRules, prior) {
 		return "", nil
 	}
 	return intent.AttemptID, nil
+}
+
+// declassificationPriorVersion returns the replaced claim version a retry may
+// inherit lineage from: the existing claim's, when this ingest recorded no
+// intent and its rule keeps every component of the existing claim's rule. A
+// selected rule that narrows the existing claim always records its own intent,
+// so the rule test is defensive.
+func declassificationPriorVersion(
+	existing *SourcePolicyClaim,
+	selected AccessRule,
+	attempt *declassificationAttempt,
+) uint64 {
+	if attempt != nil || existing == nil ||
+		ruleNarrows(existing.Rule, selected) {
+		return 0
+	}
+	return existing.Version
 }
 
 func appendDistinctRule(rules []AccessRule, rule AccessRule) []AccessRule {
