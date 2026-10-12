@@ -302,6 +302,35 @@ func TestKeyReusedAfterRetentionStillOpens(t *testing.T) {
 	}
 }
 
+// TestJournalStaysWithinItsDeclaredBound: generations of keys pruned by a
+// full Begin, faster than any Finish-time prune, still leave the file within
+// JournalBound's record count.
+func TestJournalStaysWithinItsDeclaredBound(t *testing.T) {
+	saved := compactSlack
+	compactSlack = 4
+	t.Cleanup(func() { compactSlack = saved })
+	const entries = 20
+	dir, now := t.TempDir(), &fakeNow{now: journalEpoch}
+	j := openTestJournal(t, dir, now, entries)
+	for generation := 0; generation < 4; generation++ {
+		for i := 0; i < entries; i++ {
+			runAndFinish(t, j, testKey(string(rune('a'+generation))+string(rune('A'+i))))
+		}
+		now.Advance(2 * time.Hour)
+		// Keep Finish-time pruning out of it: only the full Begin prunes.
+		j.mu.Lock()
+		j.lastPrune = now.Now()
+		j.mu.Unlock()
+		records, _, err := ReadJournal(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if limit := 2 * (2*entries + compactSlack); len(records) > limit {
+			t.Fatalf("generation %d: %d records, bound %d", generation, len(records), limit)
+		}
+	}
+}
+
 // TestCompactionKeepsEveryLiveRecordByteForByte: after compaction the file
 // holds exactly the live records, and a reopen answers every key as before.
 func TestCompactionKeepsEveryLiveRecordByteForByte(t *testing.T) {

@@ -67,14 +67,16 @@ const (
 	// maxRecordLine bounds one line read back. The largest record this code
 	// writes, two streams at MaxOutputBytesLimit in base64, is well under it.
 	maxRecordLine = 4 << 20
-	// compactSlack is how many dead records may accumulate beyond the live
-	// ones before the file is rewritten.
-	compactSlack = 1024
 	// MaxJournalEntries bounds -journal-max-entries.
 	MaxJournalEntries = 1 << 20
 	// MinJournalRetention bounds -journal-retention from below.
 	MinJournalRetention = time.Minute
 )
+
+// compactSlack is how many dead records may accumulate beyond the live ones
+// before the file is rewritten. A variable only so the bound test can reach
+// it with a small journal.
+var compactSlack = 1024
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
