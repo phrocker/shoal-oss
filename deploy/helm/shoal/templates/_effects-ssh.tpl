@@ -26,7 +26,8 @@ holds an entry name to 24 characters:
   + "-journal" 8                  -> 61: the PersistentVolumeClaim
   + "-commands" 9                 -> 62: the ConfigMap
   + "-init" 5                     -> 58: the init pod's NetworkPolicy
-  + "-init-" 6 + 4 hex digits     -> 63: the journal-init Job
+  + "-init-" 6 + 4 to 12 hex      -> 63 at most: the journal-init Job (the
+                                         digest takes what the name leaves)
 
 Takes a dict of root and ssh.
 */ -}}
@@ -311,6 +312,41 @@ Takes a dict of root and ssh. Returns JSON.
 {{- if or (lt $length (int64 $floor)) (gt $length (int64 $ceiling)) -}}
 {{- fail (printf "%s.cidrs holds %q: the prefix length must be %d to %d. The policy exists to hold this pod, which holds SSH keys, to the registered hosts; name the hosts' addresses" $at $text $floor $ceiling) -}}
 {{- end -}}
+{{- /* IPv6 ranges that carry IPv4. An IPv6 CIDR of /32 or longer fixes its
+       first 32 bits, so it overlaps an embedding range exactly when those
+       bits are 0:0 (IPv4-mapped ::ffff:0:0/96 and IPv4-compatible ::/96,
+       which a CNI may re-parse as 0.0.0.0/0) or 64:ff9b (NAT64, the
+       well-known 64:ff9b::/96 and the local-use 64:ff9b:1::/48, which
+       reach all of IPv4 on a NAT64 cluster). The first two groups are read
+       after normalizing the spelling: lower case, "::" expanded, leading
+       zeros dropped, and a trailing dotted quad counted as two groups. Write
+       the IPv4 CIDR instead. */ -}}
+{{- if $v6 -}}
+{{- $spelled := lower (regexReplaceAll `[0-9]{1,3}(\.[0-9]{1,3}){3}$` $v6address "0:0") -}}
+{{- $halves := splitList "::" $spelled -}}
+{{- $left := ternary (list) (splitList ":" (index $halves 0)) (eq (index $halves 0) "") -}}
+{{- $groups := $left -}}
+{{- if eq (len $halves) 2 -}}
+{{- $right := ternary (list) (splitList ":" (index $halves 1)) (eq (index $halves 1) "") -}}
+{{- range $_ := until (int (sub 8 (add (len $left) (len $right)))) -}}
+{{- $groups = append $groups "0" -}}
+{{- end -}}
+{{- $groups = concat $groups $right -}}
+{{- end -}}
+{{- if ne (len $groups) 8 -}}
+{{- fail (printf "%s.cidrs holds %q, which is not an IPv4 or IPv6 CIDR" $at $text) -}}
+{{- end -}}
+{{- range $group := $groups -}}
+{{- if not (regexMatch `^[0-9a-f]{1,4}$` $group) -}}
+{{- fail (printf "%s.cidrs holds %q, which is not an IPv4 or IPv6 CIDR" $at $text) -}}
+{{- end -}}
+{{- end -}}
+{{- $first := default "0" (trimPrefix "0" (trimPrefix "0" (trimPrefix "0" (index $groups 0)))) -}}
+{{- $second := default "0" (trimPrefix "0" (trimPrefix "0" (trimPrefix "0" (index $groups 1)))) -}}
+{{- if or (and (eq $first "0") (eq $second "0")) (and (eq $first "64") (eq $second "ff9b")) -}}
+{{- fail (printf "%s.cidrs holds %q, an IPv6 range that overlaps the IPv4-mapped, IPv4-compatible or NAT64 prefixes (::ffff:0:0/96, ::/96, 64:ff9b::/96, 64:ff9b:1::/48): a CNI may treat it as IPv4, up to all of it. Write the IPv4 CIDR instead" $at $text) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- $egress = append $egress (dict "cidrs" $cidrs "port" $sshPort) -}}
 {{- end -}}
@@ -505,7 +541,8 @@ spec:
 
 {{- /* <name>-init-<4 hex digits of the pod template's digest>, 63 at most. */ -}}
 {{- define "shoal.effectsSshInitJobName" -}}
-{{- printf "%s-init-%s" .plan.name (trunc 4 (sha256sum (include "shoal.effectsSshInitPod" .))) -}}
+{{- $prefix := printf "%s-init-" .plan.name -}}
+{{- printf "%s%s" $prefix (trunc (int (max 4 (min 12 (sub 63 (len $prefix))))) (sha256sum (include "shoal.effectsSshInitPod" .))) -}}
 {{- end -}}
 
 {{- define "shoal.effectsSshPodSecurity" -}}

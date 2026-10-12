@@ -470,8 +470,13 @@ replica.
 **Initialize the journal once, and pin it.** `serve` never creates a journal.
 `journal init` writes the first line, a header with a random identity and
 the creation time, fsyncs it under a temporary name and links it into place
-(so `journal.log` appears complete or not at all), fsyncs the directory, and
-prints the identity; it refuses a directory that already holds a journal file, even an
+(so `journal.log` appears complete or not at all; this needs a filesystem
+with hard links, as ext4 and xfs have, and on one without them init fails
+with the link error and creates no journal), fsyncs the directory, and
+prints the identity. A process killed between the link and removing the
+temporary leaves `journal.log.init` beside a complete journal; it is
+harmless (nothing reads it, and serve ignores it) and may be deleted by hand.
+Init refuses a directory that already holds a journal file, even an
 empty one. With `-print-existing`, a directory holding a journal with a valid
 header prints that journal's identity and exits 0 instead, writing nothing; a
 headerless or corrupt one is still an error. Put the identity in the deployment as `-journal-id`. Then a

@@ -1662,7 +1662,7 @@
        name ending in one of those suffixes is another entry's object name:
        "web-init" would collide with "web"'s init NetworkPolicy and replace
        one of the two, leaving a pod that holds SSH keys under no policy. */ -}}
-{{- if regexMatch `-(init|journal|commands)$|-init-[0-9a-f]{4}$` $name -}}
+{{- if regexMatch `-(init|journal|commands)$|-init-[0-9a-f]{4,12}$` $name -}}
 {{- fail (printf "%s.name %q ends in a suffix the chart appends to another entry's objects (-init, -init-<digest>, -journal, -commands), so its objects could collide with that entry's" $key $name) -}}
 {{- end -}}
 {{- $_ := set $sshNames $name $ssh._index -}}

@@ -3727,7 +3727,16 @@ done
 for bad in :/64 ::::/64 1:2/64 fd00::1:/64 1::2::3/64; do
   refuses_citing "not an IPv4 or IPv6 CIDR" "a malformed IPv6 CIDR $bad" "${ssh_base[@]}" --set "effectsSsh[0].commands.restart-web.cidrs={$bad}"
 done
-renders "an IPv4-mapped IPv6 address" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.address=[::ffff:10.0.4.17]:22'
+# IPv6 ranges that carry IPv4 (#672 review): mapped, compatible and NAT64,
+# in every spelling, are refused rather than rendered into the egress rule.
+for embedded in '::ffff:0.0.0.0/96' '::ffff:0:0/96' '::ffff:0.0.0.0/97' '::FFFF:0:0/96' \
+    '0:0:0:0:0:ffff:0:0/96' '0000:0000:0000:0000:0000:FFFF:0000:0000/96' '::ffff:10.0.4.17/128' \
+    '::0.0.0.0/96' '::/96' '0::1/128' '0:0:1::/32' '64:ff9b::/96' '64:FF9B::0.0.0.0/96' \
+    '0064:ff9b:0000::/96' '64:ff9b:1::/48' '64:ff9b::a00:411/128'; do
+  refuses_citing "overlaps the IPv4-mapped" "an IPv6 range carrying IPv4: $embedded" "${ssh_base[@]}" --set "effectsSsh[0].commands.restart-web.cidrs={$embedded}"
+done
+refuses_citing "overlaps the IPv4-mapped" "an IPv4-mapped address literal's derived /128" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.address=[::ffff:10.0.4.17]:22'
+renders "an IPv6 /48 outside the embedding ranges" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.cidrs={2001:db8:1::/48,64:ff9c::/32,1::/32}'
 renders "an IPv6 address" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.address=[fd00:1::17]:22'
 assert_renders "a startup probe covers the journal's replay" '^ +startupProbe:$' "${ssh_base[@]}" -s templates/effects-ssh.yaml
 refuses_citing "commands has a command named" "a command name with a slash" "${ssh_base[@]}" --set-json 'effectsSsh[0].commands={"a/b":{}}'
@@ -3759,7 +3768,7 @@ ssh_notes_probe="$(mktemp -d)"
 cp -R "$chart" "$ssh_notes_probe/shoal"
 printf '%s\n' 'notes: {{ include "shoal.effectsSshNotes" . | quote }}' > "$ssh_notes_probe/shoal/templates/zz-ssh-notes-probe.yaml"
 if notes=$(helm template shoal "$ssh_notes_probe/shoal" "${ssh_base[@]}" -s templates/zz-ssh-notes-probe.yaml --set 'effectsSsh[0].journal.id=' 2>&1); then
-  grep -qE "job/shoal-ssh-web-init-[0-9a-f]{4}([^0-9a-f]|$)" <<<"$notes" || fail "the notes do not tell the operator where the journal ID is printed"
+  grep -qE "job/shoal-ssh-web-init-[0-9a-f]{12}([^0-9a-f]|$)" <<<"$notes" || fail "the notes do not tell the operator where the journal ID is printed"
   grep -qF "is NOT serving yet" <<<"$notes" || fail "the notes do not say the entry is not serving"
 else
   fail "the notes do not render with an uninitialized journal"
