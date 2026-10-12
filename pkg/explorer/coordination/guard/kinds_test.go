@@ -55,6 +55,7 @@ var entityKinds = map[byte][]string{
 //     the event ID too. So while that event is unpublished, an approval
 //     request at its hex occupies it: the event is suppressed, and the
 //     action's outbox wedges (#681).
+//
 //   - 'D': fleet dispatch (raw, caller-chosen action ID), explorer documents
 //     (document ID), and the conformance fixture (its own domain). Dispatch
 //     and documents share one domain in the shipped binary. Their ID spaces
