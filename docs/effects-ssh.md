@@ -429,7 +429,11 @@ start instead of serving a fresh journal that has forgotten every key, which
 would re-run a command whose outcome was unknown. A different journal (another
 volume, or a wiped and re-initialized one) is refused by the identity. Run
 `journal init` as a one-off job against the volume, not in the pod's start
-script, or the protection is gone. The pod's egress policy must allow the SSH hosts' addresses and
+script, or the protection is gone. Mount the volume at `-journal-dir` itself:
+a `journal.log` that is a symlink is refused, because compaction's rename
+would replace the link with a file off the volume and leave the old journal
+behind the link. A symlinked directory is fine. A journal whose identity is
+not the pinned one is refused at its first line and left untouched. The pod's egress policy must allow the SSH hosts' addresses and
 ports. The chart's per-entry NetworkPolicy assumes a single target, so a
 sidecar deployment writes its own policy.
 
@@ -456,7 +460,7 @@ Both check the records by the same rules the server does. On a corrupt
 journal, which the server refuses to open, they print every record before the
 bad line, then its line number, byte offset and reason, and exit 1: that is
 the operator's view of the journal in the one state where nothing runs until
-someone has looked.
+someone has looked. A file with no complete header is reported as uninitialized, which is how the server treats it, and a read error is reported as such, not as corruption.
 
 | exit code | meaning |
 |---|---|

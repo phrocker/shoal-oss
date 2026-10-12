@@ -309,6 +309,95 @@ func TestPinnedJournalIDRefusesAnotherJournal(t *testing.T) {
 	_ = j.Close()
 }
 
+// TestSymlinkedJournalIsRefused: a journal.log that links to the volume
+// would be followed, and compaction's rename would replace the link with a
+// file off the volume, leaving a stale journal behind the link. Refused.
+func TestSymlinkedJournalIsRefused(t *testing.T) {
+	volume, ephemeral := t.TempDir(), t.TempDir()
+	id, err := InitJournal(volume, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(volume, JournalFileName), filepath.Join(ephemeral, JournalFileName)); err != nil {
+		t.Skip("symlinks unavailable:", err)
+	}
+	if _, err := OpenJournal(ephemeral, JournalOptions{Retention: time.Hour, MaxEntries: 10, ID: id}); err == nil ||
+		!strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("symlinked journal: %v", err)
+	}
+	// A symlinked directory is fine: the rename stays inside it.
+	linkedDir := filepath.Join(t.TempDir(), "dir")
+	if err := os.Symlink(volume, linkedDir); err != nil {
+		t.Fatal(err)
+	}
+	j, err := OpenJournal(linkedDir, JournalOptions{Retention: time.Hour, MaxEntries: 10, ID: id})
+	if err != nil {
+		t.Fatalf("symlinked directory: %v", err)
+	}
+	_ = j.Close()
+	// InitJournal refuses to write through a link too.
+	dangling := t.TempDir()
+	_ = os.Symlink(filepath.Join(t.TempDir(), "elsewhere"), filepath.Join(dangling, JournalFileName))
+	if _, err := InitJournal(dangling, nil); err == nil {
+		t.Fatal("init wrote through a link")
+	}
+}
+
+// TestMismatchedJournalIsNotTouched: a journal that is not the pinned one
+// is refused at its first line, before a torn tail is truncated, and even
+// when it is corrupt further on.
+func TestMismatchedJournalIsNotTouched(t *testing.T) {
+	dir := t.TempDir()
+	content := append(headerLine(t), []byte("00000000 {\"op\":\"started\"}\n0123")...)
+	_ = os.WriteFile(filepath.Join(dir, JournalFileName), content, 0o600)
+	_, err := OpenJournal(dir, JournalOptions{Retention: time.Hour, MaxEntries: 10, ID: "ffffffffffffffffffffffffffffffff"})
+	if !errors.Is(err, ErrJournalMismatch) || errors.Is(err, ErrJournalCorrupt) {
+		t.Fatalf("err %v", err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dir, JournalFileName)); string(raw) != string(content) {
+		t.Fatal("a journal that is not the pinned one was changed")
+	}
+}
+
+// TestCompactionDoesNotWriteThroughALeftoverLink: a planted
+// journal.log.compact link is removed, not followed.
+func TestCompactionDoesNotWriteThroughALeftoverLink(t *testing.T) {
+	dir, now := t.TempDir(), &fakeNow{now: journalEpoch}
+	j := openTestJournal(t, dir, now, 10)
+	runAndFinish(t, j, testKey("kept"))
+	victim := filepath.Join(t.TempDir(), "victim")
+	_ = os.WriteFile(victim, []byte("precious"), 0o600)
+	if err := os.Symlink(victim, filepath.Join(dir, JournalFileName+".compact")); err != nil {
+		t.Skip("symlinks unavailable:", err)
+	}
+	j.mu.Lock()
+	j.records++
+	err := j.compact()
+	j.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(victim); string(raw) != "precious" {
+		t.Fatal("compaction wrote through a link")
+	}
+	if begin := j.Begin(testKey("kept"), fp, "restart-web", true, 4); begin.Kind != BeginFinished {
+		t.Fatal(begin.Kind)
+	}
+}
+
+// TestReadJournalOnAnUninitializedFile: the operator's view says what the
+// server will do with it.
+func TestReadJournalOnAnUninitializedFile(t *testing.T) {
+	header := headerLine(t)
+	for name, content := range map[string][]byte{"empty": {}, "torn header": header[:len(header)-1]} {
+		dir := t.TempDir()
+		_ = os.WriteFile(filepath.Join(dir, JournalFileName), content, 0o600)
+		if _, _, err := ReadJournal(dir); !errors.Is(err, ErrJournalUninitialized) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 // TestInitJournalOnlyOnce: init refuses a directory that already holds a
 // journal file, even an empty one, and a missing directory.
 func TestInitJournalOnlyOnce(t *testing.T) {

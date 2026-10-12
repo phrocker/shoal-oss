@@ -298,13 +298,28 @@ func (j *Journal) closeFile() {
 // load reads every record, validates the sequence and truncates a torn tail.
 func (j *Journal) load() error {
 	// Never O_CREATE: only InitJournal makes a journal.
-	file, err := os.OpenFile(j.path(), os.O_RDWR, 0)
+	linked, err := os.Lstat(j.path())
 	if errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%w: %s has no %s; run `shoal-effects-ssh journal init` "+
 			"once, on the volume meant to hold it", ErrJournalUninitialized, j.dir, JournalFileName)
 	}
 	if err != nil {
 		return fmt.Errorf("journal cannot be opened: %w", err)
+	}
+	if !linked.Mode().IsRegular() {
+		// A symlink would be followed here and replaced by compaction's
+		// rename, leaving the live journal off the volume and the old one
+		// behind the link: the journal directory must itself be the volume.
+		return fmt.Errorf("%s is not a regular file; the journal directory must be the "+
+			"volume itself, not hold a link to it", j.path())
+	}
+	file, err := os.OpenFile(j.path(), os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("journal cannot be opened: %w", err)
+	}
+	if opened, err := file.Stat(); err != nil || !os.SameFile(linked, opened) {
+		_ = file.Close()
+		return fmt.Errorf("%s changed while it was opened", j.path())
 	}
 	j.file = file
 	good, err := readRecords(file, func(r record, at span) error { return j.apply(r, at) })
@@ -365,8 +380,12 @@ func readRecords(file io.ReadSeeker, visit func(record, span) error) (int64, err
 		if errors.Is(err, errTorn) {
 			return offset, nil
 		}
-		if err != nil {
+		if errors.Is(err, errLineBound) {
 			return offset, corrupt(err)
+		}
+		if err != nil {
+			// A read error is not corruption: the file may be fine.
+			return offset, fmt.Errorf("journal cannot be read at offset %d: %w", offset, err)
 		}
 		parsed, err := parseLine(line)
 		if err != nil {
@@ -374,6 +393,9 @@ func readRecords(file io.ReadSeeker, visit func(record, span) error) (int64, err
 		}
 		at := span{offset: offset, length: int64(len(line))}
 		if err := visit(parsed, at); err != nil {
+			if errors.Is(err, ErrJournalMismatch) {
+				return offset, err
+			}
 			return offset, corrupt(err)
 		}
 		offset += int64(len(line))
@@ -381,6 +403,8 @@ func readRecords(file io.ReadSeeker, visit func(record, span) error) (int64, err
 }
 
 var errTorn = errors.New("torn tail")
+
+var errLineBound = errors.New("record exceeds the line bound")
 
 // readLine returns one line including its LF. A final fragment without LF is
 // errTorn; a line longer than maxRecordLine is an error.
@@ -390,7 +414,7 @@ func readLine(reader *bufio.Reader) ([]byte, error) {
 		chunk, err := reader.ReadSlice('\n')
 		line = append(line, chunk...)
 		if len(line) > maxRecordLine {
-			return nil, errors.New("record exceeds the line bound")
+			return nil, errLineBound
 		}
 		switch {
 		case err == nil:
@@ -450,6 +474,12 @@ func (j *Journal) apply(r record, at span) error {
 		if !ValidJournalID(r.JournalID) || r.At.IsZero() || r.Key != "" ||
 			r.Command != "" || r.Fingerprint != "" || r.Finished != nil {
 			return errors.New("malformed journal header")
+		}
+		if j.opts.ID != "" && j.opts.ID != r.JournalID {
+			// Checked here, at the first line, so nothing of a journal that is
+			// not the pinned one is read further or truncated.
+			return fmt.Errorf("%w: the directory holds journal %s, and %s was pinned",
+				ErrJournalMismatch, r.JournalID, j.opts.ID)
 		}
 		j.id, j.header = r.JournalID, at
 		return nil
@@ -760,7 +790,12 @@ func (j *Journal) compact() error {
 		return nil
 	}
 	temporary := j.path() + ".compact"
-	out, err := os.OpenFile(temporary, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	// A leftover temporary (a crash mid-compaction) is removed, and the new
+	// one is created exclusively, so a planted link cannot redirect the write.
+	if err := os.Remove(temporary); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	out, err := os.OpenFile(temporary, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
@@ -870,6 +905,10 @@ func ReadJournal(dir string) ([]JournalRecord, bool, error) {
 	})
 	if err != nil {
 		return out, false, err
+	}
+	if check.id == "" {
+		return nil, false, fmt.Errorf("%w: %s has no complete header; the server refuses it",
+			ErrJournalUninitialized, filepath.Join(dir, JournalFileName))
 	}
 	info, err := file.Stat()
 	if err != nil {
