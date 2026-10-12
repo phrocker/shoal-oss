@@ -80,7 +80,7 @@ func TestAdminWireRoundTripAndValidation(t *testing.T) {
 		t.Fatal("revoke generation 0 accepted")
 	}
 	for name, r := range map[string]AdminReceipt{
-		"unknown state":            {Schema: Schema, CollectorID: EncodeID("c"), Generation: 1, State: "active"},
+		"unknown state": {Schema: Schema, CollectorID: EncodeID("c"), Generation: 1, State: "active"},
 	} {
 		if r.Validate() == nil {
 			t.Fatalf("%s receipt accepted", name)
