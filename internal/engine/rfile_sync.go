@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/storage"
-	"github.com/phrocker/shoal-oss/internal/tablet"
 )
 
 // SyncStateVersion is the on-disk schema version of a SyncState file.
@@ -86,15 +85,19 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 	}
 
 	e.mu.RLock()
-	tbl, ok := e.tables[tableName]
-	var configuredFormat tablet.FileFormat
-	if ok {
-		configuredFormat = tbl.fileFormat()
+	if err := e.requireAuthorityLocked(); err != nil {
+		e.mu.RUnlock()
+		return nil, err
 	}
-	e.mu.RUnlock()
+	tbl, ok := e.tables[tableName]
 	if !ok {
+		e.mu.RUnlock()
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
+	tbl.formatMu.RLock()
+	e.mu.RUnlock()
+	defer tbl.formatMu.RUnlock()
+	configuredFormat := tbl.format
 
 	priorShipped := map[string]RFileExportFile{}
 	var priorSeq int64
