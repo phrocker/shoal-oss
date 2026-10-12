@@ -271,8 +271,16 @@ func TestApprovalEventsArePublishedOncePerTransitionByItsMaker(t *testing.T) {
 	// The event names no approver and carries no input: the transition
 	// happened, and Status is where its details are.
 	approved := eventOf(t, events, fleet.ApprovalEventApproved)
-	if approved.Reason.Code != "" || len(approved.ConsumedEvidence) != 0 {
+	if approved.Reason.Code != "" || len(approved.ConsumedEvidence) != 0 ||
+		len(approved.CorrelationID) != 0 {
 		t.Fatalf("approved event carries %+v", approved)
+	}
+	// Nor the requester's correlation or reason, which the approval wire
+	// does not show an approver.
+	requested := eventOf(t, events, fleet.ApprovalEventRequested)
+	if requested.Reason != (fleetevents.Event{}).Reason ||
+		len(requested.CorrelationID) != 0 {
+		t.Fatalf("requested event carries %+v", requested)
 	}
 }
 

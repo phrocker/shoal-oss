@@ -419,6 +419,13 @@ func TestAReplayAnswersForTheCallersOwnRowWhateverFails(t *testing.T) {
 	if err := service.drainApprovalEvents(context.Background(), pending.ID, 2); err != nil {
 		t.Fatalf("another principal's row at the caller's version = %v", err)
 	}
+	// A committed version whose row this read cannot see yet is answered,
+	// not reported as published: only its maker may publish it.
+	if err := service.drainApprovalEvents(
+		context.Background(), pending.ID, 3,
+	); !errors.Is(err, ErrApprovalEventUnpublished) {
+		t.Fatalf("a committed transition whose row is not readable = %v", err)
+	}
 }
 
 type undecidedEvents struct{}
