@@ -191,7 +191,7 @@ func ApprovalPublication(
 			// neither side the other's. The publication audit still carries
 			// the publisher's, stamped by the trusted sink from its live
 			// decision (#532).
-			Reason:             reason,
+			Reason: reason,
 			Evidence: []fleetevents.Evidence{{
 				SourceID: append([]byte(nil), request.SourceID...),
 				PolicyID: append([]byte(nil), request.PolicyID...),
