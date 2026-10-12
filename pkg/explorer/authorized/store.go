@@ -180,6 +180,14 @@ type PolicyStore interface {
 	// PutLabelMigration records the label-migration report. It is written
 	// after every run, once every document has been migrated.
 	PutLabelMigration(context.Context, LabelMigrationRecord) error
+	// RecordDeclassification durably appends one relabel-narrowing audit
+	// record (#630) before returning nil. Ingest refuses to proceed past
+	// the step a record guards until it is recorded, so an implementation
+	// must not report success for a record it has not made durable.
+	RecordDeclassification(context.Context, DeclassificationRecord) error
+	// Declassifications returns every recorded declassification audit, in
+	// recording order. It is an operator read that no Client method exposes.
+	Declassifications(context.Context) ([]DeclassificationRecord, error)
 }
 
 type revisionKey struct {
@@ -214,6 +222,8 @@ type MemoryPolicyStore struct {
 	edges          map[shoal.ID]EdgeRegistration
 	coOccurrence   map[string]CoOccurrenceRecord
 	labelMigration *LabelMigrationRecord
+	// declassifications is append-only (#630).
+	declassifications []DeclassificationRecord
 }
 
 // NewMemoryPolicyStore constructs an empty reference catalog.

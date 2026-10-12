@@ -251,6 +251,8 @@ func (s *DurablePolicyStore) load() error {
 	edgeClaims := make(map[string]persistedEdge)
 	nodes := make(map[string]persistedNode)
 	coOccurrences := make(map[string]persistedCoOccurrence)
+	var declassifications []sequencedDeclassification
+	declassificationSeqs := make(map[string]struct{})
 	var (
 		versionRecord   persistedSourceVersion
 		haveVersion     bool
@@ -295,6 +297,27 @@ func (s *DurablePolicyStore) load() error {
 			if !haveMigration || record.Seq >= migrationRecord.Seq {
 				migrationRecord = record
 				haveMigration = true
+			}
+			maxSeq = maxUint64(maxSeq, record.Seq)
+		case bytes.HasPrefix(row, []byte(policyRowDeclassification)):
+			var record persistedDeclassification
+			if err := decodePolicyRecord(
+				value, policyKindDeclassification, &record,
+			); err != nil {
+				return corruptPolicyRecord("declassification audit", err)
+			}
+			decoded, err := declassificationFromPersisted(record)
+			if err != nil {
+				return corruptPolicyRecord("declassification audit", err)
+			}
+			if string(policyDeclassificationRow(decoded)) != rowStr {
+				return corruptPolicyRecord("declassification audit",
+					fmt.Errorf("declassification audit row does not match its record"))
+			}
+			if _, duplicate := declassificationSeqs[rowStr]; !duplicate {
+				declassifications = append(declassifications,
+					sequencedDeclassification{seq: record.Seq, record: decoded})
+				declassificationSeqs[rowStr] = struct{}{}
 			}
 			maxSeq = maxUint64(maxSeq, record.Seq)
 		case bytes.HasPrefix(row, []byte(policyRowSourceClaim)):
@@ -393,6 +416,7 @@ func (s *DurablePolicyStore) load() error {
 		}
 		s.memory.labelMigration = &migration
 	}
+	s.memory.declassifications = orderDeclassifications(declassifications)
 	s.seq = maxSeq + 1
 	return nil
 }

@@ -1,0 +1,577 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package authorized
+
+// Relabel narrowing (declassification) audit, issue #630.
+//
+// A principal holding every label on a document may re-ingest it under fewer
+// labels (sourceClaimAllowsMutation requires the old rule and
+// selectIngestRule the new one). That is allowed by design, but it must not
+// be indistinguishable from an ordinary ingest, so every such relabel leaves a
+// durable DeclassificationRecord in the policy catalog.
+//
+// # What counts as narrowing
+//
+// An AccessRule is a conjunction of structured policies, and a reader is
+// allowed iff it is granted every component (AccessRule.Authorize). Grants
+// are independent per logical component (domain, source, grant policy ID,
+// service role; epochs never participate), so a decision can hold any subset
+// of them. Under that model, rule N admits some reader that rule P does not
+// iff some component of P is not a component of N. That is the test used
+// here (removedComponents), and it is exact, not merely conservative: a
+// removed label, a swapped label ("x" for "secret"), a changed source policy
+// and a dropped service role all count; adding components (widening the label
+// set, which narrows the readers) never does. Components are compared by
+// their canonical logical keys, which are exact bytes: labels are never
+// folded or trimmed (LabelPolicyID), so "Secret" and "secret" are different
+// components and swapping one for the other is a removal.
+//
+// # When the audit is written
+//
+// The base write and the catalog registration are separate stores, so the
+// audit cannot share one atomic write with the narrowing. It follows the
+// approval-audit pattern instead (internal/explorerfleet ApprovalRecorder): an
+// audit records an ATTEMPT, written durably before the step it describes, and
+// the catalog's revision registrations record the outcome. Ingest writes:
+//
+//   - DeclassificationIntent, at source-claim time, after the principal has
+//     been authorized under both the replaced and the new rule and before
+//     the claim is swapped or the base is written. It compares the new rule
+//     with the claim's rule (and a pending claim's PreviousRule), or with a
+//     legacy unclaimed document's current registration.
+//   - DeclassificationCommit, immediately before the PutRevision that makes
+//     the narrowed revision current, which is the write that actually lets
+//     the new readers in. It compares the new rule with the document's
+//     current registration as well, so a narrowing is caught at the
+//     visibility commit even if the claim and the registration ever
+//     disagreed (for example a retry after an earlier attempt registered
+//     nothing). It carries the document and revision identities.
+//
+// If either audit write fails, the ingest fails before the step it guards, so
+// no narrowing becomes visible without at least one durable record of it. A
+// crash after an audit and before its step leaves an attempt record with no
+// matching outcome, never the reverse.
+//
+// # Who can read it
+//
+// Records are reachable only through the PolicyStore (Declassifications); no
+// Client method, HTTP route or MCP tool returns them. The policy catalog
+// already persists every rule in the clear, including label policy IDs and so
+// the label names, so a record holding the replaced and new rules discloses
+// nothing the catalog does not already hold to the same operator. Label names
+// are therefore kept in the clear rather than digested, because an auditor
+// needs them. A future read surface must restrict them to readers who could
+// read the replaced rule, and is out of scope here.
+//
+// # Reason codes
+//
+// Config.RequireDeclassificationReason makes a narrowing that carries no
+// reason (WithDeclassificationReason) fail with InvalidArgument before
+// anything is written. The refusal happens only after the principal has been
+// authorized under both rules, so it tells them nothing new.
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"time"
+
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
+)
+
+// DeclassificationPhase names which guarded step a record precedes.
+type DeclassificationPhase string
+
+const (
+	// DeclassificationIntent precedes the source-claim swap and the base
+	// write.
+	DeclassificationIntent DeclassificationPhase = "intent"
+	// DeclassificationCommit precedes the registration that makes the
+	// narrowed revision current.
+	DeclassificationCommit DeclassificationPhase = "commit"
+)
+
+const (
+	// MaxDeclassificationReasonBytes bounds a reason code.
+	MaxDeclassificationReasonBytes = 128
+	// maxDeclassificationPriorRules bounds the replaced rules one record
+	// may carry: a claim rule, a pending claim's previous rule and the
+	// current registration's rule.
+	maxDeclassificationPriorRules = 3
+)
+
+// Validate refuses an unknown phase.
+func (p DeclassificationPhase) Validate() error {
+	switch p {
+	case DeclassificationIntent, DeclassificationCommit:
+		return nil
+	default:
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, "unknown declassification phase")
+	}
+}
+
+// DeclassificationRecord is the durable audit of one relabel narrowing
+// attempt (#630). AttemptID groups the intent and commit records of one
+// Ingest call.
+type DeclassificationRecord struct {
+	AttemptID  shoal.ID
+	Phase      DeclassificationPhase
+	OccurredAt time.Time
+	// SourceURI is the document's source identity, the key its source claim
+	// is held under.
+	SourceURI string
+	// DocumentID and PriorRevisionID name the replaced current revision when
+	// it is known (always on a commit record). RevisionID is the narrowed
+	// revision, set only on a commit record.
+	DocumentID      shoal.ID
+	PriorRevisionID shoal.ID
+	RevisionID      shoal.ID
+	// PriorRules are the rules being replaced; Rule is the new one. At least
+	// one prior rule has a component Rule lacks.
+	PriorRules []AccessRule
+	Rule       AccessRule
+	// The acting principal and its request, from the trusted decision.
+	Subject                  shoal.ID
+	Actor                    shoal.ID
+	ClientID                 shoal.ID
+	OnBehalfOf               []shoal.ID
+	RequestID                shoal.ID
+	CorrelationID            shoal.ID
+	AuthorizationFingerprint auth.Fingerprint
+	// ReasonCode is the caller's declared reason, if any.
+	ReasonCode string
+}
+
+// RemovedPolicies returns the components of the prior rules that Rule does
+// not carry, deduplicated, in prior-rule order. These are exactly what the
+// narrowing stopped requiring.
+func (r DeclassificationRecord) RemovedPolicies() []auth.Policy {
+	var removed []auth.Policy
+	var seen [][]byte
+	for _, prior := range r.PriorRules {
+		for index, key := range prior.keys {
+			if ruleHasKey(r.Rule, key) || containsKey(seen, key) {
+				continue
+			}
+			seen = append(seen, key)
+			if cloned, _, err := clonePolicy(prior.policies[index]); err == nil {
+				removed = append(removed, cloned)
+			}
+		}
+	}
+	return removed
+}
+
+// RemovedLabels returns the free-form labels among RemovedPolicies, decoded
+// from their label policy IDs. A removed component that is not a label
+// policy (a changed source policy, for example) is not listed here.
+func (r DeclassificationRecord) RemovedLabels() []string {
+	var labels []string
+	for _, policy := range r.RemovedPolicies() {
+		if _, label, err := ParseLabelPolicyID(
+			policy.GrantPolicyID()); err == nil {
+			labels = append(labels, label)
+		}
+	}
+	return labels
+}
+
+func containsKey(keys [][]byte, key []byte) bool {
+	for _, candidate := range keys {
+		if string(candidate) == string(key) {
+			return true
+		}
+	}
+	return false
+}
+
+// validate checks the record's invariants: a known phase, required
+// identities, bounded fields, and that it really describes a narrowing.
+func (r DeclassificationRecord) validate() error {
+	if err := r.Phase.Validate(); err != nil {
+		return err
+	}
+	if err := shoal.ValidateRequiredID(
+		"declassification attempt ID", r.AttemptID); err != nil {
+		return err
+	}
+	if r.OccurredAt.IsZero() {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification occurrence time is required")
+	}
+	if err := validateSourceURI(r.SourceURI); err != nil {
+		return err
+	}
+	for name, id := range map[string]shoal.ID{
+		"declassification document ID":       r.DocumentID,
+		"declassification prior revision ID": r.PriorRevisionID,
+		"declassification revision ID":       r.RevisionID,
+		"declassification subject":           r.Subject,
+		"declassification actor":             r.Actor,
+		"declassification client ID":         r.ClientID,
+		"declassification request ID":        r.RequestID,
+		"declassification correlation ID":    r.CorrelationID,
+	} {
+		if err := shoal.ValidateOptionalID(name, id); err != nil {
+			return err
+		}
+	}
+	if r.Phase == DeclassificationCommit {
+		if err := shoal.ValidateRequiredID(
+			"declassification document ID", r.DocumentID); err != nil {
+			return err
+		}
+		if err := shoal.ValidateRequiredID(
+			"declassification revision ID", r.RevisionID); err != nil {
+			return err
+		}
+	}
+	if len(r.OnBehalfOf) > auth.MaxPolicyTerms {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification delegation chain exceeds its bound")
+	}
+	for _, id := range r.OnBehalfOf {
+		if err := shoal.ValidateRequiredID(
+			"declassification delegator", id); err != nil {
+			return err
+		}
+	}
+	if err := validateDeclassificationReason(r.ReasonCode); err != nil {
+		return err
+	}
+	if len(r.Rule.keys) == 0 {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification new rule is required")
+	}
+	if len(r.PriorRules) == 0 ||
+		len(r.PriorRules) > maxDeclassificationPriorRules {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification prior rules are out of bounds")
+	}
+	narrowed := false
+	for _, prior := range r.PriorRules {
+		if len(prior.keys) == 0 {
+			return shoal.NewError(shoal.ErrorInvalidArgument,
+				"declassification prior rule is empty")
+		}
+		if ruleNarrows(prior, r.Rule) {
+			narrowed = true
+		}
+	}
+	if !narrowed {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification record describes no narrowing")
+	}
+	return nil
+}
+
+func cloneDeclassificationRecord(
+	record DeclassificationRecord,
+) (DeclassificationRecord, error) {
+	cloned := record
+	cloned.OccurredAt = record.OccurredAt.UTC()
+	rule, err := record.Rule.clone()
+	if err != nil {
+		return DeclassificationRecord{}, err
+	}
+	cloned.Rule = rule
+	cloned.PriorRules = make([]AccessRule, 0, len(record.PriorRules))
+	for _, prior := range record.PriorRules {
+		clonedPrior, err := prior.clone()
+		if err != nil {
+			return DeclassificationRecord{}, err
+		}
+		cloned.PriorRules = append(cloned.PriorRules, clonedPrior)
+	}
+	cloned.OnBehalfOf = append([]shoal.ID(nil), record.OnBehalfOf...)
+	return cloned, nil
+}
+
+// ruleNarrows reports whether next admits a reader prior does not: whether
+// some logical component of prior is missing from next. See the file comment
+// for why this is exact for conjunctive rules.
+func ruleNarrows(prior, next AccessRule) bool {
+	for _, key := range prior.keys {
+		if !ruleHasKey(next, key) {
+			return true
+		}
+	}
+	return false
+}
+
+type declassificationReasonKey struct{}
+
+// WithDeclassificationReason attaches a reason code to an ingest. It is
+// recorded on any declassification audit the ingest writes and satisfies
+// Config.RequireDeclassificationReason. A code is 1 to
+// MaxDeclassificationReasonBytes bytes of ASCII letters, digits, '.', '_',
+// '-', ':' or '/'.
+func WithDeclassificationReason(
+	ctx context.Context,
+	reason string,
+) (context.Context, error) {
+	if reason == "" {
+		return nil, shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification reason code is required")
+	}
+	if err := validateDeclassificationReason(reason); err != nil {
+		return nil, err
+	}
+	return context.WithValue(ctx, declassificationReasonKey{}, reason), nil
+}
+
+func declassificationReason(ctx context.Context) string {
+	reason, _ := ctx.Value(declassificationReasonKey{}).(string)
+	if validateDeclassificationReason(reason) != nil {
+		return ""
+	}
+	return reason
+}
+
+func validateDeclassificationReason(reason string) error {
+	if len(reason) > MaxDeclassificationReasonBytes {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification reason code exceeds its bound")
+	}
+	for index := 0; index < len(reason); index++ {
+		character := reason[index]
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9',
+			character == '.', character == '_', character == '-',
+			character == ':', character == '/':
+		default:
+			return shoal.NewError(shoal.ErrorInvalidArgument,
+				"declassification reason code has an invalid character")
+		}
+	}
+	return nil
+}
+
+// declassificationAttempt carries one Ingest call's audit state between its
+// source claim and its registration.
+type declassificationAttempt struct {
+	id         shoal.ID
+	priorRules []AccessRule
+	reason     string
+	documentID shoal.ID
+	priorRev   shoal.ID
+}
+
+func newDeclassificationAttemptID() (shoal.ID, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", catalogUnavailable()
+	}
+	return shoal.ID(hex.EncodeToString(raw[:])), nil
+}
+
+// declassificationIntent decides, at source-claim time, whether selected
+// narrows any of the replaced rules. When it does it enforces the reason
+// policy and durably records the intent before returning, so the caller may
+// only proceed to the claim swap after this returns nil. It must be called
+// only after the principal has been authorized under every prior rule and
+// under selected.
+func (c *Client) declassificationIntent(
+	ctx context.Context,
+	decision auth.Decision,
+	now time.Time,
+	sourceURI string,
+	selected AccessRule,
+	priorRules []AccessRule,
+	documentID, priorRevisionID shoal.ID,
+) (*declassificationAttempt, error) {
+	narrowing := make([]AccessRule, 0, len(priorRules))
+	for _, prior := range priorRules {
+		if ruleNarrows(prior, selected) {
+			narrowing = appendDistinctRule(narrowing, prior)
+		}
+	}
+	if len(narrowing) == 0 {
+		return nil, nil
+	}
+	attempt := &declassificationAttempt{
+		priorRules: narrowing,
+		reason:     declassificationReason(ctx),
+		documentID: documentID,
+		priorRev:   priorRevisionID,
+	}
+	if err := c.recordDeclassification(
+		ctx, decision, now, DeclassificationIntent, sourceURI, selected,
+		attempt, ""); err != nil {
+		return nil, err
+	}
+	return attempt, nil
+}
+
+// declassificationCommit runs immediately before the registration that makes
+// revisionID current. It audits a narrowing against the document's current
+// registration, and always audits an attempt whose intent was recorded.
+func (c *Client) declassificationCommit(
+	ctx context.Context,
+	decision auth.Decision,
+	now time.Time,
+	sourceURI string,
+	documentID, revisionID shoal.ID,
+	selected AccessRule,
+	attempt *declassificationAttempt,
+) error {
+	current, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
+	if err != nil {
+		return policyCatalogReadError(ctx, err)
+	}
+	var priorRules []AccessRule
+	if attempt != nil {
+		priorRules = append(priorRules, attempt.priorRules...)
+	}
+	priorRevision := shoal.ID("")
+	if ok && current.RevisionID != revisionID {
+		priorRevision = current.RevisionID
+		if ruleNarrows(current.Rule, selected) {
+			priorRules = appendDistinctRule(priorRules, current.Rule)
+		}
+	}
+	if len(priorRules) == 0 {
+		return nil
+	}
+	if attempt == nil {
+		attempt = &declassificationAttempt{reason: declassificationReason(ctx)}
+	}
+	attempt.priorRules = priorRules
+	attempt.documentID = documentID
+	if priorRevision != "" {
+		attempt.priorRev = priorRevision
+	}
+	return c.recordDeclassification(
+		ctx, decision, now, DeclassificationCommit, sourceURI, selected,
+		attempt, revisionID)
+}
+
+func appendDistinctRule(rules []AccessRule, rule AccessRule) []AccessRule {
+	for _, existing := range rules {
+		if existing.equal(rule) {
+			return rules
+		}
+	}
+	return append(rules, rule)
+}
+
+func (c *Client) recordDeclassification(
+	ctx context.Context,
+	decision auth.Decision,
+	now time.Time,
+	phase DeclassificationPhase,
+	sourceURI string,
+	selected AccessRule,
+	attempt *declassificationAttempt,
+	revisionID shoal.ID,
+) error {
+	if c.requireDeclassificationReason && attempt.reason == "" {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"this relabel removes visibility labels and the operator "+
+				"requires a declassification reason code")
+	}
+	if attempt.id == "" {
+		id, err := newDeclassificationAttemptID()
+		if err != nil {
+			return err
+		}
+		attempt.id = id
+	}
+	fingerprint, err := auth.AuthorizationFingerprint(decision)
+	if err != nil {
+		return authorizationDenied()
+	}
+	record := DeclassificationRecord{
+		AttemptID:                attempt.id,
+		Phase:                    phase,
+		OccurredAt:               now,
+		SourceURI:                sourceURI,
+		DocumentID:               attempt.documentID,
+		PriorRevisionID:          attempt.priorRev,
+		RevisionID:               revisionID,
+		PriorRules:               attempt.priorRules,
+		Rule:                     selected,
+		Subject:                  decision.Subject(),
+		Actor:                    decision.Actor(),
+		ClientID:                 decision.ClientID(),
+		OnBehalfOf:               decision.OnBehalfOf(),
+		RequestID:                decision.RequestID(),
+		CorrelationID:            decision.CorrelationID(),
+		AuthorizationFingerprint: fingerprint,
+		ReasonCode:               attempt.reason,
+	}
+	if err := c.policyStore.RecordDeclassification(ctx, record); err != nil {
+		return policyCatalogWriteError(ctx, err)
+	}
+	return nil
+}
+
+// RecordDeclassification appends one declassification audit record. The
+// record is validated, including that it really describes a narrowing.
+func (s *MemoryPolicyStore) RecordDeclassification(
+	ctx context.Context,
+	record DeclassificationRecord,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	if err := record.validate(); err != nil {
+		return err
+	}
+	cloned, err := cloneDeclassificationRecord(record)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.declassifications = append(s.declassifications, cloned)
+	return nil
+}
+
+// Declassifications returns every declassification audit record in the order
+// it was recorded. It is an operator read: no Client method exposes it.
+func (s *MemoryPolicyStore) Declassifications(
+	ctx context.Context,
+) ([]DeclassificationRecord, error) {
+	if err := contextFailure(ctx); err != nil {
+		return nil, err
+	}
+	if s == nil {
+		return nil, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	records := make([]DeclassificationRecord, 0, len(s.declassifications))
+	for _, record := range s.declassifications {
+		cloned, err := cloneDeclassificationRecord(record)
+		if err != nil {
+			return nil, catalogUnavailable()
+		}
+		records = append(records, cloned)
+	}
+	return records, nil
+}

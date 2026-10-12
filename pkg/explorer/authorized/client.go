@@ -124,6 +124,11 @@ type Config struct {
 	// the reader label evaluator (#564). Nil means no service account has
 	// one, so every trusted service is refused labelled data.
 	CeilingResolver CeilingResolver
+	// RequireDeclassificationReason refuses an ingest that narrows a
+	// document's rule (removes a visibility label or any other rule
+	// component, #630) unless its context carries a reason code from
+	// WithDeclassificationReason. Every narrowing is audited regardless.
+	RequireDeclassificationReason bool
 }
 
 // Client enforces trusted-context authorization around an Explorer client.
@@ -146,9 +151,11 @@ type Client struct {
 	mosaic              MosaicBudget
 	accumulator         *Accumulator[[]string]
 	labelVisibility     *LabelVisibility
-	mutationMu          sync.Mutex
-	vectorMu            sync.Mutex
-	vectorAvailability  authorizedVectorAvailabilityCache
+	// requireDeclassificationReason is Config.RequireDeclassificationReason.
+	requireDeclassificationReason bool
+	mutationMu                    sync.Mutex
+	vectorMu                      sync.Mutex
+	vectorAvailability            authorizedVectorAvailabilityCache
 }
 
 type authorizedVectorAvailabilityCache struct {
@@ -235,6 +242,8 @@ func NewClient(config Config) (*Client, error) {
 		mosaic:              config.Mosaic,
 		accumulator:         accumulator,
 		labelVisibility:     labelVisibility,
+
+		requireDeclassificationReason: config.RequireDeclassificationReason,
 	}, nil
 }
 
@@ -269,7 +278,7 @@ func (c *Client) Ingest(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}
-	claim, err := c.claimSourceMutation(
+	claim, declassification, err := c.claimSourceMutation(
 		ctx, ownedSource.URI, decision, rule, now)
 	if err != nil {
 		return explorer.IngestResult{}, err
@@ -351,6 +360,16 @@ func (c *Client) Ingest(
 	if err != nil {
 		return explorer.IngestResult{}, inconsistentBase()
 	}
+	// The registration below is what lets a narrowed rule's new readers
+	// in, so a narrowing is audited immediately before it (#630).
+	if current {
+		if err := c.declassificationCommit(
+			ctx, decision, now, ownedSource.URI, result.Document.ID,
+			result.Revision.ID, rule, declassification,
+		); err != nil {
+			return explorer.IngestResult{}, err
+		}
+	}
 	if err := c.policyStore.PutRevision(ctx, RevisionRegistration{
 		DocumentID:     result.Document.ID,
 		RevisionID:     result.Revision.ID,
@@ -410,58 +429,83 @@ const (
 // base is changed. Existing claims authorize retries after a base commit even
 // when revision registration failed. Legacy registered documents may backfill
 // a missing claim only after authorization under their current rule.
+//
+// Once the principal is authorized under the replaced rule(s) and the
+// selected one, a selected rule that narrows any replaced rule is audited
+// (declassificationIntent) before the claim is swapped, and the returned
+// attempt carries that audit to the registration step (#630).
 func (c *Client) claimSourceMutation(
 	ctx context.Context,
 	sourceURI string,
 	decision auth.Decision,
 	selectedRule AccessRule,
 	now time.Time,
-) (SourcePolicyClaim, error) {
+) (SourcePolicyClaim, *declassificationAttempt, error) {
 	if err := validateSourceURI(sourceURI); err != nil {
-		return SourcePolicyClaim{}, err
+		return SourcePolicyClaim{}, nil, err
 	}
 	existingClaim, claimed, err := c.policyStore.SourceClaim(ctx, sourceURI)
 	if err != nil {
-		return SourcePolicyClaim{}, policyCatalogReadError(ctx, err)
+		return SourcePolicyClaim{}, nil, policyCatalogReadError(ctx, err)
 	}
 	var expected *SourcePolicyClaim
+	var priorRules []AccessRule
+	var legacyDocument, legacyRevision shoal.ID
 	if claimed {
 		allowed, ruleErr := sourceClaimAllowsMutation(
 			existingClaim, selectedRule, decision, now)
 		if ruleErr != nil {
-			return SourcePolicyClaim{}, ruleErr
+			return SourcePolicyClaim{}, nil, ruleErr
 		}
 		if !allowed {
-			return SourcePolicyClaim{}, auth.ObjectNotFound()
+			return SourcePolicyClaim{}, nil, auth.ObjectNotFound()
 		}
 		expected = &existingClaim
-	} else if err := c.authorizeLegacySource(
-		ctx, sourceURI, decision, now); err != nil {
-		return SourcePolicyClaim{}, err
+		priorRules = append(priorRules, existingClaim.Rule)
+		if existingClaim.Pending && existingClaim.PreviousRule != nil {
+			priorRules = append(priorRules, *existingClaim.PreviousRule)
+		}
+	} else {
+		legacy, err := c.authorizeLegacySource(
+			ctx, sourceURI, decision, now)
+		if err != nil {
+			return SourcePolicyClaim{}, nil, err
+		}
+		if legacy != nil {
+			priorRules = append(priorRules, legacy.Rule)
+			legacyDocument = legacy.DocumentID
+			legacyRevision = legacy.RevisionID
+		}
+	}
+	declassification, err := c.declassificationIntent(
+		ctx, decision, now, sourceURI, selectedRule, priorRules,
+		legacyDocument, legacyRevision)
+	if err != nil {
+		return SourcePolicyClaim{}, nil, err
 	}
 	claim, err := c.policyStore.CompareAndSwapSourceClaim(
 		ctx, sourceURI, expected, selectedRule)
 	if err == nil {
-		return claim, nil
+		return claim, declassification, nil
 	}
 	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		return SourcePolicyClaim{}, policyCatalogWriteError(ctx, err)
+		return SourcePolicyClaim{}, nil, policyCatalogWriteError(ctx, err)
 	}
 	latest, ok, readErr := c.policyStore.SourceClaim(ctx, sourceURI)
 	if readErr != nil {
-		return SourcePolicyClaim{}, policyCatalogReadError(ctx, readErr)
+		return SourcePolicyClaim{}, nil, policyCatalogReadError(ctx, readErr)
 	}
 	if ok {
 		allowed, ruleErr := sourceClaimAllowsMutation(
 			latest, selectedRule, decision, now)
 		if ruleErr != nil {
-			return SourcePolicyClaim{}, ruleErr
+			return SourcePolicyClaim{}, nil, ruleErr
 		}
 		if !allowed {
-			return SourcePolicyClaim{}, auth.ObjectNotFound()
+			return SourcePolicyClaim{}, nil, auth.ObjectNotFound()
 		}
 	}
-	return SourcePolicyClaim{}, policyCatalogWriteError(ctx, err)
+	return SourcePolicyClaim{}, nil, policyCatalogWriteError(ctx, err)
 }
 
 func sourceClaimAllowsMutation(
@@ -485,15 +529,18 @@ func sourceClaimAllowsMutation(
 	return true, nil
 }
 
+// authorizeLegacySource authorizes a mutation of an unclaimed source URI. It
+// returns the current registration of the document already stored under the
+// URI, or nil when there is none.
 func (c *Client) authorizeLegacySource(
 	ctx context.Context,
 	sourceURI string,
 	decision auth.Decision,
 	now time.Time,
-) error {
+) (*RevisionRegistration, error) {
 	summaries, err := c.base.Documents(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var documentID shoal.ID
 	found := false
@@ -502,41 +549,41 @@ func (c *Client) authorizeLegacySource(
 			continue
 		}
 		if err := validateSummary(summary); err != nil {
-			return inconsistentBase()
+			return nil, inconsistentBase()
 		}
 		if found && summary.Document.ID != documentID {
-			return inconsistentBase()
+			return nil, inconsistentBase()
 		}
 		documentID = summary.Document.ID
 		found = true
 	}
 	if !found {
-		return nil
+		return nil, nil
 	}
 	currentRevisions, err := c.resolveCurrentRevisions(
 		ctx, []shoal.ID{documentID})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	registration, ok := currentRevisions[documentID]
 	if !ok {
-		return catalogUnavailable()
+		return nil, catalogUnavailable()
 	}
 	for _, summary := range summaries {
 		if summary.Document.ID == documentID &&
 			registration.RevisionID != summary.Revision.ID {
-			return catalogUnavailable()
+			return nil, catalogUnavailable()
 		}
 	}
 	allowed, err := ruleAllows(
 		registration.Rule, decision, auth.OperationIngest, now)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !allowed {
-		return auth.ObjectNotFound()
+		return nil, auth.ObjectNotFound()
 	}
-	return nil
+	return &registration, nil
 }
 
 func (c *Client) begin(
