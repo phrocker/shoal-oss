@@ -50,9 +50,26 @@ var entityKinds = map[byte][]string{
 //   - 'P': fleet approvals (raw, caller-chosen approval ID) and fleet-event
 //     publications (hex of an event ID the publisher can precompute).
 //   - 'D': fleet dispatch (raw, caller-chosen action ID), fleet-event
-//     subscription delete receipts (a digest of a slot row), explorer
-//     documents (document ID), and the conformance fixture (its own domain).
+//     subscription delete receipts (a digest of one of 4096 slot rows, which
+//     anyone can compute), explorer documents (document ID), and the
+//     conformance fixture (its own domain). The residual here is serious: a
+//     principal holding dispatch can enqueue actions at every delete-receipt
+//     ID first and so deny every subscription Delete, which is revocation.
+//     Closing it needs a new letter for one side and a migration of its
+//     heads; it is tracked separately.
 var knownSharedKinds = map[byte]bool{'P': true, 'D': true}
+
+// storePolicies is the logical policy each store that holds a shared letter
+// writes its heads under. ownedBy treats the policy as the head's owner, so
+// stores that share a letter must not share a policy, or the ownership rule
+// stops separating them.
+var storePolicies = map[string]string{
+	"internal/explorerconformance/fixture.go":  "policy-id",
+	"internal/explorerfleet/approval_store.go": "fleet/approval/v1",
+	"internal/explorerfleet/dispatch_store.go": "fleet/dispatch/v1",
+	"internal/explorerfleetevents/adapter.go":  "fleet-events/default",
+	"pkg/explorer/publication.go":              "embedded/default",
+}
 
 var kindPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`Kind:\s*'(.)'`),
@@ -158,4 +175,31 @@ func sortedKeys(values map[string]bool) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+// TestStoresSharingAKindLetterHaveDistinctPolicies holds storePolicies to the
+// sources and to each other, for every shared letter.
+func TestStoresSharingAKindLetterHaveDistinctPolicies(t *testing.T) {
+	root := moduleRoot(t)
+	for kind := range knownSharedKinds {
+		seen := map[string]string{}
+		for _, owner := range entityKinds[kind] {
+			policy, ok := storePolicies[owner]
+			if !ok {
+				t.Fatalf("store %s shares kind %q but names no policy here", owner, kind)
+			}
+			source, err := os.ReadFile(filepath.Join(root, owner))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(source), `"`+policy+`"`) {
+				t.Fatalf("store %s no longer writes policy %q", owner, policy)
+			}
+			if other, dup := seen[policy]; dup {
+				t.Fatalf("stores %s and %s share kind %q and policy %q, so "+
+					"the guard cannot tell their heads apart", other, owner, kind, policy)
+			}
+			seen[policy] = owner
+		}
+	}
 }

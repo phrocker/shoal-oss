@@ -260,7 +260,8 @@ func decide(head *Head, intent Intent) (Decision, error) {
 			return DecisionCreate, nil
 		}
 		if head.State != StateLive || head.LogicalDigest != intent.DesiredDigest ||
-			!bytes.Equal(head.WinnerID, intent.DesiredWinnerID) {
+			!bytes.Equal(head.WinnerID, intent.DesiredWinnerID) ||
+			!bytes.Equal(head.LPART, intent.LPART) {
 			return 0, ErrConflict
 		}
 		return DecisionReuse, nil
@@ -279,8 +280,8 @@ func decide(head *Head, intent Intent) (Decision, error) {
 	}
 }
 
-// ownedBy reports whether an existing head was created by the same kind of
-// writer as the intent: the same logical policy and the same LPART.
+// ownedBy reports whether an existing head was created by the same store as
+// the intent's writer, which is what its logical policy names.
 //
 // The head key is (domain, kind, entity ID). It carries no table or store,
 // so two stores that chose one kind letter share a key space, and an entity
@@ -292,14 +293,21 @@ func decide(head *Head, intent Intent) (Decision, error) {
 // approval's, both kind 'P'). The record it guarded was then unreadable for
 // good, because its head named an epoch with no committed cell.
 //
-// Every writer derives the LPART from its own partition domain and the
-// entity, and names one logical policy per store, so a writer's own heads
-// always match. The comparison is on the head's stored values, so it needs
-// no format change and moves no existing head. Pruning copies both from the
-// head it retires.
+// The owner is the logical policy, and deliberately not the LPART as well.
+// Every store names one logical policy, and no two stores share one
+// (fleet/approval/v1, fleet/dispatch/v1, fleet/registry/v1,
+// fleet-events/default, the embedded document policy). The LPART, by
+// contrast, may legitimately differ between writes of one store's entity:
+// fleet-event subscription receipt slots are partitioned by the subscription
+// that last used them, so a reused slot is mutated under a different LPART.
+// ModeAbsentOrIdentical still requires the LPART to match for a reuse, as it
+// always did.
+//
+// The comparison reads the head's stored policy, so it needs no format change
+// and moves no existing head. Pruning copies the policy from the head it
+// retires.
 func ownedBy(head *Head, intent Intent) bool {
-	return bytes.Equal(head.LPART, intent.LPART) &&
-		bytes.Equal(head.LogicalPolicyID, intent.LogicalPolicyID)
+	return bytes.Equal(head.LogicalPolicyID, intent.LogicalPolicyID)
 }
 
 func matchesExpected(head *Head, intent Intent) bool {

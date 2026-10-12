@@ -31,9 +31,12 @@ func TestNoModeAdoptsAForeignHead(t *testing.T) {
 	head := commitAcquisition(t, client, acquired, 11)
 
 	foreign := map[string]func(*Intent){
-		"another LPART": func(i *Intent) { i.LPART = coordination.LPART("other-lpart") },
 		"another logical policy": func(i *Intent) {
 			i.LogicalPolicyID = []byte("other-policy")
+		},
+		"another logical policy and LPART": func(i *Intent) {
+			i.LogicalPolicyID = []byte("other-policy")
+			i.LPART = coordination.LPART("other-lpart")
 		},
 	}
 	for name, change := range foreign {
@@ -63,8 +66,11 @@ func TestNoModeAdoptsAForeignHead(t *testing.T) {
 		t.Fatalf("the owner's head moved: %+v, %v", current, err)
 	}
 
-	// The owner, by contrast, may still do everything.
+	// The owner, by contrast, may still do everything, including under
+	// another LPART: one store may partition one entity differently between
+	// writes (fleet-event subscription receipt slots do).
 	mutate := testIntent("shared", "txn-mutate", "owner", ModeMutate)
+	mutate.LPART = coordination.LPART("repartitioned")
 	mutate.ExpectedEpoch, mutate.ExpectedDigest = head.Epoch, head.LogicalDigest
 	mutate.DesiredDigest = digest("shared-v2")
 	mutated, err := client.Acquire(ctx, mutate)

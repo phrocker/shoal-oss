@@ -76,8 +76,11 @@ func collidingPublication(
 // approval's head. The approval was then unreadable for good ("not yet
 // readable at its committed epoch") and could never be decided.
 //
-// Both orders are refused now, and in both the first store's record is
-// intact.
+// Both orders are refused, and in both the first store's record is intact.
+// The first, a publication adopting an approval's head, is what the
+// head-ownership fix refuses; it passed before. The second was already
+// refused, because an approval's first write creates absent-or-identical,
+// which always compared the owner. It is kept so that stays true.
 func TestOneStoreCannotAdoptAnothersGuardHead(t *testing.T) {
 	h := newApprovalHarness(t)
 	attacker := requester
