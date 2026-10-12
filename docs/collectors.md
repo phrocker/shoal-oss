@@ -195,7 +195,9 @@ their part.
 - **No self-provisioning.** A request whose subject is the admin's subject or
   actor is refused (`403`) before anything is read, under any client ID. So an
   admin can neither make itself a collector nor raise, confirm or reactivate a
-  registration bound to itself.
+  registration bound to itself. The check compares identities as the admin's
+  own decision states them; a host whose admin and collector authenticators
+  can map one person to different subject strings must rule that out itself.
 - **The request decides the outcome; nothing is merged.** `generation` is the
   generation the registration holds afterwards. Provisioning creates only at
   generation 1, reactivates a revoked registration only at its current
