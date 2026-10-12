@@ -347,7 +347,13 @@ func (r *Registry) updateRegistrationAudited(ctx context.Context, id shoal.ID, c
 			mutation.Updates = append(mutation.Updates, entry.updates...)
 		}
 		status, writeErr := r.config.Backend.CompareAndMutate(ctx, mutation)
+		written := allocator.Condition{Coordinate: coord, Value: value, Timestamp: timestamp, TimestampSet: true}
 		if writeErr == nil && status == allocator.StatusAccepted {
+			if record != nil {
+				if e := r.ensureVisible(ctx, id, written, entry); e != nil {
+					return registrationRow{}, 0, indeterminate(e)
+				}
+			}
 			return next, sequence, nil
 		}
 		stored, readErr := r.read(ctx, coord)
@@ -359,6 +365,9 @@ func (r *Registry) updateRegistrationAudited(ctx context.Context, id shoal.ID, c
 				return next, 0, nil
 			}
 			if applied, checkErr := r.changeApplied(ctx, id, entry); checkErr == nil && applied {
+				if e := r.ensureVisible(ctx, id, written, entry); e != nil {
+					return registrationRow{}, 0, indeterminate(e)
+				}
 				return next, sequence, nil
 			} else if checkErr != nil {
 				return registrationRow{}, 0, indeterminate(writeErr, checkErr)

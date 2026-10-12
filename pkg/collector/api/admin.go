@@ -115,6 +115,7 @@ type AdminAttribution struct {
 const (
 	RecoveryUnreadableHead   = "unreadable_head"
 	RecoveryOccupiedSequence = "occupied_sequence"
+	RecoveryExhaustedHead    = "exhausted_head"
 )
 
 // ChangeSummary is one change log entry. By is present exactly when Source is
@@ -264,7 +265,7 @@ func (c ChangeSummary) validate() error {
 	}
 	switch c.Recovery {
 	case "":
-	case RecoveryUnreadableHead, RecoveryOccupiedSequence:
+	case RecoveryUnreadableHead, RecoveryOccupiedSequence, RecoveryExhaustedHead:
 		if c.Action != ChangeRevoke {
 			return badResponse()
 		}

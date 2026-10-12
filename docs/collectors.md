@@ -244,19 +244,23 @@ control. The log is damaged in any of these cases:
 - the head is present but is not a head this registry wrote (any cell count,
   timestamp or bytes other than one decodable head at its own sequence);
 - the head is absent while entries exist;
-- the entry the head would append is occupied, by any cell, malformed or not.
+- the entry the head would append is occupied, by any cell, malformed or not;
+- the head is healthy but sits at the largest timestamp, so no later head can
+  supersede it (`exhausted_head`).
 
 A provisioning then fails closed (`503`). A revocation, through either API,
 starts a new segment of the log, all in one mutation with the revocation:
-- **Its entry** carries a recovery marker: `unreadable_head` or
-  `occupied_sequence`, the damaged head's timestamp (0 when absent or
-  non-positive), and the SHA-256 of its exact stored bytes.
-- **Its sequence** is one above the highest of the head's timestamp, the
-  head's sequence and every stored entry. The row is scanned for the highest
-  entry where the store supports row scans, as the engine and Accumulo stores
-  do. On a store without row scans the registry probes upward in doubling
-  steps, and a stray entry above the probe could then still make a later
-  provisioning fail closed.
+- **Its entry** carries a recovery marker: `unreadable_head`,
+  `occupied_sequence` or `exhausted_head`, the damaged head's timestamp (0
+  when absent or non-positive), and the SHA-256 of its exact stored bytes.
+- **Its sequence** is one above the higher of the head's sequence and every
+  stored entry's. Sequences are independent of cell timestamps.
+  - Where the store supports row scans, as the engine and Accumulo stores do,
+    the row is scanned for the highest entry. The scan pages until a page
+    comes back empty, because a store may apply the limit before filtering.
+  - On a store without row scans the registry probes upward in doubling
+    steps. A stray entry above the probe could then still make a later
+    provisioning fail closed.
 - **A new head** at that sequence records it as `segment_start`. No stored
   entry lies above the new segment, so later appends proceed normally.
 
@@ -265,11 +269,27 @@ every logged change is. It is not pinned to the damaged head, which may not
 be pinnable. Only a failure of the store itself fails a revocation, since
 nothing can be written then anyway.
 
-In the one damage state where no sequence above the damage is representable
-(a cell at the largest timestamp or sequence), the recovery entry is written
-under a `change-overflow:` qualifier and the head is left alone. The
-revocation still applies and is still recorded, and the log reads as
-unavailable.
+If no head can supersede the damaged one (it sits at the largest timestamp),
+the entry is written without a new head. If no sequence above the damage is
+representable (an entry at the largest sequence), the entry goes under a
+`change-overflow:` qualifier instead. In both cases the revocation still
+applies and is still recorded, and the log reads as unavailable.
+
+**Delete markers.** A delete marker hides every cell at or below its
+timestamp from reads, scans and conditions alike, so the registry cannot see
+one in advance. Entries and heads are therefore written at a timestamp above
+the visible head's and at least the clock's nanoseconds. That clears markers
+left at a cell's own timestamp or at wall-clock milliseconds, as an Accumulo
+shell `delete` without a timestamp leaves.
+
+Every accepted audited write is then read back. If its entry or head is
+hidden, it is written again at a doubled timestamp. The rewrite is
+conditioned on the registration cell still being the one this write produced,
+and repeats until the cell reads back. If that cannot be achieved (a marker at
+the largest timestamp, or a concurrent change), the call reports
+`indeterminate` rather than a clean change. The read then fails closed instead
+of showing a log without the entry. Entries are immutable in content, but a
+repaired one sits at a later timestamp.
 
 Reads show only the current segment: the HTTP read lists its entries and
 reports `segment_start`, and `Registry.Changes` starts there too. Older

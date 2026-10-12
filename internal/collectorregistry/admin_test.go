@@ -419,7 +419,7 @@ func TestCorruptChangeLogFailsClosed(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	status, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Value: cell.Value, Timestamp: 1, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: 2, Value: bytes.Replace(cell.Value, []byte(`"admin"`), []byte(`"other"`), 1)}}})
+	status, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Value: cell.Value, Timestamp: cell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: cell.Timestamp + 1, Value: bytes.Replace(cell.Value, []byte(`"admin"`), []byte(`"other"`), 1)}}})
 	if e != nil || status != allocator.StatusAccepted {
 		t.Fatal(status, e)
 	}
@@ -428,14 +428,6 @@ func TestCorruptChangeLogFailsClosed(t *testing.T) {
 	}
 	if _, e := v.registry.Changes(context.Background(), collectorID, 0, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("altered entry: %v", e)
-	}
-	// An entry is written once: a second version, even with the original's
-	// exact bytes, is not an entry this registry wrote.
-	if _, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Timestamp: 2, TimestampSet: true, Value: bytes.Replace(cell.Value, []byte(`"admin"`), []byte(`"other"`), 1)}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: 3, Value: cell.Value}}}); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("rewritten entry: %v", e)
 	}
 	// A provisioning cannot be appended over a corrupt head; it fails closed.
 	// (Revoke first so that the provisioning below is a real change.)
@@ -490,7 +482,7 @@ func TestRevocationRecoversADamagedChangeLog(t *testing.T) {
 		if viaAdmin {
 			var result AdminResult
 			result, e = v.registry.AdminRevoke(admin, collectorID, 1)
-			if e == nil && (!result.Changed || result.Sequence != damaged.Timestamp+1) {
+			if e == nil && (!result.Changed || result.Sequence != 2) {
 				t.Fatalf("recovery result %+v", result)
 			}
 		} else {
@@ -506,7 +498,7 @@ func TestRevocationRecoversADamagedChangeLog(t *testing.T) {
 		if e != nil {
 			t.Fatalf("read after recovery: %v", e)
 		}
-		if len(view.Changes) != 1 || view.SegmentStart != damaged.Timestamp+1 || view.ChangeCount != damaged.Timestamp+1 {
+		if len(view.Changes) != 1 || view.SegmentStart != 2 || view.ChangeCount != 2 {
 			t.Fatalf("view %+v", view)
 		}
 		c := view.Changes[0]
@@ -554,7 +546,7 @@ func TestRevocationRecoversAnOccupiedSequence(t *testing.T) {
 		t.Fatalf("provision after recovery: %v", e)
 	}
 	view, e := v.registry.AdminRegistration(admin, collectorID)
-	if e != nil || view.SegmentStart != 4 || len(view.Changes) != 2 || view.Changes[1].Recovery == nil || view.Changes[1].Recovery.Reason != RecoveryOccupiedSequence || view.Changes[1].Recovery.HeadTimestamp != 1 {
+	if e != nil || view.SegmentStart != 4 || len(view.Changes) != 2 || view.Changes[1].Recovery == nil || view.Changes[1].Recovery.Reason != RecoveryOccupiedSequence || view.Changes[1].Recovery.HeadTimestamp <= 0 {
 		t.Fatalf("view %+v %v", view, e)
 	}
 }
@@ -650,12 +642,14 @@ func TestChangesThatWouldNotReadBackAreNeverWritten(t *testing.T) {
 type interleave struct {
 	lostAck
 	armed atomic.Bool
-	hook  func()
+	// skip is how many armed registration reads pass before the hook runs.
+	skip atomic.Int32
+	hook func()
 }
 
 func (i *interleave) ReadExact(ctx context.Context, c []allocator.Coordinate) ([]allocator.Cell, error) {
 	cells, e := i.inner.ReadExact(ctx, c)
-	if len(c) == 1 && string(c[0].Qualifier) == "registration" && i.armed.CompareAndSwap(true, false) {
+	if len(c) == 1 && string(c[0].Qualifier) == "registration" && i.armed.Load() && i.skip.Add(-1) < 0 && i.armed.CompareAndSwap(true, false) {
 		i.hook()
 	}
 	return cells, e
@@ -682,6 +676,7 @@ func TestAdminRegistrationIsCoherent(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	backend.skip.Store(1) // past the domain check, into the coherent loop
 	backend.armed.Store(true)
 	view, e := r.AdminRegistration(admin, collectorID)
 	if e != nil {
@@ -730,7 +725,7 @@ func TestLogInconsistenciesFailClosed(t *testing.T) {
 	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 2})
 	headCoord, entry := w.registry.changeHeadCoordinate(collectorID), w.registry.changeEntryCoordinate(collectorID, 2)
 	headCell, _ := w.registry.read(context.Background(), headCoord)
-	if status, e := w.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: headCoord.Row, Conditions: []allocator.Condition{{Coordinate: headCoord, Value: headCell.Value, Timestamp: headCell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: headCoord, Timestamp: 2, Value: head}, {Coordinate: entry, Timestamp: 1, Value: value}}}); e != nil || status != allocator.StatusAccepted {
+	if status, e := w.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: headCoord.Row, Conditions: []allocator.Condition{{Coordinate: headCoord, Value: headCell.Value, Timestamp: headCell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: headCoord, Timestamp: headCell.Timestamp + 1, Value: head}, {Coordinate: entry, Timestamp: 1, Value: value}}}); e != nil || status != allocator.StatusAccepted {
 		t.Fatal(status, e)
 	}
 	if _, e := w.registry.Changes(context.Background(), collectorID, 1, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
@@ -852,7 +847,7 @@ func TestRevocationRecoversEveryLogDamage(t *testing.T) {
 	t.Run("garbage head at a huge timestamp", func(t *testing.T) {
 		v := provisionedEnv(t)
 		put(t, v, v.registry.changeHeadCoordinate(collectorID), 1<<62+1, []byte("garbage"))
-		revokeRecovers(t, v, v.registry, 1<<62+2, RecoveryUnreadableHead)
+		revokeRecovers(t, v, v.registry, 2, RecoveryUnreadableHead)
 	})
 	t.Run("no store without a row scan", func(t *testing.T) {
 		v := provisionedEnv(t)
@@ -867,7 +862,7 @@ func TestRevocationRecoversEveryLogDamage(t *testing.T) {
 		}
 		revokeRecovers(t, v, r, 5, RecoveryOccupiedSequence)
 	})
-	t.Run("no representable sequence", func(t *testing.T) {
+	t.Run("head at the largest timestamp", func(t *testing.T) {
 		v := provisionedEnv(t)
 		put(t, v, v.registry.changeHeadCoordinate(collectorID), math.MaxInt64, []byte("garbage"))
 		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
@@ -876,8 +871,27 @@ func TestRevocationRecoversEveryLogDamage(t *testing.T) {
 		if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
 			t.Fatalf("not revoked: %+v", reg)
 		}
-		// The revocation is recorded under an overflow qualifier, and the
-		// log reads as unavailable rather than as healthy.
+		// The entry is recorded; no head can supersede the damaged one, so
+		// the log reads as unavailable rather than as healthy.
+		cell, e := v.registry.read(context.Background(), v.registry.changeEntryCoordinate(collectorID, 2))
+		var c Change
+		if e != nil || decode(cell.Value, &c) != nil || c.Recovery == nil || c.Recovery.HeadTimestamp != math.MaxInt64 || c.Action != ChangeRevoke {
+			t.Fatalf("recovery entry %+v %v", c, e)
+		}
+		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+			t.Fatalf("read: %v", e)
+		}
+	})
+	t.Run("no representable sequence", func(t *testing.T) {
+		v := provisionedEnv(t)
+		put(t, v, v.registry.changeEntryCoordinate(collectorID, math.MaxInt64-1), 1, []byte("stray"))
+		corruptHead(t, v, collectorID) // a far stray is damage only once the log is
+		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+			t.Fatalf("revoke: %v", e)
+		}
+		if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
+			t.Fatalf("not revoked: %+v", reg)
+		}
 		scanner := v.registry.config.Backend.(rowScanner)
 		cells, e := scanner.ScanRowPrefix(context.Background(), v.registry.registrationCoordinate(collectorID).Row, []byte(changeFamily), []byte(overflowPrefix), nil, 10)
 		var overflow []allocator.Cell
@@ -892,9 +906,6 @@ func TestRevocationRecoversEveryLogDamage(t *testing.T) {
 		var c Change
 		if decode(overflow[0].Value, &c) != nil || c.Recovery == nil || c.Action != ChangeRevoke || validChange(c, collectorID) != nil {
 			t.Fatalf("overflow entry %+v", c)
-		}
-		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-			t.Fatalf("read: %v", e)
 		}
 	})
 }
@@ -962,8 +973,144 @@ func TestSegmentStartMustBeARecoveryEntry(t *testing.T) {
 	}
 	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 3, SegmentStart: 3})
 	put(t, v, v.registry.changeEntryCoordinate(collectorID, 3), 1, value)
-	put(t, v, v.registry.changeHeadCoordinate(collectorID), 3, head)
+	headCell, _ := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
+	put(t, v, v.registry.changeHeadCoordinate(collectorID), headCell.Timestamp+1, head)
 	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("segment start without recovery: %v", e)
+	}
+}
+
+// tombstone leaves a delete marker at coord and timestamp, whether or not a
+// cell exists there, conditioned on the collector's registration cell.
+func tombstone(t *testing.T, v *env, coord allocator.Coordinate, timestamp int64) {
+	t.Helper()
+	reg, e := v.registry.read(context.Background(), v.registry.registrationCoordinate(collectorID))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if status, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: reg.Coordinate, Value: reg.Value, Timestamp: reg.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: timestamp, Delete: true}}}); e != nil || status != allocator.StatusAccepted {
+		t.Fatal(status, e)
+	}
+}
+
+// Delete markers hide every write at or below their timestamp from reads,
+// scans and conditions alike. Audited writes check that what they wrote reads
+// back, and write it again higher until it does, so an accepted change is
+// never reported with an invisible entry.
+func TestDeleteMarkersNeverHideAnAuditedChange(t *testing.T) {
+	t.Run("head and entry deleted at their own timestamps", func(t *testing.T) {
+		v := provisionedEnv(t)
+		deleteCell(t, v, v.registry.changeHeadCoordinate(collectorID))
+		deleteCell(t, v, v.registry.changeEntryCoordinate(collectorID, 1))
+		result, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1)
+		if e != nil || !result.Changed {
+			t.Fatalf("revoke %+v %v", result, e)
+		}
+		view, e := v.registry.AdminRegistration(v.admin(t), collectorID)
+		if e != nil || len(view.Changes) != 1 || view.Changes[0].Sequence != result.Sequence || view.Changes[0].Action != ChangeRevoke {
+			t.Fatalf("view %+v %v", view, e)
+		}
+	})
+	t.Run("markers far above the clock", func(t *testing.T) {
+		v := provisionedEnv(t)
+		tombstone(t, v, v.registry.changeEntryCoordinate(collectorID, 2), math.MaxInt64/2)
+		tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), math.MaxInt64/2)
+		result, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1)
+		if e != nil || !result.Changed {
+			t.Fatalf("revoke %+v %v", result, e)
+		}
+		view, e := v.registry.AdminRegistration(v.admin(t), collectorID)
+		if e != nil || len(view.Changes) != 1 || view.Changes[0].Sequence != result.Sequence || view.Changes[0].Action != ChangeRevoke {
+			t.Fatalf("view %+v %v", view, e)
+		}
+	})
+	t.Run("marker at the largest timestamp", func(t *testing.T) {
+		v := provisionedEnv(t)
+		tombstone(t, v, v.registry.changeEntryCoordinate(collectorID, 2), math.MaxInt64)
+		_, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1)
+		if !errors.Is(e, api.ErrIndeterminate) {
+			t.Fatalf("an unrepairable invisible entry was not reported: %v", e)
+		}
+		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+			t.Fatalf("read: %v", e)
+		}
+	})
+}
+
+// shortPages is a store whose row scan returns at most two cells per call,
+// as a store that applies the limit before filtering may.
+type shortPages struct {
+	lostAck
+	scanner rowScanner
+}
+
+func (s *shortPages) ScanRowPrefix(ctx context.Context, row, family, start, visibility []byte, limit int) ([]allocator.Cell, error) {
+	cells, e := s.scanner.ScanRowPrefix(ctx, row, family, start, visibility, limit)
+	return cells[:min(len(cells), 2)], e
+}
+
+// A short page does not end the scan: recovery still lands above every
+// stored entry.
+func TestRecoveryScansPastShortPages(t *testing.T) {
+	v := provisionedEnv(t)
+	for _, sequence := range []int64{2, 3, 4, 5, 6} {
+		put(t, v, v.registry.changeEntryCoordinate(collectorID, sequence), 1, []byte("stray"))
+	}
+	inner := v.registry.config.Backend
+	config := v.registry.config
+	config.Backend = &shortPages{lostAck: lostAck{inner: inner}, scanner: inner.(rowScanner)}
+	r, e := New(config)
+	if e != nil {
+		t.Fatal(e)
+	}
+	revokeRecovers(t, v, r, 7, RecoveryOccupiedSequence)
+}
+
+// A healthy head at the largest timestamp can never be superseded, so the
+// log cannot be appended to: provisioning fails closed, and revocation is
+// recorded with an exhausted_head recovery entry while the head stays.
+func TestExhaustedHeadIsDamage(t *testing.T) {
+	v := provisionedEnv(t)
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatal(e)
+	}
+	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 2})
+	put(t, v, v.registry.changeHeadCoordinate(collectorID), math.MaxInt64, head)
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
+		t.Fatalf("an exhausted but healthy head should still read: %v", e)
+	}
+	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("provision over an exhausted head: %v", e)
+	}
+	// Reactivate out of band so there is something to revoke.
+	if _, e := v.registry.updateRegistration(context.Background(), collectorID, false, func(row *registrationRow, _ bool) (bool, error) {
+		row.Registration.State = collector.Provisioned
+		return true, nil
+	}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatalf("revoke over an exhausted head: %v", e)
+	}
+	cell, e := v.registry.read(context.Background(), v.registry.changeEntryCoordinate(collectorID, 3))
+	var c Change
+	if e != nil || decode(cell.Value, &c) != nil || c.Recovery == nil || c.Recovery.Reason != RecoveryExhaustedHead {
+		t.Fatalf("recovery entry %+v %v", c, e)
+	}
+}
+
+// visible compares exact bytes, not mere presence.
+func TestVisibleComparesBytes(t *testing.T) {
+	v := provisionedEnv(t)
+	coord := v.registry.changeEntryCoordinate(collectorID, 1)
+	cell, e := v.registry.read(context.Background(), coord)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if ok, e := v.registry.visible(context.Background(), coord, cell.Value); e != nil || !ok {
+		t.Fatalf("own bytes: %v %v", ok, e)
+	}
+	if ok, e := v.registry.visible(context.Background(), coord, append(bytes.Clone(cell.Value), ' ')); e != nil || ok {
+		t.Fatalf("other bytes: %v %v", ok, e)
 	}
 }

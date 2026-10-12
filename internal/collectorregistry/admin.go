@@ -99,8 +99,11 @@ const (
 	// RecoveryUnreadableHead: the head cell exists but does not decode.
 	RecoveryUnreadableHead RecoveryReason = "unreadable_head"
 	// RecoveryOccupiedSequence: the head decodes, but the entry it would
-	// append is already present.
+	// append is already present, or the head is absent over stored entries.
 	RecoveryOccupiedSequence RecoveryReason = "occupied_sequence"
+	// RecoveryExhaustedHead: the head decodes but sits at the largest
+	// timestamp, so no later head can supersede it.
+	RecoveryExhaustedHead RecoveryReason = "exhausted_head"
 )
 
 // ChangeRecovery names the log state a recovery entry replaced: the head
@@ -222,7 +225,7 @@ func (r *Registry) readHeadState(ctx context.Context, id shoal.ID) (headState, e
 	s := headState{present: true, timestamp: max(cells[0].Timestamp, 0), digest: digestBytes(cells[0].Value)}
 	cell := cells[0]
 	var head changeHead
-	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.Sequence != cell.Timestamp || head.SegmentStart < 0 || head.SegmentStart > head.Sequence {
+	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.SegmentStart < 0 || head.SegmentStart > head.Sequence {
 		s.damaged = true
 		return s, nil
 	}
@@ -282,10 +285,16 @@ func (r *Registry) highestEntry(ctx context.Context, id shoal.ID) (highest int64
 				highest = n
 			}
 		}
-		if len(cells) < scanPage {
+		// Page until a scan returns nothing: a store may apply the limit
+		// before filtering, so a short page does not mean the end.
+		if len(cells) == 0 {
 			return highest, true, nil
 		}
-		start = append(bytes.Clone(cells[len(cells)-1].Coordinate.Qualifier), 0)
+		next := append(bytes.Clone(cells[len(cells)-1].Coordinate.Qualifier), 0)
+		if bytes.Compare(next, start) <= 0 {
+			return 0, true, ErrUnavailable
+		}
+		start = next
 	}
 }
 
@@ -300,9 +309,12 @@ func (r *Registry) anyEntry(ctx context.Context, id shoal.ID) (bool, error) {
 }
 
 type auditWrite struct {
-	sequence   int64
-	qualifier  []byte
-	value      []byte
+	sequence  int64
+	qualifier []byte
+	value     []byte
+	timestamp int64
+	// headValue is the head written with the entry, nil when none is.
+	headValue  []byte
 	conditions []allocator.Condition
 	updates    []allocator.Update
 }
@@ -321,14 +333,16 @@ type auditWrite struct {
 //   - its entry carries a ChangeRecovery naming the damaged head (its
 //     timestamp, clamped to 0, and the SHA-256 of its exact bytes, or of
 //     nothing when absent);
-//   - its sequence is one above the highest of the head's timestamp, the
+//   - its sequence is one above the higher of the
 //     head's sequence and every stored entry (found by scanning the row
 //     where the store can; by probing upward otherwise), so no stored
 //     entry sits above the new segment and later appends proceed normally;
-//   - the new head, written at that sequence, records it as SegmentStart;
+//   - the new head records the new sequence as SegmentStart; cells are
+//     written at timestamps described in the docs ("Delete markers");
 //   - all of it, with the revocation, is one mutation.
 //
-// If no sequence above the damage is representable, the entry is written
+// If no head can supersede the damaged one, the entry is written without a
+// head; if no sequence above the damage is representable, the entry is written
 // under an overflow qualifier and the head is left as it is: the revocation
 // still applies and is still recorded, and the log reads as unavailable.
 // Only a failure of the store itself fails a revocation, since then nothing
@@ -346,6 +360,8 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 	switch {
 	case head.damaged:
 		reason = RecoveryUnreadableHead
+	case head.timestamp == math.MaxInt64:
+		reason = RecoveryExhaustedHead
 	case head.head.Sequence == math.MaxInt64:
 		reason = RecoveryOccupiedSequence
 	default:
@@ -366,7 +382,7 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 	headCell := r.changeHeadCoordinate(id)
 	nextHead := changeHead{CollectorID: id, Sequence: head.head.Sequence + 1, SegmentStart: head.head.SegmentStart}
 	conditions := []allocator.Condition{head.pin}
-	writeHead := true
+	overflow := false
 	if reason != "" {
 		if change.Action != ChangeRevoke {
 			return auditWrite{}, ErrUnavailable
@@ -376,7 +392,9 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 			recovery.HeadSHA256 = digestBytes(nil)
 		}
 		change.Recovery = recovery
-		base := max(head.timestamp, head.head.Sequence)
+		// Sequences are independent of timestamps: a damaged head's
+		// timestamp says nothing about which sequences are taken.
+		base := head.head.Sequence
 		highest, scanned, e := r.highestEntry(ctx, id)
 		if e != nil {
 			return auditWrite{}, e
@@ -391,8 +409,19 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 		// be pinned reliably, and an absent one is pinned by the entries.
 		conditions = nil
 		if sequence <= 0 {
-			writeHead = false
+			overflow = true
 		}
+	}
+	// A head at the largest timestamp cannot be superseded: the entry is
+	// still written and the log reads as unavailable.
+	writeHead := !overflow && head.timestamp < math.MaxInt64
+	// Cells are written at a timestamp above the visible head's and at least
+	// the clock's nanoseconds, so a delete marker left at a cell's own
+	// timestamp, or at wall-clock milliseconds, does not hide them; any
+	// marker above that is caught by ensureVisible after the write.
+	timestamp := int64(math.MaxInt64)
+	if head.timestamp < math.MaxInt64 {
+		timestamp = max(r.nanos(), head.timestamp+1, 1)
 	}
 	change.Sequence = nextHead.Sequence
 	qualifier := r.changeEntryCoordinate(id, change.Sequence).Qualifier
@@ -401,7 +430,7 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 		return auditWrite{}, ErrUnavailable
 	}
 	change.Attempt = hex.EncodeToString(attempt[:])
-	if !writeHead {
+	if overflow {
 		change.Sequence = math.MaxInt64
 		qualifier = []byte(overflowPrefix + change.Attempt)
 	}
@@ -425,9 +454,10 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 		return auditWrite{}, invalid()
 	}
 	entry := r.changeCoordinate(id, string(qualifier))
-	w := auditWrite{sequence: change.Sequence, qualifier: qualifier, value: value, conditions: append(conditions, allocator.Condition{Coordinate: entry, Absent: true}), updates: []allocator.Update{{Coordinate: entry, Timestamp: 1, Value: value}}}
+	w := auditWrite{sequence: change.Sequence, qualifier: qualifier, value: value, timestamp: timestamp, conditions: append(conditions, allocator.Condition{Coordinate: entry, Absent: true}), updates: []allocator.Update{{Coordinate: entry, Timestamp: timestamp, Value: value}}}
 	if writeHead {
-		w.updates = append(w.updates, allocator.Update{Coordinate: headCell, Timestamp: nextHead.Sequence, Value: headValue})
+		w.headValue = headValue
+		w.updates = append(w.updates, allocator.Update{Coordinate: headCell, Timestamp: timestamp, Value: headValue})
 	}
 	return w, nil
 }
@@ -469,7 +499,86 @@ func (r *Registry) changeApplied(ctx context.Context, id shoal.ID, w auditWrite)
 	if e != nil {
 		return false, e
 	}
-	return cell.Timestamp == 1 && bytes.Equal(cell.Value, w.value), nil
+	return cell.Timestamp > 0 && bytes.Equal(cell.Value, w.value), nil
+}
+
+func (r *Registry) nanos() int64 {
+	return r.config.Clock().UTC().UnixNano()
+}
+
+// visible reports whether exactly value is what a read of coord returns.
+func (r *Registry) visible(ctx context.Context, coord allocator.Coordinate, value []byte) (bool, error) {
+	cells, e := r.config.Backend.ReadExact(ctx, []allocator.Coordinate{coord})
+	if e != nil {
+		return false, ErrUnavailable
+	}
+	return len(cells) == 1 && cells[0].Timestamp > 0 && bytes.Equal(cells[0].Value, value), nil
+}
+
+// maxVisibilityRepairs bounds ensureVisible: each repair doubles the
+// timestamp, so this reaches the largest timestamp from any start.
+const maxVisibilityRepairs = 64
+
+// ensureVisible runs after an audited write was accepted and checks that its
+// entry and head read back. A delete marker at or above the timestamp they
+// were written at hides them from every read and condition, so the registry
+// cannot see it beforehand. A hidden cell is written again at a doubled
+// timestamp, conditioned on the registration cell still being the one this
+// write produced (so it is still this write's change), until it reads back.
+// If that cannot be achieved the outcome is reported for reconciliation,
+// never as a clean change.
+func (r *Registry) ensureVisible(ctx context.Context, id shoal.ID, registration allocator.Condition, w auditWrite) error {
+	entry := r.changeCoordinate(id, string(w.qualifier))
+	head := r.changeHeadCoordinate(id)
+	timestamp := w.timestamp
+	for range maxVisibilityRepairs + 1 {
+		entryOK, e := r.visible(ctx, entry, w.value)
+		if e != nil {
+			return e
+		}
+		headOK := w.headValue == nil
+		if !headOK {
+			if headOK, e = r.visible(ctx, head, w.headValue); e != nil {
+				return e
+			}
+		}
+		if entryOK && headOK {
+			return nil
+		}
+		if timestamp == math.MaxInt64 {
+			return ErrUnavailable
+		}
+		if timestamp > math.MaxInt64/2 {
+			timestamp = math.MaxInt64
+		} else {
+			timestamp *= 2
+		}
+		mutation := allocator.Mutation{Row: entry.Row, Conditions: []allocator.Condition{registration}}
+		if !entryOK {
+			mutation.Conditions = append(mutation.Conditions, allocator.Condition{Coordinate: entry, Absent: true})
+			mutation.Updates = append(mutation.Updates, allocator.Update{Coordinate: entry, Timestamp: timestamp, Value: w.value})
+		}
+		if !headOK {
+			mutation.Updates = append(mutation.Updates, allocator.Update{Coordinate: head, Timestamp: timestamp, Value: w.headValue})
+		}
+		status, e := r.config.Backend.CompareAndMutate(ctx, mutation)
+		if e != nil || status != allocator.StatusAccepted {
+			// Someone else moved the registration, or the entry is visible
+			// with other bytes: the outcome needs reconciliation. A
+			// rejected repair may still have been preceded by an applied
+			// one, so check once more before giving up.
+			if entryOK2, _ := r.visible(ctx, entry, w.value); entryOK2 {
+				if w.headValue == nil {
+					return nil
+				}
+				if headOK2, _ := r.visible(ctx, head, w.headValue); headOK2 {
+					return nil
+				}
+			}
+			return ErrUnavailable
+		}
+	}
+	return ErrUnavailable
 }
 
 func validChange(c Change, id shoal.ID) error {
@@ -500,7 +609,7 @@ func validChange(c Change, id shoal.ID) error {
 	if c.Recovery != nil {
 		switch {
 		case c.Action != ChangeRevoke,
-			c.Recovery.Reason != RecoveryUnreadableHead && c.Recovery.Reason != RecoveryOccupiedSequence,
+			c.Recovery.Reason != RecoveryUnreadableHead && c.Recovery.Reason != RecoveryOccupiedSequence && c.Recovery.Reason != RecoveryExhaustedHead,
 			c.Recovery.HeadTimestamp < 0,
 			!collector.ValidDigest(c.Recovery.HeadSHA256):
 			return invalid()
@@ -559,7 +668,7 @@ func (r *Registry) readChange(ctx context.Context, id shoal.ID, sequence int64) 
 		return Change{}, ErrUnavailable
 	}
 	var c Change
-	if cell.Timestamp != 1 || decode(cell.Value, &c) != nil || c.Sequence != sequence || validChange(c, id) != nil {
+	if cell.Timestamp <= 0 || decode(cell.Value, &c) != nil || c.Sequence != sequence || validChange(c, id) != nil {
 		return Change{}, ErrUnavailable
 	}
 	return c, nil
@@ -693,6 +802,14 @@ func (r *Registry) AdminRevoke(ctx context.Context, id shoal.ID, generation int6
 // and the head describe the same logged state. A registration outside domain
 // reads as not found before anything about its log is disclosed.
 func (r *Registry) coherentRegistration(ctx context.Context, id shoal.ID, domain []byte) (registrationRow, changeHead, error) {
+	// The domain is fixed for a collector's life, so checking it once, before
+	// anything about the log is read, keeps every log state of another
+	// domain's collector (including store errors on its cells) concealed.
+	if row, _, e := r.readRegistration(ctx, id); e != nil {
+		return registrationRow{}, changeHead{}, e
+	} else if !bytes.Equal(row.Registration.Domain, domain) {
+		return registrationRow{}, changeHead{}, auth.ObjectNotFound()
+	}
 	for range maxCASAttempts {
 		before, e := r.readHeadState(ctx, id)
 		if e != nil {
