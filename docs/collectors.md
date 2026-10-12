@@ -321,7 +321,19 @@ describe:
 - otherwise, the entry right after the head's sequence.
 
 Writes treat the same states as damage. A provisioning fails closed, and a
-revocation recovers above them, so the log reads again. Entry and head are
+revocation recovers above them, so the log reads again.
+
+A recovery also accounts for every overflow entry stored at that moment. Its
+entry names the highest one (`AcknowledgedOverflow`) and the new head carries
+that as an acknowledgement. Only overflow cells above it count as damage
+afterwards. An overflow entry the registry wrote itself is acknowledged only
+by a later recovery that can write a head, so the log stays unavailable while
+the sequences are exhausted, as documented above.
+
+Residual for stores that apply a scan's limit before filtering by
+visibility: a page holding only another visibility's cells reads as empty,
+which ends the scan early. That needs a second registry configuration with a
+different visibility sharing the table. Entry and head are
 written in one mutation, but the reader's probe of the next entry is a
 separate read. So an entry that appears because a concurrent write committed
 in between is told apart by re-reading the head: the read retries, and only

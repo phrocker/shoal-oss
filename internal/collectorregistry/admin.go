@@ -114,6 +114,10 @@ type ChangeRecovery struct {
 	Reason        RecoveryReason
 	HeadTimestamp int64
 	HeadSHA256    string
+	// AcknowledgedOverflow is the hex of the highest overflow qualifier
+	// stored when this recovery started its segment, if any: the overflow
+	// entries it accounts for, written by an earlier revocation or stray.
+	AcknowledgedOverflow string `json:",omitempty"`
 }
 
 // AdminResult is the outcome of an admin write. Changed reports whether this
@@ -178,6 +182,10 @@ type changeHead struct {
 	// SegmentStart is the sequence of the recovery entry that started the
 	// current segment, 0 when the log never needed one.
 	SegmentStart int64
+	// OverflowAck is the hex of the highest overflow qualifier a recovery
+	// recorded (ChangeRecovery.AcknowledgedOverflow); overflow cells at or
+	// below it are already accounted for and no longer damage.
+	OverflowAck string `json:",omitempty"`
 }
 
 func (r *Registry) changeCoordinate(id shoal.ID, qualifier string) allocator.Coordinate {
@@ -230,7 +238,7 @@ func (r *Registry) readHeadState(ctx context.Context, id shoal.ID) (headState, e
 		// One stored cell can be pinned exactly, whatever its bytes.
 		s.pin = allocator.Condition{Coordinate: coord, Value: bytes.Clone(cell.Value), Timestamp: cell.Timestamp, TimestampSet: true}
 	}
-	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.SegmentStart < 0 || head.SegmentStart > head.Sequence {
+	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.SegmentStart < 0 || head.SegmentStart > head.Sequence || !validOverflowAck(head.OverflowAck) {
 		s.damaged = true
 		return s, nil
 	}
@@ -359,15 +367,16 @@ func (r *Registry) logBeyondHead(ctx context.Context, id shoal.ID, state headSta
 // entriesBeyond reports whether the log stores anything the head does not
 // describe: see logBeyondHead.
 func (r *Registry) entriesBeyond(ctx context.Context, id shoal.ID, state headState) (bool, error) {
-	highest, scanned, e := r.highestEntry(ctx, id)
-	if e != nil {
-		return false, e
-	}
-	if scanned {
-		if highest > state.head.Sequence {
-			return true, nil
+	if _, scanned := r.config.Backend.(rowScanner); scanned {
+		if above, e := r.entryAbove(ctx, id, state.head.Sequence); e != nil || above {
+			return above, e
 		}
-		return r.anyOverflow(ctx, id)
+		ack, e := hex.DecodeString(state.head.OverflowAck)
+		if e != nil {
+			return false, ErrUnavailable
+		}
+		overflow, e := r.highestOverflow(ctx, id, ack)
+		return overflow != nil, e
 	}
 	if !state.present {
 		return r.entryPresent(ctx, id, 1)
@@ -378,14 +387,76 @@ func (r *Registry) entriesBeyond(ctx context.Context, id shoal.ID, state headSta
 	return r.entryPresent(ctx, id, state.head.Sequence+1)
 }
 
-// anyOverflow reports whether any overflow entry is stored. The store can
-// scan rows when this is called.
-func (r *Registry) anyOverflow(ctx context.Context, id shoal.ID) (bool, error) {
-	cells, e := r.config.Backend.(rowScanner).ScanRowPrefix(ctx, r.registrationCoordinate(id).Row, []byte(changeFamily), []byte(overflowPrefix), bytes.Clone(r.config.Visibility), 1)
-	if e != nil {
-		return false, ErrUnavailable
+// entryAbove reports whether any entry with a sequence above sequence is
+// stored, scanning only from sequence+1 so that a read does not page through
+// the whole log. (A recovery still scans every entry, see highestEntry.)
+func (r *Registry) entryAbove(ctx context.Context, id shoal.ID, sequence int64) (bool, error) {
+	if sequence == math.MaxInt64 {
+		return false, nil
 	}
-	return len(cells) != 0 && strings.HasPrefix(string(cells[0].Coordinate.Qualifier), overflowPrefix), nil
+	scanner := r.config.Backend.(rowScanner)
+	row := r.registrationCoordinate(id).Row
+	start := r.changeEntryCoordinate(id, sequence+1).Qualifier
+	for {
+		cells, e := scanner.ScanRowPrefix(ctx, row, []byte(changeFamily), start, bytes.Clone(r.config.Visibility), scanPage)
+		if e != nil {
+			return false, ErrUnavailable
+		}
+		if len(cells) == 0 {
+			return false, nil
+		}
+		for _, cell := range cells {
+			q := string(cell.Coordinate.Qualifier)
+			if !strings.HasPrefix(q, entryPrefix) {
+				return false, nil
+			}
+			if n, e := strconv.ParseInt(strings.TrimPrefix(q, entryPrefix), 10, 64); e == nil && n > sequence {
+				return true, nil
+			}
+		}
+		next := append(bytes.Clone(cells[len(cells)-1].Coordinate.Qualifier), 0)
+		if bytes.Compare(next, start) <= 0 {
+			return false, ErrUnavailable
+		}
+		start = next
+	}
+}
+
+// highestOverflow returns the highest overflow qualifier above after (nil
+// for none), paging until an empty page or a qualifier past the overflow
+// prefix, since a store may apply the scan limit before filtering. The
+// store can scan rows when this is called.
+func (r *Registry) highestOverflow(ctx context.Context, id shoal.ID, after []byte) ([]byte, error) {
+	scanner := r.config.Backend.(rowScanner)
+	row := r.registrationCoordinate(id).Row
+	start := []byte(overflowPrefix)
+	if len(after) != 0 {
+		start = append(bytes.Clone(after), 0)
+	}
+	var highest []byte
+	for {
+		cells, e := scanner.ScanRowPrefix(ctx, row, []byte(changeFamily), start, bytes.Clone(r.config.Visibility), scanPage)
+		if e != nil {
+			return nil, ErrUnavailable
+		}
+		if len(cells) == 0 {
+			return highest, nil
+		}
+		for _, cell := range cells {
+			q := cell.Coordinate.Qualifier
+			if !bytes.HasPrefix(q, []byte(overflowPrefix)) {
+				return highest, nil
+			}
+			if bytes.Compare(q, after) > 0 && bytes.Compare(q, highest) > 0 {
+				highest = bytes.Clone(q)
+			}
+		}
+		next := append(bytes.Clone(cells[len(cells)-1].Coordinate.Qualifier), 0)
+		if bytes.Compare(next, start) <= 0 {
+			return nil, ErrUnavailable
+		}
+		start = next
+	}
 }
 
 type auditWrite struct {
@@ -465,7 +536,7 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 		}
 	}
 	headCell := r.changeHeadCoordinate(id)
-	nextHead := changeHead{CollectorID: id, Sequence: head.head.Sequence + 1, SegmentStart: head.head.SegmentStart}
+	nextHead := changeHead{CollectorID: id, Sequence: head.head.Sequence + 1, SegmentStart: head.head.SegmentStart, OverflowAck: head.head.OverflowAck}
 	conditions := []allocator.Condition{head.pin}
 	overflow := false
 	if reason != "" {
@@ -490,6 +561,24 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 			return auditWrite{}, e
 		}
 		nextHead = changeHead{CollectorID: id, Sequence: sequence, SegmentStart: sequence}
+		// Account for every overflow entry stored now, so the new segment
+		// reads again; the recovery entry names them.
+		if scanned {
+			overflow, e := r.highestOverflow(ctx, id, nil)
+			if e != nil {
+				return auditWrite{}, e
+			}
+			if overflow != nil {
+				// A qualifier longer than the bound is acknowledged by a
+				// bounded value that still sorts above it in practice: its
+				// prefix followed by 0xff bytes.
+				if len(overflow) > shoal.MaxIDBytes {
+					overflow = append(bytes.Clone(overflow[:shoal.MaxIDBytes-8]), bytes.Repeat([]byte{0xff}, 8)...)
+				}
+				nextHead.OverflowAck = hex.EncodeToString(overflow)
+				recovery.AcknowledgedOverflow = nextHead.OverflowAck
+			}
+		}
 		// The recovery is pinned to the head it judged, so it cannot commit
 		// over a head that became healthy meanwhile (a concurrent write's
 		// repair, which does not move the registration cell): an absent
@@ -757,6 +846,7 @@ func validChange(c Change, id shoal.ID) error {
 		case c.Action != ChangeRevoke,
 			c.Recovery.Reason != RecoveryUnreadableHead && c.Recovery.Reason != RecoveryOccupiedSequence && c.Recovery.Reason != RecoveryExhaustedHead,
 			c.Recovery.HeadTimestamp < 0,
+			!validOverflowAck(c.Recovery.AcknowledgedOverflow),
 			!collector.ValidDigest(c.Recovery.HeadSHA256):
 			return invalid()
 		}
@@ -800,6 +890,15 @@ func printableID(id shoal.ID, required bool) bool {
 		}
 	}
 	return true
+}
+
+// validOverflowAck accepts "" or the lowercase hex of an overflow qualifier.
+func validOverflowAck(ack string) bool {
+	if ack == "" {
+		return true
+	}
+	b, e := hex.DecodeString(ack)
+	return e == nil && hex.EncodeToString(b) == ack && bytes.HasPrefix(b, []byte(overflowPrefix)) && len(b) <= shoal.MaxIDBytes
 }
 
 func digestBytes(b []byte) string {

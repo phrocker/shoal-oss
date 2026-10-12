@@ -4,6 +4,7 @@ package collectorregistry
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"math"
 	"slices"
@@ -1629,5 +1630,28 @@ func TestEntriesFarAboveTheHeadAreDamage(t *testing.T) {
 	}
 	if _, e := w.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("Changes over an exhausted head with a recorded revocation: %v", e)
+	}
+}
+
+// A stray overflow cell is damage a revocation recovers from: the recovery
+// accounts for it in the new head, so the log reads and provisions again.
+func TestRevocationAcknowledgesStrayOverflow(t *testing.T) {
+	v := provisionedEnv(t)
+	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"x"), 1, []byte("stray"))
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("Changes over a stray overflow: %v", e)
+	}
+	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs", "authority:more")); e == nil {
+		t.Fatal("conflicting provision accepted")
+	}
+	revokeRecovers(t, v, v.registry, 2, RecoveryOccupiedSequence)
+	got, e := v.registry.Changes(context.Background(), collectorID, 1, 1)
+	if e != nil || len(got) != 1 || got[0].Recovery == nil || got[0].Recovery.AcknowledgedOverflow != hex.EncodeToString([]byte(overflowPrefix+"x")) {
+		t.Fatalf("recovery entry %+v %v", got, e)
+	}
+	// A further overflow cell above the acknowledged one is damage again.
+	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"y"), 1, []byte("stray"))
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("Changes over a new overflow: %v", e)
 	}
 }
