@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -298,20 +299,50 @@ func (r *Registry) highestEntry(ctx context.Context, id shoal.ID) (highest int64
 	}
 }
 
-// logBeyondHead fails closed when the log holds what its head does not
-// describe: a head no write can supersede, or an entry right after it (an
-// accepted change recorded without a head).
-func (r *Registry) logBeyondHead(ctx context.Context, id shoal.ID, state headState) error {
-	if state.timestamp >= maxWriteTimestamp {
-		return ErrUnavailable
+// errLogMoved reports that the log head changed while a decision about it
+// was being made: a concurrent audited write committed. The caller re-reads
+// and decides again; it is never returned to a client.
+var errLogMoved = errors.New("collector change log moved")
+
+// sameHead reports whether two head reads saw the same stored cell.
+func sameHead(a, b headState) bool {
+	return a.present == b.present && a.timestamp == b.timestamp && a.digest == b.digest
+}
+
+// headStill re-reads the head and reports errLogMoved when it is no longer
+// the one read as was.
+func (r *Registry) headStill(ctx context.Context, id shoal.ID, was headState) error {
+	now, e := r.readHeadState(ctx, id)
+	if e != nil {
+		return e
 	}
+	if !sameHead(was, now) {
+		return errLogMoved
+	}
+	return nil
+}
+
+// logBeyondHead fails closed when the log holds an entry right after the
+// head's sequence: an accepted change recorded without a head (an
+// exhausted_head recovery) or a stray. Entry and head are written in one
+// mutation, but this probe is a separate read, so an entry that appears
+// because a concurrent write committed meanwhile is told apart by re-reading
+// the head: errLogMoved then, damage only if the head is unchanged.
+func (r *Registry) logBeyondHead(ctx context.Context, id shoal.ID, state headState) error {
 	if !state.present {
 		return nil
 	}
-	if beyond, e := r.entryPresent(ctx, id, state.head.Sequence+1); e != nil || beyond {
-		return ErrUnavailable
+	beyond, e := r.entryPresent(ctx, id, state.head.Sequence+1)
+	if e != nil {
+		return e
 	}
-	return nil
+	if !beyond {
+		return nil
+	}
+	if e := r.headStill(ctx, id, state); e != nil {
+		return e
+	}
+	return ErrUnavailable
 }
 
 // anyEntry reports whether the log has any entry, scanning where the store
@@ -392,6 +423,11 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 			}
 		}
 		if occupied {
+			// A concurrent write may have committed between the head read
+			// and the probe; that is not damage.
+			if e := r.headStill(ctx, id, head); e != nil {
+				return auditWrite{}, e
+			}
 			reason = RecoveryOccupiedSequence
 		}
 	}
@@ -532,9 +568,9 @@ func (r *Registry) visible(ctx context.Context, coord allocator.Coordinate, valu
 }
 
 // maxWriteTimestamp is the highest timestamp the registry writes a log cell
-// at. Keeping the largest timestamp unused means no write of the registry's
-// own, repairs included, can leave a head that nothing can supersede; a cell
-// at the largest timestamp can come only from outside the registry.
+// at, keeping the largest timestamp free for nothing but outside writes. A
+// head that reaches it exhausts the log (docs/collectors.md, "Delete
+// markers").
 const maxWriteTimestamp = math.MaxInt64 - 1
 
 // maxVisibilityRepairs bounds ensureVisible: up to 63 doubling steps above
@@ -583,7 +619,9 @@ func (r *Registry) ensureVisible(ctx context.Context, id shoal.ID, registration 
 		if e != nil {
 			return false, e
 		}
-		return state.present && !state.damaged && state.head.Sequence >= w.sequence, nil
+		// The superseding head must still describe this entry: a recovery
+		// head that starts its segment past it has left it unreadable.
+		return state.present && !state.damaged && state.head.Sequence >= w.sequence && state.head.SegmentStart <= w.sequence, nil
 	}
 	step, last := int64(1), w.timestamp
 	for range maxVisibilityRepairs + 1 {
@@ -747,17 +785,25 @@ func (r *Registry) Changes(ctx context.Context, id shoal.ID, after int64, limit 
 	if shoal.ValidateRequiredID("collector ID", id) != nil || after < 0 || limit <= 0 || limit > MaxChangesPage {
 		return nil, invalid()
 	}
-	state, e := r.readHeadState(ctx, id)
-	if e != nil {
-		return nil, e
-	}
-	if state.damaged {
-		return nil, ErrUnavailable
+	var state headState
+	for attempt := 0; ; attempt++ {
+		var e error
+		if state, e = r.readHeadState(ctx, id); e != nil {
+			return nil, e
+		}
+		if state.damaged {
+			return nil, ErrUnavailable
+		}
+		e = r.logBeyondHead(ctx, id, state)
+		if errors.Is(e, errLogMoved) && attempt < maxCASAttempts {
+			continue
+		}
+		if e != nil {
+			return nil, ErrUnavailable
+		}
+		break
 	}
 	head := state.head
-	if e := r.logBeyondHead(ctx, id, state); e != nil {
-		return nil, e
-	}
 	if head.Sequence == 0 {
 		// An absent head over stored entries hides history: fail closed.
 		if hidden, e := r.anyEntry(ctx, id); e != nil || hidden {
@@ -906,7 +952,9 @@ func (r *Registry) coherentRegistration(ctx context.Context, id shoal.ID, domain
 		if after.damaged {
 			return registrationRow{}, changeHead{}, ErrUnavailable
 		}
-		if e := r.logBeyondHead(ctx, id, after); e != nil {
+		if e := r.logBeyondHead(ctx, id, after); errors.Is(e, errLogMoved) {
+			continue
+		} else if e != nil {
 			return registrationRow{}, changeHead{}, e
 		}
 		if !after.present {

@@ -245,9 +245,8 @@ control. The log is damaged in any of these cases:
   timestamp or bytes other than one decodable head at its own sequence);
 - the head is absent while entries exist;
 - the entry the head would append is occupied, by any cell, malformed or not;
-- the head is healthy but sits at or above the largest timestamp the
-  registry writes, so no later head can supersede it (`exhausted_head`).
-  Only a write from outside the registry can put it there.
+- the head is healthy but sits at the largest timestamp the registry writes,
+  so no later head can supersede it (`exhausted_head`).
 
 A provisioning then fails closed (`503`). A revocation, through either API,
 starts a new segment of the log, all in one mutation with the revocation:
@@ -289,21 +288,36 @@ again, conditioned on that cell, until it reads back. The rewrite timestamp
 starts at the write's own timestamp plus a doubling step, then halves the
 room left below the largest usable timestamp.
 
-The registry never writes at the largest timestamp itself. So no repair of
-its own can leave a head that nothing supersedes: a marker just above the
-clock costs a bounded jump, and later writes simply go one higher.
+Head timestamps only increase, so the timestamp space is finite headroom.
+A marker just above the clock costs a bounded jump, and later writes go one
+higher. A marker within K of the top leaves room for only about K more
+appends. After that the log is exhausted:
+- it still reads, since it is complete;
+- provisioning fails closed;
+- a revocation is recorded as an `exhausted_head` entry beyond the head,
+  after which reads fail closed.
+
+Clearing an exhausted log takes store surgery, as does a marker at the very
+largest timestamp.
 
 If a later audited write commits on top first, this write's head was
 legitimately superseded. The write is then clean when its entry reads back
-exactly and the visible head is healthy at or past its sequence.
+exactly and the visible head is healthy at or past its sequence, with a
+segment that still includes it. A recovery that started its segment past the
+entry leaves it unreadable, and the write reports `indeterminate`.
 
 Otherwise (a marker at or above the largest usable timestamp) the call reports
 `indeterminate` rather than a clean change. Entries are immutable in content,
 but a repaired one sits at a later timestamp.
 
-Both reads fail closed (`503`) when the log holds what its head does not
-describe: a head at the largest timestamp, or an entry right after the head's
-sequence (a change recorded with no head).
+Both reads fail closed (`503`) when the log holds an entry right after the
+head's sequence, that is, a change recorded with no head. Entry and head are
+written in one mutation, but the reader's probe of the next entry is a
+separate read. So an entry that appears because a concurrent write committed
+in between is told apart by re-reading the head: the read retries, and only
+an unchanged head with an entry beyond it counts as damage. A provisioning
+that sees the next entry occupied makes the same check before failing closed,
+so ordinary provision and revoke races are never reported as damage.
 
 **Limit.** A log whose head and entries are all hidden by markers at the
 largest timestamps looks exactly like a registration from before the log

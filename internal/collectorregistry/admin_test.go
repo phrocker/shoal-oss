@@ -1082,9 +1082,8 @@ func TestExhaustedHeadIsDamage(t *testing.T) {
 	}
 	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 2})
 	put(t, v, v.registry.changeHeadCoordinate(collectorID), math.MaxInt64, head)
-	// A head no write can supersede leaves a log that cannot be kept
-	// complete, so it reads as unavailable.
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+	// The log is still complete, so it reads; it just cannot grow.
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
 		t.Fatalf("read over an exhausted head: %v", e)
 	}
 	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
@@ -1105,9 +1104,12 @@ func TestExhaustedHeadIsDamage(t *testing.T) {
 	if e != nil || decode(cell.Value, &c) != nil || c.Recovery == nil || c.Recovery.Reason != RecoveryExhaustedHead {
 		t.Fatalf("recovery entry %+v %v", c, e)
 	}
-	// The trusted read does not present the log without that entry.
+	// Neither read presents the log without that entry.
 	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("Changes over an exhausted head: %v", e)
+	}
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("read over an exhausted head with a change beyond it: %v", e)
 	}
 }
 
@@ -1211,5 +1213,201 @@ func TestEntriesBeyondTheHeadFailClosed(t *testing.T) {
 	}
 	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("read: %v", e)
+	}
+}
+
+// afterHeadRead runs hook once, right after the first armed read of the
+// change-log head, so a concurrent audited write commits between a reader's
+// head read and its next probe.
+type afterHeadRead struct {
+	lostAck
+	armed atomic.Bool
+	hook  func()
+}
+
+func (a *afterHeadRead) ReadExact(ctx context.Context, c []allocator.Coordinate) ([]allocator.Cell, error) {
+	cells, e := a.inner.ReadExact(ctx, c)
+	if len(c) == 1 && string(c[0].Qualifier) == "change-head" && a.armed.CompareAndSwap(true, false) {
+		a.hook()
+	}
+	return cells, e
+}
+
+// A write that commits between a reader's head read and its probe of the
+// next entry is concurrency, not damage: reads and provisioning retry.
+func TestConcurrentWritesAreNotDamage(t *testing.T) {
+	for _, step := range []string{"changes", "read", "provision"} {
+		v := provisionedEnv(t)
+		backend := &afterHeadRead{lostAck: lostAck{inner: v.registry.config.Backend}}
+		backend.hook = func() {
+			if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+				t.Error(e)
+			}
+		}
+		if step == "provision" {
+			// Start revoked; the concurrent write is the operator
+			// reactivating the same terms.
+			if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+				t.Fatal(e)
+			}
+			backend.hook = func() {
+				if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
+					t.Error(e)
+				}
+			}
+		}
+		config := v.registry.config
+		config.Backend = backend
+		r, e := New(config)
+		if e != nil {
+			t.Fatal(e)
+		}
+		backend.armed.Store(true)
+		switch step {
+		case "changes":
+			if got, e := r.Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil || len(got) != 2 {
+				t.Fatalf("changes %d %v", len(got), e)
+			}
+		case "read":
+			if view, e := r.AdminRegistration(v.admin(t), collectorID); e != nil || view.Registration.State != collector.Revoked {
+				t.Fatalf("read %+v %v", view, e)
+			}
+		case "provision":
+			// The operator reactivates while this provisioning decides; it
+			// is not refused as damage, but re-evaluated: the same terms
+			// are now in place, a no-op.
+			result, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2)
+			if e != nil || result.Changed {
+				t.Fatalf("provision racing the operator: %+v %v", result, e)
+			}
+		}
+		if backend.armed.Load() {
+			t.Fatalf("%s: the write did not interleave", step)
+		}
+	}
+}
+
+// A change superseded by a recovery whose segment starts past it is not
+// readable, so it is not reported clean.
+func TestAChangeLeftOutsideTheSegmentIsNotClean(t *testing.T) {
+	v := newEnv(t)
+	backend := &onTop{lostAck: lostAck{inner: v.registry.config.Backend}}
+	backend.hook = func() {
+		tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), v.registry.nanos()+1000)
+		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+			t.Error(e)
+		}
+	}
+	config := v.registry.config
+	config.Backend = backend
+	r, e := New(config)
+	if e != nil {
+		t.Fatal(e)
+	}
+	backend.armed.Store(true)
+	if _, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1); !errors.Is(e, api.ErrIndeterminate) {
+		t.Fatalf("provision left outside the segment: %v", e)
+	}
+}
+
+// Ordinary churn — provisions, revocations and reads racing — never reads as
+// damage: no unavailable and no indeterminate outcome.
+func TestChurnIsNeverReportedAsDamage(t *testing.T) {
+	v := provisionedEnv(t)
+	admin := v.admin(t)
+	var wg sync.WaitGroup
+	var bad atomic.Int32
+	report := func(e error) {
+		if e != nil && !shoal.IsErrorCode(e, shoal.ErrorConflict) {
+			bad.Add(1)
+			t.Log(e)
+		}
+	}
+	for worker := range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 15 {
+				switch worker % 3 {
+				case 0:
+					reg, e := v.registry.Registration(context.Background(), collectorID)
+					report(e)
+					if reg.State == collector.Revoked {
+						_, e = v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), reg.Generation)
+					} else {
+						_, e = v.registry.AdminRevoke(admin, collectorID, reg.Generation)
+					}
+					report(e)
+				case 1:
+					_, e := v.registry.AdminRegistration(admin, collectorID)
+					report(e)
+				case 2:
+					_, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage)
+					report(e)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if bad.Load() != 0 {
+		t.Fatalf("%d outcomes reported damage under ordinary churn", bad.Load())
+	}
+}
+
+// A marker near the top uses up the headroom, as documented: the writes it
+// leaves room for stay clean and readable, then the log is exhausted —
+// provisioning fails closed, revocation is still recorded.
+func TestAMarkerNearTheTopExhaustsTheLogHonestly(t *testing.T) {
+	v := provisionedEnv(t)
+	tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), maxWriteTimestamp-2)
+	if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1); e != nil {
+		t.Fatalf("revoke: %v", e)
+	}
+	toggle := func() (collector.Registration, error) {
+		reg, _ := v.registry.Registration(context.Background(), collectorID)
+		var e error
+		if reg.State == collector.Revoked {
+			_, e = v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), reg.Generation)
+		} else {
+			_, e = v.registry.AdminRevoke(v.admin(t), collectorID, reg.Generation)
+		}
+		return reg, e
+	}
+	for writes := 0; ; writes++ {
+		head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
+		if e != nil {
+			t.Fatal(e)
+		}
+		if head.Timestamp >= maxWriteTimestamp {
+			break
+		}
+		if writes > 4 {
+			t.Fatal("the headroom was never used up; the test is vacuous")
+		}
+		if _, e := toggle(); e != nil {
+			t.Fatalf("write within the headroom: %v", e)
+		}
+		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
+			t.Fatalf("a clean write left the log unreadable: %v", e)
+		}
+	}
+	// Exhausted: the complete log still reads; then the next change is
+	// either refused (provisioning) or recorded beyond the head
+	// (revocation), after which reads fail closed.
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
+		t.Fatalf("an exhausted complete log: %v", e)
+	}
+	reg, e := toggle()
+	if reg.State == collector.Revoked {
+		if !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+			t.Fatalf("provision over an exhausted log: %v", e)
+		}
+		return
+	}
+	if e != nil {
+		t.Fatalf("revoke over an exhausted log: %v", e)
+	}
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("read after a revocation beyond the head: %v", e)
 	}
 }

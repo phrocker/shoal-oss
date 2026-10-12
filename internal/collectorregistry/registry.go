@@ -339,7 +339,9 @@ func (r *Registry) updateRegistrationAudited(ctx context.Context, id shoal.ID, c
 		var sequence int64
 		var entry auditWrite
 		if record != nil {
-			if entry, e = r.prepareChange(ctx, id, next, record); e != nil {
+			if entry, e = r.prepareChange(ctx, id, next, record); errors.Is(e, errLogMoved) {
+				continue
+			} else if e != nil {
 				return registrationRow{}, 0, e
 			}
 			sequence = entry.sequence
