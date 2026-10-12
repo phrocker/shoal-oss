@@ -366,7 +366,7 @@ func (g *gateway) compose(
 	if err != nil {
 		return nil, fmt.Errorf("-target-base-url: %v", err)
 	}
-	target, err := effectsgateway.NewTargetClient(policy, targetHeaderBytes)
+	target, err := effectsgateway.NewTargetClientTLS(policy, targetHeaderBytes, config.TargetTLS)
 	if err != nil {
 		return nil, err
 	}
