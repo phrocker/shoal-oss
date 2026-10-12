@@ -275,8 +275,8 @@ nothing can be written then anyway.
 
 If no head can supersede the damaged one (it sits at the largest timestamp),
 the entry is written without a new head. If no sequence above the damage is
-representable (an entry at the largest sequence), the entry goes under a
-`change-overflow:` qualifier instead. In both cases the revocation still
+representable (an entry at or next to the largest sequence), the entry goes
+under a `change-overflow:` qualifier instead. In both cases the revocation still
 applies and is still recorded, and the log reads as unavailable.
 
 **Delete markers.** A delete marker hides every cell at or below its
@@ -326,7 +326,14 @@ same holds for an absent head over entries: a first logged change committing
 mid-read is a retry, not hidden history. A read whose log keeps moving through
 all its retries answers `409` (retry), never `503`.
 
-**Limit.** A log whose head and entries are all hidden by markers at the
+**Limit: a missing entry inside a segment.** If an entry inside the current
+segment disappears (deleted out of band, or hidden while a later write
+committed on top, which reports `indeterminate`), appends still proceed. The
+reads fail closed (`503`) until the gap scrolls out of the 16 entries the HTTP
+read lists. `Registry.Changes` keeps failing for that segment. This is
+damage the reads detect but no write repairs.
+
+**Limit: a fully hidden log.** A log whose head and entries are all hidden by markers at the
 largest timestamps looks exactly like a registration from before the log
 existed, which legitimately has none. Such a log reads as empty. Writes over
 it still report `indeterminate`, never clean. A head at the largest timestamp

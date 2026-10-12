@@ -340,6 +340,9 @@ func (r *Registry) logBeyondHead(ctx context.Context, id shoal.ID, state headSta
 	var beyond bool
 	var e error
 	if state.present {
+		if state.head.Sequence == math.MaxInt64 {
+			return nil // nothing can follow the largest sequence
+		}
 		beyond, e = r.entryPresent(ctx, id, state.head.Sequence+1)
 	} else {
 		beyond, e = r.anyEntry(ctx, id)
@@ -831,7 +834,10 @@ func (r *Registry) Changes(ctx context.Context, id shoal.ID, after int64, limit 
 	// entry stay stored, for forensics, outside this API.
 	after = max(after, head.SegmentStart-1)
 	var out []Change
-	for sequence := after + 1; sequence <= head.Sequence && len(out) < limit; sequence++ {
+	// Counted without ever incrementing past head.Sequence, which may be
+	// the largest sequence.
+	for sequence := after; sequence < head.Sequence && len(out) < limit; {
+		sequence++
 		c, e := r.readChange(ctx, id, sequence)
 		if e != nil {
 			return nil, e

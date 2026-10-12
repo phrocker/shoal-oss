@@ -1564,3 +1564,27 @@ func TestAStaleRecoveryCannotOrphanACleanChange(t *testing.T) {
 		t.Fatalf("changes %+v %v", got, e)
 	}
 }
+
+// Sequences up to the largest are read without wrapping around.
+func TestChangesReadsUpToTheLargestSequence(t *testing.T) {
+	v := provisionedEnv(t)
+	put(t, v, v.registry.changeEntryCoordinate(collectorID, math.MaxInt64-2), 1, []byte("stray"))
+	corruptHead(t, v, collectorID)
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatalf("revoke: %v", e)
+	}
+	result, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2)
+	if e != nil || result.Sequence != math.MaxInt64 {
+		t.Fatalf("provision %+v %v", result, e)
+	}
+	got, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage)
+	if e != nil || len(got) != 2 || got[1].Sequence != math.MaxInt64 {
+		t.Fatalf("changes %d %v", len(got), e)
+	}
+	if got, e := v.registry.Changes(context.Background(), collectorID, math.MaxInt64, MaxChangesPage); e != nil || len(got) != 0 {
+		t.Fatalf("changes after the last %d %v", len(got), e)
+	}
+	if view, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil || len(view.Changes) != 2 {
+		t.Fatalf("view %+v %v", view, e)
+	}
+}
