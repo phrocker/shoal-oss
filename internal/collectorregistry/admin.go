@@ -328,11 +328,18 @@ func (r *Registry) headStill(ctx context.Context, id shoal.ID, was headState) er
 // mutation, but this probe is a separate read, so an entry that appears
 // because a concurrent write committed meanwhile is told apart by re-reading
 // the head: errLogMoved then, damage only if the head is unchanged.
+//
+// An absent head over stored entries hides history and fails closed the
+// same way, with the same re-read: a first logged change that commits
+// between the head read and the probe is concurrency, not damage.
 func (r *Registry) logBeyondHead(ctx context.Context, id shoal.ID, state headState) error {
-	if !state.present {
-		return nil
+	var beyond bool
+	var e error
+	if state.present {
+		beyond, e = r.entryPresent(ctx, id, state.head.Sequence+1)
+	} else {
+		beyond, e = r.anyEntry(ctx, id)
 	}
-	beyond, e := r.entryPresent(ctx, id, state.head.Sequence+1)
 	if e != nil {
 		return e
 	}
@@ -795,8 +802,12 @@ func (r *Registry) Changes(ctx context.Context, id shoal.ID, after int64, limit 
 			return nil, ErrUnavailable
 		}
 		e = r.logBeyondHead(ctx, id, state)
-		if errors.Is(e, errLogMoved) && attempt < maxCASAttempts {
-			continue
+		if errors.Is(e, errLogMoved) {
+			if attempt < maxCASAttempts {
+				continue
+			}
+			// Concurrency, not damage: the caller retries.
+			return nil, ErrConflict
 		}
 		if e != nil {
 			return nil, ErrUnavailable
@@ -804,12 +815,6 @@ func (r *Registry) Changes(ctx context.Context, id shoal.ID, after int64, limit 
 		break
 	}
 	head := state.head
-	if head.Sequence == 0 {
-		// An absent head over stored entries hides history: fail closed.
-		if hidden, e := r.anyEntry(ctx, id); e != nil || hidden {
-			return nil, ErrUnavailable
-		}
-	}
 	// Only the current segment is readable; entries before its recovery
 	// entry stay stored, for forensics, outside this API.
 	after = max(after, head.SegmentStart-1)
@@ -957,14 +962,11 @@ func (r *Registry) coherentRegistration(ctx context.Context, id shoal.ID, domain
 		} else if e != nil {
 			return registrationRow{}, changeHead{}, e
 		}
-		if !after.present {
-			if hidden, e := r.anyEntry(ctx, id); e != nil || hidden {
-				return registrationRow{}, changeHead{}, ErrUnavailable
-			}
-		}
 		return row, after.head, nil
 	}
-	return registrationRow{}, changeHead{}, ErrUnavailable
+	// The log kept moving under the read: concurrency, not damage, so a
+	// retryable conflict rather than unavailable.
+	return registrationRow{}, changeHead{}, ErrConflict
 }
 
 // AdminRegistration reads a registration in the admin's own authorization

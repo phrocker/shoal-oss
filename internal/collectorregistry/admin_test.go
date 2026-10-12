@@ -1411,3 +1411,94 @@ func TestAMarkerNearTheTopExhaustsTheLogHonestly(t *testing.T) {
 		t.Fatalf("read after a revocation beyond the head: %v", e)
 	}
 }
+
+// everyHeadRead runs hook on every change-head read, up to times.
+type everyHeadRead struct {
+	lostAck
+	times atomic.Int32
+	skip  atomic.Int32
+	hook  func()
+}
+
+func (a *everyHeadRead) ReadExact(ctx context.Context, c []allocator.Coordinate) ([]allocator.Cell, error) {
+	cells, e := a.inner.ReadExact(ctx, c)
+	if len(c) == 1 && string(c[0].Qualifier) == "change-head" && a.skip.Add(-1) < 0 && a.times.Add(-1) >= 0 {
+		a.hook()
+	}
+	return cells, e
+}
+
+func wrapped(t *testing.T, v *env, backend interface {
+	ReadExact(context.Context, []allocator.Coordinate) ([]allocator.Cell, error)
+	CompareAndMutate(context.Context, allocator.Mutation) (allocator.Status, error)
+}) *Registry {
+	t.Helper()
+	config := v.registry.config
+	config.Backend = backend
+	r, e := New(config)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return r
+}
+
+// With no head yet, a first logged change committing between the head read
+// and the probe for hidden entries is concurrency, not damage.
+func TestAFirstChangeRacingAnAbsentHeadReadIsNotDamage(t *testing.T) {
+	v := newEnv(t)
+	backend := &everyHeadRead{lostAck: lostAck{inner: v.registry.config.Backend}}
+	backend.times.Store(1)
+	backend.hook = func() {
+		if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
+			t.Error(e)
+		}
+	}
+	if got, e := wrapped(t, v, backend).Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil || len(got) != 1 {
+		t.Fatalf("Changes racing the first change: %d %v", len(got), e)
+	}
+
+	// A legacy row (no log) whose first logged change lands at the read's
+	// second head read.
+	w := newEnv(t)
+	if _, e := w.registry.updateRegistration(context.Background(), collectorID, true, func(row *registrationRow, _ bool) (bool, error) {
+		*row = registrationRow{Registration: collector.Registration{CollectorID: collectorID, Subject: "tail", ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved, Generation: 1, State: collector.Provisioned}}
+		return true, nil
+	}); e != nil {
+		t.Fatal(e)
+	}
+	legacy := &everyHeadRead{lostAck: lostAck{inner: w.registry.config.Backend}}
+	legacy.skip.Store(1)
+	legacy.times.Store(1)
+	legacy.hook = func() {
+		if _, e := w.registry.Revoke(context.Background(), collectorID); e != nil {
+			t.Error(e)
+		}
+	}
+	if view, e := wrapped(t, w, legacy).AdminRegistration(w.admin(t), collectorID); e != nil || view.Registration.State != collector.Revoked {
+		t.Fatalf("read racing a legacy row's first change: %+v %v", view, e)
+	}
+}
+
+// A log that keeps moving under a read is answered with a retryable
+// conflict, never unavailable.
+func TestPersistentChurnUnderAReadIsAConflict(t *testing.T) {
+	v := provisionedEnv(t)
+	backend := &everyHeadRead{lostAck: lostAck{inner: v.registry.config.Backend}}
+	backend.times.Store(40)
+	backend.hook = func() {
+		reg, _ := v.registry.Registration(context.Background(), collectorID)
+		if reg.State == collector.Revoked {
+			_, _ = v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs"))
+		} else {
+			_, _ = v.registry.Revoke(context.Background(), collectorID)
+		}
+	}
+	r := wrapped(t, v, backend)
+	if _, e := r.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorConflict) {
+		t.Fatalf("read: %v", e)
+	}
+	backend.times.Store(40)
+	if _, e := r.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorConflict) {
+		t.Fatalf("Changes: %v", e)
+	}
+}

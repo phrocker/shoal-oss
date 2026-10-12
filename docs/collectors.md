@@ -317,7 +317,10 @@ separate read. So an entry that appears because a concurrent write committed
 in between is told apart by re-reading the head: the read retries, and only
 an unchanged head with an entry beyond it counts as damage. A provisioning
 that sees the next entry occupied makes the same check before failing closed,
-so ordinary provision and revoke races are never reported as damage.
+so ordinary provision and revoke races are never reported as damage. The
+same holds for an absent head over entries: a first logged change committing
+mid-read is a retry, not hidden history. A read whose log keeps moving through
+all its retries answers `409` (retry), never `503`.
 
 **Limit.** A log whose head and entries are all hidden by markers at the
 largest timestamps looks exactly like a registration from before the log
