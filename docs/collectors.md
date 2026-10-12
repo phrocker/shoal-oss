@@ -245,8 +245,9 @@ control. The log is damaged in any of these cases:
   timestamp or bytes other than one decodable head at its own sequence);
 - the head is absent while entries exist;
 - the entry the head would append is occupied, by any cell, malformed or not;
-- the head is healthy but sits at the largest timestamp, so no later head can
-  supersede it (`exhausted_head`).
+- the head is healthy but sits at or above the largest timestamp the
+  registry writes, so no later head can supersede it (`exhausted_head`).
+  Only a write from outside the registry can put it there.
 
 A provisioning then fails closed (`503`). A revocation, through either API,
 starts a new segment of the log, all in one mutation with the revocation:
@@ -282,14 +283,34 @@ the visible head's and at least the clock's nanoseconds. That clears markers
 left at a cell's own timestamp or at wall-clock milliseconds, as an Accumulo
 shell `delete` without a timestamp leaves.
 
-Every accepted audited write is then read back. If its entry or head is
-hidden, it is written again at a doubled timestamp. The rewrite is
-conditioned on the registration cell still being the one this write produced,
-and repeats until the cell reads back. If that cannot be achieved (a marker at
-the largest timestamp, or a concurrent change), the call reports
-`indeterminate` rather than a clean change. The read then fails closed instead
-of showing a log without the entry. Entries are immutable in content, but a
-repaired one sits at a later timestamp.
+Every accepted audited write is then read back. While the registration cell
+is still the one this write produced, a hidden entry or head is written
+again, conditioned on that cell, until it reads back. The rewrite timestamp
+starts at the write's own timestamp plus a doubling step, then halves the
+room left below the largest usable timestamp.
+
+The registry never writes at the largest timestamp itself. So no repair of
+its own can leave a head that nothing supersedes: a marker just above the
+clock costs a bounded jump, and later writes simply go one higher.
+
+If a later audited write commits on top first, this write's head was
+legitimately superseded. The write is then clean when its entry reads back
+exactly and the visible head is healthy at or past its sequence.
+
+Otherwise (a marker at or above the largest usable timestamp) the call reports
+`indeterminate` rather than a clean change. Entries are immutable in content,
+but a repaired one sits at a later timestamp.
+
+Both reads fail closed (`503`) when the log holds what its head does not
+describe: a head at the largest timestamp, or an entry right after the head's
+sequence (a change recorded with no head).
+
+**Limit.** A log whose head and entries are all hidden by markers at the
+largest timestamps looks exactly like a registration from before the log
+existed, which legitimately has none. Such a log reads as empty. Writes over
+it still report `indeterminate`, never clean. A head at the largest timestamp
+can come only from outside the registry (store surgery), and so can a marker
+there. Clearing either takes store surgery too.
 
 Reads show only the current segment: the HTTP read lists its entries and
 reports `segment_start`, and `Registry.Changes` starts there too. Older

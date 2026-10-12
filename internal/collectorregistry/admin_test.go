@@ -1010,6 +1010,12 @@ func TestDeleteMarkersNeverHideAnAuditedChange(t *testing.T) {
 		if e != nil || len(view.Changes) != 1 || view.Changes[0].Sequence != result.Sequence || view.Changes[0].Action != ChangeRevoke {
 			t.Fatalf("view %+v %v", view, e)
 		}
+		// A marker just at the clock costs a small jump, not a leap towards
+		// the largest timestamp.
+		head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
+		if e != nil || head.Timestamp > v.registry.nanos()+1<<20 {
+			t.Fatalf("head repaired at %d (clock %d): %v", head.Timestamp, v.registry.nanos(), e)
+		}
 	})
 	t.Run("markers far above the clock", func(t *testing.T) {
 		v := provisionedEnv(t)
@@ -1076,8 +1082,10 @@ func TestExhaustedHeadIsDamage(t *testing.T) {
 	}
 	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 2})
 	put(t, v, v.registry.changeHeadCoordinate(collectorID), math.MaxInt64, head)
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
-		t.Fatalf("an exhausted but healthy head should still read: %v", e)
+	// A head no write can supersede leaves a log that cannot be kept
+	// complete, so it reads as unavailable.
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("read over an exhausted head: %v", e)
 	}
 	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("provision over an exhausted head: %v", e)
@@ -1097,6 +1105,10 @@ func TestExhaustedHeadIsDamage(t *testing.T) {
 	if e != nil || decode(cell.Value, &c) != nil || c.Recovery == nil || c.Recovery.Reason != RecoveryExhaustedHead {
 		t.Fatalf("recovery entry %+v %v", c, e)
 	}
+	// The trusted read does not present the log without that entry.
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("Changes over an exhausted head: %v", e)
+	}
 }
 
 // visible compares exact bytes, not mere presence.
@@ -1112,5 +1124,92 @@ func TestVisibleComparesBytes(t *testing.T) {
 	}
 	if ok, e := v.registry.visible(context.Background(), coord, append(bytes.Clone(cell.Value), ' ')); e != nil || ok {
 		t.Fatalf("other bytes: %v %v", ok, e)
+	}
+}
+
+// onTop runs hook once, right after the first accepted mutation that writes
+// the change log, so another audited write commits on top of it before its
+// read-back.
+type onTop struct {
+	lostAck
+	armed atomic.Bool
+	hook  func()
+}
+
+func (o *onTop) CompareAndMutate(ctx context.Context, m allocator.Mutation) (allocator.Status, error) {
+	status, e := o.inner.CompareAndMutate(ctx, m)
+	logs := false
+	for _, u := range m.Updates {
+		logs = logs || string(u.Coordinate.Family) == changeFamily
+	}
+	if e == nil && status == allocator.StatusAccepted && logs && o.armed.CompareAndSwap(true, false) {
+		o.hook()
+	}
+	return status, e
+}
+
+// A change that is superseded by a later audited write before it reads back
+// is still a clean change.
+func TestAChangeSupersededBeforeReadBackIsClean(t *testing.T) {
+	v := newEnv(t)
+	backend := &onTop{lostAck: lostAck{inner: v.registry.config.Backend}}
+	backend.hook = func() {
+		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+			t.Error(e)
+		}
+	}
+	config := v.registry.config
+	config.Backend = backend
+	r, e := New(config)
+	if e != nil {
+		t.Fatal(e)
+	}
+	backend.armed.Store(true)
+	result, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1)
+	if e != nil || !result.Changed || result.Sequence != 1 {
+		t.Fatalf("superseded provision %+v %v", result, e)
+	}
+	if got := v.changes(t, collectorID); len(got) != 2 || got[1].Action != ChangeRevoke {
+		t.Fatalf("changes %+v", got)
+	}
+}
+
+// A marker far above the clock costs a bounded jump, never the largest
+// timestamp: the log keeps appending afterwards.
+func TestRepairsNeverExhaustTheHead(t *testing.T) {
+	v := provisionedEnv(t)
+	tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), 7_500_000_000_000_000_000)
+	if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1); e != nil {
+		t.Fatalf("revoke: %v", e)
+	}
+	head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
+	if e != nil || head.Timestamp >= maxWriteTimestamp {
+		t.Fatalf("head at %d: %v", head.Timestamp, e)
+	}
+	for range 3 {
+		reg, _ := v.registry.Registration(context.Background(), collectorID)
+		if reg.State == collector.Revoked {
+			if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), reg.Generation); e != nil {
+				t.Fatalf("provision after repair: %v", e)
+			}
+		} else if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, reg.Generation); e != nil {
+			t.Fatalf("revoke after repair: %v", e)
+		}
+	}
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
+		t.Fatalf("read after repairs: %v", e)
+	}
+}
+
+// An entry right after the head's sequence is a change the head does not
+// describe: both reads fail closed rather than present the log without it.
+func TestEntriesBeyondTheHeadFailClosed(t *testing.T) {
+	v := provisionedEnv(t)
+	put(t, v, v.registry.changeEntryCoordinate(collectorID, 2), 1, []byte("stray"))
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("Changes: %v", e)
+	}
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("read: %v", e)
 	}
 }

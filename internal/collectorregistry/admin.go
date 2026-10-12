@@ -298,6 +298,22 @@ func (r *Registry) highestEntry(ctx context.Context, id shoal.ID) (highest int64
 	}
 }
 
+// logBeyondHead fails closed when the log holds what its head does not
+// describe: a head no write can supersede, or an entry right after it (an
+// accepted change recorded without a head).
+func (r *Registry) logBeyondHead(ctx context.Context, id shoal.ID, state headState) error {
+	if state.timestamp >= maxWriteTimestamp {
+		return ErrUnavailable
+	}
+	if !state.present {
+		return nil
+	}
+	if beyond, e := r.entryPresent(ctx, id, state.head.Sequence+1); e != nil || beyond {
+		return ErrUnavailable
+	}
+	return nil
+}
+
 // anyEntry reports whether the log has any entry, scanning where the store
 // can and checking the first sequence otherwise.
 func (r *Registry) anyEntry(ctx context.Context, id shoal.ID) (bool, error) {
@@ -360,7 +376,7 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 	switch {
 	case head.damaged:
 		reason = RecoveryUnreadableHead
-	case head.timestamp == math.MaxInt64:
+	case head.timestamp >= maxWriteTimestamp:
 		reason = RecoveryExhaustedHead
 	case head.head.Sequence == math.MaxInt64:
 		reason = RecoveryOccupiedSequence
@@ -414,14 +430,14 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 	}
 	// A head at the largest timestamp cannot be superseded: the entry is
 	// still written and the log reads as unavailable.
-	writeHead := !overflow && head.timestamp < math.MaxInt64
+	writeHead := !overflow && head.timestamp < maxWriteTimestamp
 	// Cells are written at a timestamp above the visible head's and at least
 	// the clock's nanoseconds, so a delete marker left at a cell's own
 	// timestamp, or at wall-clock milliseconds, does not hide them; any
 	// marker above that is caught by ensureVisible after the write.
-	timestamp := int64(math.MaxInt64)
-	if head.timestamp < math.MaxInt64 {
-		timestamp = max(r.nanos(), head.timestamp+1, 1)
+	timestamp := int64(maxWriteTimestamp)
+	if head.timestamp < maxWriteTimestamp {
+		timestamp = min(max(r.nanos(), head.timestamp+1, 1), maxWriteTimestamp)
 	}
 	change.Sequence = nextHead.Sequence
 	qualifier := r.changeEntryCoordinate(id, change.Sequence).Qualifier
@@ -515,22 +531,61 @@ func (r *Registry) visible(ctx context.Context, coord allocator.Coordinate, valu
 	return len(cells) == 1 && cells[0].Timestamp > 0 && bytes.Equal(cells[0].Value, value), nil
 }
 
-// maxVisibilityRepairs bounds ensureVisible: each repair doubles the
-// timestamp, so this reaches the largest timestamp from any start.
-const maxVisibilityRepairs = 64
+// maxWriteTimestamp is the highest timestamp the registry writes a log cell
+// at. Keeping the largest timestamp unused means no write of the registry's
+// own, repairs included, can leave a head that nothing can supersede; a cell
+// at the largest timestamp can come only from outside the registry.
+const maxWriteTimestamp = math.MaxInt64 - 1
+
+// maxVisibilityRepairs bounds ensureVisible: up to 63 doubling steps above
+// the write's own timestamp, then up to 63 halvings of the room left below
+// maxWriteTimestamp.
+const maxVisibilityRepairs = 128
 
 // ensureVisible runs after an audited write was accepted and checks that its
 // entry and head read back. A delete marker at or above the timestamp they
 // were written at hides them from every read and condition, so the registry
-// cannot see it beforehand. A hidden cell is written again at a doubled
-// timestamp, conditioned on the registration cell still being the one this
-// write produced (so it is still this write's change), until it reads back.
-// If that cannot be achieved the outcome is reported for reconciliation,
+// cannot see it beforehand.
+//
+// While the registration cell is still the one this write produced, a
+// hidden cell is written again at the write's timestamp plus a doubling step
+// (1, 2, 4, ...), kept below maxWriteTimestamp, conditioned on that cell, until
+// it reads back. Stepping from the write's own timestamp, not doubling the
+// absolute one, means a marker just above the clock costs a small jump, not
+// a jump towards the largest timestamp.
+//
+// Once a later audited write has committed on top (the registration cell
+// moved), this write's head has legitimately been superseded: it is then
+// enough that the entry reads back with exactly this write's bytes and the
+// visible head is healthy at or past this write's sequence.
+//
+// If neither can be established the outcome is reported for reconciliation,
 // never as a clean change.
 func (r *Registry) ensureVisible(ctx context.Context, id shoal.ID, registration allocator.Condition, w auditWrite) error {
 	entry := r.changeCoordinate(id, string(w.qualifier))
 	head := r.changeHeadCoordinate(id)
-	timestamp := w.timestamp
+	superseded := func() (bool, error) {
+		cells, e := r.config.Backend.ReadExact(ctx, []allocator.Coordinate{registration.Coordinate})
+		if e != nil {
+			return false, ErrUnavailable
+		}
+		return !(len(cells) == 1 && cells[0].Timestamp == registration.Timestamp && bytes.Equal(cells[0].Value, registration.Value)), nil
+	}
+	settledOnTop := func() (bool, error) {
+		entryOK, e := r.visible(ctx, entry, w.value)
+		if e != nil || !entryOK {
+			return false, e
+		}
+		if w.headValue == nil {
+			return true, nil
+		}
+		state, e := r.readHeadState(ctx, id)
+		if e != nil {
+			return false, e
+		}
+		return state.present && !state.damaged && state.head.Sequence >= w.sequence, nil
+	}
+	step, last := int64(1), w.timestamp
 	for range maxVisibilityRepairs + 1 {
 		entryOK, e := r.visible(ctx, entry, w.value)
 		if e != nil {
@@ -545,14 +600,37 @@ func (r *Registry) ensureVisible(ctx context.Context, id shoal.ID, registration 
 		if entryOK && headOK {
 			return nil
 		}
-		if timestamp == math.MaxInt64 {
+		moved, e := superseded()
+		if e != nil {
+			return e
+		}
+		if moved {
+			if ok, e := settledOnTop(); e != nil {
+				return e
+			} else if ok {
+				return nil
+			}
 			return ErrUnavailable
 		}
-		if timestamp > math.MaxInt64/2 {
-			timestamp = math.MaxInt64
-		} else {
-			timestamp *= 2
+		// Doubling steps above the write's timestamp while they fit below
+		// maxWriteTimestamp, then halving the remaining room, so a repair
+		// lands below maxWriteTimestamp whenever the marker does and the
+		// head is never left where nothing can supersede it.
+		var timestamp int64
+		switch {
+		case last >= maxWriteTimestamp-1:
+			return ErrUnavailable
+		case step < maxWriteTimestamp-1-w.timestamp:
+			timestamp = w.timestamp + step
+			if step > math.MaxInt64/2 {
+				step = math.MaxInt64
+			} else {
+				step *= 2
+			}
+		default:
+			timestamp = last + max((maxWriteTimestamp-1-last)/2, 1)
 		}
+		last = timestamp
 		mutation := allocator.Mutation{Row: entry.Row, Conditions: []allocator.Condition{registration}}
 		if !entryOK {
 			mutation.Conditions = append(mutation.Conditions, allocator.Condition{Coordinate: entry, Absent: true})
@@ -562,21 +640,10 @@ func (r *Registry) ensureVisible(ctx context.Context, id shoal.ID, registration 
 			mutation.Updates = append(mutation.Updates, allocator.Update{Coordinate: head, Timestamp: timestamp, Value: w.headValue})
 		}
 		status, e := r.config.Backend.CompareAndMutate(ctx, mutation)
-		if e != nil || status != allocator.StatusAccepted {
-			// Someone else moved the registration, or the entry is visible
-			// with other bytes: the outcome needs reconciliation. A
-			// rejected repair may still have been preceded by an applied
-			// one, so check once more before giving up.
-			if entryOK2, _ := r.visible(ctx, entry, w.value); entryOK2 {
-				if w.headValue == nil {
-					return nil
-				}
-				if headOK2, _ := r.visible(ctx, head, w.headValue); headOK2 {
-					return nil
-				}
-			}
+		if e != nil {
 			return ErrUnavailable
 		}
+		_ = status // a rejection is re-evaluated at the top of the loop
 	}
 	return ErrUnavailable
 }
@@ -680,8 +747,15 @@ func (r *Registry) Changes(ctx context.Context, id shoal.ID, after int64, limit 
 	if shoal.ValidateRequiredID("collector ID", id) != nil || after < 0 || limit <= 0 || limit > MaxChangesPage {
 		return nil, invalid()
 	}
-	head, e := r.readChangeHead(ctx, id)
+	state, e := r.readHeadState(ctx, id)
 	if e != nil {
+		return nil, e
+	}
+	if state.damaged {
+		return nil, ErrUnavailable
+	}
+	head := state.head
+	if e := r.logBeyondHead(ctx, id, state); e != nil {
 		return nil, e
 	}
 	if head.Sequence == 0 {
@@ -831,6 +905,9 @@ func (r *Registry) coherentRegistration(ctx context.Context, id shoal.ID, domain
 		}
 		if after.damaged {
 			return registrationRow{}, changeHead{}, ErrUnavailable
+		}
+		if e := r.logBeyondHead(ctx, id, after); e != nil {
+			return registrationRow{}, changeHead{}, e
 		}
 		if !after.present {
 			if hidden, e := r.anyEntry(ctx, id); e != nil || hidden {
