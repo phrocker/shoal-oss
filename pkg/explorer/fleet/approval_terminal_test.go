@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // The terminal-states switch (#655) and the sweep's scan, at the unit level.
@@ -28,9 +29,14 @@ func TestNoTransitionWritesATerminalStateWhileDisabled(t *testing.T) {
 		string(pending.ID): CloneApprovalRecord(pending),
 	}}
 	now := pending.RequestedAt.Add(2 * time.Minute)
+	// Disabled, the lazy settlement does not even look: reading the
+	// registry is the first thing it would do.
+	untouched := &readTrapStore{memoryStore: newMemoryStore(), t: t}
 	service := &ApprovalService{
-		dispatch: &DispatchService{clock: func() time.Time { return now }},
-		store:    store, recorder: unguardedApprovalRecorder{},
+		dispatch: &DispatchService{
+			clock: func() time.Time { return now }, registry: &Service{store: untouched},
+		},
+		store: store, recorder: unguardedApprovalRecorder{},
 		generations: fixedGenerations{generation: 4},
 		sweeper: func(context.Context, ApprovalSweepScope) (context.Context, error) {
 			t.Fatal("the sweep bound its observer while terminal states are off")
@@ -148,7 +154,72 @@ func TestTheSweepSkipsWhatCannotChange(t *testing.T) {
 	if err != nil || second.Settled != 1 || actions.reads.Load() != 1 {
 		t.Fatalf("second sweep = %+v, %v, with %d action reads", second, err, actions.reads.Load())
 	}
-	if undecodable, failed := service.ApprovalSweepCounters(); undecodable != 4 || failed != 0 {
+	if undecodable, failed, _ := service.ApprovalSweepCounters(); undecodable != 4 || failed != 0 {
 		t.Fatalf("counters = %d undecodable, %d failed", undecodable, failed)
+	}
+}
+
+// readTrapStore fails the test on any registry read.
+type readTrapStore struct {
+	*memoryStore
+	t *testing.T
+}
+
+func (s *readTrapStore) Get(context.Context, shoal.ID) (Stored, error) {
+	s.t.Error("a disabled host read the registry to judge a stranding")
+	return Stored{}, shoal.NewError(shoal.ErrorNotFound, "trap")
+}
+
+// TestASweepStoppedMidPageResumesAfterTheLastRecordItFinished: a pass whose
+// budget ends inside a page reports the last record it finished as Next, so
+// the next pass resumes after it instead of redoing, or never leaving, a page
+// too slow for one budget.
+func TestASweepStoppedMidPageResumesAfterTheLastRecordItFinished(t *testing.T) {
+	first := validApprovalRecord(t)
+	second := CloneApprovalRecord(first)
+	second.ID = []byte("held-2")
+	second.Request.ID = second.ID
+	second.Request.ExecutorKey = executorKey(second.ID, second.Request.IdempotencyKey)
+	second.RequestDigest = ApprovalRequestDigest(second.Request)
+	if err := second.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	store := &scanningApprovalStore{memoryApprovalStore: &memoryApprovalStore{
+		records: map[string]ApprovalRecord{
+			string(first.ID): CloneApprovalRecord(first), string(second.ID): CloneApprovalRecord(second),
+		},
+	}}
+	now := first.ExpiresAt.Add(time.Minute)
+	authority, err := auth.NewAuthorityWithClock(func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service := &ApprovalService{
+		dispatch: &DispatchService{resolver: authority.Resolver(), clock: func() time.Time { return now }},
+		store:    store, recorder: unguardedApprovalRecorder{},
+		generations: fixedGenerations{generation: 3}, terminal: true,
+		sweeper: func(bindCtx context.Context, scope ApprovalSweepScope) (context.Context, error) {
+			decision, err := auth.NewDecision(auth.DecisionConfig{
+				Subject: ApprovalSweeperSubject, Actor: ApprovalSweeperSubject,
+				ClientID: ApprovalSweeperClientID, AuthorizationDomain: []byte("domain"),
+				AllowedOperations:  []auth.Operation{auth.OperationApprovalSweep},
+				PermittedSourceIDs: [][]byte{scope.SourceID}, PermittedPolicyIDs: [][]byte{scope.PolicyID},
+				PolicyGeneration: 3, AuthenticationExpires: now.Add(time.Minute),
+				RequestID: "sweep", CorrelationID: "sweep",
+			})
+			if err != nil {
+				return nil, err
+			}
+			// The budget runs out after the first record's write.
+			defer cancel()
+			return authority.Binder().Bind(context.WithoutCancel(bindCtx), decision)
+		},
+	}
+	result, err := service.Sweep(ctx, ApprovalSweepRequest{Limit: MaxApprovalListResults})
+	if !errors.Is(err, context.Canceled) || result.Examined != 1 || result.Expired != 1 ||
+		string(result.Next) != string(first.ID) {
+		t.Fatalf("a sweep stopped mid-page = %+v, %v", result, err)
 	}
 }

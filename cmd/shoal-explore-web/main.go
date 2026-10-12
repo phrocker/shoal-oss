@@ -705,9 +705,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// nothing else.
 	backfill := newDevelopmentBackfill(
 		authenticator, listener.Addr().String(), authority.Binder())
-	if *approvalSweepInterval < 0 {
+	if *approvalSweepInterval < 0 ||
+		(*approvalSweepInterval > 0 && *approvalSweepInterval < minApprovalSweepInterval) {
 		listener.Close()
-		return errors.New("-approval-sweep-interval must not be negative")
+		return fmt.Errorf("-approval-sweep-interval must be zero or at least %s",
+			minApprovalSweepInterval)
 	}
 	if *approvalSweepInterval > 0 && !*approvalTerminalStates {
 		listener.Close()

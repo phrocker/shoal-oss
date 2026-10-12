@@ -111,12 +111,28 @@ const maxApprovalSweepPages = 1 << 14
 // when it reaches the end of the key space (the next starts again at the
 // beginning), when its budget runs out, or on a page that fails; the cursor
 // is then the last page that succeeded, so nothing is skipped.
+//
+// A page that keeps failing at the same cursor (a scan error that persists)
+// would otherwise hold every later pass there, so after
+// maxApprovalSweepPageFailures in a row the cursor wraps to the beginning:
+// the rest of the key space is still swept, the failing page is retried each
+// cycle, and the health surface counts each failure.
 type approvalSweeper struct {
 	service   *fleet.ApprovalService
 	pageLimit int
 	maxPages  int
 	cursor    []byte
+	failures  int
 }
+
+// maxApprovalSweepPageFailures is how many passes in a row may fail at one
+// cursor before the sweep wraps past it.
+const maxApprovalSweepPageFailures = 3
+
+// minApprovalSweepInterval is the shortest interval the host accepts: a
+// pass is bounded by the interval, and a budget too short for a page would
+// make no progress worth the work.
+const minApprovalSweepInterval = 10 * time.Second
 
 func newApprovalSweeper(service *fleet.ApprovalService) *approvalSweeper {
 	return &approvalSweeper{
@@ -144,8 +160,21 @@ func (w *approvalSweeper) pass(ctx context.Context) (fleet.ApprovalSweepResult, 
 		total.Undecodable += result.Undecodable
 		total.Settled += result.Settled
 		if err != nil {
+			if ctx.Err() != nil {
+				// Out of budget, or stopping: keep what this page finished.
+				if len(result.Next) > 0 {
+					w.cursor = append([]byte(nil), result.Next...)
+					w.failures = 0
+				}
+				return total, err
+			}
+			w.failures++
+			if w.failures >= maxApprovalSweepPageFailures {
+				w.cursor, w.failures = nil, 0
+			}
 			return total, err
 		}
+		w.failures = 0
 		w.cursor = append([]byte(nil), result.Next...)
 		if len(w.cursor) == 0 {
 			// The whole key space has been covered; the next pass wraps.
@@ -218,7 +247,7 @@ func approvalSweepMetrics(service *fleet.ApprovalService) healthsurface.MetricsW
 		return nil
 	}
 	return func(b *strings.Builder) {
-		undecodable, failed := service.ApprovalSweepCounters()
+		undecodable, failed, pageFailed := service.ApprovalSweepCounters()
 		fmt.Fprintf(b,
 			"# HELP shoal_fleet_approval_sweep_undecodable_total Stored "+
 				"approval records the sweep skipped because they do not decode.\n"+
@@ -227,8 +256,12 @@ func approvalSweepMetrics(service *fleet.ApprovalService) healthsurface.MetricsW
 				"# HELP shoal_fleet_approval_sweep_failed_total Approval records "+
 				"the sweep could not judge or write.\n"+
 				"# TYPE shoal_fleet_approval_sweep_failed_total counter\n"+
-				"shoal_fleet_approval_sweep_failed_total %d\n",
-			undecodable, failed)
+				"shoal_fleet_approval_sweep_failed_total %d\n"+
+				"# HELP shoal_fleet_approval_sweep_page_failed_total Approval "+
+				"sweep pages whose scan failed.\n"+
+				"# TYPE shoal_fleet_approval_sweep_page_failed_total counter\n"+
+				"shoal_fleet_approval_sweep_page_failed_total %d\n",
+			undecodable, failed, pageFailed)
 	}
 }
 

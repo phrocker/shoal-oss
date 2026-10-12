@@ -161,7 +161,7 @@ it is off:
 - Status and Decide answer exactly as before #655: a moved target or policy
   is reported `unresolvable`, a closed window `expired` / `window_closed`,
   and nothing new is written (Decide still writes the closed-window expiry
-  it always wrote).
+  it always wrote). Status reads no outbox either.
 - `-approval-sweep-interval` above zero refuses to start; `Sweep` refuses.
 - `commit`, which every transition passes, refuses a withdrawn or stranded
   record whatever path built it.
@@ -282,12 +282,17 @@ party:
   `approval_strand`, with the observer's identity) and published through the
   same per-transition outbox, under the observer's own live decision, with
   observer `sweeper`.
-- `-approval-sweep-interval` (default `0`, disabled; for example `10m`; it
-  requires `-approval-terminal-states`) runs a pass every interval, a page at
-  a time, bounded by the interval. **A pass resumes where the last stopped**
-  and wraps to the beginning at the end of the key space, so a store too
-  large for one pass is covered over several; a page that fails is retried
-  by the next pass. Sweeps on several replicas may run at once: every write
+- `-approval-sweep-interval` (default `0`, disabled; otherwise at least 10s,
+  for example `10m`; it requires `-approval-terminal-states`) runs a pass
+  every interval, a page at a time, bounded by the interval. **A pass resumes
+  where the last stopped** and wraps to the beginning at the end of the key
+  space, so a store too large for one pass is covered over several. A pass
+  whose budget ends inside a page resumes after the last record it finished.
+  A page whose scan fails is retried by the next pass; after three failures
+  in a row at one cursor the sweep wraps past it, so the rest of the key
+  space is still swept and the failing range is retried once a cycle. (A
+  record whose processing the budget cut short is judged again next cycle;
+  every write is a compare-and-set.) Sweeps on several replicas may run at once: every write
   is a compare-and-set from the version read, so one writer wins, and a
   sweep that loses counts the race and leaves the record. A pass also
   publishes the observer's own pending event rows on records that became
@@ -304,10 +309,17 @@ party:
   key space through a tolerant scan that skips and counts a stored record
   that does not decode (corrupt, or written by a newer build); Pending keeps
   the strict scan, which fails closed. The health surface's `/metrics`
-  serves two error-only counters,
-  `shoal_fleet_approval_sweep_undecodable_total` and
-  `shoal_fleet_approval_sweep_failed_total`, counts of this process's own
-  failures and never of tenant workload, as that surface requires.
+  serves three error-only counters,
+  `shoal_fleet_approval_sweep_undecodable_total`,
+  `shoal_fleet_approval_sweep_failed_total` and
+  `shoal_fleet_approval_sweep_page_failed_total`, counts of this process's
+  own failures and never of tenant workload, as that surface requires. A
+  store wrapper that does not forward the tolerant scan gets the strict one,
+  where an undecodable record fails its page; the wrap above still keeps the
+  rest of the key space covered.
+- The drain of the observer's own rows is detached from the pass deadline,
+  as every approval drain is (#653): a stalled event publisher can hold a
+  pass, and shutdown, past the interval until its own call returns.
 - It never decides, re-enables or materializes anything; the table above
   refuses any write that would.
 

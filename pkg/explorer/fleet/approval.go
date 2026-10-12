@@ -2318,7 +2318,8 @@ func (s *ApprovalService) Status(
 			}
 			current = reread
 		}
-	} else if current.State == ApprovalExpired || current.State == ApprovalStranded {
+	} else if s.terminal &&
+		(current.State == ApprovalExpired || current.State == ApprovalStranded) {
 		// The kinds Status writes. A Status whose write committed and whose
 		// event did not answered 503; this is the retry it asked for, and it
 		// publishes the caller's own row. Quietly: Status is a read, and a

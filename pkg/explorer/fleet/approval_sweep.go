@@ -125,6 +125,7 @@ type approvalSweepState struct {
 	settled     map[string]struct{}
 	undecodable atomic.Uint64
 	failed      atomic.Uint64
+	pageFailed  atomic.Uint64
 }
 
 func (s *approvalSweepState) isSettled(id []byte) bool {
@@ -144,10 +145,11 @@ func (s *approvalSweepState) settle(id []byte) {
 }
 
 // ApprovalSweepCounters reports the sweep's error counts since the process
-// started: records skipped as undecodable, and records it could not judge or
-// write. They count this process's own failures, never tenant workload.
-func (s *ApprovalService) ApprovalSweepCounters() (undecodable, failed uint64) {
-	return s.sweep.undecodable.Load(), s.sweep.failed.Load()
+// started: records skipped as undecodable, records it could not judge or
+// write, and pages whose scan failed. They count this process's own
+// failures, never tenant workload.
+func (s *ApprovalService) ApprovalSweepCounters() (undecodable, failed, pageFailed uint64) {
+	return s.sweep.undecodable.Load(), s.sweep.failed.Load(), s.sweep.pageFailed.Load()
 }
 
 // Sweep examines one page of approvals and records, as the system observer,
@@ -172,6 +174,9 @@ func (s *ApprovalService) Sweep(
 		return ApprovalSweepResult{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "approval sweep limit is outside its bound")
 	}
+	// A store wrapper that does not forward the tolerant scan falls back to
+	// the strict one, where an undecodable record fails its page; the host's
+	// pass then steps past a page that keeps failing (approvalSweeper).
 	var page ApprovalPage
 	var err error
 	if tolerant, ok := s.store.(ApprovalTolerantScanner); ok {
@@ -180,8 +185,12 @@ func (s *ApprovalService) Sweep(
 		page, err = s.store.ScanApprovals(ctx, request.After, request.Limit)
 	}
 	if err != nil {
+		if ctx.Err() == nil {
+			s.sweep.pageFailed.Add(1)
+		}
 		return ApprovalSweepResult{}, err
 	}
+	var lastID []byte
 	result := ApprovalSweepResult{
 		Next: append([]byte(nil), page.Next...), Undecodable: page.Undecodable,
 	}
@@ -189,10 +198,20 @@ func (s *ApprovalService) Sweep(
 	defer func() { s.sweep.failed.Add(uint64(result.Failed)) }()
 	for _, record := range page.Approvals {
 		if err := ctx.Err(); err != nil {
+			// Stopped mid-page: Next is the last record finished, so a
+			// caller resumes after it rather than redoing the page, and a
+			// page that never fits one budget still advances.
+			if result.Examined > 0 {
+				result.Next = append([]byte(nil), lastID...)
+			}
 			return result, err
 		}
 		result.Examined++
 		s.sweepOne(ctx, record, &result)
+		// Done, even if the budget ran out inside it: whatever it left
+		// unwritten is still unwritten next cycle, and every write is a
+		// compare-and-set, so the next cycle judges it again.
+		lastID = record.ID
 	}
 	return result, nil
 }

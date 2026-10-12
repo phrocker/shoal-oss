@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -168,6 +169,13 @@ func TestTheSweepRequiresTheTerminalStates(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "requires -approval-terminal-states") {
 		t.Fatalf("a sweep without the terminal states = %v", err)
 	}
+	err = run(context.Background(), []string{
+		"-data", t.TempDir(), "-listen", "127.0.0.1:0", "-dev-auth",
+		"-approval-terminal-states", "-approval-sweep-interval", "1s",
+	}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "at least") {
+		t.Fatalf("a sweep interval below the minimum = %v", err)
+	}
 }
 
 // TestTheSweepCoversAStoreLargerThanOnePass: a pass whose budget covers part
@@ -203,6 +211,14 @@ func TestTheSweepCoversAStoreLargerThanOnePass(t *testing.T) {
 			t.Fatalf("%s = %q", id, stored.State)
 		}
 	}
+	// One pass with budget to spare covers the key space exactly once: it
+	// stops at the end rather than running on from the beginning.
+	whole := newApprovalSweeper(h.opened.approvalService)
+	whole.pageLimit = 2
+	if total, err := whole.pass(context.Background()); err != nil ||
+		total.Examined != requests || len(whole.cursor) != 0 {
+		t.Fatalf("an unbounded pass = %+v, %v", total, err)
+	}
 	// The cycle wrapped: the next pass starts at the beginning again.
 	total, err := sweeper.pass(context.Background())
 	if err != nil || total.Examined != 2 || len(sweeper.cursor) == 0 {
@@ -225,11 +241,138 @@ func TestTheSweepServesErrorCountersOnly(t *testing.T) {
 		}
 		name := strings.Fields(line)[0]
 		if name != "shoal_fleet_approval_sweep_undecodable_total" &&
-			name != "shoal_fleet_approval_sweep_failed_total" {
+			name != "shoal_fleet_approval_sweep_failed_total" &&
+			name != "shoal_fleet_approval_sweep_page_failed_total" {
 			t.Fatalf("unexpected series %q", name)
 		}
 	}
 	if !strings.Contains(b.String(), "shoal_fleet_approval_sweep_undecodable_total 0") {
 		t.Fatalf("metrics = %s", b.String())
 	}
+}
+
+// TestTheSwitchIsWiredFromTheFlag: the shipped binary, started as an
+// operator starts it, refuses a withdrawal until -approval-terminal-states
+// is given, and with it answers the missing ID as such.
+func TestTheSwitchIsWiredFromTheFlag(t *testing.T) {
+	for _, probe := range []struct {
+		flags []string
+		code  int
+		want  string
+	}{
+		{nil, http.StatusConflict, "not enabled on this host"},
+		{[]string{"-approval-terminal-states"}, http.StatusNotFound, "not found"},
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		output := &lockedBuffer{}
+		done := make(chan error, 1)
+		go func() {
+			done <- run(ctx, append([]string{
+				"-data", t.TempDir(), "-listen", "127.0.0.1:0", "-dev-auth",
+			}, probe.flags...), output)
+		}()
+		baseURL := waitForListeningURL(t, output)
+		body := fmt.Sprintf(`{"request_id":"d2l0aGRyYXc","reason_code":"test","deadline":%q}`,
+			time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano))
+		response, err := http.Post(baseURL+"/api/v1/fleet/approvals/"+
+			encodeWireID([]byte("no-such-approval"))+"/withdraw",
+			"application/json", strings.NewReader(body))
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		cancel()
+		<-done
+		if response.StatusCode != probe.code || !strings.Contains(string(data), probe.want) {
+			t.Fatalf("withdraw with %v = %d %s", probe.flags, response.StatusCode, data)
+		}
+	}
+}
+
+// failingScanStore fails every scan that starts after one cursor.
+type failingScanStore struct {
+	fleet.ApprovalStore
+	after string
+}
+
+func (s failingScanStore) ScanApprovals(
+	ctx context.Context, after []byte, limit int,
+) (fleet.ApprovalPage, error) {
+	if string(after) == s.after {
+		return fleet.ApprovalPage{}, shoal.NewError(shoal.ErrorUnavailable, "injected scan failure")
+	}
+	return s.ApprovalStore.ScanApprovals(ctx, after, limit)
+}
+
+// TestAPageThatKeepsFailingDoesNotHoldTheSweep: a scan that fails at one
+// cursor, pass after pass, is counted, and after a few passes the sweep wraps
+// past it, so the rest of the key space keeps being swept.
+func TestAPageThatKeepsFailingDoesNotHoldTheSweep(t *testing.T) {
+	h := &approvalHarness{t: t, root: t.TempDir()}
+	h.clock.Store(time.Now().UTC().Add(time.Minute).Truncate(time.Second).UnixNano())
+	authority, err := auth.NewAuthorityWithClock(h.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.authority = authority
+	h.reader = &mutableFleetGeneration{}
+	h.reader.value.Store(workspacePolicyGeneration)
+	h.wrap = func(store fleet.ApprovalStore) fleet.ApprovalStore {
+		return failingScanStore{ApprovalStore: store, after: "sweep-stuck-1"}
+	}
+	h.open()
+	t.Cleanup(h.close)
+	h.register("gateway", "approval-registration", 0, true, "")
+	for i := 0; i < 4; i++ {
+		h.mustRequest(requester, h.held(fmt.Sprintf("sweep-stuck-%d", i)), fleet.ApprovalPending)
+	}
+	sweeper := newApprovalSweeper(h.opened.approvalService)
+	sweeper.pageLimit, sweeper.maxPages = 2, 1
+	if total, err := sweeper.pass(context.Background()); err != nil || total.Examined != 2 {
+		t.Fatalf("first pass = %+v, %v", total, err)
+	}
+	for i := 0; i < maxApprovalSweepPageFailures; i++ {
+		if _, err := sweeper.pass(context.Background()); err == nil {
+			t.Fatalf("pass %d at the failing page succeeded", i)
+		}
+	}
+	if len(sweeper.cursor) != 0 {
+		t.Fatalf("the sweep is still held at %q", sweeper.cursor)
+	}
+	if total, err := sweeper.pass(context.Background()); err != nil || total.Examined != 2 {
+		t.Fatalf("pass after wrapping = %+v, %v", total, err)
+	}
+	if _, _, pageFailed := h.opened.approvalService.ApprovalSweepCounters(); pageFailed !=
+		maxApprovalSweepPageFailures {
+		t.Fatalf("page failures counted %d", pageFailed)
+	}
+}
+
+// TestStatusTouchesNoOutboxWhileDisabled: with the switch off Status is the
+// read it was before #655. An expiry the requester's Request wrote, whose
+// event did not publish, is left for that Request's replay; Status does not
+// publish it.
+func TestStatusTouchesNoOutboxWhileDisabled(t *testing.T) {
+	h, probe := newDisabledHarness(t)
+	request := h.held("disabled-status-drain")
+	h.mustRequest(requester, request, fleet.ApprovalPending)
+	h.advance(fleet.DefaultApprovalWindow + time.Second)
+	probe.loseBefore(fleet.ApprovalEventExpired, 1)
+	if _, err := h.request(requester, request); !errors.Is(err, fleet.ErrApprovalEventUnpublished) {
+		t.Fatalf("expiry with its event lost = %v", err)
+	}
+	if status := h.status(request.id); status.Approval.State != fleet.ApprovalExpired {
+		t.Fatalf("status = %q", status.Approval.State)
+	}
+	for _, published := range probe.publications() {
+		if published.kind == fleet.ApprovalEventExpired {
+			t.Fatal("a disabled Status published the requester's expiry")
+		}
+	}
+	h.mustRequest(requester, request, fleet.ApprovalExpired)
+	kinds, _ := h.approvalEventsOf(requesterSubscriber, request.id)
+	assertKinds(t, "after the replay", kinds,
+		fleet.ApprovalEventRequested, fleet.ApprovalEventExpired)
 }
