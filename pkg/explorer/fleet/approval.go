@@ -1749,7 +1749,13 @@ func (s *ApprovalService) VisibleTo(
 	now := s.dispatch.clock().UTC()
 	current, err := s.store.GetApproval(ctx, id)
 	if err != nil {
-		if errors.Is(err, ErrApprovalNotFound) {
+		// A record that cannot be read for good (one that does not decode
+		// is an internal error) would otherwise fail the page of every
+		// subscriber in its scope, permanently. Not showing that one event
+		// is the lesser harm. A transient read failure still fails the page,
+		// and only while it lasts.
+		if errors.Is(err, ErrApprovalNotFound) ||
+			shoal.IsErrorCode(err, shoal.ErrorInternal) {
 			return false, nil
 		}
 		return false, err

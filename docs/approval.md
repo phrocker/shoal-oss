@@ -750,7 +750,13 @@ lapsed row is terminal, never retried and never an error.
 
 **The residual is stated, not hidden.** An event is lost only if its own
 publisher's publication failed and that publisher made no further call on the
-approval within 22h. A lapsed row whose publication had in fact landed was
+approval within 22h, or if its row stayed unreadable (the committed-read
+lag) through both the committing call, which answers `503`, and the retry
+that call asked for. A replay drains the rows it can read and cannot tell a
+lagging row from one a build before #653 never wrote. A persistent failure on
+a caller's own row, such as replica skew beyond the hour allowance, makes that
+caller's replays of that one approval answer `503` until the row publishes
+or lapses. Status, which publishes nothing, is unaffected. A lapsed row whose publication had in fact landed was
 delivered. Either way the approval record, and its audit, remain the durable
 truth. Nobody else may publish the row instead, by design (#480). An operator
 remedy, as #657 proposes for dispatch rows, is not provided here.
