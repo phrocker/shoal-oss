@@ -783,8 +783,15 @@ vary, so there is nothing to tell it. Every refusal is silent. So is a
 failure to establish eligibility at all, such as a target whose executor ref
 the host no longer configures: Status answers that `503`, but at delivery an
 error would fail the subscriber's whole page behind one approval event and
-tell a principal that should see nothing that it is there. Only a failed read
-of the approval itself fails a page, and only while it fails. A host that
+tell a principal that should see nothing that it is there. A failed read of
+the approval itself withholds the event too, for every subscriber, whether
+the failure is transient or permanent: that read runs for every subscriber
+the scope join admits, co-tenants included, so an error would fail all of
+their pages, and a permanent one forever. A party can therefore miss one
+notification during a store fault; Status still answers it. The way a record
+became permanently unreadable before, another store adopting its guard head
+through the shared kind letter 'P', is refused by the guard since the
+head-ownership fix. A host that
 configures no rule delivers approval events to nobody.
 
 **Forgery.** The public route refuses the `approval.` namespace. The trusted

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -740,4 +741,62 @@ func TestAnotherApproverCannotPublishTheDecidersRow(t *testing.T) {
 	kinds, _ = h.approvalEventsOf(requesterSubscriber, request.id)
 	assertKinds(t, "after bob returns", kinds,
 		fleet.ApprovalEventRequested, fleet.ApprovalEventApproved)
+}
+
+// unreadableApprovals answers every read of the armed approval with a
+// persistent internal error, as a record that no longer decodes, or a head
+// whose committed cell never becomes visible, would.
+type unreadableApprovals struct {
+	fleet.ApprovalStore
+	armed *atomic.Bool
+	id    []byte
+}
+
+func (s unreadableApprovals) GetApproval(
+	ctx context.Context, id []byte,
+) (fleet.ApprovalRecord, error) {
+	if s.armed.Load() && bytes.Equal(id, s.id) {
+		return fleet.ApprovalRecord{}, shoal.NewError(
+			shoal.ErrorInternal, "invalid committed fleet approval")
+	}
+	return s.ApprovalStore.GetApproval(ctx, id)
+}
+
+// TestAPermanentlyUnreadableApprovalNeverFailsAPage: the delivery gate reads
+// the approval for every subscriber the scope join admits, co-tenants
+// included. If that read fails for good, no subscriber's page may fail with
+// it, or one bad record would stop the stream for the whole scope and tell
+// every subscriber an approval event is there. The event is withheld, from
+// everyone, and everything else is delivered.
+//
+// Since the guard head-ownership fix, another store can no longer make an
+// approval unreadable by adopting its head. This is the second line.
+func TestAPermanentlyUnreadableApprovalNeverFailsAPage(t *testing.T) {
+	h, _ := newEventHarness(t)
+	request := h.held("events-unreadable")
+	receipt := h.mustRequest(requester, request, fleet.ApprovalPending)
+	if _, err := h.decide(approver, receipt, fleet.ApprovalVerdictApprove); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRequest(requester, request, fleet.ApprovalEnqueued)
+	armed := &atomic.Bool{}
+	h.wrap = func(store fleet.ApprovalStore) fleet.ApprovalStore {
+		return unreadableApprovals{ApprovalStore: store, armed: armed, id: request.id}
+	}
+	h.reopen()
+	armed.Store(true)
+	for name, who := range map[string]principal{
+		"requester": requesterSubscriber, "approver": approverSubscriber,
+		"co-tenant": coTenant,
+	} {
+		kinds, _ := h.approvalEventsOf(who, request.id)
+		for _, kind := range kinds {
+			if fleetevents.IsApprovalKind(kind) {
+				t.Fatalf("%s was delivered %s for an unreadable approval", name, kind)
+			}
+		}
+		if name != "approver" {
+			assertKinds(t, name, kinds, "action.enqueued")
+		}
+	}
 }

@@ -1749,16 +1749,25 @@ func (s *ApprovalService) VisibleTo(
 	now := s.dispatch.clock().UTC()
 	current, err := s.store.GetApproval(ctx, id)
 	if err != nil {
-		// A record that cannot be read for good (one that does not decode
-		// is an internal error) would otherwise fail the page of every
-		// subscriber in its scope, permanently. Not showing that one event
-		// is the lesser harm. A transient read failure still fails the page,
-		// and only while it lasts.
-		if errors.Is(err, ErrApprovalNotFound) ||
-			shoal.IsErrorCode(err, shoal.ErrorInternal) {
-			return false, nil
+		// Any read failure withholds the event and never fails the page.
+		// The read is not about the subscriber: it runs for every subscriber
+		// the scope join admits, co-tenants included, so an error here would
+		// fail all of their pages for as long as it lasts, and one that lasts
+		// (a record that does not decode, a head whose committed cell never
+		// becomes visible) would fail them forever and tell each of them that
+		// an approval event is there. Withholding costs at most one
+		// notification for a party during a store fault. Status, which is the
+		// durable truth, still answers them. A cancelled pull is the one
+		// error passed on, because it is the subscriber's own.
+		//
+		// The way a head became permanently unreadable before, another
+		// store adopting the approval's guard head through a shared kind
+		// letter, is refused by the guard itself since the head-ownership
+		// fix. This is the second line, not the first.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
 		}
-		return false, err
+		return false, nil
 	}
 	if sameActionPrincipal(decision, current.Request) &&
 		decision.AuthorizeObject(auth.OperationDispatch, auth.ResourceRequest{
