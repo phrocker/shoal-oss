@@ -81,6 +81,7 @@ var (
 		problems []string
 		exempted map[string]bool
 		universe *universe // the root module's, for the fixtures
+		listing  *moduleListing
 	}
 )
 
@@ -94,9 +95,10 @@ func scanRepository(t *testing.T) {
 		repositoryScan.found = map[byte]map[string]bool{}
 		repositoryScan.exempted = map[string]bool{}
 		for _, dir := range repositoryModules(t, root) {
-			u, scan := scanModule(t, listModule(t, root, dir))
+			listing := listModule(t, root, dir)
+			u, scan := scanModule(t, listing)
 			if dir == root {
-				repositoryScan.universe = u
+				repositoryScan.universe, repositoryScan.listing = u, listing
 			}
 			if u == nil {
 				continue
@@ -170,7 +172,9 @@ func TestEveryGuardEntityKindIsRegistered(t *testing.T) {
 	}
 	// An exemption nothing uses any more would silently cover whatever
 	// next lands at its file and function.
-	for _, exemptions := range []map[string]string{decodedKinds, decodedEntities} {
+	for _, exemptions := range []map[string]string{
+		decodedKinds, decodedEntities, exportedKindMethods,
+	} {
 		for key := range exemptions {
 			if !repositoryScan.exempted[key] {
 				t.Errorf("exemption %s is no longer used; remove it", key)
@@ -201,8 +205,17 @@ var kindFixtures = map[string]struct {
 		"non-constant *ast.IndexExpr",
 		"which takes a kind, is used as a value",
 		"compound assignment",
-		"json.Unmarshal decodes into",
+		"from which reflection can set a kind field, becomes any",
 	}},
+	// Dodges an independent review of #671 found in a first version of the
+	// analysis, each passing it unreported.
+	"generic":       {problems: []string{"is identical to github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard.Entity"}},
+	"unnamed":       {problems: []string{"is identical to github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard.Entity"}},
+	"ifacevalue":    {problems: []string{"Make, which takes a kind, is used as a value", "exported method"}},
+	"jsonany":       {problems: []string{"*github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard.Entity, from which reflection can set a kind field, becomes any"}},
+	"genericdecode": {problems: []string{"decode is instantiated with github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard.Entity"}},
+	"jsonfield":     {problems: []string{"*kindspelling/jsonfield.req, from which reflection can set a kind field, becomes any"}},
+	"reflectw":      {problems: []string{"from which reflection can set a kind field, becomes any"}},
 }
 
 func TestKindAnalysisCannotBeDodgedBySpelling(t *testing.T) {
@@ -297,5 +310,26 @@ func TestStoresSharingAKindLetterHaveDistinctPolicies(t *testing.T) {
 			}
 			seen[policy] = owner
 		}
+	}
+}
+
+// TestKindAnalysisSeesAPackageTheBuildExcludes: go list ./... does not list a
+// directory whose every file the build excludes, so a package that builds
+// only elsewhere (on Windows, say) would never be type checked. The
+// analysis finds such a directory itself and holds its files to the
+// syntactic rule for excluded files. Found in review of #671.
+func TestKindAnalysisSeesAPackageTheBuildExcludes(t *testing.T) {
+	scanRepository(t)
+	file := filepath.Join(repositoryScan.root, "pkg", "explorer", "coordination", "guard",
+		"testdata", "kindspelling", "winonly", "fixture.go")
+	listing := *repositoryScan.listing
+	listing.unlisted = append(append([]unlistedFiles(nil), listing.unlisted...),
+		unlistedFiles{files: []string{file}, imports: importsOf(t, file)})
+	u := listing.load(t, map[string]bool{guardImportPath: true})
+	scan := scanKinds(t, repositoryScan.root, u, u.packages)
+	want := "pkg/explorer/coordination/guard/testdata/kindspelling/winonly/fixture.go: " +
+		"excluded from this build and imports the guard"
+	if !strings.Contains(strings.Join(scan.problems, "\n"), want) {
+		t.Fatalf("no problem %q; problems: %v", want, scan.problems)
 	}
 }

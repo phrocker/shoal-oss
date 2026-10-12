@@ -23,19 +23,29 @@ package guard
 // A value the analysis cannot follow is reported as a problem rather than
 // skipped. That covers:
 //   - A map or slice element, or arithmetic on non-constants.
-//   - A function value, a closure parameter, or a call it cannot resolve.
+//   - A function value (including an interface method value), a closure
+//     parameter, a call it cannot resolve, or an exported method taking a
+//     kind, which an interface outside the analysis could call.
 //   - An address-taken variable, a compound assignment, or a range variable.
-//   - A struct type identical to Entity but distinct from it.
+//   - A followed field of an unnamed struct, any other type identical to a
+//     followed field's struct, and a type parameter whose constraint admits
+//     one: a value of these reaches the field without writing it.
+//   - A value from which reflection can set a followed field (a pointer,
+//     slice or map reaching it) becoming an interface, as in json.Unmarshal
+//     or reflect.ValueOf, outside decodedEntities and readOnlyReflection;
+//     and a generic instantiated with such a type.
+//   - A file the build excludes that imports the guard or names anything
+//     followed, including a package go list skips because the build
+//     excludes all of its files.
 //
-// The analysis does not see reflection or unsafe; nothing outside the
-// guard's own decoders writes kinds that way.
+// unsafe is not modelled.
 //
-// The packages analysed are those in this repository's modules (the root
+// The packages analysed are those of this repository's modules (the root
 // module and every module under extensions/) that depend on this package,
-// and this package itself. Only they can name Entity, or call something that
-// does. They are type checked from source. Their dependencies are read from
-// the export data `go list -export` builds, so the analysis needs no module
-// outside the standard library.
+// this package itself, and every repository package a kind is found to pass
+// through, with everything that depends on those. They are type checked from
+// source. Their dependencies are read from the export data `go list -export`
+// builds, so the analysis needs no module outside the standard library.
 
 import (
 	"bytes"
@@ -84,7 +94,13 @@ type listedPackage struct {
 // so that each module resolves against its own go.mod.
 func goList(t *testing.T, dir string, args ...string) []listedPackage {
 	t.Helper()
-	command := exec.Command("go", append([]string{"list", "-e"}, args...)...)
+	// The go command of the toolchain running this test, whose export data
+	// go/importer can read.
+	gocmd := filepath.Join(runtime.GOROOT(), "bin", "go")
+	if _, err := os.Stat(gocmd); err != nil {
+		gocmd = "go"
+	}
+	command := exec.Command(gocmd, append([]string{"list", "-e"}, args...)...)
 	command.Dir = dir
 	command.Env = append(os.Environ(), "GOWORK=off")
 	var stderr bytes.Buffer
@@ -199,7 +215,7 @@ func (u *universe) check(
 	info := &types.Info{
 		Types: map[ast.Expr]types.TypeAndValue{}, Defs: map[*ast.Ident]types.Object{},
 		Uses: map[*ast.Ident]types.Object{}, Selections: map[*ast.SelectorExpr]*types.Selection{},
-		Implicits: map[ast.Node]types.Object{},
+		Implicits: map[ast.Node]types.Object{}, Instances: map[*ast.Ident]types.Instance{},
 	}
 	var typeErrors []string
 	config := types.Config{
@@ -223,18 +239,97 @@ type moduleListing struct {
 	root, dir string
 	listed    []listedPackage
 	byPath    map[string]listedPackage
+	// excludedImports are the imports of each listed package's non-test
+	// files that this build excludes, which go list leaves out of Imports.
+	excludedImports map[string][]string
+	// unlisted are the directories of non-test Go files no listed package
+	// covers, because this build excludes every one of their files.
+	unlisted []unlistedFiles
+}
+
+type unlistedFiles struct {
+	files   []string
+	imports []string
 }
 
 func listModule(t *testing.T, root, dir string) *moduleListing {
 	t.Helper()
-	m := &moduleListing{root: root, dir: dir, byPath: map[string]listedPackage{}}
+	m := &moduleListing{
+		root: root, dir: dir, byPath: map[string]listedPackage{},
+		excludedImports: map[string][]string{},
+	}
 	m.listed = goList(t, dir, "-deps",
 		"-json=ImportPath,Dir,GoFiles,CgoFiles,IgnoredGoFiles,Imports,ImportMap,Error,DepsErrors",
 		"./...")
+	listedDirs := map[string]bool{}
 	for _, pkg := range m.listed {
 		m.byPath[pkg.ImportPath] = pkg
+		listedDirs[pkg.Dir] = true
+	}
+	for _, pkg := range m.listed {
+		if !m.inRepository(pkg.ImportPath) {
+			continue
+		}
+		for _, name := range pkg.IgnoredGoFiles {
+			if !strings.HasSuffix(name, "_test.go") {
+				m.excludedImports[pkg.ImportPath] = append(
+					m.excludedImports[pkg.ImportPath],
+					importsOf(t, filepath.Join(pkg.Dir, name))...)
+			}
+		}
+	}
+	// go list ./... skips a directory whose every file this build
+	// excludes, so find those by walking the module.
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		if path != dir && (name == "testdata" || name == "vendor" ||
+			strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")) {
+			return filepath.SkipDir
+		}
+		if path != dir {
+			if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+				return filepath.SkipDir
+			}
+		}
+		if listedDirs[path] {
+			return nil
+		}
+		matches, _ := filepath.Glob(filepath.Join(path, "*.go"))
+		var unlisted unlistedFiles
+		for _, file := range matches {
+			if !strings.HasSuffix(file, "_test.go") {
+				unlisted.files = append(unlisted.files, file)
+				unlisted.imports = append(unlisted.imports, importsOf(t, file)...)
+			}
+		}
+		if len(unlisted.files) != 0 {
+			m.unlisted = append(m.unlisted, unlisted)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	return m
+}
+
+func importsOf(t *testing.T, filename string) []string {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), filename, nil, parser.ImportsOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imports := make([]string, 0, len(file.Imports))
+	for _, spec := range file.Imports {
+		imports = append(imports, strings.Trim(spec.Path.Value, "`\""))
+	}
+	return imports
 }
 
 // inRepository reports whether path is a package of this repository.
@@ -268,7 +363,8 @@ func (m *moduleListing) load(t *testing.T, seeds map[string]bool) *universe {
 		visiting[path] = true
 		pkg := m.byPath[path]
 		result := false
-		for _, imported := range pkg.Imports {
+		for _, imported := range append(append([]string(nil), pkg.Imports...),
+			m.excludedImports[path]...) {
 			if mapped, ok := pkg.ImportMap[imported]; ok {
 				imported = mapped
 			}
@@ -296,6 +392,14 @@ func (m *moduleListing) load(t *testing.T, seeds map[string]bool) *universe {
 		analysed = append(analysed, pkg)
 	}
 	u := newUniverse()
+	for _, unlisted := range m.unlisted {
+		for _, imported := range unlisted.imports {
+			if reaches(imported, map[string]bool{}) {
+				u.excluded = append(u.excluded, unlisted.files...)
+				break
+			}
+		}
+	}
 	if len(analysed) == 0 {
 		return u
 	}
@@ -383,6 +487,8 @@ type kindScan struct {
 	local   map[*types.Package]bool
 	// exempted are the decodedKinds and decodedEntities entries used.
 	exempted map[string]bool
+	// owners are the named struct types declaring a followed field.
+	owners []types.Type
 
 	seenVars    map[*types.Var]bool
 	seenResults map[resultKey]bool
@@ -714,10 +820,6 @@ func (s *kindScan) literalWrites(field *types.Var) int {
 			}
 		}
 		if index < 0 {
-			if owner != nil && types.Identical(structure, owner.Underlying()) {
-				s.problem(lit.node, "a literal of %s, identical to %s, can carry a kind unseen",
-					typ, owner)
-			}
 			continue
 		}
 		for i, element := range lit.node.Elts {
@@ -739,22 +841,12 @@ func (s *kindScan) literalWrites(field *types.Var) int {
 			s.resolve(lit.pkg, value)
 		}
 	}
-	if owner != nil {
-		for _, call := range s.calls {
-			tv, ok := call.pkg.info.Types[call.node.Fun]
-			if !ok || !tv.IsType() || len(call.node.Args) != 1 {
-				continue
-			}
-			target := tv.Type
-			if !types.Identical(target.Underlying(), owner.Underlying()) {
-				continue
-			}
-			from := call.pkg.info.Types[call.node.Args[0]].Type
-			if from != nil && !types.Identical(from, target) {
-				s.problem(call.node, "a conversion from %s to %s can carry a kind unseen",
-					from, target)
-			}
-		}
+	if owner == nil {
+		s.problems = append(s.problems, fmt.Sprintf(
+			"%s: a kind is field %s of an unnamed struct type, which an identical "+
+				"struct type can carry unseen", s.position(field.Pos()), field.Name()))
+	} else {
+		s.owners = append(s.owners, owner)
 	}
 	return writes
 }
@@ -766,9 +858,12 @@ func (s *kindScan) ownerOf(field *types.Var) types.Type {
 		if pkg.pkg != field.Pkg() {
 			continue
 		}
-		scope := pkg.pkg.Scope()
-		for _, name := range scope.Names() {
-			named, ok := scope.Lookup(name).Type().(*types.Named)
+		for _, object := range pkg.info.Defs {
+			name, ok := object.(*types.TypeName)
+			if !ok {
+				continue
+			}
+			named, ok := name.Type().(*types.Named)
 			if !ok {
 				continue
 			}
@@ -790,10 +885,25 @@ func (s *kindScan) ownerOf(field *types.Var) types.Type {
 func (s *kindScan) callArguments(fn *types.Func, index int) int {
 	writes := 0
 	sig := fn.Type().(*types.Signature)
-	for _, use := range s.funcUses[fn] {
-		if !s.callFuns[use.node] {
-			s.problem(use.node, "%s, which takes a kind, is used as a value", fn.Name())
+	for method, uses := range s.funcUses {
+		if method != fn && !s.dispatchesTo(method, fn) {
+			continue
 		}
+		for _, use := range uses {
+			if !s.callFuns[use.node] {
+				s.problem(use.node, "%s, which takes a kind, is used as a value", method.Name())
+			}
+		}
+	}
+	if key := fn.FullName(); sig.Recv() != nil && fn.Exported() && exportedKindMethods[key] != "" {
+		s.exempted[key] = true
+	} else if sig.Recv() != nil && fn.Exported() {
+		// An interface this analysis does not type check, in the standard
+		// library say, can call an exported method out of its sight. An
+		// unexported method satisfies only interfaces of its own package.
+		s.problems = append(s.problems, fmt.Sprintf(
+			"%s: exported method %s takes a kind, so an interface outside "+
+				"the analysis can pass it one", s.position(fn.Pos()), fn.FullName()))
 	}
 	for _, call := range s.calls {
 		callee, shift := s.callee(call.pkg.info, call.node)
@@ -1009,83 +1119,342 @@ func scanKinds(t *testing.T, root string, u *universe, packages []*scannedPackag
 	scan := newKindScan(root, u.fset, packages)
 	scan.run(kind)
 	scan.checkExcluded(u.excluded)
-	scan.checkDecoders(entity.Type())
+	scan.checkIdentical()
+	scan.checkEscapes()
+	sort.Strings(scan.problems)
 	return scan
 }
 
-// reflectiveDecoders are the standard decoders that can set a field by
-// reflection, keyed by package path, with the index of the decoded-into
-// argument for each function or method.
-var reflectiveDecoders = map[string]map[string]int{
-	"encoding/json": {"Unmarshal": 1, "Decode": 0},
-	"encoding/gob":  {"Decode": 0},
-	"encoding/xml":  {"Unmarshal": 1, "Decode": 0, "DecodeElement": 0},
-	"encoding/asn1": {"Unmarshal": 1, "UnmarshalWithParams": 1},
+// exportedKindMethods are the exported methods allowed to take a kind
+// parameter, by full name. Each implements an interface the analysis type
+// checks, through which it follows every call, and no interface outside the
+// repository declares a method of the same name and signature.
+var exportedKindMethods = map[string]string{
+	"(*github.com/phrocker/shoal-oss/internal/explorercoord.Runtime).RecordHead": "implements explorer.RecordPublisher",
 }
 
-// decodedEntities are the calls allowed to decode into a value holding a
-// guard.Entity, keyed by file and enclosing function. Each reads back a
-// record this process wrote, so it brings no kind of its own.
+// readOnlyReflection are functions that walk their arguments by reflection
+// but never set a field through them: encoders and formatters read, and
+// sort.Slice only swaps whole elements. A value handed to one is not an
+// escape. A method the value defines (MarshalJSON, String) is code the
+// analysis already reads.
+var readOnlyReflection = map[string]bool{
+	"encoding/json.Marshal": true, "encoding/json.MarshalIndent": true,
+	"(*encoding/json.Encoder).Encode": true,
+	"sort.Slice":                      true, "sort.SliceStable": true,
+	"fmt.Sprint": true, "fmt.Sprintf": true, "fmt.Sprintln": true,
+	"fmt.Print": true, "fmt.Printf": true, "fmt.Println": true,
+	"fmt.Fprint": true, "fmt.Fprintf": true, "fmt.Fprintln": true,
+	"fmt.Errorf": true, "fmt.Append": true, "fmt.Appendf": true, "fmt.Appendln": true,
+}
+
+// decodedEntities are the places allowed to hand reflection a value that
+// reaches a followed field, keyed by file and enclosing function. Each reads
+// back a record this process wrote, so it brings no kind of its own.
 var decodedEntities = map[string]string{
 	"internal/explorercoord/intents.go:decodeStoredIntent": "a stored publication intent",
 }
 
-// checkDecoders reports a reflective decode into a value that holds a
-// guard.Entity. Reflection writes Kind out of the analysis's sight, from
-// whatever the input says.
-func (s *kindScan) checkDecoders(entity types.Type) {
-	for _, call := range s.calls {
-		fn, _ := s.callee(call.pkg.info, call.node)
-		if fn == nil || fn.Pkg() == nil {
-			continue
+// checkIdentical reports every type, other than a followed field's owner,
+// whose structure is identical to the owner's. A value of such a type is
+// assignable or convertible to the owner, so it can carry a kind into the
+// followed field without ever writing it. A type parameter whose constraint
+// admits such a structure counts too.
+func (s *kindScan) checkIdentical() {
+	if len(s.owners) == 0 {
+		return
+	}
+	seen := map[types.Type]bool{}
+	check := func(pos token.Pos, typ types.Type) {
+		if typ == nil || seen[typ] {
+			return
 		}
-		index, ok := reflectiveDecoders[fn.Pkg().Path()][fn.Name()]
-		if !ok || index >= len(call.node.Args) {
-			continue
+		seen[typ] = true
+		for _, owner := range s.owners {
+			// The owner itself, and the struct type of its declaration.
+			if types.Identical(typ, owner) || typ == owner.Underlying() {
+				continue
+			}
+			if admits(typ, owner.Underlying(), map[types.Type]bool{}) {
+				s.problems = append(s.problems, fmt.Sprintf(
+					"%s: %s is identical to %s, so a value of it can carry a kind unseen",
+					s.position(pos), typ, owner))
+			}
 		}
-		target := call.pkg.info.Types[call.node.Args[index]].Type
-		if target == nil || !holds(target, entity, map[types.Type]bool{}) {
-			continue
+	}
+	for _, pkg := range s.packages {
+		for expr, tv := range pkg.info.Types {
+			check(expr.Pos(), tv.Type)
 		}
-		key := s.relative(call.node.Pos()) + ":" + call.fn
-		if _, ok := decodedEntities[key]; ok {
-			s.exempted[key] = true
-			continue
+		for _, object := range pkg.info.Defs {
+			if object != nil {
+				check(object.Pos(), object.Type())
+			}
 		}
-		s.problem(call.node, "%s.%s decodes into %s, which holds a guard.Entity, "+
-			"so its kind comes from the input", fn.Pkg().Name(), fn.Name(), target)
 	}
 }
 
-// holds reports whether a value of typ can contain a value of entity.
-func holds(typ, entity types.Type, seen map[types.Type]bool) bool {
-	if types.Identical(typ, entity) {
-		return true
-	}
+// admits reports whether typ, or any type a type parameter typ may be, has
+// the given structure.
+func admits(typ, structure types.Type, seen map[types.Type]bool) bool {
 	if seen[typ] {
 		return false
 	}
 	seen[typ] = true
+	if parameter, ok := typ.(*types.TypeParam); ok {
+		return admits(parameter.Constraint(), structure, seen)
+	}
+	iface, ok := typ.Underlying().(*types.Interface)
+	if !ok {
+		return types.IdenticalIgnoreTags(typ.Underlying(), structure)
+	}
+	for i := 0; i < iface.NumEmbeddeds(); i++ {
+		embedded := iface.EmbeddedType(i)
+		if union, ok := embedded.(*types.Union); ok {
+			for j := 0; j < union.Len(); j++ {
+				if admits(union.Term(j).Type(), structure, seen) {
+					return true
+				}
+			}
+		} else if admits(embedded, structure, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+type settableKey struct {
+	typ      types.Type
+	settable bool
+}
+
+// reaches reports whether reflection, handed a value of typ, can set a
+// followed field. A field is settable through a pointer, a slice or a map,
+// not in a copy.
+func (s *kindScan) reaches(typ types.Type, settable bool, seen map[settableKey]bool) bool {
+	key := settableKey{typ, settable}
+	if seen[key] {
+		return false
+	}
+	seen[key] = true
 	switch t := typ.Underlying().(type) {
 	case *types.Pointer:
-		return holds(t.Elem(), entity, seen)
+		return s.reaches(t.Elem(), true, seen)
 	case *types.Slice:
-		return holds(t.Elem(), entity, seen)
-	case *types.Array:
-		return holds(t.Elem(), entity, seen)
+		return s.reaches(t.Elem(), true, seen)
 	case *types.Map:
-		return holds(t.Key(), entity, seen) || holds(t.Elem(), entity, seen)
+		return s.reaches(t.Key(), true, seen) || s.reaches(t.Elem(), true, seen)
+	case *types.Array:
+		return s.reaches(t.Elem(), settable, seen)
 	case *types.Struct:
 		for i := 0; i < t.NumFields(); i++ {
-			if holds(t.Field(i).Type(), entity, seen) {
+			field := t.Field(i)
+			if settable && s.seenVars[field.Origin()] {
+				return true
+			}
+			if s.reaches(field.Type(), settable, seen) {
 				return true
 			}
 		}
-	case *types.Interface:
-		// any can hold anything; a decode into one yields maps and slices,
-		// never a guard.Entity.
 	}
 	return false
+}
+
+// checkEscapes reports every place a value from which reflection can set a
+// followed field becomes an interface: an argument to a parameter of
+// interface type (json.Unmarshal, reflect.ValueOf, fmt.Sscan), an assignment,
+// a return, an element or a send. It also reports every instantiation of a
+// generic function or type with such a type, whose body this analysis does
+// not follow per instance (a generic decode helper, say). Code past that
+// point can write a kind out of the analysis's sight.
+func (s *kindScan) checkEscapes() {
+	for _, pkg := range s.packages {
+		for ident, instance := range pkg.info.Instances {
+			for i := 0; i < instance.TypeArgs.Len(); i++ {
+				argument := instance.TypeArgs.At(i)
+				if s.reaches(argument, true, map[settableKey]bool{}) {
+					s.problems = append(s.problems, fmt.Sprintf(
+						"%s: %s is instantiated with %s, which reaches a kind field, "+
+							"so what its body writes goes unseen",
+						s.position(ident.Pos()), ident.Name, argument))
+				}
+			}
+		}
+		for _, file := range pkg.files {
+			for _, decl := range file.Decls {
+				name := ""
+				if fd, ok := decl.(*ast.FuncDecl); ok {
+					name = fd.Name.Name
+				}
+				s.escapesIn(pkg, decl, name)
+			}
+		}
+	}
+}
+
+func (s *kindScan) escapesIn(pkg *scannedPackage, decl ast.Decl, fn string) {
+	info := pkg.info
+	var stack []ast.Node
+	var signatures []*types.Signature
+	escape := func(expr ast.Expr, destination types.Type) {
+		if destination == nil || !types.IsInterface(destination) {
+			return
+		}
+		// A named interface with methods, declared in a package this
+		// analysis type checks, is reached only through those methods,
+		// whose bodies it reads.
+		if named, ok := destination.(*types.Named); ok && named.Obj().Pkg() != nil &&
+			s.local[named.Obj().Pkg()] &&
+			destination.Underlying().(*types.Interface).NumMethods() != 0 {
+			return
+		}
+		source := info.Types[expr].Type
+		if source == nil || types.IsInterface(source) ||
+			!s.reaches(source, false, map[settableKey]bool{}) {
+			return
+		}
+		key := s.relative(expr.Pos()) + ":" + fn
+		if _, ok := decodedEntities[key]; ok {
+			s.exempted[key] = true
+			return
+		}
+		s.problem(expr, "%s, from which reflection can set a kind field, becomes %s",
+			source, destination)
+	}
+	ast.Inspect(decl, func(node ast.Node) bool {
+		if node == nil {
+			top := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			switch top.(type) {
+			case *ast.FuncDecl, *ast.FuncLit:
+				signatures = signatures[:len(signatures)-1]
+			}
+			return true
+		}
+		stack = append(stack, node)
+		switch n := node.(type) {
+		case *ast.FuncDecl:
+			signature, _ := info.Defs[n.Name].Type().(*types.Signature)
+			signatures = append(signatures, signature)
+		case *ast.FuncLit:
+			signature, _ := info.Types[n].Type.(*types.Signature)
+			signatures = append(signatures, signature)
+		case *ast.CallExpr:
+			tv := info.Types[n.Fun]
+			if tv.IsType() {
+				if len(n.Args) == 1 {
+					escape(n.Args[0], tv.Type)
+				}
+				break
+			}
+			if id, ok := ast.Unparen(n.Fun).(*ast.Ident); ok {
+				if _, builtin := info.Uses[id].(*types.Builtin); builtin {
+					if id.Name == "append" && len(n.Args) > 1 && !n.Ellipsis.IsValid() {
+						if slice, ok := info.Types[n.Args[0]].Type.Underlying().(*types.Slice); ok {
+							for _, argument := range n.Args[1:] {
+								escape(argument, slice.Elem())
+							}
+						}
+					}
+					break
+				}
+			}
+			if callee, _ := s.callee(info, n); callee != nil && readOnlyReflection[callee.FullName()] {
+				break
+			}
+			signature, ok := tv.Type.Underlying().(*types.Signature)
+			if !ok {
+				break
+			}
+			params := signature.Params()
+			for i, argument := range n.Args {
+				var destination types.Type
+				switch {
+				case signature.Variadic() && i >= params.Len()-1:
+					destination = params.At(params.Len() - 1).Type()
+					if !n.Ellipsis.IsValid() {
+						destination = destination.(*types.Slice).Elem()
+					}
+				case i < params.Len():
+					destination = params.At(i).Type()
+				}
+				escape(argument, destination)
+			}
+		case *ast.AssignStmt:
+			if n.Tok == token.ASSIGN && len(n.Lhs) == len(n.Rhs) {
+				for i := range n.Lhs {
+					escape(n.Rhs[i], info.Types[n.Lhs[i]].Type)
+				}
+			}
+		case *ast.ValueSpec:
+			if n.Type != nil && len(n.Values) == len(n.Names) {
+				for _, value := range n.Values {
+					escape(value, info.Types[n.Type].Type)
+				}
+			}
+		case *ast.ReturnStmt:
+			if len(signatures) != 0 && signatures[len(signatures)-1] != nil {
+				results := signatures[len(signatures)-1].Results()
+				if len(n.Results) == results.Len() {
+					for i, result := range n.Results {
+						escape(result, results.At(i).Type())
+					}
+				}
+			}
+		case *ast.SendStmt:
+			if channel, ok := info.Types[n.Chan].Type.Underlying().(*types.Chan); ok {
+				escape(n.Value, channel.Elem())
+			}
+		case *ast.CompositeLit:
+			typ := info.Types[n].Type
+			if typ == nil {
+				break
+			}
+			switch t := typ.Underlying().(type) {
+			case *types.Struct:
+				for i, element := range n.Elts {
+					if kv, ok := element.(*ast.KeyValueExpr); ok {
+						if key, ok := kv.Key.(*ast.Ident); ok {
+							if field, ok := info.Uses[key].(*types.Var); ok {
+								escape(kv.Value, field.Type())
+							}
+						}
+					} else if i < t.NumFields() {
+						escape(element, t.Field(i).Type())
+					}
+				}
+			case *types.Slice, *types.Array, *types.Map:
+				var key, elem types.Type
+				switch c := t.(type) {
+				case *types.Slice:
+					elem = c.Elem()
+				case *types.Array:
+					elem = c.Elem()
+				case *types.Map:
+					key, elem = c.Key(), c.Elem()
+				}
+				for _, element := range n.Elts {
+					if kv, ok := element.(*ast.KeyValueExpr); ok {
+						if key != nil {
+							escape(kv.Key, key)
+						}
+						escape(kv.Value, elem)
+					} else {
+						escape(element, elem)
+					}
+				}
+			}
+		}
+		return true
+	})
+}
+
+func (s *kindScan) position(pos token.Pos) token.Position {
+	position := s.fset.Position(pos)
+	if relative, err := filepath.Rel(s.root, position.Filename); err == nil {
+		position.Filename = filepath.ToSlash(relative)
+	}
+	return position
 }
 
 // checkExcluded reports a file this build leaves out that could write a kind
