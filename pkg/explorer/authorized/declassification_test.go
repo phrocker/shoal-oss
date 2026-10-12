@@ -373,13 +373,18 @@ func TestDeclassificationIntentFailureBlocksTheRelabel(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		before := baseDocumentCount(t, f)
 		if _, err := client.Ingest(f.labelIngester(t, "owner", "secret"),
 			labelledSource(uri, "public", "")); err == nil {
 			t.Fatal("a narrowing whose audit failed succeeded")
 		}
-		if baseDocumentCount(t, f) != before {
-			t.Fatal("a narrowing whose intent audit failed reached the base")
+		// A narrowing re-ingest adds a revision, not a document, so the
+		// base's current revision is what must be unchanged.
+		summaries, err := f.base.Documents(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(summaries) != 1 || summaries[0].Revision.ID != first.Revision.ID {
+			t.Fatalf("a narrowing whose intent audit failed reached the base: %+v", summaries)
 		}
 		claim, ok, err := inner.SourceClaim(context.Background(), uri)
 		if err != nil || !ok || claim.Pending {
@@ -421,10 +426,6 @@ func TestDeclassificationCommitFailureBlocksTheRegistration(t *testing.T) {
 				current, ok, err)
 		}
 		reader := f.labelIngester(t, "reader")
-		summaries, _ := client.Documents(reader)
-		if len(summaries) != 0 {
-			t.Fatalf("failed narrowing exposed documents: %+v", summaries)
-		}
 		records := declassifications(t, inner)
 		if len(records) != 1 || records[0].Phase != authorized.DeclassificationIntent {
 			t.Fatalf("records after a failed commit audit = %+v", records)

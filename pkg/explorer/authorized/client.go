@@ -128,6 +128,9 @@ type Config struct {
 	// document's rule (removes a visibility label or any other rule
 	// component, #630) unless its context carries a reason code from
 	// WithDeclassificationReason. Every narrowing is audited regardless.
+	// It is enforced where the narrowing is decided (the source claim), by
+	// the Client making it, so every Client sharing one PolicyStore should
+	// be configured alike.
 	RequireDeclassificationReason bool
 }
 
