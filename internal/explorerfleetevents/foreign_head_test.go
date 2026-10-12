@@ -14,6 +14,7 @@ import (
 	"github.com/phrocker/shoal-oss/internal/explorercoord"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard"
+	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleetevents"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -66,12 +67,25 @@ func squat(
 	entity guard.Entity,
 ) {
 	t.Helper()
+	if err := writeUnder(
+		t, runtime, domain, entity, "fleet/approval/v1"); err != nil {
+		t.Fatalf("the foreign store's write: %v", err)
+	}
+}
+
+// writeUnder publishes one cell guarded by entity, created absent or
+// identical under policy.
+func writeUnder(
+	t *testing.T, runtime *explorercoord.Runtime, domain coordination.DomainID,
+	entity guard.Entity, policy string,
+) error {
+	t.Helper()
 	lpart, err := explorercoord.Partition(domain, entity.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := append([]byte("zz-foreign-"), entity.ID...)
-	if _, err := runtime.Publish(context.Background(), explorercoord.Request{
+	row := append([]byte("zz-"+policy+"-"), entity.ID...)
+	_, err = runtime.Publish(context.Background(), explorercoord.Request{
 		Intent: explorercoord.Intent{
 			Operation: []byte("foreign-store-write"), Token: row,
 			Cells: []explorercoord.Cell{{
@@ -82,15 +96,37 @@ func squat(
 			Guards: []explorercoord.GuardIntent{{
 				Entity: entity, Mode: guard.ModeAbsentOrIdentical,
 				DesiredState: guard.StateLive, DesiredWinnerID: []byte("foreign"),
-				LPART: lpart, LogicalPolicyID: []byte("fleet/approval/v1"),
+				LPART: lpart, LogicalPolicyID: []byte(policy),
 				RetirementGeneration: 1,
 			}},
 			Results: []explorercoord.ResultIdentity{{
 				Kind: []byte("foreign-store-write"), ID: row,
 			}},
 		},
-	}); err != nil {
-		t.Fatalf("the foreign store's write: %v", err)
+	})
+	return err
+}
+
+// TestTheRuntimeKeepsAnOwnershipRefusalTyped: the guard's refusal reaches a
+// runtime caller as guard.ErrForeignHead, still a transaction conflict. The
+// coordinator retries a conflicted publication, and a retry reads back only
+// the conflicted root's bare conflict, so it must return this refusal as it
+// is instead.
+func TestTheRuntimeKeepsAnOwnershipRefusalTyped(t *testing.T) {
+	config := runtimeConfig(t.TempDir())
+	runtime, err := explorercoord.Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	entity := guard.Entity{Kind: 'P', ID: coordination.EntityID("shared-id")}
+	squat(t, runtime, config.Domain, entity)
+	err = writeUnder(t, runtime, config.Domain, entity, string(logicalPolicy))
+	if !errors.Is(err, guard.ErrForeignHead) ||
+		!errors.Is(err, transaction.ErrConflict) ||
+		errors.Is(err, explorercoord.ErrIndeterminatePublication) {
+		t.Fatalf("a write over another store's head = %v, want a typed, "+
+			"definite ownership refusal", err)
 	}
 }
 
