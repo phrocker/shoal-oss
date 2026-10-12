@@ -386,7 +386,8 @@ no unauthenticated mode.
   admits it when the chain verifies to `-client-ca-file` for client
   authentication (extended key usage `clientAuth`, or none), it is within its
   validity, and the leaf matches at least one `-client-identity`:
-  - `uri:<URI>`, a URI SAN compared exactly, such as a SPIFFE ID;
+  - `uri:<URI>`, a URI SAN compared byte for byte as the CA issued it (no
+    normalization of case, fragment or path), such as a SPIFFE ID;
   - `dns:<name>`, a DNS SAN compared without regard to case, never a wildcard;
   - `spki-sha256:<digest>`, the SHA-256 of the leaf's SubjectPublicKeyInfo, as
     64 hex digits or 44 characters of base64
@@ -399,9 +400,9 @@ no unauthenticated mode.
   key, and must be changed whenever the gateway's key is rotated. The CA
   bundle is read on every request, like the token, so a rotated bundle takes
   effect at once and an unreadable one refuses every request.
-- **Both.** With both flags set, a request must pass both. This is what the
-  chart renders when both are configured. Pick one alone only when you have
-  decided it is enough.
+- **Both.** With both flags set, a request must pass both. This is the
+  recommended configuration. Pick one alone only when you have decided it is
+  enough.
 
 The listener *requests* a client certificate and does not verify it in the
 handshake. The handshake still proves the client holds the certificate's key,
@@ -417,7 +418,8 @@ gateway (#424). A plaintext listener has no client certificate, so
 
 The serving certificate (`-tls-cert-file`, `-tls-key-file`) is read again at
 each handshake, so a rotated Secret takes effect without a restart. A pair
-that cannot be loaded at a handshake keeps the last one that could. At startup
+that cannot be loaded at a handshake keeps the last one that could, and is
+logged (`tls_certificate_reload_failed`) at most once a minute. At startup
 it refuses the start.
 
 ### Timing

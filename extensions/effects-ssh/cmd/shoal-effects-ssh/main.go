@@ -204,6 +204,7 @@ func parseServe(args []string, stderr io.Writer) (*serveConfig, error) {
 			_ = journal.Close()
 			return nil, err
 		}
+		certificate.log = stderr
 		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certificate.get}
 		if clientAuth != nil {
 			// Request, and do not verify, at the handshake: the handshake
@@ -246,6 +247,11 @@ type servingCertificate struct {
 	certFile, keyFile string
 	mu                sync.Mutex
 	last              *tls.Certificate
+	// log receives a failed reload, at most once a minute, so a broken
+	// rotation is seen before the last good certificate expires. The line
+	// names nothing from the files.
+	log      io.Writer
+	reported time.Time
 }
 
 func newServingCertificate(certFile, keyFile string) (*servingCertificate, error) {
@@ -253,7 +259,8 @@ func newServingCertificate(certFile, keyFile string) (*servingCertificate, error
 	if err != nil {
 		return nil, errors.New("TLS certificate and key cannot be loaded")
 	}
-	return &servingCertificate{certFile: certFile, keyFile: keyFile, last: &certificate}, nil
+	return &servingCertificate{certFile: certFile, keyFile: keyFile, last: &certificate,
+		log: io.Discard}, nil
 }
 
 func (s *servingCertificate) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -262,6 +269,14 @@ func (s *servingCertificate) get(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	defer s.mu.Unlock()
 	if err == nil {
 		s.last = &certificate
+		return s.last, nil
+	}
+	if s.reported.IsZero() || time.Since(s.reported) >= time.Minute {
+		s.reported = time.Now()
+		line, _ := json.Marshal(map[string]string{
+			"time": s.reported.UTC().Format(time.RFC3339Nano), "event": "tls_certificate_reload_failed",
+			"detail": "serving the last pair that loaded"})
+		_, _ = s.log.Write(append(line, '\n'))
 	}
 	return s.last, nil
 }

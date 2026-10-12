@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
@@ -100,8 +101,11 @@ func ParseClientIdentity(raw string) (ClientIdentity, error) {
 func (c ClientIdentity) matches(leaf *x509.Certificate) bool {
 	switch c.kind {
 	case pinURI:
-		for _, uri := range leaf.URIs {
-			if uri.String() == c.value {
+		// The SAN's bytes as issued, not leaf.URIs: url.URL.String
+		// normalizes (a scheme's case, an empty fragment), so two SANs a CA
+		// issued as different strings would both match one pin.
+		for _, uri := range rawURISANs(leaf) {
+			if uri == c.value {
 				return true
 			}
 		}
@@ -116,6 +120,38 @@ func (c ClientIdentity) matches(leaf *x509.Certificate) bool {
 		return sum == c.spki
 	}
 	return false
+}
+
+// oidSubjectAltName is the subjectAltName extension (RFC 5280, 4.2.1.6).
+var oidSubjectAltName = asn1.ObjectIdentifier{2, 5, 29, 17}
+
+// rawURISANs returns the leaf's uniformResourceIdentifier names ([6]
+// IA5String) byte for byte. A SAN extension that does not parse yields
+// none, so it matches no pin; x509.ParseCertificate has already refused a
+// malformed one in any case.
+func rawURISANs(leaf *x509.Certificate) []string {
+	var uris []string
+	for _, extension := range leaf.Extensions {
+		if !extension.Id.Equal(oidSubjectAltName) {
+			continue
+		}
+		var names asn1.RawValue
+		rest, err := asn1.Unmarshal(extension.Value, &names)
+		if err != nil || len(rest) != 0 || !names.IsCompound || names.Tag != asn1.TagSequence {
+			return nil
+		}
+		for body := names.Bytes; len(body) > 0; {
+			var name asn1.RawValue
+			body, err = asn1.Unmarshal(body, &name)
+			if err != nil {
+				return nil
+			}
+			if name.Class == asn1.ClassContextSpecific && name.Tag == 6 && !name.IsCompound {
+				uris = append(uris, string(name.Bytes))
+			}
+		}
+	}
+	return uris
 }
 
 // ClientAuth admits a caller by its TLS client certificate.

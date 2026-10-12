@@ -24,6 +24,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -199,11 +200,16 @@ func TestTargetClientPresentsTheClientCertificate(t *testing.T) {
 
 	// A half-written rotation (a key that does not match) keeps the last
 	// good pair rather than taking the target away.
+	var reports int
+	certificate.OnReloadFailure(func() { reports++ })
 	otherCert, _, _ := clientPKI.issue("gateway-v3", x509.ExtKeyUsageClientAuth)
 	writeFile(t, dir, "tls.crt", otherCert)
 	client.CloseIdleConnections()
 	if response, err := get(t, client, base+"/v1/commands/x"); err != nil || response.StatusCode != http.StatusOK {
 		t.Fatalf("half-written rotation: %v", err)
+	}
+	if reports != 1 {
+		t.Fatalf("a failed reload was reported %d times, not once", reports)
 	}
 	if got := strings.Join(target.subjects(), ","); got != "gateway-v1,gateway-v2,gateway-v2" {
 		t.Fatalf("subjects presented: %s", got)
@@ -292,6 +298,21 @@ func TestLoadClientCertificateRefusals(t *testing.T) {
 	if _, err := LoadClientCertificate(cert, key); err != nil {
 		t.Fatal(err)
 	}
+	// A leaf restricted to an extended key usage this code does not know is
+	// not usable for client authentication.
+	unknownKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	unknownTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(1000), Subject: pkix.Name{CommonName: "unknown-eku"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, UnknownExtKeyUsage: []asn1.ObjectIdentifier{{1, 2, 3, 4}},
+	}
+	unknownDER, _ := x509.CreateCertificate(rand.Reader, unknownTemplate, pki.cert, &unknownKey.PublicKey, pki.key)
+	unknownKeyDER, _ := x509.MarshalECPrivateKey(unknownKey)
+	if _, err := LoadClientCertificate(
+		writeFile(t, dir, "unknown.crt", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: unknownDER})),
+		writeFile(t, dir, "unknown.key", pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: unknownKeyDER}))); err == nil {
+		t.Error("a leaf with only an unknown extended key usage was accepted")
+	}
 	if _, err := LoadClientCertificate(writeFile(t, dir, "uc", unrestricted),
 		writeFile(t, dir, "uk", unrestrictedKey)); err != nil {
 		t.Fatalf("a certificate with no extended key usage is unrestricted: %v", err)
@@ -303,11 +324,12 @@ func TestLoadRootCAsRefusals(t *testing.T) {
 	dir := t.TempDir()
 	_, keyPEM, _ := pki.issue("x", x509.ExtKeyUsageClientAuth)
 	for name, data := range map[string][]byte{
-		"empty":        nil,
-		"no PEM":       []byte("not a certificate"),
-		"a key":        keyPEM,
-		"cert and key": append(pki.caPEM(), keyPEM...),
-		"bad DER":      pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte{1, 2, 3}}),
+		"empty":         nil,
+		"no PEM":        []byte("not a certificate"),
+		"a key":         keyPEM,
+		"cert and key":  append(pki.caPEM(), keyPEM...),
+		"bad DER":       pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte{1, 2, 3}}),
+		"trailing junk": append(pki.caPEM(), []byte("-----BEGIN CERTIFICATE-----\nMIIB")...),
 	} {
 		if _, err := LoadRootCAs(writeFile(t, dir, "ca-"+strings.ReplaceAll(name, " ", "-"), data)); err == nil {
 			t.Errorf("%s: accepted", name)

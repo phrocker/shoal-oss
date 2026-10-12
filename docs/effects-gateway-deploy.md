@@ -136,10 +136,12 @@ one surface the egress policy admits.
 - **Presented when asked.** The pair is offered whenever the target's handshake
   requests a client certificate, and not otherwise.
 - **Reloaded at each handshake.** Both files are read again for every new
-  connection, so a rotated Secret takes effect without a restart. Idle
-  connections close after 30 seconds, which bounds how long an old certificate
-  stays in use. A pair that cannot be loaded at a handshake (a rotation caught
-  half written) keeps the last pair that could. At startup there is no such
+  connection, so a rotated Secret takes effect without a restart. A
+  connection keeps the certificate it was opened with: an idle one closes
+  after 30 seconds, and a busy one keeps its certificate until it closes. A
+  pair that cannot be loaded at a handshake (a rotation caught half written)
+  keeps the last pair that could, and the gateway says so on stderr at most
+  once a minute, naming the flags and nothing from the files. At startup there is no such
   fallback: a missing file, a key that does not match, or a certificate whose
   extended key usage excludes client authentication refuses the start.
 - **Never logged.** No error carries a file's contents or the certificate.

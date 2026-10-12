@@ -165,10 +165,17 @@ func TestServingCertificateReloads(t *testing.T) {
 	if bytes.Equal(first.Certificate[0], second.Certificate[0]) {
 		t.Fatal("the rotated certificate was not served")
 	}
+	var log bytes.Buffer
+	serving.log = &log
 	_ = os.WriteFile(keyFile, []byte("half written"), 0o600)
 	third, err := serving.get(nil)
 	if err != nil || !bytes.Equal(third.Certificate[0], second.Certificate[0]) {
 		t.Fatalf("a broken pair did not keep the last good one: %v", err)
+	}
+	_, _ = serving.get(nil)
+	if n := strings.Count(log.String(), "tls_certificate_reload_failed"); n != 1 ||
+		strings.Contains(log.String(), "half written") {
+		t.Fatalf("the failed reload was not reported once, without contents: %q", log.String())
 	}
 	if _, err := newServingCertificate(certFile, keyFile); err == nil {
 		t.Fatal("a broken pair was accepted at startup")

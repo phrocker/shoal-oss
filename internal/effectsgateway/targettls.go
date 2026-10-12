@@ -18,11 +18,13 @@
 package effectsgateway
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"sync"
+	"time"
 )
 
 // maxPEMFileBytes bounds a certificate, key or CA bundle file. A real one is
@@ -59,8 +61,10 @@ type TargetTLS struct {
 type ClientCertificate struct {
 	certFile, keyFile string
 
-	mu   sync.Mutex
-	last *tls.Certificate
+	mu              sync.Mutex
+	last            *tls.Certificate
+	onReloadFailure func()
+	reported        time.Time
 }
 
 // LoadClientCertificate loads the pair once, to refuse a start on a pair
@@ -129,8 +133,24 @@ func (c *ClientCertificate) GetClientCertificate(*tls.CertificateRequestInfo) (*
 	defer c.mu.Unlock()
 	if err == nil {
 		c.last = certificate
+		return c.last, nil
+	}
+	// A broken rotation is reported, at most once a minute, so it is seen
+	// before the last good certificate expires. The report names nothing
+	// from the files.
+	if c.onReloadFailure != nil && (c.reported.IsZero() || time.Since(c.reported) >= time.Minute) {
+		c.reported = time.Now()
+		c.onReloadFailure()
 	}
 	return c.last, nil
+}
+
+// OnReloadFailure sets what is called, at most once a minute, when a
+// handshake's reload fails and the last good pair is presented instead.
+func (c *ClientCertificate) OnReloadFailure(report func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onReloadFailure = report
 }
 
 // LoadRootCAs reads a PEM bundle of CA certificates. Every PEM block must be
@@ -148,6 +168,13 @@ func LoadRootCAs(path string) (*x509.CertPool, error) {
 		var block *pem.Block
 		block, rest = pem.Decode(rest)
 		if block == nil {
+			// Anything after the last block is a truncated or mangled
+			// certificate, not commentary: refuse it rather than load a
+			// bundle with a CA silently missing.
+			if len(bytes.TrimSpace(rest)) != 0 {
+				return nil, errors.New("the CA file holds data after its last certificate " +
+					"that is not PEM")
+			}
 			break
 		}
 		if block.Type != "CERTIFICATE" {

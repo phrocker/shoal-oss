@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
@@ -251,6 +252,67 @@ func TestClientAuthPinKinds(t *testing.T) {
 		if gotGateway != want[0] || gotOther != want[1] {
 			t.Errorf("%s: gateway=%v same-name=%v, want %v", pin, gotGateway, gotOther, want)
 		}
+	}
+}
+
+// TestURIPinIsTheIssuedBytes: a URI pin compares the SAN as the CA issued
+// it. url.URL.String would lower a scheme's case and drop an empty
+// fragment, so these SANs would otherwise match the pin.
+func TestURIPinIsTheIssuedBytes(t *testing.T) {
+	ca := newTestCA(t, "ca")
+	auth, err := NewClientAuth(writeCA(t, ca.pem()), []string{"uri:spiffe://td/x"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issueRaw := func(san string) tls.Certificate {
+		value, err := asn1.Marshal([]asn1.RawValue{{Class: asn1.ClassContextSpecific, Tag: 6, Bytes: []byte(san)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		ca.serial++
+		template := &x509.Certificate{
+			SerialNumber: big.NewInt(ca.serial), Subject: pkix.Name{CommonName: "gw"},
+			NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+			KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			ExtraExtensions: []pkix.Extension{{Id: oidSubjectAltName, Value: value}},
+		}
+		der, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
+	}
+	if _, ok := auth.Verify(stateFor(issueRaw("spiffe://td/x"))); !ok {
+		t.Fatal("the exact SAN was refused")
+	}
+	for _, variant := range []string{"SPIFFE://td/x", "spiffe://td/x#", "spiffe://td/x/", "spiffe://TD/x"} {
+		if _, ok := auth.Verify(stateFor(issueRaw(variant))); ok {
+			t.Errorf("SAN %q matched the pin spiffe://td/x", variant)
+		}
+	}
+}
+
+// TestClientAuthBoundsThePresentedChain: a client cannot make the service
+// verify an unbounded chain.
+func TestClientAuthBoundsThePresentedChain(t *testing.T) {
+	ca := newTestCA(t, "ca")
+	auth, _ := NewClientAuth(writeCA(t, ca.pem()), []string{"uri:" + gatewaySPIFFE}, nil)
+	leaf := ca.issue(leafSpec{cn: "gw", uris: []string{gatewaySPIFFE},
+		usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
+	state := stateFor(leaf)
+	if _, ok := auth.Verify(state); !ok {
+		t.Fatal("the leaf alone was refused")
+	}
+	for len(state.PeerCertificates) <= clientCertMaxPresent {
+		state.PeerCertificates = append(state.PeerCertificates, ca.cert)
+	}
+	if reason, ok := auth.Verify(state); ok || reason != clientCertUntrusted {
+		t.Fatalf("a chain of %d was admitted: %s", len(state.PeerCertificates), reason)
 	}
 }
 
