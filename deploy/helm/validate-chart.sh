@@ -3373,7 +3373,7 @@ note "== effects-ssh (#662): renders, and nothing without an enabled entry =="
 helm lint "$chart" "${ssh_base[@]}" --set 'effectsGateways[0].target.baseURL=https://test-release-shoal-ssh-web.default.svc:8443' >/dev/null ||
   fail "helm lint with effects-ssh"
 renders "an effects-ssh entry and its gateway" "${ssh_base[@]}"
-assert_absent "a disabled entry renders nothing" 'shoal-ssh-[a-z]+"$' "${ssh_base[@]}" --set 'effectsSsh[0].enabled=false,effectsGateways[0].networkPolicy.enabled=false'
+assert_absent "a disabled entry renders nothing" 'name: "shoal-ssh-' "${ssh_base[@]}" --set 'effectsSsh[0].enabled=false,effectsGateways[0].networkPolicy.enabled=false'
 assert_absent "the default values render no effects-ssh" 'effects-ssh' -f "$chart/values.yaml"
 
 ssh_objects=$(cat <<'OBJECTS'
@@ -3457,8 +3457,8 @@ elif check == "init":
             problems.append(f"the Job mounts {mounts}, not exactly the journal at {directory}")
         if volumes.get("journal", {}).get("persistentVolumeClaim", {}).get("claimName") != (claims[0]["metadata"]["name"] if claims else os.environ.get("SHOAL_EXPECTED_CLAIM")):
             problems.append("the Job's journal is not the entry's claim")
-        if pod.get("restartPolicy") != "Never" or job["spec"].get("backoffLimit") != 0:
-            problems.append("the Job retries: init must run once")
+        if pod.get("restartPolicy") != "Never":
+            problems.append("the Job's pod restarts in place: a retry is a new pod, counted by backoffLimit")
         if pod.get("automountServiceAccountToken") is not False:
             problems.append("the Job's pod automounts a token")
         own = container.get("securityContext", {})
@@ -3627,6 +3627,14 @@ note "== effects-ssh: journal init is a one-off Job, never beside serve =="
 ssh_check init "journal.id empty renders the Job and no Deployment" "${ssh_base[@]}" --set 'effectsSsh[0].journal.id='
 SHOAL_EXPECTED_CLAIM=ssh-journal ssh_check init "the Job initializes an existing claim" "${ssh_base[@]}" --set 'effectsSsh[0].journal.id=,effectsSsh[0].journal.storage=existingClaim,effectsSsh[0].journal.existingClaim=ssh-journal'
 assert_absent "a pinned journal renders no Job" 'kind: Job' "${ssh_base[@]}" -s templates/effects-ssh.yaml
+# A Job's pod template is immutable, so a changed template must be a new Job.
+init_job_name() { helm template shoal "$chart" "${ssh_base[@]}" --set 'effectsSsh[0].journal.id=' "$@" -s templates/effects-ssh.yaml | grep -A2 '^kind: Job$' | sed -n 's/^  name: "\(.*\)"$/\1/p'; }
+first_job="$(init_job_name)"
+if [ -z "$first_job" ] || [ "$first_job" = "$(init_job_name --set 'effectsSsh[0].image.tag=other')" ] ||
+  [ "$first_job" = "$(init_job_name --set 'effectsSsh[0].resources.limits.memory=512Mi')" ] ||
+  [ "$first_job" != "$(init_job_name)" ]; then
+  fail "the journal-init Job's name does not follow its pod template ($first_job)"
+fi
 ssh_check serving "a pinned journal renders the Deployment alone" "${ssh_base[@]}"
 
 note "== effects-ssh: non-root, read-only, no capabilities =="
@@ -3693,6 +3701,17 @@ refuses_citing "is not a command setting" "a misspelled field" "${ssh_base[@]}" 
 refuses_citing "hostKeys must list 1 to 8" "no pinned host key" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.hostKeys=null'
 refuses_citing "address must be host:port" "an address with no port" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.address=10.0.4.17'
 refuses_citing "privateKeyKey must be a Secret key" "a key path that climbs" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.privateKeyKey=../x'
+refuses_citing "must be 1 to 64 printable bytes" "a user with a space" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.user=de ploy'
+refuses_citing "not starting with .." "a key name Kubernetes reserves" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.privateKeyKey=..data'
+for name in web-init web-init-0a1b web-journal web-commands; do
+  refuses_citing "ends in a suffix the chart appends" "an entry named $name" "${ssh_base[@]}" --set "effectsSsh[0].name=$name"
+done
+for bad in :/64 ::::/64 1:2/64 fd00::1:/64 1::2::3/64; do
+  refuses_citing "not an IPv4 or IPv6 CIDR" "a malformed IPv6 CIDR $bad" "${ssh_base[@]}" --set "effectsSsh[0].commands.restart-web.cidrs={$bad}"
+done
+renders "an IPv4-mapped IPv6 address" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.address=[::ffff:10.0.4.17]:22'
+renders "an IPv6 address" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.address=[fd00:1::17]:22'
+assert_renders "a startup probe covers the journal's replay" '^ +startupProbe:$' "${ssh_base[@]}" -s templates/effects-ssh.yaml
 refuses_citing "commands has a command named" "a command name with a slash" "${ssh_base[@]}" --set-json 'effectsSsh[0].commands={"a/b":{}}'
 refuses_citing "bytes of live records" "a compaction bound the binary refuses" "${ssh_base[@]}" --set 'effectsSsh[0].journal.maxEntries=1048576,effectsSsh[0].commands.restart-web.maxOutputBytes=262144'
 renders "the largest compaction bound the binary allows" "${ssh_base[@]}" --set 'effectsSsh[0].journal.maxEntries=700,effectsSsh[0].commands.restart-web.maxOutputBytes=262144,effectsSsh[0].journal.size=3Gi'
@@ -3820,6 +3839,31 @@ else
   ssh_accepted "pinned client certificate alone" "${ssh_base[@]}" --set 'effectsSsh[0].callerToken.secretName=,effectsGateways[0].target.credentialSecretName='
   ssh_accepted "longer bounds" "${ssh_base[@]}" --set 'effectsSsh[0].journal.retention=72h,effectsSsh[0].shutdownGrace=5m,effectsSsh[0].maxConcurrent=64,effectsSsh[0].journal.maxEntries=700,effectsSsh[0].commands.restart-web.maxOutputBytes=262144,effectsSsh[0].journal.size=3Gi,effectsSsh[0].commands.restart-web.connectTimeout=20s'
   accepted "the gateway with a CA and a client certificate" "${ssh_base[@]}"
+  # The init Job's arguments, run twice on one directory: the first run
+  # creates the journal and prints its identity, the second prints the same
+  # identity and writes nothing.
+  if ! helm template shoal "$chart" "${ssh_base[@]}" --set 'effectsSsh[0].journal.id=' | python3 -c '
+import os, subprocess, sys, tempfile, yaml
+binary = sys.argv[1]
+job = next(d for d in yaml.safe_load_all(sys.stdin) if d and d["kind"] == "Job")
+container = job["spec"]["template"]["spec"]["containers"][0]
+scratch = tempfile.mkdtemp()
+args = []
+for argument in container["args"]:
+    flag, _, value = argument.partition("=")
+    if flag == "-journal-dir":
+        argument = f"{flag}={scratch}"
+    args.append(argument)
+first = subprocess.run([binary, *args], capture_output=True, text=True)
+before = open(os.path.join(scratch, "journal.log"), "rb").read() if first.returncode == 0 else b""
+second = subprocess.run([binary, *args], capture_output=True, text=True)
+after = open(os.path.join(scratch, "journal.log"), "rb").read() if second.returncode == 0 else b"?"
+if first.returncode or second.returncode or not first.stdout.strip() or first.stdout != second.stdout or before != after:
+    print(f"      first: {first.returncode} {first.stdout!r} {first.stderr.strip()[:200]}; second: {second.returncode} {second.stdout!r} {second.stderr.strip()[:200]}")
+    raise SystemExit(1)
+' "$ssh_binary"; then
+    fail "the journal-init Job's arguments do not initialize once and then print the same identity"
+  fi
 fi
 
 note "== the effects gateway guide's worked example still installs =="

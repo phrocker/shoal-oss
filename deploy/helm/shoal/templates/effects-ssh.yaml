@@ -82,8 +82,8 @@ spec:
     requests:
       storage: {{ $ssh.journal.size | quote }}
 {{- end }}
-{{- $podSecurity := dict "runAsNonRoot" true "runAsUser" 65532 "runAsGroup" 65532 "fsGroup" 65532 "fsGroupChangePolicy" "OnRootMismatch" "seccompProfile" (dict "type" "RuntimeDefault") }}
-{{- $containerSecurity := dict "runAsNonRoot" true "allowPrivilegeEscalation" false "readOnlyRootFilesystem" true "capabilities" (dict "drop" (list "ALL")) }}
+{{- $podSecurity := fromJson (include "shoal.effectsSshPodSecurity" .) }}
+{{- $containerSecurity := fromJson (include "shoal.effectsSshContainerSecurity" .) }}
 {{- if not $plan.journalID }}
 ---
 # Step 1 of an install: initialize the journal once, on the claim, and print
@@ -98,48 +98,18 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ $plan.initJob | quote }}
+  name: {{ include "shoal.effectsSshInitJobName" (dict "root" $root "ssh" $ssh "plan" $plan) | quote }}
   labels:
     {{- include "shoal.labels" $root | nindent 4 }}
     app.kubernetes.io/component: effects-ssh-journal-init
 spec:
-  backoffLimit: 0
-  activeDeadlineSeconds: 600
+  # A rerun is safe (-print-existing never replaces a journal), so a pod
+  # lost to a preemption or a slow node is retried. A Job that still failed
+  # is deleted by hand (kubectl delete job) and recreated by the next
+  # upgrade.
+  backoffLimit: 3
   template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: shoal-effects-ssh-journal-init
-        app.kubernetes.io/instance: {{ $root.Release.Name }}
-        app.kubernetes.io/component: effects-ssh-journal-init
-    spec:
-      restartPolicy: Never
-      serviceAccountName: {{ $name | quote }}
-      automountServiceAccountToken: false
-      securityContext: {{ toJson $podSecurity }}
-      {{- with $ssh.nodeSelector }}
-      nodeSelector: {{ toJson . }}
-      {{- end }}
-      {{- with $ssh.tolerations }}
-      tolerations: {{ toJson . }}
-      {{- end }}
-      {{- with $ssh.affinity }}
-      affinity: {{ toJson . }}
-      {{- end }}
-      containers:
-        - name: journal-init
-          image: {{ printf "%v:%v" $ssh.image.repository $ssh.image.tag | quote }}
-          imagePullPolicy: {{ $ssh.image.pullPolicy | quote }}
-          command: ["/usr/local/bin/shoal-effects-ssh"]
-          args: ["journal", "init", "-print-existing", {{ printf "-journal-dir=%s" $journalMount | quote }}]
-          resources: {{ toJson $ssh.resources }}
-          securityContext: {{ toJson $containerSecurity }}
-          volumeMounts:
-            - name: journal
-              mountPath: {{ $journalMount | quote }}
-      volumes:
-        - name: journal
-          persistentVolumeClaim:
-            claimName: {{ $plan.claim | quote }}
+    {{- include "shoal.effectsSshInitPod" (dict "root" $root "ssh" $ssh "plan" $plan) | nindent 4 }}
 {{- else }}
 ---
 apiVersion: apps/v1
@@ -216,6 +186,14 @@ spec:
               containerPort: {{ $port }}
           # The service has no health endpoint: an HTTP probe would be a
           # request it refuses. A TCP probe checks the listener.
+          # serve replays the journal before it listens, which on a slow disk
+          # and a full journal takes a while: up to 10 minutes before the
+          # liveness probe may restart it.
+          startupProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 10
+            failureThreshold: 60
           readinessProbe:
             tcpSocket:
               port: https

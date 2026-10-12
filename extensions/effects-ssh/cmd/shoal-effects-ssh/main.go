@@ -457,22 +457,18 @@ func journalInit(args []string, stdout, stderr io.Writer) int {
 	}
 	if *printExisting {
 		if _, err := os.Lstat(filepath.Join(*dir, service.JournalFileName)); err == nil {
-			// The whole file is checked by the server's rules: a corrupt or
-			// headerless journal is an error here too, never a fresh start.
-			records, _, err := service.ReadJournal(*dir)
+			// Only the header is read, in constant memory: a mature
+			// journal can be far larger than this pod's memory. A headerless
+			// or malformed header is an error, never a fresh start. The
+			// rest of the file is the server's to check when it opens it.
+			id, err := service.ReadJournalID(*dir)
 			if err != nil {
 				fmt.Fprintln(stderr, err)
 				return exitRuntime
 			}
-			for _, record := range records {
-				if record.JournalID != "" {
-					fmt.Fprintln(stderr, "the journal already exists; its identity is printed, and nothing was written")
-					fmt.Fprintln(stdout, record.JournalID)
-					return exitOK
-				}
-			}
-			fmt.Fprintln(stderr, "the journal has no header")
-			return exitRuntime
+			fmt.Fprintln(stderr, "the journal already exists; its identity is printed, and nothing was written")
+			fmt.Fprintln(stdout, id)
+			return exitOK
 		}
 	}
 	id, err := service.InitJournal(*dir, nil)

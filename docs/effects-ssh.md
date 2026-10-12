@@ -469,8 +469,9 @@ replica.
 
 **Initialize the journal once, and pin it.** `serve` never creates a journal.
 `journal init` writes the first line, a header with a random identity and
-the creation time, fsyncs it and its directory entry, and prints the
-identity; it refuses a directory that already holds a journal file, even an
+the creation time, fsyncs it under a temporary name and links it into place
+(so `journal.log` appears complete or not at all), fsyncs the directory, and
+prints the identity; it refuses a directory that already holds a journal file, even an
 empty one. With `-print-existing`, a directory holding a journal with a valid
 header prints that journal's identity and exits 0 instead, writing nothing; a
 headerless or corrupt one is still an error. Put the identity in the deployment as `-journal-id`. Then a
@@ -533,29 +534,38 @@ itself.**
 
 1. Install with `journal.id` empty. The chart renders the claim and a one-off
    Job, `<release stem>-ssh-<name>-init-<digest>`, that runs
-   `journal init -print-existing` on it (`backoffLimit: 0`, denied all
-   network), and **no Deployment**. Read the identity it printed with
+   `journal init -print-existing` on it (denied all network), and **no
+   Deployment**. Read the identity it printed with
    `kubectl logs job/<the Job's name>`; NOTES prints the exact command.
 2. Set `journal.id` to that identity and upgrade. The Job is no longer
    rendered, and the Deployment serves with `-journal-id` pinned.
 
 The Job is an ordinary resource, not a Helm hook. It is the claim's first
-consumer, so a `WaitForFirstConsumer` claim binds for it, and `helm install
---wait` (or Argo CD) waits for it rather than for a claim nothing uses.
+consumer, so a `WaitForFirstConsumer` claim binds for it. `helm install
+--wait` does not wait for Jobs; add `--wait-for-jobs` to wait for the
+identity to be printed.
 Kubernetes does not rerun a finished Job, so an upgrade between the two steps
 leaves it, and its log, in place. A change to its pod template (the image, say)
 gives it a new name, since a Job's template is immutable; the new Job finds
 the journal and, with `-print-existing`, prints that journal's identity and
-writes nothing. A headerless or corrupt journal is an error there too, never a
-fresh start.
+writes nothing. Only the header is read, so a journal of any size is
+answered in constant memory; a missing or malformed header is an error, never
+a fresh start. A rerun is always safe, so the Job retries a lost pod
+(`backoffLimit: 3`); one that still failed is deleted by hand (`kubectl delete
+job`) and recreated by the next upgrade.
 
 `journal init` never appears in the pod's start script. After step 2, a
 claim that is lost, empty or replaced is refused at startup by the pinned
 identity, and nothing re-initializes it: re-running step 1 requires an
 operator to clear `journal.id` on purpose, and then it prints the identity of
 any journal already on the claim rather than replacing it. The chart refuses
-an empty `journal.id` while the entry's Deployment is running (a `lookup`
-guard, like the gateways' rename guard, silent under `helm template`). A
+an empty `journal.id` while the entry's Deployment is running, and any
+running effects-ssh Deployment of the release that no enabled, pinned entry
+names any more (a rename or a removal), by `lookup` guards like the gateways'
+rename guard, silent under `helm template`. A rename starts a fresh claim and
+journal, so keep the journal across one: stop the old entry (`replicas: 0`),
+then name its claim in the new entry (`journal.storage: existingClaim`) with
+the same `journal.id`. A
 random identity also means a re-initialized journal can never match the old
 pin.
 
@@ -599,6 +609,12 @@ pin.
   `kube-system`/`k8s-app: kube-dns` by default). A prefix shorter than /8
   (IPv4) or /32 (IPv6) is refused, as is any malformed CIDR.
 - The journal-init Job's pod is denied all network.
+- Entry names may not end in a suffix the chart appends to another entry's
+  objects (`-init`, `-init-<digest>`, `-journal`, `-commands`), so no two
+  entries' objects can share a name and replace each other's policy.
+
+The Deployment has a TCP startup probe allowing ten minutes, because `serve`
+replays the journal before it listens.
 - The gateway's own policy reaches this entry by pod selector instead of
   `targetCIDRs`.
 

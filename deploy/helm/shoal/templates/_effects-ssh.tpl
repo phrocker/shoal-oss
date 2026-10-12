@@ -217,6 +217,14 @@ Takes a dict of root and ssh. Returns JSON.
 {{- fail (printf "%s.%s is required" $at $field) -}}
 {{- end -}}
 {{- end -}}
+{{- /* config.go: a user of at most 64 printable bytes with no space, and a
+       command on one line with no control character. */ -}}
+{{- if not (regexMatch `^[!-~]{1,64}$` (toString $spec.user)) -}}
+{{- fail (printf "%s.user must be 1 to 64 printable bytes with no space (got %q)" $at (toString $spec.user)) -}}
+{{- end -}}
+{{- if regexMatch `[\p{Cc}]` (toString $spec.command) -}}
+{{- fail (printf "%s.command holds a control character or a line break: it is one line, run as written; a multi-line script belongs in a file on the host" $at) -}}
+{{- end -}}
 {{- $address := toString $spec.address -}}
 {{- if not (regexMatch `^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]*):[0-9]{1,5}$` $address) -}}
 {{- fail (printf "%s.address must be host:port, with an IPv6 address in brackets (got %q)" $at $address) -}}
@@ -231,8 +239,8 @@ Takes a dict of root and ssh. Returns JSON.
 {{- fail (printf "%s.hostKeys must list 1 to 8 pinned host keys: there is no trust on first use" $at) -}}
 {{- end -}}
 {{- $keyName := toString $spec.privateKeyKey -}}
-{{- if or (gt (len $keyName) 253) (not (regexMatch `^[-._a-zA-Z0-9]+$` $keyName)) (has $keyName (list "." "..")) -}}
-{{- fail (printf "%s.privateKeyKey must be a Secret key ([-._a-zA-Z0-9]+, not . or ..; got %q)" $at $keyName) -}}
+{{- if or (gt (len $keyName) 253) (not (regexMatch `^[-._a-zA-Z0-9]+$` $keyName)) (has $keyName (list "." "..")) (hasPrefix ".." $keyName) -}}
+{{- fail (printf "%s.privateKeyKey must be a Secret key usable as a file name ([-._a-zA-Z0-9]+, not starting with ..; got %q)" $at $keyName) -}}
 {{- end -}}
 {{- if not (has $keyName $keys) -}}
 {{- $keys = append $keys $keyName -}}
@@ -282,7 +290,9 @@ Takes a dict of root and ssh. Returns JSON.
 {{- range $cidr := $cidrs -}}
 {{- $text := toString $cidr -}}
 {{- $v4 := regexMatch `^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}/(0|[1-9][0-9]?)$` $text -}}
-{{- $v6 := regexMatch `^[0-9A-Fa-f:]*:[0-9A-Fa-f:]*/(0|[1-9][0-9]{0,2})$` $text -}}
+{{- $v6address := regexReplaceAll `/.*$` $text "" -}}
+{{- $colons := len (regexFindAll ":" $v6address -1) -}}
+{{- $v6 := and (regexMatch `^[0-9A-Fa-f:]+([0-9]{1,3}(\.[0-9]{1,3}){3})?/(0|[1-9][0-9]{0,2})$` $text) (not (contains ":::" $v6address)) (le (len (regexFindAll "::" $v6address -1)) 1) (ge $colons 2) (le $colons 7) (or (contains "::" $v6address) (eq $colons 7) (and (eq $colons 6) (contains "." $v6address))) (not (hasPrefix ":" (trimPrefix "::" $v6address))) (not (and (hasSuffix ":" $v6address) (not (hasSuffix "::" $v6address)))) -}}
 {{- if not (or $v4 $v6) -}}
 {{- fail (printf "%s.cidrs holds %q, which is not an IPv4 or IPv6 CIDR" $at $text) -}}
 {{- end -}}
@@ -436,14 +446,69 @@ Takes a dict of root and ssh. Returns JSON.
 {{- $grace = int64 $graceOverride -}}
 {{- end -}}
 {{- $_ := set $plan "grace" $grace -}}
-{{- /* The journal-init Job's name carries a digest of its pod template. A
-       Job's template is immutable, so a fixed name would fail every upgrade
-       that changed the image or scheduling before journal.id is pinned; a
-       new name is a new Job, which (with -print-existing) prints the
-       identity of the journal already there rather than failing. */ -}}
-{{- $initSpec := toJson (list $ssh.image $ssh.resources $ssh.nodeSelector $ssh.tolerations $ssh.affinity (get $plan "claim")) -}}
-{{- $_ := set $plan "initJob" (printf "%s-init-%s" $name (trunc 4 (sha256sum $initSpec))) -}}
 {{- toJson $plan -}}
+{{- end -}}
+
+{{- /* The journal-init Job's pod template. A named template so the Job's
+       name can carry a digest of exactly what it renders: a Job's template
+       is immutable, so any change to it (an operator's value or this chart's
+       own) gives a new Job rather than a failed upgrade. Takes a dict of
+       root, ssh and plan. */ -}}
+{{- define "shoal.effectsSshInitPod" -}}
+{{- $root := .root -}}
+{{- $ssh := .ssh -}}
+{{- $plan := .plan -}}
+{{- $name := $plan.name -}}
+{{- $journalMount := "/var/lib/effects-ssh" -}}
+{{- $podSecurity := fromJson (include "shoal.effectsSshPodSecurity" .) -}}
+{{- $containerSecurity := fromJson (include "shoal.effectsSshContainerSecurity" .) }}
+metadata:
+  labels:
+    app.kubernetes.io/name: shoal-effects-ssh-journal-init
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+    app.kubernetes.io/component: effects-ssh-journal-init
+spec:
+  restartPolicy: Never
+  serviceAccountName: {{ $name | quote }}
+  automountServiceAccountToken: false
+  securityContext: {{ toJson $podSecurity }}
+  {{- with $ssh.nodeSelector }}
+  nodeSelector: {{ toJson . }}
+  {{- end }}
+  {{- with $ssh.tolerations }}
+  tolerations: {{ toJson . }}
+  {{- end }}
+  {{- with $ssh.affinity }}
+  affinity: {{ toJson . }}
+  {{- end }}
+  containers:
+    - name: journal-init
+      image: {{ printf "%v:%v" $ssh.image.repository $ssh.image.tag | quote }}
+      imagePullPolicy: {{ $ssh.image.pullPolicy | quote }}
+      command: ["/usr/local/bin/shoal-effects-ssh"]
+      args: ["journal", "init", "-print-existing", {{ printf "-journal-dir=%s" $journalMount | quote }}]
+      resources: {{ toJson $ssh.resources }}
+      securityContext: {{ toJson $containerSecurity }}
+      volumeMounts:
+        - name: journal
+          mountPath: {{ $journalMount | quote }}
+  volumes:
+    - name: journal
+      persistentVolumeClaim:
+        claimName: {{ $plan.claim | quote }}
+{{- end -}}
+
+{{- /* <name>-init-<4 hex digits of the pod template's digest>, 63 at most. */ -}}
+{{- define "shoal.effectsSshInitJobName" -}}
+{{- printf "%s-init-%s" .plan.name (trunc 4 (sha256sum (include "shoal.effectsSshInitPod" .))) -}}
+{{- end -}}
+
+{{- define "shoal.effectsSshPodSecurity" -}}
+{{- toJson (dict "runAsNonRoot" true "runAsUser" 65532 "runAsGroup" 65532 "fsGroup" 65532 "fsGroupChangePolicy" "OnRootMismatch" "seccompProfile" (dict "type" "RuntimeDefault")) -}}
+{{- end -}}
+
+{{- define "shoal.effectsSshContainerSecurity" -}}
+{{- toJson (dict "runAsNonRoot" true "allowPrivilegeEscalation" false "readOnlyRootFilesystem" true "capabilities" (dict "drop" (list "ALL"))) -}}
 {{- end -}}
 
 {{- /* Install notes for the effects-ssh entries; NOTES.txt includes this. */ -}}
@@ -458,7 +523,7 @@ Takes a dict of root and ssh. Returns JSON.
   empty, so this release rendered the journal-init Job and no Deployment.
 
   1. Read the journal's identity, which the Job printed:
-       kubectl logs -n {{ $.Release.Namespace }} job/{{ $plan.initJob }}
+       kubectl logs -n {{ $.Release.Namespace }} job/{{ include "shoal.effectsSshInitJobName" (dict "root" $ "ssh" $ssh "plan" $plan) }}
   2. Set effectsSsh[{{ $ssh._index }}].journal.id to it and upgrade.
 
   If the claim already held a journal, the Job printed that journal's identity

@@ -393,7 +393,7 @@ func readRecords(file io.ReadSeeker, visit func(record, span) error) (int64, err
 		}
 		at := span{offset: offset, length: int64(len(line))}
 		if err := visit(parsed, at); err != nil {
-			if errors.Is(err, ErrJournalMismatch) {
+			if errors.Is(err, ErrJournalMismatch) || errors.Is(err, errStopReading) {
 				return offset, err
 			}
 			return offset, corrupt(err)
@@ -403,6 +403,37 @@ func readRecords(file io.ReadSeeker, visit func(record, span) error) (int64, err
 }
 
 var errTorn = errors.New("torn tail")
+
+// errStopReading ends a readRecords pass early, without error.
+var errStopReading = errors.New("stop reading")
+
+// ReadJournalID returns the identity in the journal's header, reading and
+// checking only the first line, so a journal of any size is answered in
+// constant memory. A file whose first line is not a complete, valid header
+// is an error (ErrJournalUninitialized or a *CorruptError), never an empty
+// identity. It takes no lock and writes nothing.
+func ReadJournalID(dir string) (string, error) {
+	file, err := os.Open(filepath.Join(dir, JournalFileName))
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	check := &Journal{entries: map[string]*Entry{}}
+	_, err = readRecords(file, func(r record, at span) error {
+		if err := check.apply(r, at); err != nil {
+			return err
+		}
+		return errStopReading
+	})
+	if err != nil && !errors.Is(err, errStopReading) {
+		return "", err
+	}
+	if check.id == "" {
+		return "", fmt.Errorf("%w: %s has no complete header", ErrJournalUninitialized,
+			filepath.Join(dir, JournalFileName))
+	}
+	return check.id, nil
+}
 
 var errLineBound = errors.New("record exceeds the line bound")
 
@@ -976,10 +1007,22 @@ func InitJournal(dir string, now func() time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// The header is written and synced under a temporary name, then linked
+	// into place, so journal.log appears complete or not at all: a process
+	// killed mid-init leaves no empty journal.log that every later init and
+	// serve would refuse. link fails if journal.log appeared meanwhile, so an
+	// existing journal is never replaced. A leftover temporary is removed and
+	// the new one created exclusively, so a planted link cannot redirect the
+	// write.
+	temporary := path + ".init"
+	if err := os.Remove(temporary); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = os.Remove(temporary) }()
 	if _, err := file.Write(line); err != nil {
 		_ = file.Close()
 		return "", err
@@ -989,6 +1032,12 @@ func InitJournal(dir string, now func() time.Time) (string, error) {
 		return "", err
 	}
 	if err := file.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Link(temporary, path); err != nil {
+		return "", fmt.Errorf("%s cannot be created: %w; an existing journal is never replaced", path, err)
+	}
+	if err := os.Remove(temporary); err != nil {
 		return "", err
 	}
 	if err := syncDir(dir); err != nil {
