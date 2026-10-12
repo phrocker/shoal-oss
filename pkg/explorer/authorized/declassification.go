@@ -675,19 +675,30 @@ func (c *Client) claimIntentCovers(
 
 // declassificationPriorVersion returns the replaced claim version a retry may
 // inherit lineage from: the existing claim's, when this ingest recorded no
-// intent and its rule keeps every component of the existing claim's rule. A
+// intent, its rule keeps every component of the existing claim's rule, and
+// that version is bound to an intent whose rule it also keeps. A
 // selected rule that narrows the existing claim always records its own intent,
 // so the rule test is defensive.
-func declassificationPriorVersion(
+func (c *Client) declassificationPriorVersion(
+	ctx context.Context,
+	sourceURI string,
 	existing *SourcePolicyClaim,
 	selected AccessRule,
 	attempt *declassificationAttempt,
-) uint64 {
+) (uint64, error) {
 	if attempt != nil || existing == nil ||
 		ruleNarrows(existing.Rule, selected) {
-		return 0
+		return 0, nil
 	}
-	return existing.Version
+	intent, ok, err := c.policyStore.DeclassificationClaimIntent(
+		ctx, sourceURI, existing.Version)
+	if err != nil {
+		return 0, policyCatalogReadError(ctx, err)
+	}
+	if !ok || ruleNarrows(intent.Rule, selected) {
+		return 0, nil
+	}
+	return existing.Version, nil
 }
 
 func appendDistinctRule(rules []AccessRule, rule AccessRule) []AccessRule {

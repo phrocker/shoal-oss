@@ -1207,3 +1207,129 @@ func TestDeclassificationReconcilingRetryKeepsLineage(t *testing.T) {
 		}
 	})
 }
+
+// failNthBindStore fails BindDeclassificationClaim on the listed call numbers.
+type failNthBindStore struct {
+	authorized.PolicyStore
+	mu    sync.Mutex
+	calls int
+	fail  map[int]bool
+}
+
+func (s *failNthBindStore) BindDeclassificationClaim(
+	ctx context.Context, uri string, version uint64, attemptID shoal.ID,
+) error {
+	s.mu.Lock()
+	s.calls++
+	fail := s.fail[s.calls]
+	s.mu.Unlock()
+	if fail {
+		return shoal.NewError(shoal.ErrorUnavailable, "bind down")
+	}
+	return s.PolicyStore.BindDeclassificationClaim(ctx, uri, version, attemptID)
+}
+
+// flakyDocumentsBase fails Documents once, when armed.
+type flakyDocumentsBase struct {
+	explorer.Client
+	mu    sync.Mutex
+	armed bool
+}
+
+func (b *flakyDocumentsBase) Documents(ctx context.Context) ([]explorer.DocumentSummary, error) {
+	b.mu.Lock()
+	armed := b.armed
+	b.armed = false
+	b.mu.Unlock()
+	if armed {
+		return nil, shoal.NewError(shoal.ErrorUnavailable, "base flake")
+	}
+	return b.Client.Documents(ctx)
+}
+
+// TestDeclassificationFailedInheritingRetryKeepsLineage pins R5-1 of the
+// fifth review. A retry that may inherit lineage from the claim it replaced
+// must not commit its new claim version before that version is bound. A
+// failure after an applied base write (the carry bind itself, or a base read
+// before pre-commit) rolls the claim back to the bound version, so the next
+// retry still reconciles.
+func TestDeclassificationFailedInheritingRetryKeepsLineage(t *testing.T) {
+	for _, failure := range []string{"carry bind", "base read"} {
+		t.Run(failure, func(t *testing.T) {
+			withPolicyStores(t, func(t *testing.T, inner authorized.PolicyStore) {
+				f := newFixture(t)
+				records := &failingDeclassificationStore{
+					PolicyStore: inner, fail: map[int]bool{2: true}}
+				var store authorized.PolicyStore = records
+				if failure == "carry bind" {
+					store = &failNthBindStore{
+						PolicyStore: records, fail: map[int]bool{2: true}}
+				}
+				base := &flakyDocumentsBase{Client: f.base}
+				client := f.declassificationClientOver(t, base, store, true)
+				const uri = "file:///declassify/inheriting-retry.txt"
+				first, err := client.Ingest(f.labelIngester(t, "owner", "secret"),
+					labelledSource(uri, "secret", "secret"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := client.Ingest(withReason(t, f.labelIngester(t, "owner", "secret"), "r"),
+					labelledSource(uri, "public", "")); err == nil {
+					t.Fatal("pre-commit failure ignored")
+				}
+				if failure == "base read" {
+					base.mu.Lock()
+					base.armed = true
+					base.mu.Unlock()
+				}
+				if _, err := client.Ingest(f.labelIngester(t, "retrier-1"),
+					labelledSource(uri, "public, retry 1", "")); err == nil {
+					t.Fatalf("%s failure ignored", failure)
+				}
+				second, err := client.Ingest(f.labelIngester(t, "retrier-2"),
+					labelledSource(uri, "public, retry 2", ""))
+				if err != nil {
+					t.Fatalf("retry after a failed inheriting retry = %v, want reconciliation", err)
+				}
+				current, ok, err := inner.CurrentRevision(context.Background(), first.Document.ID)
+				if err != nil || !ok || current.RevisionID != second.Revision.ID {
+					t.Fatalf("current = %+v %v %v", current, ok, err)
+				}
+			})
+		})
+	}
+}
+
+// TestDeclassificationOrdinaryIngestKeepsClaimCommitOnApply pins that the
+// deferred claim commit applies only to a retry that inherits lineage. An
+// ordinary re-ingest of a URI with no declassification lineage still commits
+// its claim as soon as the base applies it, exactly as before #630, even when
+// a later step fails.
+func TestDeclassificationOrdinaryIngestKeepsClaimCommitOnApply(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		f := newFixture(t)
+		base := &flakyDocumentsBase{Client: f.base}
+		client := f.declassificationClientOver(t, base, store, false)
+		const uri = "file:///declassify/ordinary-commit.txt"
+		owner := f.labelIngester(t, "owner", "x", "y")
+		if _, err := client.Ingest(owner, labelledSource(uri, "x", "x")); err != nil {
+			t.Fatal(err)
+		}
+		before, _, err := store.SourceClaim(context.Background(), uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base.mu.Lock()
+		base.armed = true
+		base.mu.Unlock()
+		if _, err := client.Ingest(owner, labelledSource(uri, "x and y", "x&y")); err == nil {
+			t.Fatal("base flake ignored")
+		}
+		after, ok, err := store.SourceClaim(context.Background(), uri)
+		if err != nil || !ok || after.Pending || after.Version == before.Version ||
+			after.Rule.String() == before.Rule.String() {
+			t.Fatalf("claim after an applied ordinary ingest failed later = %+v (before %+v) %v %v",
+				after, before, ok, err)
+		}
+	})
+}

@@ -333,7 +333,14 @@ func (c *Client) Ingest(
 		}
 		return explorer.IngestResult{}, err
 	}
-	if result.Disposition == explorer.IngestApplied {
+	// A retry that may inherit declassification lineage from the claim it
+	// replaced (#630) must not commit its new claim version before its
+	// pre-commit check has bound that version, or a failure in between
+	// would leave an unbound version in place of the bound one and lose
+	// the lineage for good. Until then a failure rolls the claim back to
+	// the bound version, which still authorizes the retry.
+	inheritsLineage := priorClaimVersion != 0
+	if result.Disposition == explorer.IngestApplied && !inheritsLineage {
 		claimOutcome = sourceClaimCommit
 	}
 	view, err := c.base.Document(
@@ -385,6 +392,9 @@ func (c *Client) Ingest(
 			},
 		); err != nil {
 			return explorer.IngestResult{}, err
+		}
+		if inheritsLineage && result.Disposition == explorer.IngestApplied {
+			claimOutcome = sourceClaimCommit
 		}
 	}
 	if err := c.policyStore.PutRevision(ctx, RevisionRegistration{
@@ -502,8 +512,11 @@ func (c *Client) claimSourceMutation(
 	if err != nil {
 		return SourcePolicyClaim{}, nil, 0, err
 	}
-	priorVersion := declassificationPriorVersion(
-		expected, selectedRule, declassification)
+	priorVersion, err := c.declassificationPriorVersion(
+		ctx, sourceURI, expected, selectedRule, declassification)
+	if err != nil {
+		return SourcePolicyClaim{}, nil, 0, err
+	}
 	claim, err := c.policyStore.CompareAndSwapSourceClaim(
 		ctx, sourceURI, expected, selectedRule)
 	if err == nil {
