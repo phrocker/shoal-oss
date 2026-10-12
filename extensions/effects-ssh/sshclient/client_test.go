@@ -85,11 +85,17 @@ func TestRunRecordsExitStatusAndSignal(t *testing.T) {
 func TestRunWithoutAnExitStatusIsUnknown(t *testing.T) {
 	server := sshtest.New(t)
 	server.Handle(func(command string, _, _ io.Writer, _ <-chan struct{}) sshtest.Exit {
-		if command == "drop" {
+		switch command {
+		case "drop":
 			return sshtest.Exit{Drop: true}
+		case "malformed":
+			return sshtest.Exit{Malformed: true}
 		}
 		return sshtest.Exit{NoStatus: true}
 	})
+	if result := sshclient.Run(context.Background(), target(t, server), "malformed", limits); result.Outcome != sshclient.OutcomeUnknown || result.Reason != sshclient.ReasonTransport {
+		t.Fatalf("malformed status: %+v", result)
+	}
 	if result := sshclient.Run(context.Background(), target(t, server), "quiet", limits); result.Outcome != sshclient.OutcomeUnknown || result.Reason != sshclient.ReasonNoExitStatus {
 		t.Fatalf("no status: %+v", result)
 	}

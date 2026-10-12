@@ -32,6 +32,8 @@ type Exit struct {
 	NoStatus bool
 	// Drop closes the TCP connection abruptly, with no status.
 	Drop bool
+	// Malformed sends an exit-status too short to carry a status.
+	Malformed bool
 }
 
 // Handler runs one exec request. closed is closed when the client goes away.
@@ -317,6 +319,8 @@ func (s *Server) handleSession(conn net.Conn, server *ssh.ServerConn, channel ss
 		switch {
 		case exit.Drop:
 			_ = conn.Close()
+		case exit.Malformed:
+			_, _ = channel.SendRequest("exit-status", false, []byte{0, 1})
 		case exit.NoStatus:
 		case exit.Signal != "":
 			_, _ = channel.SendRequest("exit-signal", false, ssh.Marshal(struct {

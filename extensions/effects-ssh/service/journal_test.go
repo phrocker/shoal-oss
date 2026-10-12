@@ -141,8 +141,16 @@ func TestCorruptionRefusesToOpen(t *testing.T) {
 		Finished: &Finished{Outcome: OutcomeCompleted, Reference: "exit-0", ExitStatus: &status}})
 	flipped := append([]byte(nil), started...)
 	flipped[20] ^= 0x01
+	// A checksum that does not match a record that still decodes.
+	wrongSum := append([]byte(nil), started...)
+	if wrongSum[0] == '0' {
+		wrongSum[0] = '1'
+	} else {
+		wrongSum[0] = '0'
+	}
 	cases := map[string][]byte{
 		"flipped byte, last line":  flipped,
+		"wrong checksum":           wrongSum,
 		"flipped byte, mid file":   append(append([]byte(nil), flipped...), finished...),
 		"finished without started": finished,
 		"started twice":            append(append([]byte(nil), started...), started...),
@@ -218,6 +226,10 @@ func TestRetentionPrunesOnlyExpiredIdleKeys(t *testing.T) {
 	dir, now := t.TempDir(), &fakeNow{now: journalEpoch}
 	j := openTestJournal(t, dir, now, 10)
 	runAndFinish(t, j, testKey("old"))
+	// Still running when its started record passes retention.
+	if begin := j.Begin(testKey("long"), fp, "restart-web", true, 4); begin.Kind != BeginRun {
+		t.Fatal(begin.Kind)
+	}
 	now.Advance(30 * time.Minute)
 	runAndFinish(t, j, testKey("young"))
 	if begin := j.Begin(testKey("running"), fp, "restart-web", true, 4); begin.Kind != BeginRun {
@@ -235,6 +247,9 @@ func TestRetentionPrunesOnlyExpiredIdleKeys(t *testing.T) {
 	}
 	if _, ok := j.Lookup(testKey("running")); !ok {
 		t.Fatal("a running key was pruned")
+	}
+	if _, ok := j.Lookup(testKey("long")); !ok {
+		t.Fatal("a running key past retention was pruned")
 	}
 	_ = j.Close()
 	// On reopen the same rule applies to what is on disk: the running key's
@@ -416,6 +431,22 @@ func TestSyncFailureBeforeTheDialRunsNothing(t *testing.T) {
 	case <-e.journal.Failed():
 	default:
 		t.Fatal("the journal did not fail")
+	}
+}
+
+// TestOneFailedSyncFailsTheJournalForGood: Linux may report an fsync error
+// once and then let the next fsync succeed over lost data, so after one
+// failure no new key is ever started, even when the disk seems to recover.
+func TestOneFailedSyncFailsTheJournalForGood(t *testing.T) {
+	e := newEnv(t)
+	original := syncFile
+	syncFile = func(*os.File) error { return errors.New("injected fsync failure") }
+	e.post("restart-web", testKey("first")).is(t, loadAnswers(t), "refused_journal_unavailable")
+	syncFile = original
+	t.Cleanup(func() { syncFile = original })
+	e.post("restart-web", testKey("second")).is(t, loadAnswers(t), "refused_journal_unavailable")
+	if e.host.ssh.Accepts() != 0 {
+		t.Fatal("dialed on a failed journal")
 	}
 }
 
