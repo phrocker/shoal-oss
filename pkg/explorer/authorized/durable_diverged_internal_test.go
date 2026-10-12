@@ -321,3 +321,32 @@ func TestDurablePolicyStoreWriteAfterCloseIsNotADivergence(t *testing.T) {
 		t.Fatalf("a write after close diverged=%v fired=%d", store.Diverged(), fired)
 	}
 }
+
+// TestDivergedStoreRefusesPersistFirstWrites pins that a write which
+// persists before it applies is refused too once the store has diverged, so
+// nothing reaches disk from a store that no longer serves reads.
+func TestDivergedStoreRefusesPersistFirstWrites(t *testing.T) {
+	store, err := OpenDurablePolicyStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	rule := batchTestRule(t, "source", "policy")
+	labelled, err := LabelRule(rule.components()[0], []string{"secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.diverged.Store(true)
+	if err := store.RecordDeclassification(context.Background(), DeclassificationRecord{
+		AttemptID: "a", Phase: DeclassificationIntent,
+		OccurredAt: time.Date(2026, time.August, 26, 18, 0, 0, 0, time.UTC),
+		SourceURI:  "file:///x",
+		PriorRules: []AccessRule{labelled}, Rule: rule,
+	}); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("persist-first write on a diverged store = %v, want unavailable", err)
+	}
+	store.diverged.Store(false)
+	if records, err := store.Declassifications(context.Background()); err != nil || len(records) != 0 {
+		t.Fatalf("a refused write was recorded: %+v %v", records, err)
+	}
+}
