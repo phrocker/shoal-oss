@@ -333,7 +333,9 @@ timestamp, not by qualifier:
 So an overflow cell above the acknowledgement is damage. That covers every
 overflow entry the registry writes afterwards, whatever its qualifier sorts
 as. An overflow cell at the top of the timestamp space cannot be acknowledged
-and stays damage.
+and stays damage. One near the top uses up the headroom like a delete marker
+there (see "Delete markers"). A head whose acknowledgement is not below its
+own timestamp is not one the registry wrote, and reads as damaged.
 
 Only entry qualifiers the registry could have written (the exact 20-digit
 zero-padded form) count as entries, for recovery and readers alike. Other

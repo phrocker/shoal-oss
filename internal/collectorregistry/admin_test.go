@@ -1723,3 +1723,19 @@ func TestRecoveryLandsAboveAnAcknowledgedOverflow(t *testing.T) {
 		t.Fatalf("head at %d, below the acknowledged overflow at %d: %v", head.Timestamp, int64(far), e)
 	}
 }
+
+// A head whose acknowledgement is not below its own timestamp was not
+// written by the registry: it is damage, not an acknowledgement.
+func TestAForgedAcknowledgementIsDamage(t *testing.T) {
+	v := provisionedEnv(t)
+	cell, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
+	if e != nil {
+		t.Fatal(e)
+	}
+	forged, _ := encode(changeHead{CollectorID: collectorID, Sequence: 1, OverflowAck: math.MaxInt64 - 2})
+	put(t, v, v.registry.changeHeadCoordinate(collectorID), cell.Timestamp+1, forged)
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("Changes over a forged acknowledgement: %v", e)
+	}
+	revokeRecovers(t, v, v.registry, 2, RecoveryUnreadableHead)
+}

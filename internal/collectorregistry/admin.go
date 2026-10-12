@@ -241,7 +241,7 @@ func (r *Registry) readHeadState(ctx context.Context, id shoal.ID) (headState, e
 		// One stored cell can be pinned exactly, whatever its bytes.
 		s.pin = allocator.Condition{Coordinate: coord, Value: bytes.Clone(cell.Value), Timestamp: cell.Timestamp, TimestampSet: true}
 	}
-	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.SegmentStart < 0 || head.SegmentStart > head.Sequence || head.OverflowAck < 0 {
+	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.SegmentStart < 0 || head.SegmentStart > head.Sequence || head.OverflowAck < 0 || head.OverflowAck >= cell.Timestamp {
 		s.damaged = true
 		return s, nil
 	}
