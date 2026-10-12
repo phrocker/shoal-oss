@@ -127,8 +127,8 @@ var oidSubjectAltName = asn1.ObjectIdentifier{2, 5, 29, 17}
 
 // rawURISANs returns the leaf's uniformResourceIdentifier names ([6]
 // IA5String) byte for byte. A SAN extension that does not parse yields
-// none, so it matches no pin; x509.ParseCertificate has already refused a
-// malformed one in any case.
+// none, so it matches no pin. This parse is stricter than
+// x509.ParseCertificate (trailing bytes are refused here), and fails closed.
 func rawURISANs(leaf *x509.Certificate) []string {
 	var uris []string
 	for _, extension := range leaf.Extensions {

@@ -130,19 +130,26 @@ func usableForClientAuth(leaf *x509.Certificate) bool {
 func (c *ClientCertificate) GetClientCertificate(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 	certificate, err := c.load()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err == nil {
 		c.last = certificate
-		return c.last, nil
+		c.mu.Unlock()
+		return certificate, nil
 	}
 	// A broken rotation is reported, at most once a minute, so it is seen
 	// before the last good certificate expires. The report names nothing
-	// from the files.
+	// from the files, and is made outside the lock: a blocked writer must
+	// not stall every other handshake.
+	last := c.last
+	var report func()
 	if c.onReloadFailure != nil && (c.reported.IsZero() || time.Since(c.reported) >= time.Minute) {
 		c.reported = time.Now()
-		c.onReloadFailure()
+		report = c.onReloadFailure
 	}
-	return c.last, nil
+	c.mu.Unlock()
+	if report != nil {
+		report()
+	}
+	return last, nil
 }
 
 // OnReloadFailure sets what is called, at most once a minute, when a

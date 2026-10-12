@@ -204,7 +204,7 @@ func parseServe(args []string, stderr io.Writer) (*serveConfig, error) {
 			_ = journal.Close()
 			return nil, err
 		}
-		certificate.log = stderr
+		certificate.report = server.LogEvent
 		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certificate.get}
 		if clientAuth != nil {
 			// Request, and do not verify, at the handshake: the handshake
@@ -247,10 +247,10 @@ type servingCertificate struct {
 	certFile, keyFile string
 	mu                sync.Mutex
 	last              *tls.Certificate
-	// log receives a failed reload, at most once a minute, so a broken
-	// rotation is seen before the last good certificate expires. The line
-	// names nothing from the files.
-	log      io.Writer
+	// report receives a failed reload (the server's serialized log), at most
+	// once a minute, so a broken rotation is seen before the last good
+	// certificate expires. It names nothing from the files.
+	report   func(event, reason string)
 	reported time.Time
 }
 
@@ -259,26 +259,28 @@ func newServingCertificate(certFile, keyFile string) (*servingCertificate, error
 	if err != nil {
 		return nil, errors.New("TLS certificate and key cannot be loaded")
 	}
-	return &servingCertificate{certFile: certFile, keyFile: keyFile, last: &certificate,
-		log: io.Discard}, nil
+	return &servingCertificate{certFile: certFile, keyFile: keyFile, last: &certificate}, nil
 }
 
 func (s *servingCertificate) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	certificate, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err == nil {
 		s.last = &certificate
-		return s.last, nil
+		s.mu.Unlock()
+		return &certificate, nil
 	}
-	if s.reported.IsZero() || time.Since(s.reported) >= time.Minute {
+	last := s.last
+	report := s.report != nil && (s.reported.IsZero() || time.Since(s.reported) >= time.Minute)
+	if report {
 		s.reported = time.Now()
-		line, _ := json.Marshal(map[string]string{
-			"time": s.reported.UTC().Format(time.RFC3339Nano), "event": "tls_certificate_reload_failed",
-			"detail": "serving the last pair that loaded"})
-		_, _ = s.log.Write(append(line, '\n'))
 	}
-	return s.last, nil
+	s.mu.Unlock()
+	// Outside the lock: a blocked log writer must not stall every handshake.
+	if report {
+		s.report("tls_certificate_reload_failed", "serving_last_loaded_pair")
+	}
+	return last, nil
 }
 
 func loopback(host string) bool {

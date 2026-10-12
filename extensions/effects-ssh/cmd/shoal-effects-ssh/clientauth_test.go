@@ -166,7 +166,7 @@ func TestServingCertificateReloads(t *testing.T) {
 		t.Fatal("the rotated certificate was not served")
 	}
 	var log bytes.Buffer
-	serving.log = &log
+	serving.report = func(event, reason string) { log.WriteString(event + " " + reason + "\n") }
 	_ = os.WriteFile(keyFile, []byte("half written"), 0o600)
 	third, err := serving.get(nil)
 	if err != nil || !bytes.Equal(third.Certificate[0], second.Certificate[0]) {

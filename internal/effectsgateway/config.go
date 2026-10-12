@@ -71,12 +71,16 @@ type Config struct {
 	Capability         string
 	SurfaceName        string
 
-	TargetBaseURL        *url.URL
-	TargetCredential     func() (string, error)
-	TargetAuthHeader     string
-	TargetAllowPrivate   bool
-	IdempotencyHeader    string
-	IdempotencyRetention time.Duration
+	TargetBaseURL    *url.URL
+	TargetCredential func() (string, error)
+	// TargetCredentialNamed is true when -target-credential-env or
+	// -target-credential-file was passed: a credential was configured, so
+	// its absence is breakage even beside a client certificate.
+	TargetCredentialNamed bool
+	TargetAuthHeader      string
+	TargetAllowPrivate    bool
+	IdempotencyHeader     string
+	IdempotencyRetention  time.Duration
 	// TargetTLS is the client certificate presented to the target and the
 	// roots it is verified against (#662); the zero value is no certificate
 	// and the system roots.
@@ -145,7 +149,11 @@ func (c *Config) TargetAuthorization() (header, value string, err error) {
 		return c.TargetAuthHeader, value, nil
 	case errors.Is(err, ErrNoCredential) && isLoopbackHost(c.TargetBaseURL.Hostname()):
 		return "", "", nil
-	case errors.Is(err, ErrNoCredential) && c.TargetTLS.ClientCertificate != nil:
+	case errors.Is(err, ErrNoCredential) && c.TargetTLS.ClientCertificate != nil &&
+		!c.TargetCredentialNamed:
+		// Only the default variable, unset: no credential was configured.
+		// An env variable the operator named is a credential they meant to
+		// send, and its absence (a typo, a Secret never mounted) is refused.
 		return "", "", nil
 	default:
 		return "", "", errors.New("target credential is unavailable")
@@ -327,6 +335,7 @@ func ParseFlags(args []string, output io.Writer) (*Config, error) {
 		chosen["target-credential-env"]); err != nil {
 		return nil, err
 	}
+	config.TargetCredentialNamed = chosen["target-credential-env"] || chosen["target-credential-file"]
 	if config.TargetTLS, err = targetTLSFlags(config.TargetBaseURL,
 		strings.TrimSpace(*targetClientCert), strings.TrimSpace(*targetClientKey),
 		strings.TrimSpace(*targetCA)); err != nil {

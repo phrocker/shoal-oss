@@ -380,7 +380,21 @@ func TestParseFlagsTargetTLS(t *testing.T) {
 	if config.TargetTLS.ClientCertificate == nil || config.TargetTLS.RootCAs == nil {
 		t.Fatal("the TLS settings were not carried")
 	}
-	if header, value, err := config.TargetAuthorization(); err != nil || header != "" || value != "" {
+	// A named variable that is unset is a credential meant and missing:
+	// refused, certificate or not.
+	if _, _, err := config.TargetAuthorization(); err == nil {
+		t.Fatal("an explicitly named, unset credential variable was treated as no credential")
+	}
+	// No credential flag at all, and the default variable unset: the
+	// certificate is the credential.
+	t.Setenv("SHOAL_TARGET_CREDENTIAL", "")
+	certOnly, err := ParseFlags(with(map[string]string{
+		"target-client-cert-file": cert, "target-client-key-file": key, "target-ca-file": ca,
+	}), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header, value, err := certOnly.TargetAuthorization(); err != nil || header != "" || value != "" {
 		t.Fatalf("a client certificate with no credential = %q %q %v", header, value, err)
 	}
 	// Both: the credential is still sent.

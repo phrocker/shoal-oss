@@ -123,9 +123,13 @@ Two credential rules carried over from the LLM gateway: passing the env flag
 beside the file flag is refused even when the env flag is typed as its default,
 and an unset env variable is *absence* while an unreadable file is *breakage*.
 Absence of a target credential is accepted only for a loopback target, or for a
-target the gateway presents a client certificate to, where the certificate is
-the credential. A credential file that is configured and unreadable is refused
-either way.
+target the gateway presents a client certificate to and no credential flag is
+passed, where the certificate is the credential. A credential that is named
+(`-target-credential-env FOO` with `FOO` unset, or an unreadable
+`-target-credential-file`) is refused either way: it was meant to be sent.
+The certificate is presented only when the target's handshake asks for one,
+so a target that does not ask for one receives no credential at all; configure
+both for a target that needs both.
 
 ### Client certificates (mTLS)
 

@@ -172,6 +172,13 @@ type logLine struct {
 	Millis     int64  `json:"duration_ms,omitempty"`
 }
 
+// LogEvent writes one event line through the server's serialized log, for
+// the command's own events (a failed certificate reload). event and reason
+// are fixed strings the caller chooses; never pass a value read from a file.
+func (s *Server) LogEvent(event, reason string) {
+	s.log(logLine{Event: event, Reason: reason})
+}
+
 // log writes one JSON line. It never carries a key (only its digest), a
 // command string, output, a credential or any request header.
 func (s *Server) log(line logLine) {

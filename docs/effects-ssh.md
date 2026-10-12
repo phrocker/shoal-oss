@@ -384,7 +384,7 @@ no unauthenticated mode.
 - **Client certificate.** The gateway presents `-target-client-cert-file`
   (`docs/effects-gateway-deploy.md`, "Client certificates"). This service
   admits it when the chain verifies to `-client-ca-file` for client
-  authentication (extended key usage `clientAuth`, or none), it is within its
+  authentication (extended key usage `clientAuth`, `any`, or none), it is within its
   validity, and the leaf matches at least one `-client-identity`:
   - `uri:<URI>`, a URI SAN compared byte for byte as the CA issued it (no
     normalization of case, fragment or path), such as a SPIFFE ID;
