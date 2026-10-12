@@ -157,8 +157,8 @@ func registryErrors(found map[byte]map[string]bool) []string {
 // TestEveryGuardEntityKindIsRegistered holds every kind the code can write to
 // guard.Entity.Kind, found by type checking every package that depends on the
 // guard, to entityKinds. A value the analysis cannot resolve to a constant
-// fails too, so a kind cannot be hidden from it by how it is spelled or
-// passed.
+// fails too, so how a kind is spelled cannot hide it, and how it is passed
+// can hide it only in the ways kindscan_test.go lists as uncovered.
 func TestEveryGuardEntityKindIsRegistered(t *testing.T) {
 	scanRepository(t)
 	for _, problem := range repositoryScan.problems {
@@ -226,7 +226,7 @@ var kindFixtures = map[string]struct {
 	"quiet": {kinds: []byte{'B'}},
 }
 
-func TestKindAnalysisCannotBeDodgedBySpelling(t *testing.T) {
+func TestKindAnalysisCatchesKnownDodges(t *testing.T) {
 	scanRepository(t)
 	u := repositoryScan.universe
 	directory := filepath.Join(repositoryScan.root,

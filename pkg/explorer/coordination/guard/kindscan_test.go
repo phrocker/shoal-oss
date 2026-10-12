@@ -38,7 +38,18 @@ package guard
 //     followed, including a package go list skips because the build
 //     excludes all of its files.
 //
-// unsafe is not modelled.
+// What it does not cover. Each needs deliberate effort, and nothing like
+// it exists in the repository:
+//   - unsafe.
+//   - A local interface with methods is treated as reached only through
+//     them. Its value is reported when widened to another interface, but not
+//     when a pointer to it, or a container of it, becomes an interface, nor
+//     when a generic passes it on as a type argument. A decoder can then
+//     follow the pointer it holds (json.Unmarshal(b, &h), with h holding an
+//     *Entity). Treating those as escapes reports more than a hundred
+//     ordinary uses of service interfaces such as explorer.Client, whose
+//     values hold such pointers deep down.
+// So this is a strong tripwire, not a proof.
 //
 // The packages analysed are those of this repository's modules (the root
 // module and every module under extensions/) that depend on this package,
