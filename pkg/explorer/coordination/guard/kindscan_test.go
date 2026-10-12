@@ -489,6 +489,11 @@ type kindScan struct {
 	exempted map[string]bool
 	// owners are the named struct types declaring a followed field.
 	owners []types.Type
+	// tainted are the local interfaces some value reaching a followed field
+	// was converted to, and widenings every conversion of a named
+	// interface to another interface (checkWidenings).
+	tainted   map[*types.TypeName]bool
+	widenings []widening
 
 	seenVars    map[*types.Var]bool
 	seenResults map[resultKey]bool
@@ -532,7 +537,7 @@ func newKindScan(root string, fset *token.FileSet, packages []*scannedPackage) *
 		root: root, fset: fset, packages: packages,
 		found:   map[byte]map[string]bool{},
 		foreign: map[string]bool{}, local: map[*types.Package]bool{},
-		exempted: map[string]bool{},
+		exempted: map[string]bool{}, tainted: map[*types.TypeName]bool{},
 		seenVars: map[*types.Var]bool{}, seenResults: map[resultKey]bool{},
 		decls: map[*types.Func]*ast.FuncDecl{}, declPkg: map[*types.Func]*scannedPackage{},
 		params: map[*types.Var]paramSite{}, funcUses: map[*types.Func][]located[*ast.Ident]{},
@@ -1121,6 +1126,7 @@ func scanKinds(t *testing.T, root string, u *universe, packages []*scannedPackag
 	scan.checkExcluded(u.excluded)
 	scan.checkIdentical()
 	scan.checkEscapes()
+	scan.checkWidenings()
 	sort.Strings(scan.problems)
 	return scan
 }
@@ -1145,8 +1151,19 @@ var readOnlyReflection = map[string]bool{
 	"fmt.Sprint": true, "fmt.Sprintf": true, "fmt.Sprintln": true,
 	"fmt.Print": true, "fmt.Printf": true, "fmt.Println": true,
 	"fmt.Fprint": true, "fmt.Fprintf": true, "fmt.Fprintln": true,
-	"fmt.Errorf": true, "fmt.Append": true, "fmt.Appendf": true, "fmt.Appendln": true,
+	"fmt.Append": true, "fmt.Appendf": true, "fmt.Appendln": true,
+	"log.Print": true, "log.Printf": true, "log.Println": true,
+	"log.Fatal": true, "log.Fatalf": true, "log.Fatalln": true,
+	"log.Panic": true, "log.Panicf": true, "log.Panicln": true,
+	"(*log.Logger).Print": true, "(*log.Logger).Printf": true, "(*log.Logger).Println": true,
+	// Not fmt.Errorf: %w keeps its operand and errors.Unwrap hands it back.
+	// Not log/slog: an Attr keeps its value for any handler.
 }
+
+// movingGenerics are standard packages whose generic functions only copy,
+// compare and reorder whole values of their type arguments. Instantiating
+// one with a type that reaches a followed field is not an escape.
+var movingGenerics = map[string]bool{"slices": true, "maps": true}
 
 // decodedEntities are the places allowed to hand reflection a value that
 // reaches a followed field, keyed by file and enclosing function. Each reads
@@ -1270,12 +1287,17 @@ func (s *kindScan) reaches(typ types.Type, settable bool, seen map[settableKey]b
 func (s *kindScan) checkEscapes() {
 	for _, pkg := range s.packages {
 		for ident, instance := range pkg.info.Instances {
+			if object := pkg.info.Uses[ident]; object != nil && object.Pkg() != nil &&
+				movingGenerics[object.Pkg().Path()] {
+				continue
+			}
 			for i := 0; i < instance.TypeArgs.Len(); i++ {
 				argument := instance.TypeArgs.At(i)
 				if s.reaches(argument, true, map[settableKey]bool{}) {
 					s.problems = append(s.problems, fmt.Sprintf(
 						"%s: %s is instantiated with %s, which reaches a kind field, "+
-							"so what its body writes goes unseen",
+							"so its body, which this analysis reads once and not per "+
+							"instance, can write one unseen",
 						s.position(ident.Pos()), ident.Name, argument))
 				}
 			}
@@ -1296,30 +1318,57 @@ func (s *kindScan) escapesIn(pkg *scannedPackage, decl ast.Decl, fn string) {
 	info := pkg.info
 	var stack []ast.Node
 	var signatures []*types.Signature
-	escape := func(expr ast.Expr, destination types.Type) {
-		if destination == nil || !types.IsInterface(destination) {
+	escapeType := func(node ast.Node, source, destination types.Type) {
+		if source == nil || destination == nil || !types.IsInterface(destination) {
+			return
+		}
+		if types.IsInterface(source) {
+			// Widening one interface to another. It matters only from a
+			// local interface that an exempt conversion below filled.
+			if named, ok := source.(*types.Named); ok && !types.Identical(source, destination) {
+				s.widenings = append(s.widenings, widening{s.position(node.Pos()), named, destination})
+			}
+			return
+		}
+		if !s.reaches(source, false, map[settableKey]bool{}) {
 			return
 		}
 		// A named interface with methods, declared in a package this
 		// analysis type checks, is reached only through those methods,
-		// whose bodies it reads.
+		// whose bodies it reads, unless it is widened (checkWidenings).
 		if named, ok := destination.(*types.Named); ok && named.Obj().Pkg() != nil &&
 			s.local[named.Obj().Pkg()] &&
 			destination.Underlying().(*types.Interface).NumMethods() != 0 {
+			s.tainted[named.Obj()] = true
 			return
 		}
-		source := info.Types[expr].Type
-		if source == nil || types.IsInterface(source) ||
-			!s.reaches(source, false, map[settableKey]bool{}) {
-			return
-		}
-		key := s.relative(expr.Pos()) + ":" + fn
+		key := s.relative(node.Pos()) + ":" + fn
 		if _, ok := decodedEntities[key]; ok {
 			s.exempted[key] = true
 			return
 		}
-		s.problem(expr, "%s, from which reflection can set a kind field, becomes %s",
+		s.problem(node, "%s, from which reflection can set a kind field, becomes %s",
 			source, destination)
+	}
+	escape := func(expr ast.Expr, destination types.Type) {
+		escapeType(expr, info.Types[expr].Type, destination)
+	}
+	// escapeAll checks values flowing into destinations, where values is
+	// either one expression per destination or one multi-valued call.
+	escapeAll := func(values []ast.Expr, destinations []types.Type) {
+		if len(values) == 1 && len(destinations) > 1 {
+			if tuple, ok := info.Types[values[0]].Type.(*types.Tuple); ok {
+				for i := 0; i < tuple.Len() && i < len(destinations); i++ {
+					escapeType(values[0], tuple.At(i).Type(), destinations[i])
+				}
+			}
+			return
+		}
+		for i, value := range values {
+			if i < len(destinations) {
+				escape(value, destinations[i])
+			}
+		}
 	}
 	ast.Inspect(decl, func(node ast.Node) bool {
 		if node == nil {
@@ -1339,6 +1388,11 @@ func (s *kindScan) escapesIn(pkg *scannedPackage, decl ast.Decl, fn string) {
 		case *ast.FuncLit:
 			signature, _ := info.Types[n].Type.(*types.Signature)
 			signatures = append(signatures, signature)
+		case *ast.TypeAssertExpr:
+			// x.(I) widens x's interface to I as surely as a conversion.
+			if n.Type != nil {
+				escapeType(n, info.Types[n.X].Type, info.Types[n.Type].Type)
+			}
 		case *ast.CallExpr:
 			tv := info.Types[n.Fun]
 			if tv.IsType() {
@@ -1367,39 +1421,62 @@ func (s *kindScan) escapesIn(pkg *scannedPackage, decl ast.Decl, fn string) {
 				break
 			}
 			params := signature.Params()
-			for i, argument := range n.Args {
-				var destination types.Type
+			count := params.Len()
+			if len(n.Args) == 0 {
+				break
+			}
+			if tuple, ok := info.Types[n.Args[0]].Type.(*types.Tuple); len(n.Args) == 1 && ok {
+				count = max(count, tuple.Len())
+			} else {
+				count = max(count, len(n.Args))
+			}
+			destinations := make([]types.Type, count)
+			for i := range destinations {
 				switch {
 				case signature.Variadic() && i >= params.Len()-1:
-					destination = params.At(params.Len() - 1).Type()
+					destinations[i] = params.At(params.Len() - 1).Type()
 					if !n.Ellipsis.IsValid() {
-						destination = destination.(*types.Slice).Elem()
+						destinations[i] = destinations[i].(*types.Slice).Elem()
 					}
 				case i < params.Len():
-					destination = params.At(i).Type()
+					destinations[i] = params.At(i).Type()
 				}
-				escape(argument, destination)
 			}
+			escapeAll(n.Args, destinations)
 		case *ast.AssignStmt:
-			if n.Tok == token.ASSIGN && len(n.Lhs) == len(n.Rhs) {
-				for i := range n.Lhs {
-					escape(n.Rhs[i], info.Types[n.Lhs[i]].Type)
+			if n.Tok == token.ASSIGN {
+				destinations := make([]types.Type, len(n.Lhs))
+				for i, lhs := range n.Lhs {
+					destinations[i] = info.Types[lhs].Type
+				}
+				escapeAll(n.Rhs, destinations)
+			}
+		case *ast.RangeStmt:
+			if n.Tok == token.ASSIGN {
+				key, value := rangeTypes(info.Types[n.X].Type)
+				if n.Key != nil {
+					escapeType(n.Key, key, info.Types[n.Key].Type)
+				}
+				if n.Value != nil {
+					escapeType(n.Value, value, info.Types[n.Value].Type)
 				}
 			}
 		case *ast.ValueSpec:
-			if n.Type != nil && len(n.Values) == len(n.Names) {
-				for _, value := range n.Values {
-					escape(value, info.Types[n.Type].Type)
+			if n.Type != nil {
+				destinations := make([]types.Type, len(n.Names))
+				for i := range destinations {
+					destinations[i] = info.Types[n.Type].Type
 				}
+				escapeAll(n.Values, destinations)
 			}
 		case *ast.ReturnStmt:
 			if len(signatures) != 0 && signatures[len(signatures)-1] != nil {
 				results := signatures[len(signatures)-1].Results()
-				if len(n.Results) == results.Len() {
-					for i, result := range n.Results {
-						escape(result, results.At(i).Type())
-					}
+				destinations := make([]types.Type, results.Len())
+				for i := range destinations {
+					destinations[i] = results.At(i).Type()
 				}
+				escapeAll(n.Results, destinations)
 			}
 		case *ast.SendStmt:
 			if channel, ok := info.Types[n.Chan].Type.Underlying().(*types.Chan); ok {
@@ -1447,6 +1524,64 @@ func (s *kindScan) escapesIn(pkg *scannedPackage, decl ast.Decl, fn string) {
 		}
 		return true
 	})
+}
+
+// rangeTypes are the key and value types a range over typ yields.
+func rangeTypes(typ types.Type) (types.Type, types.Type) {
+	if typ == nil {
+		return nil, nil
+	}
+	switch t := typ.Underlying().(type) {
+	case *types.Pointer:
+		if array, ok := t.Elem().Underlying().(*types.Array); ok {
+			return types.Typ[types.Int], array.Elem()
+		}
+	case *types.Slice:
+		return types.Typ[types.Int], t.Elem()
+	case *types.Array:
+		return types.Typ[types.Int], t.Elem()
+	case *types.Map:
+		return t.Key(), t.Elem()
+	case *types.Chan:
+		return t.Elem(), nil
+	case *types.Signature:
+		// A range-over-func iterator yields its yield function's
+		// parameters.
+		if t.Params().Len() == 1 {
+			if yield, ok := t.Params().At(0).Type().Underlying().(*types.Signature); ok {
+				params := yield.Params()
+				var key, value types.Type
+				if params.Len() > 0 {
+					key = params.At(0).Type()
+				}
+				if params.Len() > 1 {
+					value = params.At(1).Type()
+				}
+				return key, value
+			}
+		}
+	}
+	return nil, nil
+}
+
+type widening struct {
+	at          token.Position
+	source      *types.Named
+	destination types.Type
+}
+
+// checkWidenings reports every widening, to another interface, of a local
+// interface that holds a value from which reflection can set a followed
+// field. Past that point the value is no longer reached only through the
+// interface's methods.
+func (s *kindScan) checkWidenings() {
+	for _, w := range s.widenings {
+		if s.tainted[w.source.Obj()] {
+			s.problems = append(s.problems, fmt.Sprintf(
+				"%s: %s, which can hold a value from which reflection can set a "+
+					"kind field, becomes %s", w.at, w.source, w.destination))
+		}
+	}
 }
 
 func (s *kindScan) position(pos token.Pos) token.Position {

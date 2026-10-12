@@ -216,6 +216,14 @@ var kindFixtures = map[string]struct {
 	"genericdecode": {problems: []string{"decode is instantiated with github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard.Entity"}},
 	"jsonfield":     {problems: []string{"*kindspelling/jsonfield.req, from which reflection can set a kind field, becomes any"}},
 	"reflectw":      {problems: []string{"from which reflection can set a kind field, becomes any"}},
+	// From the second review.
+	"localiface":  {problems: []string{"kindspelling/localiface.holder, which can hold a value from which reflection can set a kind field, becomes any"}},
+	"tuplecall":   {problems: []string{"*github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard.Entity, from which reflection can set a kind field, becomes any"}},
+	"tuplereturn": {problems: []string{"tuplereturn/fixture.go:17:", "tuplereturn/fixture.go:21:"}},
+	"rangeassign": {problems: []string{"*github.com/phrocker/shoal-oss/pkg/explorer/coordination/guard.Entity, from which reflection can set a kind field, becomes any"}},
+	"errorf":      {problems: []string{"*kindspelling/errorf.carrier, from which reflection can set a kind field, becomes any"}},
+	// Ordinary code the analysis must not report: slices and log.
+	"quiet": {kinds: []byte{'B'}},
 }
 
 func TestKindAnalysisCannotBeDodgedBySpelling(t *testing.T) {
