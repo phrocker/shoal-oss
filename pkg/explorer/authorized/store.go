@@ -196,8 +196,11 @@ type PolicyStore interface {
 	// so a later retry completing that narrowing can be told apart from one
 	// whose claim no reason-checked intent produced.
 	BindDeclassificationClaim(context.Context, string, uint64, shoal.ID) error
+	// CloseDeclassificationClaim durably ends a bound claim version's
+	// lineage once its narrowing is registered.
+	CloseDeclassificationClaim(context.Context, string, uint64) error
 	// DeclassificationClaimIntent returns the intent a source claim version
-	// is bound to, if any, by exact lookup.
+	// is bound to, if any and while its lineage is open, by exact lookup.
 	DeclassificationClaimIntent(
 		context.Context, string, uint64,
 	) (DeclassificationRecord, bool, error)
@@ -242,6 +245,8 @@ type MemoryPolicyStore struct {
 	// declassificationClaims binds source claim versions to the intent they
 	// descend from.
 	declassificationClaims map[declassificationClaimKey]shoal.ID
+	// closedDeclassificationClaims marks bound versions whose lineage ended.
+	closedDeclassificationClaims map[declassificationClaimKey]struct{}
 }
 
 // NewMemoryPolicyStore constructs an empty reference catalog.

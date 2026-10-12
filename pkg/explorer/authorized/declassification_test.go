@@ -1333,3 +1333,147 @@ func TestDeclassificationOrdinaryIngestKeepsClaimCommitOnApply(t *testing.T) {
 		}
 	})
 }
+
+// TestDeclassificationPendedInheritingRetryKeepsLineage pins D1 of the sixth
+// review: an inheriting retry whose base write is indeterminate pends its
+// claim version, and that version is already bound (before the base write),
+// so any claim holder can still complete the narrowing afterwards.
+func TestDeclassificationPendedInheritingRetryKeepsLineage(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, inner authorized.PolicyStore) {
+		f := newFixture(t)
+		store := &failingDeclassificationStore{
+			PolicyStore: inner, fail: map[int]bool{2: true}}
+		client := f.declassificationClient(t, store, true)
+		const uri = "file:///declassify/pended-retry.txt"
+		first, err := client.Ingest(f.labelIngester(t, "owner", "secret"),
+			labelledSource(uri, "secret", "secret"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Ingest(withReason(t, f.labelIngester(t, "owner", "secret"), "r"),
+			labelledSource(uri, "public", "")); err == nil {
+			t.Fatal("pre-commit failure ignored")
+		}
+		indeterminate := &ingestOverrideClient{
+			Client: f.base,
+			ingest: func(ctx context.Context, source explorer.Source) (explorer.IngestResult, error) {
+				if _, err := f.base.Ingest(ctx, source); err != nil {
+					return explorer.IngestResult{}, err
+				}
+				return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(
+					shoal.NewError(shoal.ErrorUnavailable, "indeterminate"))
+			},
+		}
+		flaky := f.declassificationClientOver(t, indeterminate, store, true)
+		if _, err := flaky.Ingest(f.labelIngester(t, "retrier-1"),
+			labelledSource(uri, "public, retry 1", "")); !explorer.IsIndeterminateCommit(err) {
+			t.Fatalf("indeterminate retry = %v", err)
+		}
+		if claim, ok, err := inner.SourceClaim(context.Background(), uri); err != nil || !ok || !claim.Pending {
+			t.Fatalf("claim after the indeterminate retry = %+v %v %v, want pending", claim, ok, err)
+		}
+		second, err := client.Ingest(f.labelIngester(t, "retrier-2"),
+			labelledSource(uri, "public, retry 1", ""))
+		if err != nil {
+			t.Fatalf("retry after a pended inheriting retry = %v, want reconciliation", err)
+		}
+		current, ok, err := inner.CurrentRevision(context.Background(), first.Document.ID)
+		if err != nil || !ok || current.RevisionID != second.Revision.ID {
+			t.Fatalf("current = %+v %v %v", current, ok, err)
+		}
+	})
+}
+
+// TestDeclassificationCompletedNarrowingEndsLineage pins D2 of the sixth
+// review: once a narrowing is registered its lineage is closed, so the next
+// ordinary ingest is not an inheriting retry. It commits its claim on apply,
+// as before #630, even when a later step fails, and writes no binding.
+func TestDeclassificationCompletedNarrowingEndsLineage(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, inner authorized.PolicyStore) {
+		f := newFixture(t)
+		store := &bindCountingStore{PolicyStore: inner}
+		base := &flakyDocumentsBase{Client: f.base}
+		client := f.declassificationClientOver(t, base, store, false)
+		const uri = "file:///declassify/lineage-ends.txt"
+		owner := f.labelIngester(t, "owner", "secret", "x")
+		if _, err := client.Ingest(owner, labelledSource(uri, "secret", "secret")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Ingest(owner, labelledSource(uri, "public", "")); err != nil {
+			t.Fatal(err)
+		}
+		binds := store.count()
+		before, _, err := inner.SourceClaim(context.Background(), uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := inner.DeclassificationClaimIntent(context.Background(), uri, before.Version); err != nil || ok {
+			t.Fatalf("lineage of a completed narrowing is still open: %v %v", ok, err)
+		}
+		base.mu.Lock()
+		base.armed = true
+		base.mu.Unlock()
+		if _, err := client.Ingest(owner, labelledSource(uri, "x", "x")); err == nil {
+			t.Fatal("base flake ignored")
+		}
+		after, ok, err := inner.SourceClaim(context.Background(), uri)
+		if err != nil || !ok || after.Pending || after.Version == before.Version ||
+			after.Rule.String() == before.Rule.String() {
+			t.Fatalf("claim after an applied ordinary ingest failed later = %+v (before %+v) %v %v",
+				after, before, ok, err)
+		}
+		if store.count() != binds {
+			t.Fatalf("an ordinary ingest after a completed narrowing wrote a binding")
+		}
+	})
+}
+
+// TestDeclassificationClosedLineageSurvivesReopen pins that a closed lineage
+// stays closed across a durable reopen, while an open one stays open.
+func TestDeclassificationClosedLineageSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	durable, err := authorized.OpenDurablePolicyStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t)
+	client := f.declassificationClient(t, durable, false)
+	const done, lagging = "file:///declassify/closed.txt", "file:///declassify/open.txt"
+	owner := f.labelIngester(t, "owner", "secret")
+	for _, uri := range []string{done, lagging} {
+		if _, err := client.Ingest(owner, labelledSource(uri, "secret "+uri, "secret")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := client.Ingest(owner, labelledSource(done, "public", "")); err != nil {
+		t.Fatal(err)
+	}
+	failing := &failingDeclassificationStore{
+		PolicyStore: durable, fail: map[int]bool{2: true}}
+	if _, err := f.declassificationClient(t, failing, false).Ingest(owner,
+		labelledSource(lagging, "public", "")); err == nil {
+		t.Fatal("pre-commit failure ignored")
+	}
+	versions := map[string]uint64{}
+	for _, uri := range []string{done, lagging} {
+		claim, ok, err := durable.SourceClaim(context.Background(), uri)
+		if err != nil || !ok {
+			t.Fatalf("claim %s: %v %v", uri, ok, err)
+		}
+		versions[uri] = claim.Version
+	}
+	if err := durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := authorized.OpenDurablePolicyStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if _, ok, err := reopened.DeclassificationClaimIntent(context.Background(), done, versions[done]); err != nil || ok {
+		t.Fatalf("completed narrowing's lineage reopened open: %v %v", ok, err)
+	}
+	if _, ok, err := reopened.DeclassificationClaimIntent(context.Background(), lagging, versions[lagging]); err != nil || !ok {
+		t.Fatalf("lagging narrowing's lineage reopened closed: %v %v", ok, err)
+	}
+}

@@ -825,6 +825,7 @@ var (
 		"RecordDeclassification": {}, "Declassifications": {},
 		// Claim-lineage binding and its exact lookup, used only by Ingest.
 		"BindDeclassificationClaim": {}, "DeclassificationClaimIntent": {},
+		"CloseDeclassificationClaim": {},
 	}
 )
 

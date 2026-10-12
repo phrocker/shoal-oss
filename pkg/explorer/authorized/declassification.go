@@ -120,12 +120,15 @@ package authorized
 //     works like this: every claim version created by a CAS that followed an
 //     intent is bound to that intent (BindDeclassificationClaim, written
 //     before the base). A later ingest that records no intent and keeps
-//     every component of the replaced claim's rule inherits the replaced
-//     version's binding, but only when its pre-commit check actually
-//     reconciles through it; it then binds its own version before
-//     recording, so a further retry still descends. Ordinary re-ingests
-//     write nothing, and the lineage of a completed narrowing ends at the
-//     next ingest. "Covering" means the same URI, the selected rule keeping
+//     every component of the replaced claim's rule and of the bound
+//     intent's rule inherits that binding while the lineage is open: its
+//     own version is bound to the same intent, also before the base write,
+//     so the lineage survives its failures, pends and restarts. When an
+//     ingest on a bound version registers its revision as current, the
+//     narrowing no longer lags, and the lineage is closed
+//     (CloseDeclassificationClaim). Ordinary later ingests therefore
+//     inherit nothing, write nothing, and keep the pre-#630 claim commit on
+//     apply. "Covering" means the same URI, the selected rule keeping
 //     every component of the intent's rule (a retry may be stricter), and
 //     the current registration's rule being exactly one of the intent's
 //     replaced rules. Here the claim already holds the narrow rule while the
@@ -495,7 +498,7 @@ func (c *Client) declassificationCommit(
 	documentID, revisionID shoal.ID,
 	selected AccessRule,
 	attempt *declassificationAttempt,
-	lineage declassificationClaimLineage,
+	claimVersion uint64,
 ) error {
 	current, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
 	if err != nil {
@@ -523,8 +526,9 @@ func (c *Client) declassificationCommit(
 		return nil
 	}
 	if uncovered {
-		reconciled, err := c.reconcileClaimLineage(
-			ctx, sourceURI, lineage, attempt == nil, selected, current.Rule)
+		covering, err := c.claimIntentCovers(
+			ctx, sourceURI, claimVersion, selected, current.Rule)
+		reconciled := covering != ""
 		if err != nil {
 			return err
 		}
@@ -599,58 +603,12 @@ func containsRule(rules []AccessRule, rule AccessRule) bool {
 	return false
 }
 
-// declassificationClaimLineage is what an Ingest knows about its claim's
-// descent: the claim version it holds, and the version of the claim it
-// replaced when the replacement recorded no intent and kept every component
-// of that claim's rule (zero otherwise).
-type declassificationClaimLineage struct {
-	version      uint64
-	priorVersion uint64
-}
-
-// reconcileClaimLineage reports whether the claim this ingest holds descends
-// from an intent that covers narrowing prior to selected. Such an intent has
-// the same URI, a rule whose every component selected keeps (a retry may
-// choose a stricter rule), and prior exactly among its replaced rules. Only
-// such an intent passed the reason policy for this narrowing on this claim's
-// lineage.
-//
-// The intent is the one bound to the held claim version. Or, when this ingest
-// recorded no intent (carry is true) and its claim replaced one without
-// dropping a component, it is the one bound to that replaced version; the
-// held version is then bound to it as well, before the narrowing is recorded
-// or registered, so a further retry still descends from it. Lineage is thus
-// carried only by a retry that actually reconciles. An ordinary re-ingest
-// writes nothing, and the lineage of a completed narrowing ends at the next
-// ingest.
-func (c *Client) reconcileClaimLineage(
-	ctx context.Context,
-	sourceURI string,
-	lineage declassificationClaimLineage,
-	carry bool,
-	selected, prior AccessRule,
-) (bool, error) {
-	if covered, err := c.claimIntentCovers(
-		ctx, sourceURI, lineage.version, selected, prior); err != nil || covered != "" {
-		return covered != "", err
-	}
-	if !carry || lineage.priorVersion == 0 {
-		return false, nil
-	}
-	covered, err := c.claimIntentCovers(
-		ctx, sourceURI, lineage.priorVersion, selected, prior)
-	if err != nil || covered == "" {
-		return false, err
-	}
-	if err := c.policyStore.BindDeclassificationClaim(
-		ctx, sourceURI, lineage.version, covered); err != nil {
-		return false, policyCatalogWriteError(ctx, err)
-	}
-	return true, nil
-}
-
-// claimIntentCovers returns the attempt ID of the intent bound to
-// (sourceURI, version) when it covers narrowing prior to selected, or "".
+// claimIntentCovers returns the attempt ID of the intent the held claim
+// version (sourceURI, version) is bound to, while that lineage is open, when
+// it covers narrowing prior to selected, or "". Covering means the same URI,
+// a rule whose every component selected keeps (a retry may choose a stricter
+// rule), and prior exactly among its replaced rules. Only such an intent
+// passed the reason policy for this narrowing on this claim's lineage.
 func (c *Client) claimIntentCovers(
 	ctx context.Context,
 	sourceURI string,
@@ -673,32 +631,39 @@ func (c *Client) claimIntentCovers(
 	return intent.AttemptID, nil
 }
 
-// declassificationPriorVersion returns the replaced claim version a retry may
-// inherit lineage from: the existing claim's, when this ingest recorded no
-// intent, its rule keeps every component of the existing claim's rule, and
-// that version is bound to an intent whose rule it also keeps. A
-// selected rule that narrows the existing claim always records its own intent,
-// so the rule test is defensive.
-func (c *Client) declassificationPriorVersion(
+// declassificationLineage returns the intent the new claim version must be
+// bound to before the base is written, or "". That is this ingest's own
+// intent, if it recorded one. Otherwise, it is the intent the replaced claim
+// version is bound to, while that lineage is open (its narrowing has not yet
+// been registered) and the selected rule keeps every component of both the
+// replaced claim's rule and the intent's rule. So a retry completing a lagging
+// narrowing (#665) stays on its lineage across failures, pends and restarts,
+// and a claim created without an intent never acquires one. Once a narrowing
+// is registered its lineage is closed, so ordinary later ingests inherit
+// nothing and write nothing. A selected rule that narrows the replaced claim
+// always records its own intent, so that rule test is defensive.
+func (c *Client) declassificationLineage(
 	ctx context.Context,
 	sourceURI string,
 	existing *SourcePolicyClaim,
 	selected AccessRule,
 	attempt *declassificationAttempt,
-) (uint64, error) {
-	if attempt != nil || existing == nil ||
-		ruleNarrows(existing.Rule, selected) {
-		return 0, nil
+) (shoal.ID, error) {
+	if attempt != nil {
+		return attempt.id, nil
+	}
+	if existing == nil || ruleNarrows(existing.Rule, selected) {
+		return "", nil
 	}
 	intent, ok, err := c.policyStore.DeclassificationClaimIntent(
 		ctx, sourceURI, existing.Version)
 	if err != nil {
-		return 0, policyCatalogReadError(ctx, err)
+		return "", policyCatalogReadError(ctx, err)
 	}
 	if !ok || ruleNarrows(intent.Rule, selected) {
-		return 0, nil
+		return "", nil
 	}
-	return existing.Version, nil
+	return intent.AttemptID, nil
 }
 
 func appendDistinctRule(rules []AccessRule, rule AccessRule) []AccessRule {
@@ -944,8 +909,58 @@ func (s *MemoryPolicyStore) declassificationIntentLocked(
 	return s.declassifications[index], true
 }
 
+// CloseDeclassificationClaim ends the lineage of a bound source claim
+// version: its narrowing has been registered, so nothing lags behind it.
+// Closing an unbound version is refused; closing twice is a no-op.
+func (s *MemoryPolicyStore) CloseDeclassificationClaim(
+	ctx context.Context,
+	sourceURI string,
+	version uint64,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeDeclassificationClaimLocked(sourceURI, version)
+}
+
+func (s *MemoryPolicyStore) checkCloseDeclassificationClaimLocked(
+	sourceURI string,
+	version uint64,
+) (bool, error) {
+	key := declassificationClaimKey{sourceURI: sourceURI, version: version}
+	if _, bound := s.declassificationClaims[key]; !bound {
+		return false, shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification claim to close is not bound")
+	}
+	_, closed := s.closedDeclassificationClaims[key]
+	return closed, nil
+}
+
+func (s *MemoryPolicyStore) closeDeclassificationClaimLocked(
+	sourceURI string,
+	version uint64,
+) error {
+	closed, err := s.checkCloseDeclassificationClaimLocked(sourceURI, version)
+	if err != nil || closed {
+		return err
+	}
+	if s.closedDeclassificationClaims == nil {
+		s.closedDeclassificationClaims = make(map[declassificationClaimKey]struct{})
+	}
+	s.closedDeclassificationClaims[declassificationClaimKey{
+		sourceURI: sourceURI, version: version,
+	}] = struct{}{}
+	return nil
+}
+
 // DeclassificationClaimIntent returns the intent record source claim version
-// version of sourceURI is bound to, if any. It is an exact indexed read.
+// version of sourceURI is bound to, if any and only while that lineage is
+// open (not closed). It is an exact indexed read.
 func (s *MemoryPolicyStore) DeclassificationClaimIntent(
 	ctx context.Context,
 	sourceURI string,
@@ -959,10 +974,12 @@ func (s *MemoryPolicyStore) DeclassificationClaimIntent(
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	attemptID, ok := s.declassificationClaims[declassificationClaimKey{
-		sourceURI: sourceURI, version: version,
-	}]
+	key := declassificationClaimKey{sourceURI: sourceURI, version: version}
+	attemptID, ok := s.declassificationClaims[key]
 	if !ok {
+		return DeclassificationRecord{}, false, nil
+	}
+	if _, closed := s.closedDeclassificationClaims[key]; closed {
 		return DeclassificationRecord{}, false, nil
 	}
 	intent, ok := s.declassificationIntentLocked(attemptID)

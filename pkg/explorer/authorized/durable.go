@@ -307,8 +307,7 @@ func (s *DurablePolicyStore) load() error {
 			); err != nil {
 				return corruptPolicyRecord("declassification claim binding", err)
 			}
-			if string(policyDeclassificationClaimRow(
-				record.SourceURI, record.Version)) != rowStr {
+			if string(policyDeclassificationClaimRowFor(record)) != rowStr {
 				return corruptPolicyRecord("declassification claim binding",
 					fmt.Errorf("declassification claim binding row does not match its record"))
 			}

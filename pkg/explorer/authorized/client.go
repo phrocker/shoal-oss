@@ -281,7 +281,7 @@ func (c *Client) Ingest(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}
-	claim, declassification, priorClaimVersion, err := c.claimSourceMutation(
+	claim, declassification, lineage, err := c.claimSourceMutation(
 		ctx, ownedSource.URI, decision, rule, now)
 	if err != nil {
 		return explorer.IngestResult{}, err
@@ -312,14 +312,14 @@ func (c *Client) Ingest(
 			}
 		}
 	}()
-	// Bind the new claim version to this ingest's intent before the base
-	// is written, so a later retry can complete this narrowing as a
+	// Bind the new claim version to the intent it descends from (this
+	// ingest's own, or one inherited from a lagging narrowing) before the
+	// base is written, so a later retry can complete that narrowing as a
 	// reconciliation and nothing else can (#630). A failure rolls the
-	// claim back.
-	if declassification != nil {
+	// claim back; a later pend or commit keeps the bound version.
+	if lineage != "" {
 		if err := c.policyStore.BindDeclassificationClaim(
-			ctx, ownedSource.URI, claim.Version,
-			declassification.id); err != nil {
+			ctx, ownedSource.URI, claim.Version, lineage); err != nil {
 			return explorer.IngestResult{}, policyCatalogWriteError(ctx, err)
 		}
 	}
@@ -333,14 +333,7 @@ func (c *Client) Ingest(
 		}
 		return explorer.IngestResult{}, err
 	}
-	// A retry that may inherit declassification lineage from the claim it
-	// replaced (#630) must not commit its new claim version before its
-	// pre-commit check has bound that version, or a failure in between
-	// would leave an unbound version in place of the bound one and lose
-	// the lineage for good. Until then a failure rolls the claim back to
-	// the bound version, which still authorizes the retry.
-	inheritsLineage := priorClaimVersion != 0
-	if result.Disposition == explorer.IngestApplied && !inheritsLineage {
+	if result.Disposition == explorer.IngestApplied {
 		claimOutcome = sourceClaimCommit
 	}
 	view, err := c.base.Document(
@@ -386,15 +379,9 @@ func (c *Client) Ingest(
 	if current {
 		if err := c.declassificationCommit(
 			ctx, decision, now, ownedSource.URI, result.Document.ID,
-			result.Revision.ID, rule, declassification,
-			declassificationClaimLineage{
-				version: claim.Version, priorVersion: priorClaimVersion,
-			},
+			result.Revision.ID, rule, declassification, claim.Version,
 		); err != nil {
 			return explorer.IngestResult{}, err
-		}
-		if inheritsLineage && result.Disposition == explorer.IngestApplied {
-			claimOutcome = sourceClaimCommit
 		}
 	}
 	if err := c.policyStore.PutRevision(ctx, RevisionRegistration{
@@ -410,6 +397,15 @@ func (c *Client) Ingest(
 	}
 	if current {
 		claimOutcome = sourceClaimCommit
+		// The registration is current, so no narrowing lags behind this
+		// claim version any more: end its lineage, so later ingests
+		// inherit nothing and write nothing (#630).
+		if lineage != "" {
+			if err := c.policyStore.CloseDeclassificationClaim(
+				ctx, ownedSource.URI, claim.Version); err != nil {
+				return explorer.IngestResult{}, policyCatalogWriteError(ctx, err)
+			}
+		}
 	}
 	sectionCount, spanCount := documentViewCounts(view)
 	cloned := explorer.IngestResult{
@@ -461,21 +457,21 @@ const (
 // selected one, a selected rule that narrows any replaced rule is audited
 // (declassificationIntent) before the claim is swapped, and the returned
 // attempt carries that audit to the registration step (#630). The returned
-// version is the replaced claim version this ingest may inherit declassification
-// lineage from (see declassificationPriorVersion), or zero.
+// lineage is the intent the new claim version must be bound to before the
+// base is written (see declassificationLineage), or empty.
 func (c *Client) claimSourceMutation(
 	ctx context.Context,
 	sourceURI string,
 	decision auth.Decision,
 	selectedRule AccessRule,
 	now time.Time,
-) (SourcePolicyClaim, *declassificationAttempt, uint64, error) {
+) (SourcePolicyClaim, *declassificationAttempt, shoal.ID, error) {
 	if err := validateSourceURI(sourceURI); err != nil {
-		return SourcePolicyClaim{}, nil, 0, err
+		return SourcePolicyClaim{}, nil, "", err
 	}
 	existingClaim, claimed, err := c.policyStore.SourceClaim(ctx, sourceURI)
 	if err != nil {
-		return SourcePolicyClaim{}, nil, 0, policyCatalogReadError(ctx, err)
+		return SourcePolicyClaim{}, nil, "", policyCatalogReadError(ctx, err)
 	}
 	var expected *SourcePolicyClaim
 	var priorRules []AccessRule
@@ -484,10 +480,10 @@ func (c *Client) claimSourceMutation(
 		allowed, ruleErr := sourceClaimAllowsMutation(
 			existingClaim, selectedRule, decision, now)
 		if ruleErr != nil {
-			return SourcePolicyClaim{}, nil, 0, ruleErr
+			return SourcePolicyClaim{}, nil, "", ruleErr
 		}
 		if !allowed {
-			return SourcePolicyClaim{}, nil, 0, auth.ObjectNotFound()
+			return SourcePolicyClaim{}, nil, "", auth.ObjectNotFound()
 		}
 		expected = &existingClaim
 		priorRules = append(priorRules, existingClaim.Rule)
@@ -498,7 +494,7 @@ func (c *Client) claimSourceMutation(
 		legacy, err := c.authorizeLegacySource(
 			ctx, sourceURI, decision, now)
 		if err != nil {
-			return SourcePolicyClaim{}, nil, 0, err
+			return SourcePolicyClaim{}, nil, "", err
 		}
 		if legacy != nil {
 			priorRules = append(priorRules, legacy.Rule)
@@ -510,36 +506,36 @@ func (c *Client) claimSourceMutation(
 		ctx, decision, now, sourceURI, selectedRule, priorRules,
 		legacyDocument, legacyRevision)
 	if err != nil {
-		return SourcePolicyClaim{}, nil, 0, err
+		return SourcePolicyClaim{}, nil, "", err
 	}
-	priorVersion, err := c.declassificationPriorVersion(
+	lineage, err := c.declassificationLineage(
 		ctx, sourceURI, expected, selectedRule, declassification)
 	if err != nil {
-		return SourcePolicyClaim{}, nil, 0, err
+		return SourcePolicyClaim{}, nil, "", err
 	}
 	claim, err := c.policyStore.CompareAndSwapSourceClaim(
 		ctx, sourceURI, expected, selectedRule)
 	if err == nil {
-		return claim, declassification, priorVersion, nil
+		return claim, declassification, lineage, nil
 	}
 	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-		return SourcePolicyClaim{}, nil, 0, policyCatalogWriteError(ctx, err)
+		return SourcePolicyClaim{}, nil, "", policyCatalogWriteError(ctx, err)
 	}
 	latest, ok, readErr := c.policyStore.SourceClaim(ctx, sourceURI)
 	if readErr != nil {
-		return SourcePolicyClaim{}, nil, 0, policyCatalogReadError(ctx, readErr)
+		return SourcePolicyClaim{}, nil, "", policyCatalogReadError(ctx, readErr)
 	}
 	if ok {
 		allowed, ruleErr := sourceClaimAllowsMutation(
 			latest, selectedRule, decision, now)
 		if ruleErr != nil {
-			return SourcePolicyClaim{}, nil, 0, ruleErr
+			return SourcePolicyClaim{}, nil, "", ruleErr
 		}
 		if !allowed {
-			return SourcePolicyClaim{}, nil, 0, auth.ObjectNotFound()
+			return SourcePolicyClaim{}, nil, "", auth.ObjectNotFound()
 		}
 	}
-	return SourcePolicyClaim{}, nil, 0, policyCatalogWriteError(ctx, err)
+	return SourcePolicyClaim{}, nil, "", policyCatalogWriteError(ctx, err)
 }
 
 func sourceClaimAllowsMutation(

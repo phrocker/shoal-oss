@@ -45,17 +45,69 @@ const (
 	policyKindDeclassificationClaim = byte(11)
 )
 
+// persistedDeclassificationClaim is a binding, or with Closed the end of a
+// bound version's lineage (written under its own row).
 type persistedDeclassificationClaim struct {
 	Seq       uint64
 	SourceURI string
 	Version   uint64
 	AttemptID string
+	Closed    bool
 }
 
 func policyDeclassificationClaimRow(sourceURI string, version uint64) []byte {
 	digest := sha256.Sum256([]byte(sourceURI))
 	return []byte(fmt.Sprintf("%s%s/%020d", policyRowDeclassificationClaim,
 		hex.EncodeToString(digest[:]), version))
+}
+
+func policyDeclassificationClaimRowFor(
+	record persistedDeclassificationClaim,
+) []byte {
+	row := policyDeclassificationClaimRow(record.SourceURI, record.Version)
+	if record.Closed {
+		row = append(row, "/closed"...)
+	}
+	return row
+}
+
+// CloseDeclassificationClaim validates the closure, writes it through to the
+// engine, and only then makes it observable in memory.
+func (s *DurablePolicyStore) CloseDeclassificationClaim(
+	ctx context.Context,
+	sourceURI string,
+	version uint64,
+) error {
+	if s == nil {
+		return (*MemoryPolicyStore)(nil).CloseDeclassificationClaim(
+			ctx, sourceURI, version)
+	}
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return catalogUnavailable()
+	}
+	s.memory.mu.RLock()
+	closed, err := s.memory.checkCloseDeclassificationClaimLocked(
+		sourceURI, version)
+	s.memory.mu.RUnlock()
+	if err != nil || closed {
+		return err
+	}
+	record := persistedDeclassificationClaim{
+		Seq: s.nextSeq(), SourceURI: sourceURI, Version: version, Closed: true,
+	}
+	if err := s.writeRow(
+		policyDeclassificationClaimRowFor(record),
+		policyKindDeclassificationClaim, record,
+	); err != nil {
+		return err
+	}
+	return s.memory.CloseDeclassificationClaim(
+		context.WithoutCancel(ctx), sourceURI, version)
 }
 
 // BindDeclassificationClaim validates the binding, writes it through to the
@@ -120,13 +172,26 @@ func (s *MemoryPolicyStore) restoreDeclassifications(
 	s.declassifications = nil
 	s.declassificationIntents = nil
 	s.declassificationClaims = nil
+	s.closedDeclassificationClaims = nil
 	for _, record := range records {
 		s.appendDeclassificationLocked(record)
 	}
 	for _, claim := range claims {
+		if claim.Closed {
+			continue
+		}
 		if err := s.bindDeclassificationClaimLocked(
 			claim.SourceURI, claim.Version, shoal.ID(claim.AttemptID),
 		); err != nil {
+			return err
+		}
+	}
+	for _, claim := range claims {
+		if !claim.Closed {
+			continue
+		}
+		if err := s.closeDeclassificationClaimLocked(
+			claim.SourceURI, claim.Version); err != nil {
 			return err
 		}
 	}
