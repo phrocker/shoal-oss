@@ -191,6 +191,16 @@ type PolicyStore interface {
 	// attempt; whether the narrowing took effect is the catalog's revision
 	// registration (a pre_commit record's RevisionID being current).
 	Declassifications(context.Context) ([]DeclassificationRecord, error)
+	// BindDeclassificationClaim durably records, before the base is
+	// written, that a source claim version descends from a recorded intent,
+	// so a later retry completing that narrowing can be told apart from one
+	// whose claim no reason-checked intent produced.
+	BindDeclassificationClaim(context.Context, string, uint64, shoal.ID) error
+	// DeclassificationClaimIntent returns the intent a source claim version
+	// is bound to, if any, by exact lookup.
+	DeclassificationClaimIntent(
+		context.Context, string, uint64,
+	) (DeclassificationRecord, bool, error)
 }
 
 type revisionKey struct {
@@ -227,6 +237,11 @@ type MemoryPolicyStore struct {
 	labelMigration *LabelMigrationRecord
 	// declassifications is append-only (#630).
 	declassifications []DeclassificationRecord
+	// declassificationIntents indexes intent records by attempt ID.
+	declassificationIntents map[shoal.ID]int
+	// declassificationClaims binds source claim versions to the intent they
+	// descend from.
+	declassificationClaims map[declassificationClaimKey]shoal.ID
 }
 
 // NewMemoryPolicyStore constructs an empty reference catalog.

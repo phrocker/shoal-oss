@@ -21,6 +21,9 @@ package authorized
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"sort"
 	"time"
 
@@ -34,7 +37,101 @@ import (
 const (
 	policyRowDeclassification  = "audit/declassification/"
 	policyKindDeclassification = byte(10)
+
+	// Claim-lineage bindings: which intent a source claim version descends
+	// from. A separate append-only prefix and kind; the source-claim record
+	// itself is unchanged.
+	policyRowDeclassificationClaim  = "audit/declassification-claim/"
+	policyKindDeclassificationClaim = byte(11)
 )
+
+type persistedDeclassificationClaim struct {
+	Seq       uint64
+	SourceURI string
+	Version   uint64
+	AttemptID string
+}
+
+func policyDeclassificationClaimRow(sourceURI string, version uint64) []byte {
+	digest := sha256.Sum256([]byte(sourceURI))
+	return []byte(fmt.Sprintf("%s%s/%020d", policyRowDeclassificationClaim,
+		hex.EncodeToString(digest[:]), version))
+}
+
+// BindDeclassificationClaim validates the binding, writes it through to the
+// engine, and only then makes it observable in memory.
+func (s *DurablePolicyStore) BindDeclassificationClaim(
+	ctx context.Context,
+	sourceURI string,
+	version uint64,
+	attemptID shoal.ID,
+) error {
+	if s == nil {
+		return (*MemoryPolicyStore)(nil).BindDeclassificationClaim(
+			ctx, sourceURI, version, attemptID)
+	}
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return catalogUnavailable()
+	}
+	s.memory.mu.RLock()
+	bound, err := s.memory.checkDeclassificationClaimLocked(
+		sourceURI, version, attemptID)
+	s.memory.mu.RUnlock()
+	if err != nil || bound {
+		return err
+	}
+	if err := s.writeRow(
+		policyDeclassificationClaimRow(sourceURI, version),
+		policyKindDeclassificationClaim,
+		persistedDeclassificationClaim{
+			Seq: s.nextSeq(), SourceURI: sourceURI, Version: version,
+			AttemptID: string(attemptID),
+		},
+	); err != nil {
+		return err
+	}
+	return s.memory.BindDeclassificationClaim(
+		context.WithoutCancel(ctx), sourceURI, version, attemptID)
+}
+
+// DeclassificationClaimIntent is a pure read delegated to the memory store.
+func (s *DurablePolicyStore) DeclassificationClaimIntent(
+	ctx context.Context,
+	sourceURI string,
+	version uint64,
+) (DeclassificationRecord, bool, error) {
+	return s.memoryStore().DeclassificationClaimIntent(ctx, sourceURI, version)
+}
+
+// restoreDeclassifications rebuilds the records, their intent index and the
+// claim bindings on open. A binding naming no recorded intent for its source
+// fails closed.
+func (s *MemoryPolicyStore) restoreDeclassifications(
+	records []DeclassificationRecord,
+	claims []persistedDeclassificationClaim,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.declassifications = nil
+	s.declassificationIntents = nil
+	s.declassificationClaims = nil
+	for _, record := range records {
+		s.appendDeclassificationLocked(record)
+	}
+	for _, claim := range claims {
+		if err := s.bindDeclassificationClaimLocked(
+			claim.SourceURI, claim.Version, shoal.ID(claim.AttemptID),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 type persistedDeclassification struct {
 	Seq                      uint64

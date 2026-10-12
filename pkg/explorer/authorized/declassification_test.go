@@ -806,12 +806,13 @@ func TestDeclassificationDivergedCatalogIsAnIntent(t *testing.T) {
 	}
 }
 
-// TestDeclassificationReconciliationNeedsAMatchingIntent pins that only an
-// intent for the same URI, the same new rule and the current registration's
-// rule makes a pre-commit narrowing a reason-free reconciliation. An intent
-// that differs in either rule must not lift the reason policy in the
-// diverged-catalog state.
-func TestDeclassificationReconciliationNeedsAMatchingIntent(t *testing.T) {
+// TestDeclassificationStaleIntentNeverReconciles pins F1 of the third review:
+// an intent on file that the current claim does not descend from (left by a
+// CAS conflict, a failed base write or an old completed narrowing) never makes
+// a pre-commit narrowing a reconciliation, even when it names exactly this
+// URI, rule and registration. In the diverged-catalog state an outsider is
+// refused as absent and a label holder still needs a reason.
+func TestDeclassificationStaleIntentNeverReconciles(t *testing.T) {
 	policy, err := auth.NewPolicy(auth.PolicyConfig{
 		AuthorizationDomain: []byte("domain-one"), SourceID: []byte("source-a"),
 		GrantPolicyID: []byte("policy-a"), Epoch: 1,
@@ -827,22 +828,20 @@ func TestDeclassificationReconciliationNeedsAMatchingIntent(t *testing.T) {
 		}
 		return built
 	}
-	const uri = "file:///declassify/unmatched-intent.txt"
+	const uri = "file:///declassify/stale-intent.txt"
 	for _, seed := range []struct {
 		name        string
 		prior, next authorized.AccessRule
-		reconciles  bool
 	}{
-		{"other prior rule", rule("x"), rule(), false},
-		{"other new rule", rule("secret", "y"), rule("y"), false},
-		{"other new rule, same prior", rule("secret"), rule("y"), false},
-		{"matching", rule("secret"), rule(), true},
+		{"exactly matching", rule("secret"), rule()},
+		{"other prior rule", rule("x"), rule()},
+		{"other new rule", rule("secret"), rule("y")},
 	} {
 		t.Run(seed.name, func(t *testing.T) {
 			f := newFixture(t)
 			if err := f.store.RecordDeclassification(context.Background(),
 				authorized.DeclassificationRecord{
-					AttemptID: "seeded", Phase: authorized.DeclassificationIntent,
+					AttemptID: "stale", Phase: authorized.DeclassificationIntent,
 					OccurredAt: f.clock.Now(), SourceURI: uri,
 					PriorRules: []authorized.AccessRule{seed.prior}, Rule: seed.next,
 				}); err != nil {
@@ -862,17 +861,207 @@ func TestDeclassificationReconciliationNeedsAMatchingIntent(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = restored.Close() })
 			client := f.declassificationClientOver(t, restored, f.store, true)
-			_, err = client.Ingest(f.labelIngester(t, "holder", "secret"),
-				labelledSource(uri, "public", ""))
+			public := labelledSource(uri, "public", "")
+			if _, err := client.Ingest(f.labelIngester(t, "outsider"), public); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				t.Fatalf("outsider with a stale intent on file = %v, want not found", err)
+			}
+			if _, err := client.Ingest(f.labelIngester(t, "holder", "secret"), public); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+				t.Fatalf("holder without a reason, stale intent on file = %v, want invalid argument", err)
+			}
+		})
+	}
+}
+
+// TestDeclassificationStricterRetryReconciles pins F2 of the third review: a
+// retry completing an earlier narrowing (#665) may choose a stricter rule
+// than the one its intent recorded, and is still that narrowing's
+// reconciliation. The claim lineage carries forward to the retry's claim
+// version, including across a durable reopen.
+func TestDeclassificationStricterRetryReconciles(t *testing.T) {
+	dir := t.TempDir()
+	durable, err := authorized.OpenDurablePolicyStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t)
+	store := &failingDeclassificationStore{
+		PolicyStore: durable, fail: map[int]bool{2: true}}
+	client := f.declassificationClient(t, store, true)
+	const uri = "file:///declassify/stricter-retry.txt"
+	first, err := client.Ingest(f.labelIngester(t, "owner", "secret", "x"),
+		labelledSource(uri, "secret and x", "secret&x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The owner drops x with a reason; the pre-commit audit fails, so the
+	// claim holds {secret} while the registration keeps {secret, x}.
+	if _, err := client.Ingest(withReason(t, f.labelIngester(t, "owner", "secret", "x"), "drop-x"),
+		labelledSource(uri, "secret only", "secret")); err == nil {
+		t.Fatal("pre-commit audit failure was ignored")
+	}
+	if err := durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := authorized.OpenDurablePolicyStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	client = f.declassificationClient(t, reopened, true)
+
+	// A retrier holding secret and y but not x, with no reason, completes
+	// it under the stricter {secret, y}.
+	retried, err := client.Ingest(f.labelIngester(t, "retrier", "secret", "y"),
+		labelledSource(uri, "secret and y", "secret&y"))
+	if err != nil {
+		t.Fatalf("stricter retry of a recorded narrowing = %v, want reconciliation", err)
+	}
+	current, ok, err := reopened.CurrentRevision(context.Background(), first.Document.ID)
+	if err != nil || !ok || current.RevisionID != retried.Revision.ID {
+		t.Fatalf("current = %+v %v %v", current, ok, err)
+	}
+	records := declassifications(t, reopened)
+	if len(records) != 2 || records[1].Phase != authorized.DeclassificationPreCommit ||
+		records[1].Subject != "retrier" ||
+		!reflect.DeepEqual(records[1].RemovedLabels(), []string{"x"}) {
+		t.Fatalf("records = %+v", records)
+	}
+}
+
+// TestDeclassificationBoundIntentMustCoverTheNarrowing pins the match a bound
+// intent must make: the selected rule keeps every component of the intent's
+// rule, and the current registration's rule is exactly one of its replaced
+// rules. A claim bound to an intent that fails either is not a
+// reconciliation.
+func TestDeclassificationBoundIntentMustCoverTheNarrowing(t *testing.T) {
+	policy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: []byte("domain-one"), SourceID: []byte("source-a"),
+		GrantPolicyID: []byte("policy-a"), Epoch: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := func(labels ...string) authorized.AccessRule {
+		t.Helper()
+		built, err := authorized.LabelRule(policy, labels)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return built
+	}
+	const uri = "file:///declassify/bound-intent.txt"
+	for _, seed := range []struct {
+		name        string
+		prior, next authorized.AccessRule
+		reconciles  bool
+	}{
+		{"covers", rule("secret"), rule(), true},
+		{"other prior rule", rule("x"), rule(), false},
+		{"intent rule not kept", rule("secret"), rule("y"), false},
+	} {
+		t.Run(seed.name, func(t *testing.T) {
+			f := newFixture(t)
+			if _, err := f.base.Ingest(context.Background(),
+				labelledSource(uri, "labelled before the catalog", "secret")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.clientA.BackfillExistingDocumentsForDevelopment(
+				f.labelIngester(t, "operator", "secret"), devbackfill.NewCapability()); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := explorer.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = restored.Close() })
+			client := f.declassificationClientOver(t, restored, f.store, true)
+			public := labelledSource(uri, "public", "")
+			// The outsider's refused attempt leaves an unbound claim under
+			// the public rule. Bind it to the seeded intent directly.
+			if _, err := client.Ingest(f.labelIngester(t, "outsider"), public); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+				t.Fatalf("outsider = %v, want not found", err)
+			}
+			claim, ok, err := f.store.SourceClaim(context.Background(), uri)
+			if err != nil || !ok {
+				t.Fatalf("claim = %v %v", ok, err)
+			}
+			if err := f.store.RecordDeclassification(context.Background(),
+				authorized.DeclassificationRecord{
+					AttemptID: "bound", Phase: authorized.DeclassificationIntent,
+					OccurredAt: f.clock.Now(), SourceURI: uri,
+					PriorRules: []authorized.AccessRule{seed.prior}, Rule: seed.next,
+				}); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.store.BindDeclassificationClaim(
+				context.Background(), uri, claim.Version, "bound"); err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Ingest(f.labelIngester(t, "holder", "secret"), public)
 			if seed.reconciles {
 				if err != nil {
-					t.Fatalf("narrowing covered by a matching intent = %v, want reconciliation", err)
+					t.Fatalf("covered narrowing = %v, want reconciliation", err)
 				}
 				return
 			}
 			if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-				t.Fatalf("narrowing with no matching intent and no reason = %v, want invalid argument", err)
+				t.Fatalf("uncovered narrowing without a reason = %v, want invalid argument", err)
 			}
 		})
 	}
+}
+
+// TestDeclassificationClaimBindingRequiresItsIntent pins that a claim version
+// can be bound only to a recorded intent for the same source, and only once.
+func TestDeclassificationClaimBindingRequiresItsIntent(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		policy, err := auth.NewPolicy(auth.PolicyConfig{
+			AuthorizationDomain: []byte("domain-one"), SourceID: []byte("source-a"),
+			GrantPolicyID: []byte("policy-a"), Epoch: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		public, err := authorized.NewAccessRule(policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secret, err := authorized.LabelRule(policy, []string{"secret"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+		if err := store.BindDeclassificationClaim(ctx, "file:///a", 1, "missing"); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("binding to no intent = %v", err)
+		}
+		for _, id := range []shoal.ID{"one", "two"} {
+			if err := store.RecordDeclassification(ctx, authorized.DeclassificationRecord{
+				AttemptID: id, Phase: authorized.DeclassificationIntent,
+				OccurredAt: time.Date(2026, time.August, 26, 18, 0, 0, 0, time.UTC),
+				SourceURI:  "file:///a",
+				PriorRules: []authorized.AccessRule{secret}, Rule: public,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.BindDeclassificationClaim(ctx, "file:///b", 1, "one"); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("binding to another source's intent = %v", err)
+		}
+		if err := store.BindDeclassificationClaim(ctx, "file:///a", 1, "one"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.BindDeclassificationClaim(ctx, "file:///a", 1, "one"); err != nil {
+			t.Fatalf("idempotent rebinding = %v", err)
+		}
+		if err := store.BindDeclassificationClaim(ctx, "file:///a", 1, "two"); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			t.Fatalf("rebinding to another intent = %v", err)
+		}
+		intent, ok, err := store.DeclassificationClaimIntent(ctx, "file:///a", 1)
+		if err != nil || !ok || intent.AttemptID != "one" {
+			t.Fatalf("bound intent = %+v %v %v", intent, ok, err)
+		}
+		if _, ok, err := store.DeclassificationClaimIntent(ctx, "file:///a", 2); err != nil || ok {
+			t.Fatalf("unbound version = %v %v", ok, err)
+		}
+	})
 }

@@ -253,6 +253,7 @@ func (s *DurablePolicyStore) load() error {
 	coOccurrences := make(map[string]persistedCoOccurrence)
 	var declassifications []sequencedDeclassification
 	declassificationSeqs := make(map[string]struct{})
+	var declassificationClaims []persistedDeclassificationClaim
 	var (
 		versionRecord   persistedSourceVersion
 		haveVersion     bool
@@ -298,6 +299,20 @@ func (s *DurablePolicyStore) load() error {
 				migrationRecord = record
 				haveMigration = true
 			}
+			maxSeq = maxUint64(maxSeq, record.Seq)
+		case bytes.HasPrefix(row, []byte(policyRowDeclassificationClaim)):
+			var record persistedDeclassificationClaim
+			if err := decodePolicyRecord(
+				value, policyKindDeclassificationClaim, &record,
+			); err != nil {
+				return corruptPolicyRecord("declassification claim binding", err)
+			}
+			if string(policyDeclassificationClaimRow(
+				record.SourceURI, record.Version)) != rowStr {
+				return corruptPolicyRecord("declassification claim binding",
+					fmt.Errorf("declassification claim binding row does not match its record"))
+			}
+			declassificationClaims = append(declassificationClaims, record)
 			maxSeq = maxUint64(maxSeq, record.Seq)
 		case bytes.HasPrefix(row, []byte(policyRowDeclassification)):
 			var record persistedDeclassification
@@ -416,7 +431,11 @@ func (s *DurablePolicyStore) load() error {
 		}
 		s.memory.labelMigration = &migration
 	}
-	s.memory.declassifications = orderDeclassifications(declassifications)
+	if err := s.memory.restoreDeclassifications(
+		orderDeclassifications(declassifications), declassificationClaims,
+	); err != nil {
+		return corruptPolicyRecord("declassification claim binding", err)
+	}
 	s.seq = maxSeq + 1
 	return nil
 }

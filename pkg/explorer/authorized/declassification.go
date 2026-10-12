@@ -103,23 +103,34 @@ package authorized
 //   - Normally the first check is the intent check, before anything is
 //     written. It compares against the claim, a pending claim's previous
 //     rule, or an unclaimed URI's registration found through the base.
-//   - A narrowing first seen at the pre-commit check, with no recorded
-//     intent covering it, is also a first check. The claim-time check had
-//     nothing to compare with because the catalog and the base diverged:
-//     for example, a base restored from backup no longer holds a document
-//     the catalog still registers, or such a state let an attempt create a
-//     claim without passing this check. The principal is first authorized
-//     under the registration it replaces (NotFound otherwise), and then the
-//     reason policy applies, after the base write and before the
-//     registration.
-//   - A narrowing first seen at the pre-commit check that IS covered by a
-//     recorded intent (same URI, same new rule, the current registration's
-//     rule among its replaced rules) is a reconciliation. The claim already
-//     holds the narrow rule while the registration lags (#665), and that
-//     intent already passed the reason policy. It is recorded but not
-//     refused. The claim is the mutation authority, so the claim holder
-//     completing it need not be authorized under the lagging registration,
-//     and a refusal would disclose that the registration carries labels.
+//   - A narrowing first seen at the pre-commit check, where the claim this
+//     ingest holds does not descend from an intent covering it, is also a
+//     first check. The claim-time check had nothing to compare with because
+//     the catalog and the base diverged: for example, a base restored from
+//     backup no longer holds a document the catalog still registers, or
+//     such a state let an attempt create a claim without passing this
+//     check. The principal is first authorized under the registration it
+//     replaces (NotFound otherwise), and then the reason policy applies,
+//     after the base write and before the registration.
+//   - A narrowing first seen at the pre-commit check, where the claim DOES
+//     descend from a covering intent, is a reconciliation. Claim lineage
+//     works like this: every claim version created by a CAS that followed an
+//     intent is bound to that intent (BindDeclassificationClaim, written
+//     before the base), and a later CAS that records no intent and keeps
+//     every component of the existing claim's rule carries that binding
+//     forward. "Covering" means the same URI, the selected rule keeping
+//     every component of the intent's rule (a retry may be stricter), and
+//     the current registration's rule being exactly one of the intent's
+//     replaced rules. Here the claim already holds the narrow rule while the
+//     registration lags (#665), and that intent already passed the reason
+//     policy. The narrowing is recorded but not refused. The claim is the
+//     mutation authority, so the claim holder completing it need not be
+//     authorized under the lagging registration, and a refusal would
+//     disclose that the registration carries labels.
+//
+// An intent on file that the current claim does not descend from never
+// counts: one left by a CAS conflict, a failed base write, or an old
+// completed narrowing. Neither does a claim created without an intent.
 //
 // The invariant: a narrowing never becomes current unless the reason policy
 // was applied at its first check. That check is either an earlier attempt's
@@ -477,6 +488,7 @@ func (c *Client) declassificationCommit(
 	documentID, revisionID shoal.ID,
 	selected AccessRule,
 	attempt *declassificationAttempt,
+	claimVersion uint64,
 ) error {
 	current, ok, err := c.policyStore.CurrentRevision(ctx, documentID)
 	if err != nil {
@@ -497,33 +509,38 @@ func (c *Client) declassificationCommit(
 		return nil
 	}
 	if attempt == nil {
-		reconciliation, err := c.reconcilesRecordedIntent(
-			ctx, sourceURI, selected, current.Rule)
+		reconciliation, err := c.reconcilesClaimIntent(
+			ctx, sourceURI, claimVersion, selected, current.Rule)
 		if err != nil {
 			return err
 		}
 		if reconciliation {
-			// The claim already holds the narrow rule while the
-			// registration lags (an earlier pre-commit audit or
-			// PutRevision failed after the base write, #665), and that
-			// earlier attempt's intent, recorded under the reason policy,
-			// is on file. The claim is the mutation authority, so any
-			// claim holder may complete it, exactly as before #630. The
-			// reason policy is not re-applied: refusing would tell a
-			// claim holder outside the registration's rule that the
-			// registration carries labels it lacks. The record names the
-			// principal whose ingest makes the narrowing current.
+			// The claim this ingest holds descends from an earlier
+			// attempt's intent (its claim lineage, not merely some intent
+			// on file), which narrowed exactly this registration and passed
+			// the reason policy. The claim already holds the narrow rule
+			// while the registration lags (an earlier pre-commit audit or
+			// PutRevision failed after the base write, #665). The claim is
+			// the mutation authority, so any claim holder may complete it,
+			// exactly as before #630. The reason policy is not re-applied:
+			// refusing would tell a claim holder outside the
+			// registration's rule that the registration carries labels it
+			// lacks. The record names the principal whose ingest makes the
+			// narrowing current.
 			attempt = &declassificationAttempt{
 				reason:         declassificationReason(ctx),
 				reconciliation: true,
 			}
 		} else {
-			// No recorded intent covers this narrowing, so this is its
-			// first check: the claim-time check had nothing to compare
-			// with because the catalog and the base diverged (a current
-			// registration for a URI whose base document is gone, for
-			// example a base restored from backup, or whose claim was
-			// created by an attempt that never passed this check). It is
+			// The claim does not descend from an intent covering this
+			// narrowing, so this is its first check: the claim-time check
+			// had nothing to compare with because the catalog and the
+			// base diverged (a current registration for a URI whose base
+			// document is gone, for example a base restored from backup,
+			// or whose claim was created by an attempt that never passed
+			// this check). An intent on file that this claim does not
+			// descend from (a CAS conflict, a failed base write, an old
+			// completed narrowing) never counts. It is
 			// treated as an intent: the principal must be authorized
 			// under the registration it replaces (NotFound otherwise, so
 			// nothing about its labels is disclosed) and the reason policy
@@ -551,32 +568,70 @@ func (c *Client) declassificationCommit(
 		attempt, revisionID)
 }
 
-// reconcilesRecordedIntent reports whether a recorded intent already covers
-// narrowing the registration rule prior to selected on sourceURI: an intent
-// with exactly the selected rule whose replaced rules include prior. Only such
-// an intent passed the reason policy for this narrowing. It is read only on
-// the rare path of a narrowing first seen at the pre-commit check.
-func (c *Client) reconcilesRecordedIntent(
+// reconcilesClaimIntent reports whether the source claim version this
+// ingest holds descends from an intent that covers narrowing prior to
+// selected: the intent bound to (sourceURI, claimVersion) (see
+// bindDeclassificationLineage) for the same URI, whose rule selected keeps
+// every component of (a retry may choose a stricter rule), and whose
+// replaced rules include prior exactly. Only such an intent passed the
+// reason policy for this narrowing on this claim's lineage.
+func (c *Client) reconcilesClaimIntent(
 	ctx context.Context,
 	sourceURI string,
+	claimVersion uint64,
 	selected, prior AccessRule,
 ) (bool, error) {
-	records, err := c.policyStore.Declassifications(ctx)
+	if claimVersion == 0 {
+		return false, nil
+	}
+	intent, ok, err := c.policyStore.DeclassificationClaimIntent(
+		ctx, sourceURI, claimVersion)
 	if err != nil {
 		return false, policyCatalogReadError(ctx, err)
 	}
-	for _, record := range records {
-		if record.Phase != DeclassificationIntent ||
-			record.SourceURI != sourceURI || !record.Rule.equal(selected) {
-			continue
-		}
-		for _, replaced := range record.PriorRules {
-			if replaced.equal(prior) {
-				return true, nil
-			}
+	if !ok || intent.Phase != DeclassificationIntent ||
+		intent.SourceURI != sourceURI || ruleNarrows(intent.Rule, selected) {
+		return false, nil
+	}
+	for _, replaced := range intent.PriorRules {
+		if replaced.equal(prior) {
+			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// declassificationLineage returns the intent a new claim version must be
+// bound to, if any: this ingest's own intent, or, when this ingest recorded
+// none and its rule keeps every component of the existing claim's rule, the
+// intent the existing claim version is already bound to. So a retry that
+// completes an earlier narrowing (#665) keeps that narrowing's lineage, and a
+// claim created by an attempt with no intent never acquires one.
+func (c *Client) declassificationLineage(
+	ctx context.Context,
+	sourceURI string,
+	existing *SourcePolicyClaim,
+	selected AccessRule,
+	attempt *declassificationAttempt,
+) (shoal.ID, error) {
+	if attempt != nil {
+		return attempt.id, nil
+	}
+	// A selected rule that narrows the existing claim always records its own
+	// intent above, so the second test is defensive: lineage is never
+	// carried onto a claim that drops components of the one it replaces.
+	if existing == nil || ruleNarrows(existing.Rule, selected) {
+		return "", nil
+	}
+	intent, ok, err := c.policyStore.DeclassificationClaimIntent(
+		ctx, sourceURI, existing.Version)
+	if err != nil {
+		return "", policyCatalogReadError(ctx, err)
+	}
+	if !ok {
+		return "", nil
+	}
+	return intent.AttemptID, nil
 }
 
 func appendDistinctRule(rules []AccessRule, rule AccessRule) []AccessRule {
@@ -664,8 +719,20 @@ func (s *MemoryPolicyStore) RecordDeclassification(
 	if s.hasDeclassificationLocked(record.AttemptID, record.Phase) {
 		return duplicateDeclassification()
 	}
-	s.declassifications = append(s.declassifications, cloned)
+	s.appendDeclassificationLocked(cloned)
 	return nil
+}
+
+func (s *MemoryPolicyStore) appendDeclassificationLocked(
+	record DeclassificationRecord,
+) {
+	if record.Phase == DeclassificationIntent {
+		if s.declassificationIntents == nil {
+			s.declassificationIntents = make(map[shoal.ID]int)
+		}
+		s.declassificationIntents[record.AttemptID] = len(s.declassifications)
+	}
+	s.declassifications = append(s.declassifications, record)
 }
 
 // hasDeclassification reports whether (attemptID, phase) is recorded. Records
@@ -719,4 +786,125 @@ func (s *MemoryPolicyStore) Declassifications(
 		records = append(records, cloned)
 	}
 	return records, nil
+}
+
+// declassificationClaimKey names one source claim version. Versions come from
+// one monotonic counter, are kept by commit and pend, and are restored by
+// rollback, so a version identifies one claim state for its whole life.
+type declassificationClaimKey struct {
+	sourceURI string
+	version   uint64
+}
+
+// BindDeclassificationClaim records that source claim version version of
+// sourceURI descends from the intent attemptID. The intent must already be
+// recorded for the same URI. Rebinding a version to the same intent is a
+// no-op; to a different one, a conflict.
+func (s *MemoryPolicyStore) BindDeclassificationClaim(
+	ctx context.Context,
+	sourceURI string,
+	version uint64,
+	attemptID shoal.ID,
+) error {
+	if err := contextFailure(ctx); err != nil {
+		return err
+	}
+	if s == nil {
+		return catalogUnavailable()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bindDeclassificationClaimLocked(sourceURI, version, attemptID)
+}
+
+func (s *MemoryPolicyStore) checkDeclassificationClaimLocked(
+	sourceURI string,
+	version uint64,
+	attemptID shoal.ID,
+) (bool, error) {
+	if err := validateSourceURI(sourceURI); err != nil {
+		return false, err
+	}
+	if version == 0 {
+		return false, shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification claim version is required")
+	}
+	if err := shoal.ValidateRequiredID(
+		"declassification attempt ID", attemptID); err != nil {
+		return false, err
+	}
+	intent, ok := s.declassificationIntentLocked(attemptID)
+	if !ok || intent.SourceURI != sourceURI {
+		return false, shoal.NewError(shoal.ErrorInvalidArgument,
+			"declassification claim binding names no intent for its source")
+	}
+	key := declassificationClaimKey{sourceURI: sourceURI, version: version}
+	if existing, bound := s.declassificationClaims[key]; bound {
+		if existing != attemptID {
+			return false, duplicateDeclassification()
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (s *MemoryPolicyStore) bindDeclassificationClaimLocked(
+	sourceURI string,
+	version uint64,
+	attemptID shoal.ID,
+) error {
+	bound, err := s.checkDeclassificationClaimLocked(
+		sourceURI, version, attemptID)
+	if err != nil || bound {
+		return err
+	}
+	if s.declassificationClaims == nil {
+		s.declassificationClaims = make(map[declassificationClaimKey]shoal.ID)
+	}
+	s.declassificationClaims[declassificationClaimKey{
+		sourceURI: sourceURI, version: version,
+	}] = attemptID
+	return nil
+}
+
+func (s *MemoryPolicyStore) declassificationIntentLocked(
+	attemptID shoal.ID,
+) (DeclassificationRecord, bool) {
+	index, ok := s.declassificationIntents[attemptID]
+	if !ok || index >= len(s.declassifications) {
+		return DeclassificationRecord{}, false
+	}
+	return s.declassifications[index], true
+}
+
+// DeclassificationClaimIntent returns the intent record source claim version
+// version of sourceURI is bound to, if any. It is an exact indexed read.
+func (s *MemoryPolicyStore) DeclassificationClaimIntent(
+	ctx context.Context,
+	sourceURI string,
+	version uint64,
+) (DeclassificationRecord, bool, error) {
+	if err := contextFailure(ctx); err != nil {
+		return DeclassificationRecord{}, false, err
+	}
+	if s == nil {
+		return DeclassificationRecord{}, false, catalogUnavailable()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	attemptID, ok := s.declassificationClaims[declassificationClaimKey{
+		sourceURI: sourceURI, version: version,
+	}]
+	if !ok {
+		return DeclassificationRecord{}, false, nil
+	}
+	intent, ok := s.declassificationIntentLocked(attemptID)
+	if !ok {
+		return DeclassificationRecord{}, false, catalogUnavailable()
+	}
+	cloned, err := cloneDeclassificationRecord(intent)
+	if err != nil {
+		return DeclassificationRecord{}, false, catalogUnavailable()
+	}
+	return cloned, true, nil
 }
