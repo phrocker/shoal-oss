@@ -457,36 +457,6 @@ func TestDeclassificationCommitFailureBlocksTheRegistration(t *testing.T) {
 	})
 }
 
-// TestDeclassificationCommitReasonPolicyOnRetry pins that the reason policy
-// also binds a narrowing first seen at the commit check.
-func TestDeclassificationCommitReasonPolicyOnRetry(t *testing.T) {
-	f := newFixture(t)
-	inner := authorized.NewMemoryPolicyStore()
-	store := &failingDeclassificationStore{
-		PolicyStore: inner, fail: map[int]bool{2: true}}
-	client := f.declassificationClient(t, store, true)
-	const uri = "file:///declassify/commit-reason.txt"
-	first, err := client.Ingest(f.labelIngester(t, "owner", "secret"),
-		labelledSource(uri, "secret", "secret"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	public := labelledSource(uri, "public", "")
-	if _, err := client.Ingest(withReason(t, f.labelIngester(t, "owner", "secret"), "r1"), public); err == nil {
-		t.Fatal("commit audit failure was ignored")
-	}
-	if _, err := client.Ingest(f.labelIngester(t, "retrier", "secret"), public); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
-		t.Fatalf("retry without a reason = %v, want invalid argument", err)
-	}
-	current, ok, err := inner.CurrentRevision(context.Background(), first.Document.ID)
-	if err != nil || !ok || current.RevisionID != first.Revision.ID {
-		t.Fatalf("a refused retry registered the narrowing: %+v %v %v", current, ok, err)
-	}
-	if _, err := client.Ingest(withReason(t, f.labelIngester(t, "retrier", "secret"), "r2"), public); err != nil {
-		t.Fatalf("retry with a reason: %v", err)
-	}
-}
-
 // TestDeclassificationAuditsLegacyUnclaimedDocument covers a document
 // registered without a source claim (the development backfill): its current
 // registration is the replaced rule.
@@ -652,4 +622,113 @@ func TestDeclassificationAuditsPendingClaimRetry(t *testing.T) {
 			t.Fatalf("records after the retry = %+v", records)
 		}
 	})
+}
+
+// TestDeclassificationReconciliationIsRecordedNotRefused covers the state a
+// failed commit leaves behind: the claim holds the narrow rule while the
+// registration keeps the labelled one. The claim is the mutation authority,
+// so a claim holder may complete it (as before #630), even one outside the
+// labelled rule. With the reason policy on, that completion must not be
+// refused, since a refusal would tell such a principal the registration
+// carries labels; the narrowing was decided, reason-checked and recorded at
+// the earlier intent. The completion is recorded, attributed to whoever
+// made it current.
+func TestDeclassificationReconciliationIsRecordedNotRefused(t *testing.T) {
+	f := newFixture(t)
+	inner := authorized.NewMemoryPolicyStore()
+	store := &failingDeclassificationStore{
+		PolicyStore: inner, fail: map[int]bool{2: true}}
+	client := f.declassificationClient(t, store, true)
+	const uri = "file:///declassify/reconcile.txt"
+	first, err := client.Ingest(f.labelIngester(t, "owner", "secret"),
+		labelledSource(uri, "secret", "secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := labelledSource(uri, "public", "")
+	if _, err := client.Ingest(withReason(t, f.labelIngester(t, "owner", "secret"), "r1"), public); err == nil {
+		t.Fatal("commit audit failure was ignored")
+	}
+	current, ok, err := inner.CurrentRevision(context.Background(), first.Document.ID)
+	if err != nil || !ok || current.RevisionID != first.Revision.ID {
+		t.Fatalf("failed commit audit registered the narrowing: %+v %v %v", current, ok, err)
+	}
+	reconciled, err := client.Ingest(f.labelIngester(t, "nobody"), public)
+	if err != nil {
+		t.Fatalf("claim holder reconciliation without a reason = %v", err)
+	}
+	records := declassifications(t, inner)
+	if len(records) != 2 ||
+		records[0].Phase != authorized.DeclassificationIntent ||
+		records[0].Subject != "owner" || records[0].ReasonCode != "r1" ||
+		records[1].Phase != authorized.DeclassificationCommit ||
+		records[1].Subject != "nobody" || records[1].ReasonCode != "" ||
+		records[1].AttemptID == records[0].AttemptID ||
+		records[1].RevisionID != reconciled.Revision.ID ||
+		records[1].PriorRevisionID != first.Revision.ID {
+		t.Fatalf("records = %+v", records)
+	}
+}
+
+// TestDeclassificationRecordsAreAppendOnly pins that a second record for one
+// (attempt, phase) is refused rather than shadowing the first on disk.
+func TestDeclassificationRecordsAreAppendOnly(t *testing.T) {
+	dir := t.TempDir()
+	durableStore, err := authorized.OpenDurablePolicyStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableDirs := map[*authorized.DurablePolicyStore]string{durableStore: dir}
+	for _, store := range []authorized.PolicyStore{
+		authorized.NewMemoryPolicyStore(), durableStore,
+	} {
+		policy, err := auth.NewPolicy(auth.PolicyConfig{AuthorizationDomain: []byte("domain-one"), SourceID: []byte("source-a"), GrantPolicyID: []byte("policy-a"), Epoch: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule, err := authorized.NewAccessRule(policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		labelled, err := authorized.LabelRule(policy, []string{"secret"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		record := authorized.DeclassificationRecord{
+			AttemptID: "a", Phase: authorized.DeclassificationIntent,
+			OccurredAt: time.Date(2026, time.August, 26, 18, 0, 0, 0, time.UTC),
+			SourceURI:  "file:///x", ReasonCode: "first",
+			PriorRules: []authorized.AccessRule{labelled}, Rule: rule,
+		}
+		if err := store.RecordDeclassification(context.Background(), record); err != nil {
+			t.Fatal(err)
+		}
+		record.ReasonCode = "overwrite"
+		if err := store.RecordDeclassification(context.Background(), record); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+			t.Fatalf("duplicate record = %v, want conflict", err)
+		}
+		records := declassifications(t, store)
+		if len(records) != 1 || records[0].ReasonCode != "first" {
+			t.Fatalf("records = %+v", records)
+		}
+		durable, ok := store.(*authorized.DurablePolicyStore)
+		if !ok {
+			continue
+		}
+		// The refused duplicate must not have reached the disk either,
+		// where it would shadow the original on the next open.
+		dir := durableDirs[durable]
+		if err := durable.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := authorized.OpenDurablePolicyStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = reopened.Close() })
+		records = declassifications(t, reopened)
+		if len(records) != 1 || records[0].ReasonCode != "first" {
+			t.Fatalf("records after reopen = %+v", records)
+		}
+	}
 }

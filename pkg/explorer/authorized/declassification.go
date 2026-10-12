@@ -83,9 +83,15 @@ package authorized
 // # Reason codes
 //
 // Config.RequireDeclassificationReason makes a narrowing that carries no
-// reason (WithDeclassificationReason) fail with InvalidArgument before
-// anything is written. The refusal happens only after the principal has been
-// authorized under both rules, so it tells them nothing new.
+// reason (WithDeclassificationReason) fail with InvalidArgument at the intent
+// check, before anything is written and only after the principal has been
+// authorized under the replaced and the new rule, so it tells them nothing
+// new. The claim reaches a narrow rule only through that check. A narrowing
+// first seen at the commit check is the reconciliation of such an attempt
+// (the claim already holds the narrow rule while the registration lags); it
+// is recorded but not refused, because the claim holder completing it need
+// not be authorized under the lagging registration and a refusal would
+// disclose that it carries labels.
 
 import (
 	"context"
@@ -245,7 +251,7 @@ func (r DeclassificationRecord) validate() error {
 			return err
 		}
 	}
-	if len(r.OnBehalfOf) > auth.MaxPolicyTerms {
+	if len(r.OnBehalfOf) > auth.MaxOnBehalfOfEntries {
 		return shoal.NewError(shoal.ErrorInvalidArgument,
 			"declassification delegation chain exceeds its bound")
 	}
@@ -376,6 +382,9 @@ type declassificationAttempt struct {
 	reason     string
 	documentID shoal.ID
 	priorRev   shoal.ID
+	// reconciliation marks a narrowing first seen at the commit check,
+	// which completes an earlier, already-audited attempt.
+	reconciliation bool
 }
 
 func newDeclassificationAttemptID() (shoal.ID, error) {
@@ -455,7 +464,21 @@ func (c *Client) declassificationCommit(
 		return nil
 	}
 	if attempt == nil {
-		attempt = &declassificationAttempt{reason: declassificationReason(ctx)}
+		// A narrowing first seen here is the reconciliation of an earlier
+		// attempt: the claim already holds the narrow rule while the
+		// registration lags (an earlier commit audit or PutRevision
+		// failed after the base write). The claim is the mutation
+		// authority, so any claim holder may complete it, exactly as
+		// before #630; the claim only reached the narrow rule through an
+		// intent check that recorded the narrowing and enforced the reason
+		// policy. So the reason policy is not re-applied here: refusing
+		// would tell a claim holder outside the registration's rule that
+		// the registration carries labels it lacks. The record names the
+		// principal whose ingest makes the narrowing current.
+		attempt = &declassificationAttempt{
+			reason:         declassificationReason(ctx),
+			reconciliation: true,
+		}
 	}
 	attempt.priorRules = priorRules
 	attempt.documentID = documentID
@@ -486,7 +509,8 @@ func (c *Client) recordDeclassification(
 	attempt *declassificationAttempt,
 	revisionID shoal.ID,
 ) error {
-	if c.requireDeclassificationReason && attempt.reason == "" {
+	if c.requireDeclassificationReason && attempt.reason == "" &&
+		!attempt.reconciliation {
 		return shoal.NewError(shoal.ErrorInvalidArgument,
 			"this relabel removes visibility labels and the operator "+
 				"requires a declassification reason code")
@@ -548,8 +572,40 @@ func (s *MemoryPolicyStore) RecordDeclassification(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.hasDeclassificationLocked(record.AttemptID, record.Phase) {
+		return duplicateDeclassification()
+	}
 	s.declassifications = append(s.declassifications, cloned)
 	return nil
+}
+
+// hasDeclassification reports whether (attemptID, phase) is recorded. Records
+// are append-only, so a second record for the same pair is refused rather
+// than allowed to shadow the first on disk.
+func (s *MemoryPolicyStore) hasDeclassification(
+	attemptID shoal.ID,
+	phase DeclassificationPhase,
+) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hasDeclassificationLocked(attemptID, phase)
+}
+
+func (s *MemoryPolicyStore) hasDeclassificationLocked(
+	attemptID shoal.ID,
+	phase DeclassificationPhase,
+) bool {
+	for _, existing := range s.declassifications {
+		if existing.AttemptID == attemptID && existing.Phase == phase {
+			return true
+		}
+	}
+	return false
+}
+
+func duplicateDeclassification() error {
+	return shoal.NewError(shoal.ErrorConflict,
+		"declassification audit record already exists")
 }
 
 // Declassifications returns every declassification audit record in the order

@@ -103,6 +103,11 @@ func (s *DurablePolicyStore) RecordDeclassification(
 	if s.closed {
 		return catalogUnavailable()
 	}
+	// s.mu serializes every durable write, so no record for this pair can
+	// appear between this check and the write below.
+	if s.memory.hasDeclassification(record.AttemptID, record.Phase) {
+		return duplicateDeclassification()
+	}
 	persisted, err := declassificationToPersisted(record, s.nextSeq())
 	if err != nil {
 		return catalogUnavailable()
