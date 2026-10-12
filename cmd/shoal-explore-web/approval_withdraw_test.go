@@ -296,6 +296,32 @@ func TestApprovalWithdrawalEventLostIsPublishedByTheReplay(t *testing.T) {
 		fleet.ApprovalEventRequested, fleet.ApprovalEventWithdrawn)
 }
 
+// TestApprovalWithdrawalAnswersForTheExpiryItWrote: a withdrawal that finds
+// the window closed writes the expiry, as the requester. If that expiry's
+// event does not publish, the withdrawal answers 503, and a retried
+// withdrawal is the retry it asked for: it answers for that row until it
+// publishes, then answers expired.
+func TestApprovalWithdrawalAnswersForTheExpiryItWrote(t *testing.T) {
+	h, probe := newEventHarness(t)
+	request := h.held("withdraw-own-expiry")
+	h.mustRequest(requester, request, fleet.ApprovalPending)
+	h.advance(fleet.DefaultApprovalWindow + time.Second)
+	probe.loseBefore(fleet.ApprovalEventExpired, 2)
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := h.withdraw(requester, request.id); !errors.Is(
+			err, fleet.ErrApprovalEventUnpublished) {
+			t.Fatalf("withdraw %d with the expiry event lost = %v", attempt, err)
+		}
+	}
+	if _, err := h.withdraw(requester, request.id); !errors.Is(
+		err, fleet.ErrApprovalExpired) {
+		t.Fatalf("withdraw once the event published = %v", err)
+	}
+	kinds, _ := h.approvalEventsOf(requesterSubscriber, request.id)
+	assertKinds(t, "after the retries", kinds,
+		fleet.ApprovalEventRequested, fleet.ApprovalEventExpired)
+}
+
 // TestApprovalWithdrawOverHTTP: the route is served by the composed provider
 // and answers the record.
 func TestApprovalWithdrawOverHTTP(t *testing.T) {

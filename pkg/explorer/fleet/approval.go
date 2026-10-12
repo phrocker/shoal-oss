@@ -2231,10 +2231,11 @@ func (s *ApprovalService) Status(
 	}
 	requester := requestedBy(decision, current, now)
 	if !requester {
-		// The approver path, which is also where a target that has moved
-		// stops being visible: eligibility resolves the binding at the
-		// request's generation. An approver therefore sees a request only
-		// while it is decidable in principle, and the requester always.
+		// The approver path. Eligibility resolves the agent unpinned (a
+		// heartbeat moves its generation), so an approver still sees a
+		// request whose target generation moved — and records it as
+		// stranded below (#655) — and stops seeing it only on a revocation
+		// or a lost scope. The requester always sees its own.
 		if _, err := s.eligibleApprover(ctx, decision, current, now); err != nil {
 			if shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
 				errors.Is(err, ErrIdentitySchemeMoved) {
