@@ -1502,3 +1502,65 @@ func TestPersistentChurnUnderAReadIsAConflict(t *testing.T) {
 		t.Fatalf("Changes: %v", e)
 	}
 }
+
+// gate holds the first change-log mutation until released.
+type gate struct {
+	lostAck
+	armed   atomic.Bool
+	reached chan struct{}
+	release chan struct{}
+}
+
+func (g *gate) CompareAndMutate(ctx context.Context, m allocator.Mutation) (allocator.Status, error) {
+	logs := false
+	for _, u := range m.Updates {
+		logs = logs || string(u.Coordinate.Family) == changeFamily
+	}
+	if logs && g.armed.CompareAndSwap(true, false) {
+		close(g.reached)
+		<-g.release
+	}
+	return g.inner.CompareAndMutate(ctx, m)
+}
+
+// A recovery judged against a head that then becomes healthy (a concurrent
+// write repairing its own head above a delete marker) must not commit: it is
+// pinned to the head it judged, re-evaluates, and appends normally, so the
+// concurrent write's entry stays in the readable segment.
+func TestAStaleRecoveryCannotOrphanACleanChange(t *testing.T) {
+	v := provisionedEnv(t)
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatal(e)
+	}
+	held := &gate{lostAck: lostAck{inner: v.registry.config.Backend}, reached: make(chan struct{}), release: make(chan struct{})}
+	revoker := wrapped(t, v, held)
+	done := make(chan error, 1)
+	first := &onTop{lostAck: lostAck{inner: v.registry.config.Backend}}
+	first.hook = func() {
+		head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
+		if e != nil {
+			t.Error(e)
+			return
+		}
+		tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), head.Timestamp+3)
+		held.armed.Store(true)
+		go func() {
+			_, e := revoker.Revoke(context.Background(), collectorID)
+			done <- e
+		}()
+		<-held.reached // the revoker has judged the head absent and is at its CAS
+	}
+	first.armed.Store(true)
+	result, e := wrapped(t, v, first).AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2)
+	close(held.release)
+	if e != nil || !result.Changed || result.Sequence != 3 {
+		t.Fatalf("provision %+v %v", result, e)
+	}
+	if e := <-done; e != nil {
+		t.Fatalf("revoke: %v", e)
+	}
+	got, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage)
+	if e != nil || len(got) != 4 || got[2].Sequence != 3 || got[3].Action != ChangeRevoke || got[3].Recovery != nil {
+		t.Fatalf("changes %+v %v", got, e)
+	}
+}

@@ -265,8 +265,12 @@ starts a new segment of the log, all in one mutation with the revocation:
   entry lies above the new segment, so later appends proceed normally.
 
 The mutation is serialized by the registration cell's compare-and-set, as
-every logged change is. It is not pinned to the damaged head, which may not
-be pinnable. Only a failure of the store itself fails a revocation, since
+every logged change is. It is also pinned to the head it judged: an absent
+head by an absence condition, and a single stored cell by its exact value and
+timestamp. So a recovery cannot commit over a head that a concurrent write
+has meanwhile repaired, which would orphan that write's entry. It
+re-evaluates and appends normally instead. Only a head that is not a single
+pinnable cell is left unpinned, and the registry never writes one. Only a failure of the store itself fails a revocation, since
 nothing can be written then anyway.
 
 If no head can supersede the damaged one (it sits at the largest timestamp),

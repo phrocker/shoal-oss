@@ -226,6 +226,10 @@ func (r *Registry) readHeadState(ctx context.Context, id shoal.ID) (headState, e
 	s := headState{present: true, timestamp: max(cells[0].Timestamp, 0), digest: digestBytes(cells[0].Value)}
 	cell := cells[0]
 	var head changeHead
+	if len(cells) == 1 && sameCoordinate(cell.Coordinate, coord) && cell.Timestamp > 0 {
+		// One stored cell can be pinned exactly, whatever its bytes.
+		s.pin = allocator.Condition{Coordinate: coord, Value: bytes.Clone(cell.Value), Timestamp: cell.Timestamp, TimestampSet: true}
+	}
 	if len(cells) != 1 || !sameCoordinate(cell.Coordinate, coord) || cell.Timestamp <= 0 || decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.SegmentStart < 0 || head.SegmentStart > head.Sequence {
 		s.damaged = true
 		return s, nil
@@ -464,9 +468,17 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 			return auditWrite{}, e
 		}
 		nextHead = changeHead{CollectorID: id, Sequence: sequence, SegmentStart: sequence}
-		// Serialized by the registration condition; a damaged head cannot
-		// be pinned reliably, and an absent one is pinned by the entries.
-		conditions = nil
+		// The recovery is pinned to the head it judged, so it cannot commit
+		// over a head that became healthy meanwhile (a concurrent write's
+		// repair, which does not move the registration cell): an absent
+		// head by an Absent condition, one stored cell by its exact value
+		// and timestamp. Only a head that is not one pinnable cell (several
+		// versions, a non-positive timestamp) is left unpinned, serialized
+		// by the registration condition alone; the registry never writes
+		// such a head, so no write of its own can race the recovery there.
+		if head.pin.Coordinate.Row == nil {
+			conditions = nil
+		}
 		if sequence <= 0 {
 			overflow = true
 		}
