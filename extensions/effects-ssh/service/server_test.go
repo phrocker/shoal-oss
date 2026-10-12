@@ -32,6 +32,7 @@ func TestAnswersAreThePinnedBytes(t *testing.T) {
 		"busy":                            BusyAnswer(),
 		"not_run":                         NotRunAnswer(false),
 		"not_run_replayed":                NotRunAnswer(true),
+		"key_conflict":                    KeyConflictAnswer(),
 	}
 	for reason := range refusalStatus {
 		built["refused_"+reason] = Refused(reason)
@@ -329,8 +330,8 @@ func TestKeyConflictIsRefusedAndRunsNothing(t *testing.T) {
 	answers := loadAnswers(t)
 	key := testKey("k")
 	e.post("restart-web", key).is(t, answers, "completed")
-	e.post("restart-web2", key).is(t, answers, "refused_key_conflict")
-	e.post("not-registered", key).is(t, answers, "refused_key_conflict")
+	e.post("restart-web2", key).is(t, answers, "key_conflict")
+	e.post("not-registered", key).is(t, answers, "key_conflict")
 	e.post("restart-web", key).is(t, answers, "completed_replayed")
 	if n := e.host.ssh.Execs("systemctl restart web"); n != 1 {
 		t.Fatalf("ran %d times", n)
@@ -509,14 +510,45 @@ func TestShutdownJournalsCancelledRunsAsUnknown(t *testing.T) {
 }
 
 // TestNoRunStartsAfterShutdown: once Shutdown has begun, a new key is
-// refused and nothing is dialed, so Shutdown's wait covers every run.
+// answered busy and nothing is dialed or journaled, so Shutdown's wait covers
+// every run; a known key is still answered from the journal, never with a
+// refusal that would read as "nothing ran".
 func TestNoRunStartsAfterShutdown(t *testing.T) {
 	e := newEnv(t)
+	answers := loadAnswers(t)
+	e.post("restart-web", testKey("done")).is(t, answers, "completed")
+	e.post("hang", testKey("unknown")).is(t, answers, "outcome_unknown")
+	accepts := e.host.ssh.Accepts()
 	e.server.Shutdown(expiredContext())
-	e.post("restart-web", testKey("late")).is(t, loadAnswers(t), "refused_journal_unavailable")
-	if e.host.ssh.Accepts() != 0 || e.journal.Len() != 0 {
+	e.post("restart-web", testKey("late")).is(t, answers, "busy")
+	e.post("restart-web", testKey("done")).is(t, answers, "completed_replayed")
+	e.post("hang", testKey("unknown")).is(t, answers, "outcome_unknown_replayed")
+	if e.host.ssh.Accepts() != accepts || e.journal.Len() != 2 {
 		t.Fatal("a run started after shutdown")
 	}
+}
+
+// TestRunningKeyDuringShutdownIsNotRefused: a repeat of a key still running
+// in the shutdown grace attaches to it.
+func TestRunningKeyDuringShutdownIsNotRefused(t *testing.T) {
+	e := newEnv(t, func(o *Options, _ *JournalOptions) { o.AttachWait = 200 * time.Millisecond })
+	answers := loadAnswers(t)
+	key := testKey("grace")
+	first := make(chan reply, 1)
+	go func() { first <- e.post("block", key) }()
+	<-e.host.entered
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stopped := make(chan struct{})
+	go func() { e.server.Shutdown(ctx); close(stopped) }()
+	for !e.server.isStopped() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	e.post("block", key).is(t, answers, "in_progress")
+	close(e.host.release)
+	(<-first).is(t, answers, "completed")
+	<-stopped
+	e.post("block", key).is(t, answers, "completed_replayed")
 }
 
 func TestNewServerRefusals(t *testing.T) {

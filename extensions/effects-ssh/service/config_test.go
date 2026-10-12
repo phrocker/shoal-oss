@@ -76,6 +76,12 @@ func TestParseConfigRefusals(t *testing.T) {
 		"blank command":        with("command", "   "),
 		"newline command":      with("command", "a\nb"),
 		"nul command":          with("command", "a\x00b"),
+		"nel command":          with("command", "a\u0085b"),
+		"csi command":          with("command", "a\u009bb"),
+		"line separator":       with("command", "a b"),
+		"bidi override":        with("command", "echo ‮b"),
+		"zero width":           with("command", "a​b"),
+		"bidi user":            with("user", "de‮ploy"),
 		"long command":         with("command", strings.Repeat("a", MaxCommandBytes+1)),
 		"no run timeout":       with("run_timeout", nil),
 		"bad run timeout":      with("run_timeout", "soon"),

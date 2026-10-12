@@ -216,6 +216,12 @@ func (e *env) restart(journalOptions JournalOptions) {
 	e.open(journalOptions)
 }
 
+func (s *Server) isStopped() bool {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	return s.stopped
+}
+
 func expiredContext() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

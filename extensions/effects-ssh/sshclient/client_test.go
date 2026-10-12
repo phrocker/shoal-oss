@@ -115,6 +115,41 @@ func TestExecWhoseReplyIsNotSuccessIsUnknown(t *testing.T) {
 	}
 }
 
+// TestStalledHostIsBounded: a host that authenticates and then never
+// confirms the session, or never replies to exec, while answering
+// keepalives, is bounded by the connect timeout and the run timeout. A
+// stalled session open is not_run (no exec was sent); a stalled exec reply
+// is unknown.
+func TestStalledHostIsBounded(t *testing.T) {
+	for _, c := range []struct {
+		answer  sshtest.ExecAnswer
+		outcome sshclient.Outcome
+		reason  sshclient.Reason
+	}{
+		{sshtest.SessionStall, sshclient.OutcomeNotRun, sshclient.ReasonSession},
+		{sshtest.ExecStall, sshclient.OutcomeUnknown, sshclient.ReasonTimeout},
+	} {
+		server := sshtest.New(t)
+		server.AnswerExec(c.answer)
+		tgt := target(t, server)
+		tgt.ConnectTimeout = 500 * time.Millisecond
+		start := time.Now()
+		done := make(chan sshclient.Result, 1)
+		go func() {
+			done <- sshclient.Run(context.Background(), tgt, "uptime", sshclient.Limits{
+				RunTimeout: 500 * time.Millisecond, MaxOutputBytes: 64, KeepaliveInterval: 100 * time.Millisecond})
+		}()
+		select {
+		case result := <-done:
+			if result.Outcome != c.outcome || result.Reason != c.reason {
+				t.Fatalf("answer %d: %+v", c.answer, result)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("answer %d: Run is still blocked after %v", c.answer, time.Since(start))
+		}
+	}
+}
+
 func TestRunTimesOutAsUnknown(t *testing.T) {
 	server := sshtest.New(t)
 	server.Handle(func(_ string, _, _ io.Writer, closed <-chan struct{}) sshtest.Exit {

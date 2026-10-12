@@ -379,8 +379,13 @@ func (j *Journal) apply(r record, at span) error {
 		if r.Finished != nil || !ValidCommandName(r.Command) || len(r.Fingerprint) != 64 {
 			return errors.New("malformed started record")
 		}
-		if _, exists := j.entries[r.Key]; exists {
-			return errors.New("a key is started twice")
+		if previous, exists := j.entries[r.Key]; exists {
+			// A key may start again only after the earlier entry passed
+			// retention: the running process had pruned it, and the
+			// records stayed until a compaction. The same rule as prune.
+			if !previous.last().Before(r.At.Add(-j.opts.Retention)) {
+				return errors.New("a key is started twice within retention")
+			}
 		}
 		j.entries[r.Key] = &Entry{Key: r.Key, Command: r.Command,
 			Fingerprint: r.Fingerprint, StartedAt: r.At, started: at}
@@ -476,6 +481,10 @@ func (j *Journal) Begin(key, fingerprint, command string, registered bool, maxRu
 	}
 	if len(j.entries) >= j.opts.MaxEntries {
 		j.prune()
+		j.compactIfDead()
+		if j.failed != nil {
+			return Begin{Kind: BeginUnavailable}
+		}
 		if len(j.entries) >= j.opts.MaxEntries {
 			return Begin{Kind: BeginFull}
 		}
@@ -637,6 +646,13 @@ func (j *Journal) maybeCompact() {
 	}
 	j.lastPrune = now
 	j.prune()
+	j.compactIfDead()
+}
+
+// compactIfDead rewrites the file once dead records outnumber the live ones
+// by compactSlack; every prune is followed by it, which is what bounds the
+// file (JournalBound).
+func (j *Journal) compactIfDead() {
 	if live := j.live(); j.records-live <= live+compactSlack {
 		return
 	}

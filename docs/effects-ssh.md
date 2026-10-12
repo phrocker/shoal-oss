@@ -49,8 +49,10 @@ agent ──enqueue──> explorer <──pull/claim/complete── shoal-gatew
   no keyboard-interactive login and no agent. The key file is read on every
   run, so a rotated Secret takes effect without a restart.
 - **Everything is bounded.** The connect timeout covers TCP, the handshake and
-  authentication together. The run timeout covers the command from exec to
-  exit. Stdout and stderr are each kept up to `max_output_bytes`. The rest is
+  authentication together, and then bounds the session open. The run
+  timeout covers the command from the exec request to its exit: when it ends,
+  the connection is closed whatever the client is waiting on, including a host
+  that never replies to exec. Stdout and stderr are each kept up to `max_output_bytes`. The rest is
   read and counted, so the host is never stalled, and truncation is recorded.
   A keepalive every 30 seconds ends a run on a dead connection as unknown.
 - **No session-gateway state.** Nothing here depends on #447. The SSH client
@@ -75,7 +77,7 @@ The service keeps a journal keyed by that value:
 
 1. **`started` is fsync'd before any connection is opened.** If the record
    cannot be made durable, the request is refused (`journal_unavailable`) and
-   nothing is dialed. `TestStartedIsDurableBeforeTheRun` reads the file from
+   nothing is dialed. `TestSyncsPrecedeTheDial` checks the fsync order, and `TestStartedIsDurableBeforeTheRun` reads the file from
    inside the run.
 2. **A key with a `started` record is never dialed again.** A repeat is
    answered from the journal:
@@ -83,15 +85,25 @@ The service keeps a journal keyed by that value:
    - This process is still running the key: the repeat waits up to
      `-attach-wait` for the result, then answers `in_progress`.
    - Otherwise (the process restarted, or the finish could not be written):
-     `outcome_unknown`, for good.
+     `outcome_unknown`. It is never run again.
 3. **`finished` is written when the run ends**, and every answer is a function
    of what is durable. If the finish cannot be written, the request is
-   answered `outcome_unknown` and so is every repeat. The journal is then
-   failed, no new key starts, and the process exits 3.
-4. **A conflicting request under a known key is refused** (`key_conflict`),
-   and the key's entry is left as it was. The fingerprint is the command name.
-   The gateway's binder is pure, so the same action always sends the same
-   request, and a mismatch is a different caller reusing a key.
+   answered `outcome_unknown`, and so is every repeat from this process. The
+   journal is then failed, no new key starts, and the process exits 3. A
+   finish whose write reached the page cache and whose fsync failed may still
+   be read back after a restart, so a later repeat can replay it: each answer
+   is honest, but they need not agree across restarts.
+4. **A different request under a known key runs nothing** and is answered
+   `key_conflict`, and the key's entry is left as it was. The fingerprint is
+   the command name. The gateway's binder is pure, so the same action sends
+   the same request unless its route changed between attempts (a gateway
+   restarted with a new `-routes` while the action was in flight). The key's
+   command may then have run, so `key_conflict` is a 409 that the gateway
+   records exactly as `outcome_unknown`, never as a rejection.
+5. **Stopping does not refuse known keys.** From SIGTERM on, a new key is
+   answered `busy` (nothing journaled, retried), while a known key is still
+   answered from the journal: replayed, attached to its run, or
+   `outcome_unknown`. Refusing it would read as "nothing ran".
 
 So a command is dialed at most once per key while the journal remembers the
 key, whatever happens to the gateway: a worker restart, a lost fence, a
@@ -107,8 +119,11 @@ is dropped, which leaves exactly that state
 (`TestTornFinishedTailLeavesUnknown`). `TestKillBetweenStartedAndFinishedNeverRunsAgain`
 does this with a real `SIGKILL` of a child process while its command runs,
 then restarts on the same journal: the repeat answers `outcome_unknown` and
-the host sees one exec. If a complete line fails its checksum, or a record
-contradicts the records before it, the journal is corrupt. It refuses to open
+the host sees one exec. Only a final fragment without its newline is a torn
+tail. If a complete line fails its checksum, or a record contradicts the
+records before it, the journal is corrupt; that includes a final line that
+ends in a newline but whose earlier pages a node crash never wrote, which
+fails closed. It refuses to open
 and nothing runs until an operator has looked. Do not delete a journal to get
 past this: deleting it forgets every key it holds.
 
@@ -120,7 +135,10 @@ past this: deleting it forgets every key it holds.
   gateway's retention plus any clock skew between the explorer and this host.
   The gateway cannot read this service's retention. Keeping the two in step is
   a deployment rule, written down here. Retention uses the wall clock, so a
-  clock that jumps forward can prune a key early.
+  clock that jumps forward can prune a key early. A key past retention that
+  the process still holds is replayed, not re-run; only a key already
+  forgotten starts again, and its older records are then superseded
+  (`TestKeyReusedAfterRetentionStillOpens`).
 - **The journal is the guarantee.** It does not hold if the journal volume is
   lost or replaced, if the journal is moved aside, or if two instances share
   one journal on a filesystem where `flock` does not exclude them (a network
@@ -168,8 +186,9 @@ get.
 | outcome unknown | 409 | `{"state":"outcome_unknown"}` | failed, `outcome_unknown` |
 | in progress | 503, `Retry-After: 1` | `{"state":"in_progress"}` | retried under the same key |
 | busy | 503, `Retry-After: 5` | `{"state":"busy"}` | retried; nothing was journaled |
+| key conflict | 409 | `{"state":"key_conflict"}` | failed, `outcome_unknown` |
 | not run | 502 | `{"state":"not_run"}` | failed, `target_rejected_502` |
-| refused | 400, 401, 404, 405, 422, 500, 507 | `{"state":"refused","reason":"…"}` | failed, `target_rejected_NNN` |
+| refused | 400, 401, 404, 405, 500, 507 | `{"state":"refused","reason":"…"}` | failed, `target_rejected_NNN` |
 
 Why these statuses:
 
@@ -191,8 +210,9 @@ Why these statuses:
   with `-truncated` appended when either stream exceeded its bound. Recording
   a non-zero exit as `target_rejected` would claim that nothing happened.
 - **`not_run` and the refusals are definite failures**, because nothing ran.
-  An unregistered command, a credential or input refusal, a full or failed
-  journal, and a key conflict all reach that answer before any dial.
+  Every refusal is for a key the journal does not hold: an unregistered
+  command, a credential or input refusal, or a full or failed journal, all
+  before any dial.
 
 ### What reaches `ActionRecord.Output`
 
@@ -304,7 +324,7 @@ exists to avoid.
 | `-config` | | required |
 | `-listen` | | required, `host:port` |
 | `-tls-cert-file`, `-tls-key-file` | | both, or neither with `-allow-plaintext-loopback` |
-| `-allow-plaintext-loopback` | false | plaintext HTTP, refused unless `-listen` is a loopback address |
+| `-allow-plaintext-loopback` | false | plaintext HTTP, refused unless `-listen` is a loopback address and the bound address is loopback |
 | `-caller-token-file` | | required; at least 32 printable bytes; read on every request |
 | `-idempotency-header` | `Idempotency-Key` | the gateway's `-idempotency-header` |
 | `-journal-dir` | | required; must exist (it is not created) |
@@ -312,7 +332,7 @@ exists to avoid.
 | `-journal-max-entries` | 10000 | 1 to 1048576 keys; a new key beyond it is refused `journal_full` |
 | `-max-concurrent` | 4 | 1 to 64 runs; a new key beyond it is answered `busy` |
 | `-attach-wait` | `30s` | below the gateway's `-operation-timeout` |
-| `-shutdown-grace` | `60s` | on SIGTERM, how long runs may finish; then they are cancelled and journaled `unknown` |
+| `-shutdown-grace` | `60s` | on SIGTERM, how long runs may finish; then their connections are closed and they are journaled `unknown` |
 
 **The journal's size is declared.** With `-journal-max-entries` N and the
 largest `max_output_bytes` M, one key's records take at most

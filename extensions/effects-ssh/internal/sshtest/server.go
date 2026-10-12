@@ -135,6 +135,10 @@ const (
 	ExecAccept ExecAnswer = iota
 	ExecRefuse
 	ExecDrop
+	// ExecStall never replies to the exec request.
+	ExecStall
+	// SessionStall never answers the session channel open.
+	SessionStall
 )
 
 // AnswerExec sets how exec requests are answered.
@@ -236,6 +240,12 @@ func (s *Server) handleConn(conn net.Conn, config *ssh.ServerConfig) {
 		s.mu.Lock()
 		s.opened = append(s.opened, newChannel.ChannelType())
 		s.mu.Unlock()
+		s.mu.Lock()
+		stall := s.execAnswer == SessionStall
+		s.mu.Unlock()
+		if stall {
+			continue
+		}
 		if newChannel.ChannelType() != "session" {
 			_ = newChannel.Reject(ssh.UnknownChannelType, "only sessions")
 			continue
@@ -280,6 +290,9 @@ func (s *Server) handleSession(conn net.Conn, server *ssh.ServerConn, channel ss
 		case ExecDrop:
 			_ = conn.Close()
 			return
+		case ExecStall:
+			// Never reply; the connection stays up and answers keepalives.
+			continue
 		}
 		_ = request.Reply(true, nil)
 		for _, channelType := range reverse {

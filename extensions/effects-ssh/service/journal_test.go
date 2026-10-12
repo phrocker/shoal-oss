@@ -248,6 +248,29 @@ func TestRetentionPrunesOnlyExpiredIdleKeys(t *testing.T) {
 	}
 }
 
+// TestKeyReusedAfterRetentionStillOpens: a key the running process forgot
+// (past retention) and then saw again has two started records on disk until
+// a compaction; the journal must still open, holding the later one.
+func TestKeyReusedAfterRetentionStillOpens(t *testing.T) {
+	dir, now := t.TempDir(), &fakeNow{now: journalEpoch}
+	j := openTestJournal(t, dir, now, 10)
+	key := testKey("reused")
+	runAndFinish(t, j, key)
+	now.Advance(2 * time.Hour)
+	// Another key's finish prunes the expired one in memory; its records
+	// stay on disk (too few dead records to compact).
+	runAndFinish(t, j, testKey("other"))
+	if _, known := j.Lookup(key); known {
+		t.Fatal("the expired key was not pruned")
+	}
+	runAndFinish(t, j, key)
+	_ = j.Close()
+	j = openTestJournal(t, dir, now, 10)
+	if begin := j.Begin(key, fp, "restart-web", true, 4); begin.Kind != BeginFinished {
+		t.Fatalf("reused key after reopen: %v", begin.Kind)
+	}
+}
+
 // TestCompactionKeepsEveryLiveRecordByteForByte: after compaction the file
 // holds exactly the live records, and a reopen answers every key as before.
 func TestCompactionKeepsEveryLiveRecordByteForByte(t *testing.T) {

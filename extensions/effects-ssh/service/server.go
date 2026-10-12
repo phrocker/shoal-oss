@@ -208,19 +208,25 @@ func (s *Server) handle(r *http.Request, body []byte, bodyOK bool) (Answer, logL
 	command, registered := s.opts.Config.Lookup(name)
 	// Begin and the run's registration happen under stopMu, so Shutdown's
 	// wait covers every run that is ever started.
+	//
+	// Once stopping, a known key is still answered from the journal (its
+	// replay, its run, or unknown): refusing it would read as "nothing ran".
+	// A new key is answered busy, which starts nothing, journals nothing and
+	// is retried, by which time another instance may be serving.
 	s.stopMu.Lock()
+	maxRunning := s.opts.MaxRunning
 	if s.stopped {
-		s.stopMu.Unlock()
-		return refuse(RefusedJournalUnavailable)
+		maxRunning = 0
 	}
-	begin := s.opts.Journal.Begin(key, Fingerprint(name), name, registered, s.opts.MaxRunning)
+	begin := s.opts.Journal.Begin(key, Fingerprint(name), name, registered, maxRunning)
 	if begin.Kind == BeginRun {
 		s.runs.Add(1)
 	}
 	s.stopMu.Unlock()
 	switch begin.Kind {
 	case BeginConflict:
-		return refuse(RefusedKeyConflict)
+		line.Answer = StateKeyConflict
+		return KeyConflictAnswer(), line
 	case BeginUnregistered:
 		return refuse(RefusedUnknownCommand)
 	case BeginFull:

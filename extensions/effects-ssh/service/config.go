@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/extensions/effects-ssh/sshclient"
 )
@@ -223,7 +225,14 @@ func parseCommand(name string, raw []byte) (*Command, error) {
 	return command, nil
 }
 
-func isControl(r rune) bool { return r < 0x20 || r == 0x7f }
+// isControl refuses what would make the text a reviewer reads differ from
+// what the host receives: C0 and C1 controls, format characters (bidi
+// overrides, zero-width), line and paragraph separators, and the
+// replacement character (input that was not valid UTF-8).
+func isControl(r rune) bool {
+	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) ||
+		r == ' ' || r == ' ' || r == utf8.RuneError
+}
 
 func isControlOrSpace(r rune) bool { return isControl(r) || r == ' ' }
 

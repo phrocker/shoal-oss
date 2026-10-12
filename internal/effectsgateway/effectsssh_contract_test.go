@@ -182,7 +182,7 @@ func TestEffectsSSHOutcomeUnknownIsNeverAFailureOrARetry(t *testing.T) {
 			t.Errorf("409 %q classified %s/%s", body, got.Outcome, got.ErrorCode)
 		}
 	}
-	for _, name := range []string{"outcome_unknown", "outcome_unknown_replayed"} {
+	for _, name := range []string{"outcome_unknown", "outcome_unknown_replayed", "key_conflict"} {
 		got := Classify(route, Observation{Written: true, Response: answers[name].response()})
 		if got.Outcome != OutcomeFailed || got.ErrorCode != ErrorOutcomeUnknown {
 			t.Fatalf("%s classified %s/%s", name, got.Outcome, got.ErrorCode)
@@ -533,7 +533,6 @@ func TestEffectsSSHEndToEndRefusalsAreRecordedOnce(t *testing.T) {
 	for name, code := range map[string]string{
 		"not_run":                     "target_rejected_502",
 		"refused_unknown_command":     "target_rejected_404",
-		"refused_key_conflict":        "target_rejected_422",
 		"refused_unauthorized":        "target_rejected_401",
 		"refused_journal_full":        "target_rejected_507",
 		"refused_body_not_allowed":    "target_rejected_400",

@@ -156,6 +156,16 @@ func parseServe(args []string, stderr io.Writer) (*serveConfig, error) {
 		_ = journal.Close()
 		return nil, fmt.Errorf("-listen: %w", err)
 	}
+	if !tlsEnabled {
+		// "localhost" is resolved by the system, which need not map it to
+		// loopback; what was actually bound is what counts.
+		bound, ok := listener.Addr().(*net.TCPAddr)
+		if !ok || !bound.IP.IsLoopback() {
+			_ = listener.Close()
+			_ = journal.Close()
+			return nil, errors.New("-allow-plaintext-loopback: -listen did not bind a loopback address")
+		}
+	}
 	var tlsConfig *tls.Config
 	if tlsEnabled {
 		certificate, err := tls.LoadX509KeyPair(*certFile, *keyFile)

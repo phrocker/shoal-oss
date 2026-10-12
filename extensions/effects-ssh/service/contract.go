@@ -25,6 +25,7 @@ import (
 //	outcome_unknown    409     failed/outcome_unknown (conflict status, the
 //	                           body is not the done marker, not retryable)
 //	in_progress, busy  503     retry under the same key (retryable)
+//	key_conflict       409     failed/outcome_unknown (as outcome_unknown)
 //	not_run            502     failed/target_rejected_502
 //	refused            4xx/5xx failed/target_rejected_NNN; nothing ran
 //
@@ -40,12 +41,12 @@ const (
 	StateInProgress     = "in_progress"
 	StateBusy           = "busy"
 	StateNotRun         = "not_run"
+	StateKeyConflict    = "key_conflict"
 	StateRefused        = "refused"
 )
 
 // Refusal reasons. Each is answered before anything is journaled or dialed,
-// except key_conflict, which is answered from the journal without touching
-// the key's entry.
+// for a request whose key the journal does not hold, so nothing ran for it.
 const (
 	RefusedUnauthorized       = "unauthorized"
 	RefusedMethod             = "method_not_allowed"
@@ -54,7 +55,6 @@ const (
 	RefusedBody               = "body_not_allowed"
 	RefusedKey                = "idempotency_key_invalid"
 	RefusedUnknownCommand     = "unknown_command"
-	RefusedKeyConflict        = "key_conflict"
 	RefusedJournalFull        = "journal_full"
 	RefusedJournalUnavailable = "journal_unavailable"
 )
@@ -67,7 +67,6 @@ var refusalStatus = map[string]int{
 	RefusedBody:               http.StatusBadRequest,
 	RefusedKey:                http.StatusBadRequest,
 	RefusedUnknownCommand:     http.StatusNotFound,
-	RefusedKeyConflict:        http.StatusUnprocessableEntity,
 	RefusedJournalFull:        http.StatusInsufficientStorage,
 	RefusedJournalUnavailable: http.StatusInternalServerError,
 }
@@ -126,6 +125,16 @@ func NotRunAnswer(replayed bool) Answer {
 		answer.Header[ReplayHeader] = "true"
 	}
 	return answer
+}
+
+// KeyConflictAnswer is the answer for a known key under a different request.
+// The gateway's binder is pure, so the same action sends the same request
+// unless its route changed between attempts (a restart with a new -routes);
+// the key's command may then have run, so the answer is classified exactly as
+// outcome_unknown is, never as a rejection.
+func KeyConflictAnswer() Answer {
+	return Answer{Status: http.StatusConflict, Header: jsonHeader(),
+		Body: `{"state":"key_conflict"}`}
 }
 
 // InProgressAnswer is the answer for a key this process is still running.

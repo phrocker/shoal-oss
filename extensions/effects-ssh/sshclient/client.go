@@ -232,11 +232,22 @@ func Run(ctx context.Context, t Target, command string, limits Limits) Result {
 		return Result{Outcome: OutcomeNotRun, Reason: reason}
 	}
 	defer client.Close()
+	// Opening the session waits on the host with no timeout of its own, so
+	// the connect timeout bounds it: when it ends the connection is closed,
+	// which makes NewSession return. No exec request has been sent then.
+	openCtx, cancelOpen := context.WithTimeout(ctx, t.ConnectTimeout)
+	stopOpen := context.AfterFunc(openCtx, func() { _ = client.Close() })
 	session, err := client.NewSession()
-	if err != nil {
-		// The session channel was refused or never confirmed: no exec request
-		// was sent on it.
-		return Result{Outcome: OutcomeNotRun, Reason: ReasonSession}
+	opened := stopOpen()
+	cancelOpen()
+	if err != nil || !opened {
+		// The session channel was refused, never confirmed, or not confirmed
+		// in time: no exec request was sent on it.
+		reason := ReasonSession
+		if ctx.Err() != nil {
+			reason = ReasonCanceled
+		}
+		return Result{Outcome: OutcomeNotRun, Reason: reason}
 	}
 	defer session.Close()
 	stdout := &boundedBuffer{limit: limits.MaxOutputBytes}
@@ -248,26 +259,40 @@ func Run(ctx context.Context, t Target, command string, limits Limits) Result {
 
 	runCtx, cancel := context.WithTimeout(ctx, limits.RunTimeout)
 	defer cancel()
+	// The exec request's reply is also awaited with no timeout of its own:
+	// the run's end closes the connection whatever the client is waiting on.
+	context.AfterFunc(runCtx, func() { _ = client.Close() })
+	endReason := func() Reason {
+		if ctx.Err() != nil {
+			return ReasonCanceled
+		}
+		return ReasonTimeout
+	}
 	if limits.KeepaliveInterval > 0 {
 		go keepalive(runCtx, client, limits.KeepaliveInterval)
 	}
 	if err := session.Start(command); err != nil {
 		// The exec request may have reached the host and its answer been
 		// lost; there is no way to tell that from a refusal, so it is unknown.
-		return finish(Result{Outcome: OutcomeUnknown, Reason: ReasonStart}, stdout, stderr)
+		reason := ReasonStart
+		if runCtx.Err() != nil {
+			reason = endReason()
+		}
+		return finish(Result{Outcome: OutcomeUnknown, Reason: reason}, stdout, stderr)
 	}
 	done := make(chan error, 1)
 	go func() { done <- session.Wait() }()
 	select {
 	case err := <-done:
-		return finish(waited(err), stdout, stderr)
+		result := waited(err)
+		if result.Outcome == OutcomeUnknown && runCtx.Err() != nil {
+			result.Reason = endReason()
+		}
+		return finish(result, stdout, stderr)
 	case <-runCtx.Done():
 		// Closing does not stop a command already running on the host. The
 		// result says unknown; what the command did is not known.
-		reason := ReasonTimeout
-		if ctx.Err() != nil {
-			reason = ReasonCanceled
-		}
+		reason := endReason()
 		_ = session.Close()
 		_ = client.Close()
 		select {

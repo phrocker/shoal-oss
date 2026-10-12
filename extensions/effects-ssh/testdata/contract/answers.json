@@ -161,6 +161,20 @@
     }
   },
   {
+    "name": "key_conflict",
+    "status": 409,
+    "header": {
+      "Content-Type": "application/json"
+    },
+    "body": "{\"state\":\"key_conflict\"}",
+    "gateway": {
+      "outcome": "failed",
+      "kind": "conflict_unmatched",
+      "status": 409,
+      "error_code": "outcome_unknown"
+    }
+  },
+  {
     "name": "refused_unauthorized",
     "status": 401,
     "header": {
@@ -257,20 +271,6 @@
       "kind": "rejected",
       "status": 404,
       "error_code": "target_rejected_404"
-    }
-  },
-  {
-    "name": "refused_key_conflict",
-    "status": 422,
-    "header": {
-      "Content-Type": "application/json"
-    },
-    "body": "{\"state\":\"refused\",\"reason\":\"key_conflict\"}",
-    "gateway": {
-      "outcome": "failed",
-      "kind": "rejected",
-      "status": 422,
-      "error_code": "target_rejected_422"
     }
   },
   {
