@@ -21,7 +21,7 @@ func TestAdminWireWorstCases(t *testing.T) {
 		return EncodeID(shoal.ID(prefix + strings.Repeat("x", shoal.MaxIDBytes-len(prefix))))
 	}
 	at := time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
-	receipt := AdminReceipt{Schema: Schema, CollectorID: long(""), Generation: 1<<63 - 1, State: string(collector.Provisioned), Changed: true, Sequence: 1<<63 - 1}
+	receipt := AdminReceipt{Schema: Schema, CollectorID: long(""), Generation: 1<<63 - 1, State: string(collector.Provisioned), Changed: true}
 	var b bytes.Buffer
 	if e := json.NewEncoder(&b).Encode(receipt); e != nil {
 		t.Fatal(e)
@@ -31,12 +31,18 @@ func TestAdminWireWorstCases(t *testing.T) {
 		t.Fatalf("admin receipt is %d bytes, above MaxAdminReceiptBytes", b.Len())
 	}
 
-	record := RegistrationRecord{Schema: Schema, CollectorID: long(""), Subject: long(""), ClientID: long(""), Domain: EncodeKey(bytes.Repeat([]byte("d"), shoal.MaxIDBytes)), Control: string(collector.CandidateControlled), Mode: string(collector.ServerObserved), Generation: 1<<63 - 1, State: string(collector.Enrolled), EnrollmentID: long("enrollment:"), ChangeCount: 1<<63 - 1}
+	record := RegistrationRecord{Schema: Schema, CollectorID: long(""), Subject: long(""), ClientID: long(""), Domain: EncodeKey(bytes.Repeat([]byte("d"), shoal.MaxIDBytes)), Control: string(collector.CandidateControlled), Mode: string(collector.ServerObserved), Generation: 1<<63 - 1, State: string(collector.Enrolled), EnrollmentID: long("enrollment:"), FromGeneration: 1<<63 - ViewGenerations, Gaps: []LogGap{}, Anomalies: []LogAnomaly{}}
 	for i := range collector.MaxAuthorityPolicyIDs {
 		record.AuthorityPolicyIDs = append(record.AuthorityPolicyIDs, long(fmt.Sprintf("%02d", i)))
 	}
-	for i := range MaxRegistrationChanges {
-		record.Changes = append(record.Changes, ChangeSummary{Sequence: 1<<63 - 1 - int64(i), Action: ChangeProvision, Source: SourceCollectorAdmin, Generation: 1<<63 - 1, State: string(collector.Provisioned), At: at, By: &AdminAttribution{Subject: long(""), Actor: long(""), ClientID: long(""), RequestID: long(""), CorrelationID: long(""), AuthorizationFingerprint: "auth-sha256:" + strings.Repeat("f", 64)}})
+	for range MaxRegistrationChanges {
+		record.Changes = append(record.Changes, ChangeSummary{Action: ChangeProvision, Source: SourceCollectorAdmin, Generation: 1<<63 - 1, State: string(collector.Provisioned), At: at, By: &AdminAttribution{Subject: long(""), Actor: long(""), ClientID: long(""), RequestID: long(""), CorrelationID: long(""), AuthorizationFingerprint: "auth-sha256:" + strings.Repeat("f", 64)}})
+	}
+	for range MaxRegistrationAnomalies {
+		record.Anomalies = append(record.Anomalies, LogAnomaly{Generation: 1<<63 - 1, Action: ChangeProvision, Reason: AnomalyUnknownVersion})
+	}
+	for range 2 * ViewGenerations {
+		record.Gaps = append(record.Gaps, LogGap{Generation: 1<<63 - 1, Action: ChangeProvision})
 	}
 	b.Reset()
 	if e := json.NewEncoder(&b).Encode(record); e != nil {
@@ -74,50 +80,51 @@ func TestAdminWireRoundTripAndValidation(t *testing.T) {
 		t.Fatal("revoke generation 0 accepted")
 	}
 	for name, r := range map[string]AdminReceipt{
-		"changed without sequence": {Schema: Schema, CollectorID: EncodeID("c"), Generation: 1, State: "provisioned", Changed: true},
-		"sequence without changed": {Schema: Schema, CollectorID: EncodeID("c"), Generation: 1, State: "provisioned", Sequence: 1},
 		"unknown state":            {Schema: Schema, CollectorID: EncodeID("c"), Generation: 1, State: "active"},
 	} {
 		if r.Validate() == nil {
 			t.Fatalf("%s receipt accepted", name)
 		}
 	}
-	record := RegistrationRecord{Schema: Schema, CollectorID: EncodeID("c"), Subject: EncodeID("s"), Domain: EncodeKey([]byte("d")), AuthorityPolicyIDs: []string{EncodeID("a"), EncodeID("b")}, Control: string(collector.ExternalControlled), Mode: string(collector.ServerObserved), Generation: 2, State: "revoked", ChangeCount: 2, Changes: []ChangeSummary{
-		{Sequence: 2, Action: ChangeRevoke, Source: SourceOperatorAPI, Generation: 2, State: "revoked", At: time.Now().UTC()},
-		{Sequence: 1, Action: ChangeProvision, Source: SourceCollectorAdmin, Generation: 1, State: "provisioned", At: time.Now().UTC(), By: &AdminAttribution{Subject: EncodeID("admin"), Actor: EncodeID("admin"), RequestID: EncodeID("r"), AuthorizationFingerprint: "auth-sha256:00"}},
-	}}
+	record := RegistrationRecord{Schema: Schema, CollectorID: EncodeID("c"), Subject: EncodeID("s"), Domain: EncodeKey([]byte("d")), AuthorityPolicyIDs: []string{EncodeID("a"), EncodeID("b")}, Control: string(collector.ExternalControlled), Mode: string(collector.ServerObserved), Generation: 3, State: "revoked", FromGeneration: 1, Changes: []ChangeSummary{
+		{Action: ChangeRevoke, Source: SourceOperatorAPI, Generation: 3, State: "revoked", At: time.Now().UTC()},
+		{Action: ChangeProvision, Source: SourceOperatorAPI, Generation: 2, State: "provisioned", At: time.Now().UTC()},
+		{Action: ChangeProvision, Source: SourceCollectorAdmin, Generation: 1, State: "provisioned", At: time.Now().UTC(), By: &AdminAttribution{Subject: EncodeID("admin"), Actor: EncodeID("admin"), RequestID: EncodeID("r"), AuthorizationFingerprint: "auth-sha256:00"}},
+	}, Gaps: []LogGap{{Generation: 2, Action: ChangeRevoke}}, Anomalies: []LogAnomaly{{Reason: AnomalyMisplaced}, {Generation: 4, Action: ChangeRevoke, Reason: AnomalyUnexpected}}}
 	if e := record.Validate(); e != nil {
 		t.Fatalf("valid record refused: %v", e)
 	}
-	recovered := record
-	recovered.Changes = []ChangeSummary{record.Changes[0]}
-	recovered.Changes[0].Recovery = RecoveryUnreadableHead
-	recovered.SegmentStart = 2
-	if e := recovered.Validate(); e != nil {
-		t.Fatalf("valid recovered record refused: %v", e)
-	}
 	for name, mutate := range map[string]func(*RegistrationRecord){
 		"unsorted authority":       func(r *RegistrationRecord) { r.AuthorityPolicyIDs = []string{EncodeID("b"), EncodeID("a")} },
-		"oldest first":             func(r *RegistrationRecord) { r.Changes[0], r.Changes[1] = r.Changes[1], r.Changes[0] },
-		"admin change without by":  func(r *RegistrationRecord) { r.Changes[1].By = nil },
-		"operator change with by":  func(r *RegistrationRecord) { r.Changes[0].By = r.Changes[1].By },
+		"oldest first":             func(r *RegistrationRecord) { r.Changes[0], r.Changes[2] = r.Changes[2], r.Changes[0] },
+		"admin change without by":  func(r *RegistrationRecord) { r.Changes[2].By = nil },
+		"operator change with by":  func(r *RegistrationRecord) { r.Changes[0].By = r.Changes[2].By },
 		"revoke not revoked":       func(r *RegistrationRecord) { r.Changes[0].State = "provisioned" },
-		"more changes than count":  func(r *RegistrationRecord) { r.ChangeCount = 1 },
 		"enrollment while revoked": func(r *RegistrationRecord) { r.EnrollmentID = EncodeID("e") },
-		"recovery on a provision":  func(r *RegistrationRecord) { r.Changes[1].Recovery = RecoveryUnreadableHead; r.SegmentStart = 1 },
-		"recovery not the oldest":  func(r *RegistrationRecord) { r.Changes[0].Recovery = RecoveryUnreadableHead; r.SegmentStart = 2 },
-		"recovery without segment": func(r *RegistrationRecord) { r.Changes = r.Changes[:1]; r.Changes[0].Recovery = RecoveryUnreadableHead },
-		"segment without recovery": func(r *RegistrationRecord) { r.SegmentStart = 1 },
-		"segment beyond changes":   func(r *RegistrationRecord) { r.SegmentStart = 7 },
-		"negative segment":         func(r *RegistrationRecord) { r.SegmentStart = -1 },
-		"unknown recovery": func(r *RegistrationRecord) {
-			r.Changes = r.Changes[:1]
-			r.Changes[0].Recovery = "lost"
-			r.SegmentStart = 2
+		"provision while revoked": func(r *RegistrationRecord) {
+			r.Changes[0] = ChangeSummary{Action: ChangeProvision, Source: SourceOperatorAPI, Generation: 3, State: "provisioned", At: time.Now().UTC()}
+		},
+		"revoke into generation 1": func(r *RegistrationRecord) {
+			r.Changes[2] = ChangeSummary{Action: ChangeRevoke, Source: SourceOperatorAPI, Generation: 1, State: "revoked", At: time.Now().UTC()}
+		},
+		"change above generation":   func(r *RegistrationRecord) { r.Changes[0].Generation = 4 },
+		"change below range":        func(r *RegistrationRecord) { r.FromGeneration = 2 },
+		"range too wide":            func(r *RegistrationRecord) { r.Generation = 1 + ViewGenerations; r.Changes = r.Changes[:0] },
+		"gap where an entry is":     func(r *RegistrationRecord) { r.Gaps = append(r.Gaps, LogGap{Generation: 3, Action: ChangeRevoke}) },
+		"gap outside the slots":     func(r *RegistrationRecord) { r.Gaps = []LogGap{{Generation: 3, Action: ChangeProvision}} },
+		"unknown anomaly":           func(r *RegistrationRecord) { r.Anomalies = []LogAnomaly{{Reason: "lost"}} },
+		"anomaly with a bad action": func(r *RegistrationRecord) { r.Anomalies = []LogAnomaly{{Action: "enroll", Reason: AnomalyMisplaced}} },
+		"null gaps":                 func(r *RegistrationRecord) { r.Gaps = nil },
+		"too many anomalies": func(r *RegistrationRecord) {
+			r.Anomalies = make([]LogAnomaly, MaxRegistrationAnomalies+1)
+			for i := range r.Anomalies {
+				r.Anomalies[i].Reason = AnomalyMisplaced
+			}
 		},
 	} {
 		changed := record
 		changed.Changes = append([]ChangeSummary(nil), record.Changes...)
+		changed.Gaps = append([]LogGap{}, record.Gaps...)
 		mutate(&changed)
 		if changed.Validate() == nil {
 			t.Fatalf("%s accepted", name)

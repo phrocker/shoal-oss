@@ -300,17 +300,17 @@ func (r *Registry) updateRegistration(ctx context.Context, id shoal.ID, create b
 }
 
 // updateRegistrationAudited is updateRegistration that, when record is set,
-// appends the change record describes to the collector's change log in the
+// writes the change record describes to the collector's change log in the
 // same one-row mutation as the registration write (admin.go), so a change is
-// never durable without its audit entry or the reverse. It reports the
-// sequence of the entry it wrote, or 0 when nothing changed.
-func (r *Registry) updateRegistrationAudited(ctx context.Context, id shoal.ID, create bool, change func(*registrationRow, bool) (bool, error), record func(registrationRow) (Change, error)) (registrationRow, int64, error) {
+// never durable without its entry or the reverse. It reports whether it
+// wrote a change.
+func (r *Registry) updateRegistrationAudited(ctx context.Context, id shoal.ID, create bool, change func(*registrationRow, bool) (bool, error), record func(registrationRow) (Change, error)) (registrationRow, bool, error) {
 	coord := r.registrationCoordinate(id)
 	for range maxCASAttempts {
 		current, cell, e := r.readRegistration(ctx, id)
 		exists := e == nil
 		if e != nil && !(create && shoal.IsErrorCode(e, shoal.ErrorNotFound)) {
-			return registrationRow{}, 0, e
+			return registrationRow{}, false, e
 		}
 		next := current
 		if exists {
@@ -318,16 +318,16 @@ func (r *Registry) updateRegistrationAudited(ctx context.Context, id shoal.ID, c
 		}
 		write, e := change(&next, exists)
 		if e != nil || !write {
-			return next, 0, e
+			return next, false, e
 		}
 		canonical, e := next.Registration.Canonical()
 		if e != nil {
-			return registrationRow{}, 0, invalid()
+			return registrationRow{}, false, invalid()
 		}
 		next.Registration = canonical
 		value, e := encode(next)
 		if e != nil {
-			return registrationRow{}, 0, invalid()
+			return registrationRow{}, false, invalid()
 		}
 		condition := allocator.Condition{Coordinate: coord, Absent: !exists}
 		timestamp := int64(1)
@@ -336,50 +336,37 @@ func (r *Registry) updateRegistrationAudited(ctx context.Context, id shoal.ID, c
 			timestamp = cell.Timestamp + 1
 		}
 		mutation := allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{condition}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: timestamp, Value: value}}}
-		var sequence int64
 		var entry auditWrite
 		if record != nil {
-			if entry, e = r.prepareChange(ctx, id, next, record); errors.Is(e, errLogMoved) {
-				continue
-			} else if e != nil {
-				return registrationRow{}, 0, e
+			if entry, e = r.prepareChange(id, next, record); e != nil {
+				return registrationRow{}, false, e
 			}
-			sequence = entry.sequence
 			mutation.Conditions = append(mutation.Conditions, entry.conditions...)
 			mutation.Updates = append(mutation.Updates, entry.updates...)
 		}
 		status, writeErr := r.config.Backend.CompareAndMutate(ctx, mutation)
-		written := allocator.Condition{Coordinate: coord, Value: value, Timestamp: timestamp, TimestampSet: true}
 		if writeErr == nil && status == allocator.StatusAccepted {
-			if record != nil {
-				if e := r.ensureVisible(ctx, id, written, entry); e != nil {
-					return registrationRow{}, 0, indeterminate(e)
-				}
-			}
-			return next, sequence, nil
+			return next, true, nil
 		}
 		stored, readErr := r.read(ctx, coord)
 		if readErr == nil && stored.Timestamp == timestamp && bytes.Equal(stored.Value, value) {
 			// An identical registration write is not proof that this
 			// mutation applied when another writer could have produced the
-			// same bytes; with an audit entry its exact bytes decide.
+			// same bytes; with an entry, this attempt's own cell decides.
 			if record == nil {
-				return next, 0, nil
+				return next, true, nil
 			}
 			if applied, checkErr := r.changeApplied(ctx, id, entry); checkErr == nil && applied {
-				if e := r.ensureVisible(ctx, id, written, entry); e != nil {
-					return registrationRow{}, 0, indeterminate(e)
-				}
-				return next, sequence, nil
+				return next, true, nil
 			} else if checkErr != nil {
-				return registrationRow{}, 0, indeterminate(writeErr, checkErr)
+				return registrationRow{}, false, indeterminate(writeErr, checkErr)
 			}
 		}
 		if writeErr != nil || status != allocator.StatusRejected {
-			return registrationRow{}, 0, indeterminate(writeErr, readErr)
+			return registrationRow{}, false, indeterminate(writeErr, readErr)
 		}
 	}
-	return registrationRow{}, 0, ErrConflict
+	return registrationRow{}, false, ErrConflict
 }
 
 func cloneRow(row registrationRow) registrationRow {
@@ -418,10 +405,10 @@ func (r *Registry) Provision(ctx context.Context, p Provisioning) (collector.Reg
 // a no-op only for an active registration at that generation with the same
 // terms. Anything else is a conflict, never a merge, so a retry cannot undo a
 // revocation that happened in between.
-func (r *Registry) provision(ctx context.Context, p Provisioning, generation int64, by attribution) (registrationRow, int64, error) {
+func (r *Registry) provision(ctx context.Context, p Provisioning, generation int64, by attribution) (registrationRow, bool, error) {
 	want, e := collector.Registration{CollectorID: p.CollectorID, Subject: p.Subject, ClientID: p.ClientID, Domain: p.Domain, AuthorityPolicyIDs: p.AuthorityPolicyIDs, Control: p.Control, Mode: p.Mode, Generation: 1, State: collector.Provisioned}.Canonical()
 	if e != nil || generation < 0 {
-		return registrationRow{}, 0, invalid()
+		return registrationRow{}, false, invalid()
 	}
 	return r.updateRegistrationAudited(ctx, p.CollectorID, true, func(row *registrationRow, exists bool) (bool, error) {
 		if !exists {
@@ -468,9 +455,9 @@ func (r *Registry) Revoke(ctx context.Context, id shoal.ID) (collector.Registrat
 // generation is the one being revoked. Revoking it again is a no-op; revoking
 // any other generation is a conflict. permit, when set, re-checks the row the
 // write is computed from.
-func (r *Registry) revoke(ctx context.Context, id shoal.ID, generation int64, by attribution, permit func(collector.Registration) error) (registrationRow, int64, error) {
+func (r *Registry) revoke(ctx context.Context, id shoal.ID, generation int64, by attribution, permit func(collector.Registration) error) (registrationRow, bool, error) {
 	if generation < 0 {
-		return registrationRow{}, 0, invalid()
+		return registrationRow{}, false, invalid()
 	}
 	return r.updateRegistrationAudited(ctx, id, false, func(row *registrationRow, _ bool) (bool, error) {
 		if permit != nil {

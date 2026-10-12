@@ -150,7 +150,7 @@ the SDK: `sdk.New(...).Collectors()` gains `ProvisionCollector`,
 | --- | --- |
 | `POST /api/v1/collectors/admin/provision` | `ProvisionRequest` (collector ID, subject, optional client ID, domain, authority policy IDs, control, mode, generation) → `AdminReceipt` |
 | `POST /api/v1/collectors/admin/revoke` | `RevokeRequest` (collector ID, generation) → `AdminReceipt` |
-| `GET /api/v1/collectors/admin/registrations/{id}` | `RegistrationRecord`: the registration, its current enrollment ID, the change count and the 16 most recent changes, newest first |
+| `GET /api/v1/collectors/admin/registrations/{id}` | `RegistrationRecord`: the registration, its current enrollment ID, and the change log of its last 8 generations (entries newest first, gaps, anomalies) |
 
 IDs and the domain are base64url without padding, as on the collector routes;
 bodies are decoded with the same strict rules.
@@ -217,176 +217,101 @@ their part.
 
 ### Audit
 
-Every provisioning and revocation that changes a registration, through either
-API, appends one immutable entry to that collector's change log **in the same
-one-row mutation** as the registration write, so neither is durable without
-the other. An entry records the action, the registration as written, the time,
-and its source: `collector_admin` with the admin's subject, actor, client ID,
-domain, request ID, correlation ID and authorization fingerprint, or
-`operator_api` for the Go API, which has no caller identity. No-op retries and
-refused requests change nothing and write no entry. A lost acknowledgement is
-reconciled by reading the exact entry back (each attempt carries a random
-nonce, so two identical concurrent requests cannot both claim the change).
-`Registry.Changes` is a trusted Go read of the whole log; the HTTP read returns
-the 16 most recent entries.
+Every provisioning and revocation that changes a registration writes one
+immutable entry to that collector's change log. It does so in the **same
+one-row compare-and-set mutation** as the registration write, through either
+API, so neither is durable without the other.
 
-**Recorded identities.** An admin decision whose subject, actor, client ID or
-request ID is not valid, printable UTF-8 within `shoal.MaxIDBytes`, or whose
-correlation ID fails `interaction.ValidateCorrelationID`, is refused as an
-admin (`401`) before anything is read. Spaces are allowed in the first four,
-as OIDC-mapped subjects contain them. Independently, the registry decodes
-every entry and head it is about to write, under the same rules its readers
-apply, and refuses to write anything that would not read back as itself. So
-the log never holds an entry its own read API refuses.
+An entry records:
+- the action;
+- the registration as written;
+- the time;
+- its source: `collector_admin` with the admin's subject, actor, client ID,
+  domain, request ID, correlation ID and authorization fingerprint, or
+  `operator_api` for the Go API, which has no caller identity.
 
-**A damaged log never blocks revocation.** Revocation is the emergency
-control. The log is damaged in any of these cases:
-- the head is present but is not a head this registry wrote (any cell count,
-  timestamp or bytes other than one decodable head at its own sequence);
-- the head is absent while entries exist;
-- the entry the head would append is occupied, by any cell, malformed or not;
-- the head is healthy but sits at the largest timestamp the registry writes,
-  so no later head can supersede it (`exhausted_head`).
+No-op retries and refused requests change nothing and write no entry.
+`Registry.Changes` is a trusted Go read of the log. The HTTP read covers the
+last 8 generations.
 
-A provisioning then fails closed (`503`). A revocation, through either API,
-starts a new segment of the log, all in one mutation with the revocation:
-- **Its entry** carries a recovery marker: `unreadable_head`,
-  `occupied_sequence` or `exhausted_head`, the damaged head's timestamp (0
-  when absent or non-positive), and the SHA-256 of its exact stored bytes.
-- **Its sequence** is one above the higher of the head's sequence and every
-  stored entry's. Sequences are independent of cell timestamps.
-  - Where the store supports row scans, as the engine and Accumulo stores do,
-    the row is scanned for the highest entry. The scan pages until a page
-    comes back empty, because a store may apply the limit before filtering.
-  - On a store without row scans the registry probes upward in doubling
-    steps. A stray entry above the probe could then still make a later
-    provisioning fail closed.
-- **A new head** at that sequence records it as `segment_start`. No stored
-  entry lies above the new segment, so later appends proceed normally.
+**Slots, not a sequence.** The log has no head and no global sequence. Each
+entry has a slot, (generation, action):
+- a provisioning that creates a collector writes (1, provision);
+- a revocation moves generation g to g+1 and writes (g+1, revoke);
+- a provisioning that reactivates a revoked collector at g writes
+  (g, provision).
 
-The mutation is serialized by the registration cell's compare-and-set, as
-every logged change is. It is also pinned to the head it judged: an absent
-head by an absence condition, and a single stored cell by its exact value and
-timestamp. So a recovery cannot commit over a head that a concurrent write
-has meanwhile repaired, which would orphan that write's entry. It
-re-evaluates and appends normally instead. Only a head that is not a single
-pinnable cell is left unpinned, and the registry never writes one. Only a failure of the store itself fails a revocation, since
-nothing can be written then anyway.
+So a registration at generation G implies exactly (1, provision), then
+(g, revoke) and (g, provision) for each g from 2 to G. The exception is
+(G, provision), which is absent while the collector is revoked. At most one
+change can land in a slot, because the registration compare-and-set admits
+one.
 
-If no head can supersede the damaged one (it sits at the largest timestamp),
-the entry is written without a new head. If no sequence above the damage is
-representable (an entry at or next to the largest sequence), the entry goes
-under a `change-overflow:` qualifier instead. In both cases the revocation still
-applies and is still recorded, and the log reads as unavailable.
+The entry's qualifier is its slot plus the write attempt's random nonce. The
+write is conditioned only on that exact cell being absent. A write therefore
+reads nothing else in the log, and no other cell can block it, damaged or
+stray. A revocation, and a provisioning, depends only on the collector's own
+registration row.
 
-**Delete markers.** A delete marker hides every cell at or below its
-timestamp from reads, scans and conditions alike, so the registry cannot see
-one in advance. Entries and heads are therefore written at a timestamp above
-the visible head's and at least the clock's nanoseconds. That clears markers
-left at a cell's own timestamp or at wall-clock milliseconds, as an Accumulo
-shell `delete` without a timestamp leaves.
+A lost acknowledgement is reconciled by reading back that attempt's exact
+cell. An attempt that did not commit wrote nothing, since the entry and the
+registration are one atomic mutation, so lost-ack races leave no stray
+entries behind.
 
-Every accepted audited write is then read back. While the registration cell
-is still the one this write produced, a hidden entry or head is written
-again, conditioned on that cell, until it reads back. The rewrite timestamp
-starts at the write's own timestamp plus a doubling step, then halves the
-room left below the largest usable timestamp.
+**Reads check the log against the registration.** A read takes the
+registration, scans that collector's entries for the requested generations,
+and reads the registration again. If its logged state (generation,
+revocation, terms) moved in between, the read retries, and answers `409` if
+it keeps moving. So the entries and the registration always describe the
+same moment. Enrollment changes the registration without a logged change, so
+it never causes a retry. The domain is checked before anything in the log is
+read.
 
-Head timestamps only increase, so the timestamp space is finite headroom.
-A marker just above the clock costs a bounded jump, and later writes go one
-higher. A marker within K of the top leaves room for only about K more
-appends. After that the log is exhausted:
-- it still reads, since it is complete;
-- provisioning fails closed;
-- a revocation is recorded as an `exhausted_head` entry beyond the head,
-  after which reads fail closed.
+The read reports:
+- **gaps**: slots the registration implies that hold no entry. Examples are a
+  registration from before the log existed, or an entry deleted or hidden by
+  a delete marker out of band.
+- **anomalies**: cells that are not exactly one valid entry for their slot.
+  - `undecodable`;
+  - `unknown_version`;
+  - `misplaced`: the content does not match the qualifier, or the qualifier
+    is not one the registry writes;
+  - `unexpected`: a slot the registration does not imply, such as a
+    generation above it;
+  - `duplicate`: several entries in one slot, none of which is presented;
+  - `inconsistent`: the newest slot's entry describes a registration other
+    than the current one.
 
-Clearing an exhausted log takes store surgery, as does a marker at the very
-largest timestamp.
+Gaps and anomalies are reported, never repaired, and they never block a
+write. A delete marker cannot pre-empt a write either, because the qualifier
+is unknown until the write happens.
 
-If a later audited write commits on top first, this write's head was
-legitimately superseded. The write is then clean when its entry reads back
-exactly and the visible head is healthy at or past its sequence, with a
-segment that still includes it. A recovery that started its segment past the
-entry leaves it unreadable, and the write reports `indeterminate`.
+**Recorded identities.** An admin decision is refused as an admin (`401`)
+before anything is read if any of these fails:
+- its subject, actor, client ID or request ID is valid, printable UTF-8
+  within `shoal.MaxIDBytes`; spaces are allowed, since OIDC-mapped subjects
+  contain them;
+- its correlation ID passes `interaction.ValidateCorrelationID`.
 
-Otherwise (a marker at or above the largest usable timestamp) the call reports
-`indeterminate` rather than a clean change. Entries are immutable in content,
-but a repaired one sits at a later timestamp.
+Independently, the registry decodes every entry it is about to write, under
+the readers' rules, and refuses to write one that would not read back as
+itself. So the log never holds an entry its own read API refuses.
 
-Both reads fail closed (`503`) when the log holds a change its head does not
-describe:
-- where the store can scan, any entry above the head's sequence or any
-  overflow entry;
-- otherwise, the entry right after the head's sequence.
+**Versioned entries.** Every entry carries a format version. The decoder
+reads the version first, then decodes strictly into that version's own
+structure. A version it does not know is refused explicitly and reported as
+`unknown_version`, never guessed at. A later build adds fields by adding a
+version, and entries written in an earlier version stay readable.
 
-Writes treat the same states as damage. A provisioning fails closed, and a
-revocation recovers above them, so the log reads again.
-
-A recovery also accounts for every overflow cell stored at that moment, by
-timestamp, not by qualifier:
-- its entry records the highest such timestamp
-  (`AcknowledgedOverflowTimestamp`);
-- the new head carries it;
-- the recovery and every later registry write land above it.
-
-So an overflow cell above the acknowledgement is damage. That covers every
-overflow entry the registry writes afterwards, whatever its qualifier sorts
-as. An overflow cell at the top of the timestamp space cannot be acknowledged
-and stays damage. One near the top uses up the headroom like a delete marker
-there (see "Delete markers"). A head whose acknowledgement is not below its
-own timestamp is not one the registry wrote, and reads as damaged.
-
-Only entry qualifiers the registry could have written (the exact 20-digit
-zero-padded form) count as entries, for recovery and readers alike. Other
-cells in the family are ignored consistently.
-
-Residual for stores that apply a scan's limit before filtering by
-visibility: a page holding only another visibility's cells reads as empty,
-which ends the scan early. That needs a second registry configuration with a
-different visibility sharing the table. Entry and head are
-written in one mutation, but the reader's probe of the next entry is a
-separate read. So an entry that appears because a concurrent write committed
-in between is told apart by re-reading the head: the read retries, and only
-an unchanged head with an entry beyond it counts as damage. A provisioning
-that sees the next entry occupied makes the same check before failing closed,
-so ordinary provision and revoke races are never reported as damage. The
-same holds for an absent head over entries: a first logged change committing
-mid-read is a retry, not hidden history. A read whose log keeps moving through
-all its retries answers `409` (retry), never `503`.
-
-**Limit: a missing entry inside a segment.** If an entry inside the current
-segment disappears (deleted out of band, or hidden while a later write
-committed on top, which reports `indeterminate`), appends still proceed. The
-reads fail closed (`503`) until the gap scrolls out of the 16 entries the HTTP
-read lists. `Registry.Changes` keeps failing for that segment. This is
-damage the reads detect but no write repairs.
-
-**Limit: a fully hidden log.** A log whose head and entries are all hidden by markers at the
-largest timestamps looks exactly like a registration from before the log
-existed, which legitimately has none. Such a log reads as empty. Writes over
-it still report `indeterminate`, never clean. A head at the largest timestamp
-can come only from outside the registry (store surgery), and so can a marker
-there. Clearing either takes store surgery too.
-
-Reads show only the current segment: the HTTP read lists its entries and
-reports `segment_start`, and `Registry.Changes` starts there too. Older
-entries stay stored, for forensics, outside these APIs. After a recovery,
-`change_count` is the newest sequence, not a count of stored entries. An
-absent head over stored entries reads as unavailable, not as an empty log, so
-deleting the head cannot hide history.
-
-**Upgrades.** A build without the log (before slice 5) that provisions or
-revokes leaves the registration ahead of its newest entry. The admin read then
-fails closed (`503`) until the next logged change.
-
-**Coherent reads.** The HTTP read takes the registration between two reads of
-the head that agree (retrying a bounded number of times), and checks that the
-registration matches the newest entry's generation, revocation, authority,
-control and mode. A provisioning or revocation that lands mid-read therefore
-cannot produce a registration that lags `changes[0]`. Enrollment is not a
-logged change, so `state` may read `enrolled` where the newest entry says
-`provisioned`.
+**Requirements and limits.**
+- Reads need a store with row scans; the engine and Accumulo stores have
+  them. Writes need only exact reads and the compare-and-set.
+- A read examines at most 512 cells, so a range flooded with stray cells
+  reads as unavailable rather than partially.
+- On a store that applies a scan's limit before filtering by visibility, a
+  page holding only another visibility's cells reads as empty and ends the
+  scan early. That needs a second registry configuration with a different
+  visibility sharing the table.
 
 The log lives in its own column family (`a`) of the registration's row. The
 cells the existing flows write are unchanged byte for byte
@@ -399,10 +324,10 @@ Provision and revoke are idempotent and listed in `requestMayCommit`, so an
 over-budget or uncertain response reports `indeterminate`; retry with the
 identical request. `AdminReceipt.Changed` says whether this call made the
 change, so a retry of a change that already applied reports `false` with the
-same registration. Receipts carry only the collector ID, generation, state,
-`changed` and the entry's sequence: at most 1498 bytes with a maximal ID, within
+same registration. Receipts carry only the collector ID, generation, state
+and `changed`: at most 1467 bytes with a maximal ID, within
 `api.MaxAdminReceiptBytes` (2048). The largest registration record is about
-166 KB, within `api.MaxResponseBytes`.
+172 KB, within `api.MaxResponseBytes`.
 
 ## Attestation
 

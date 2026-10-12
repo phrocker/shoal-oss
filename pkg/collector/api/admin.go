@@ -23,8 +23,11 @@ const (
 	// collector ID at shoal.MaxIDBytes.
 	MaxAdminReceiptBytes = 2048
 	// MaxRegistrationChanges bounds the change summaries in one
-	// RegistrationRecord.
+	// RegistrationRecord: two per generation over ViewGenerations.
 	MaxRegistrationChanges = 16
+	// ViewGenerations is how many recent generations a RegistrationRecord
+	// covers.
+	ViewGenerations = 8
 )
 
 // Change log actions and sources, as RegistrationRecord reports them.
@@ -91,14 +94,12 @@ type RevokeRequest struct {
 // receipts it carries identifiers and counters only; the registration is read
 // back through the registrations route. Changed reports whether this call
 // made the change: a retry of a change that already applied reports false.
-// Sequence is the change log entry the call wrote, 0 when it changed nothing.
 type AdminReceipt struct {
 	Schema      int    `json:"schema"`
 	CollectorID string `json:"collector_id"`
 	Generation  int64  `json:"generation"`
 	State       string `json:"state"`
 	Changed     bool   `json:"changed"`
-	Sequence    int64  `json:"sequence"`
 }
 
 // AdminAttribution identifies the admin decision behind a change.
@@ -111,30 +112,46 @@ type AdminAttribution struct {
 	AuthorizationFingerprint string `json:"authorization_fingerprint"`
 }
 
-// Recovery reasons, as ChangeSummary reports them.
+// Anomaly reasons, as RegistrationRecord reports them (docs/collectors.md,
+// "Audit").
 const (
-	RecoveryUnreadableHead   = "unreadable_head"
-	RecoveryOccupiedSequence = "occupied_sequence"
-	RecoveryExhaustedHead    = "exhausted_head"
+	AnomalyUndecodable    = "undecodable"
+	AnomalyUnknownVersion = "unknown_version"
+	AnomalyMisplaced      = "misplaced"
+	AnomalyUnexpected     = "unexpected"
+	AnomalyDuplicate      = "duplicate"
+	AnomalyInconsistent   = "inconsistent"
 )
 
-// ChangeSummary is one change log entry. By is present exactly when Source is
-// SourceCollectorAdmin; the trusted Go API has no caller identity. Recovery
-// is set on a revocation that started a new log segment because the log
-// could not be appended to (docs/collectors.md, "Audit").
+// ChangeSummary is one change log entry. Its slot is (Generation, Action).
+// By is present exactly when Source is SourceCollectorAdmin; the trusted Go
+// API has no caller identity.
 type ChangeSummary struct {
-	Sequence   int64             `json:"sequence"`
 	Action     string            `json:"action"`
 	Source     string            `json:"source"`
 	Generation int64             `json:"generation"`
 	State      string            `json:"state"`
 	By         *AdminAttribution `json:"by,omitempty"`
 	At         time.Time         `json:"at"`
-	Recovery   string            `json:"recovery,omitempty"`
 }
 
-// RegistrationRecord is a registration as an admin reads it, with its most
-// recent changes, newest first. It carries no quarantine status:
+// LogGap is a slot the registration implies that holds no entry.
+type LogGap struct {
+	Generation int64  `json:"generation"`
+	Action     string `json:"action"`
+}
+
+// LogAnomaly is a stored cell that is not exactly one valid entry for its
+// slot. Generation and Action are absent when its qualifier names no slot.
+type LogAnomaly struct {
+	Generation int64  `json:"generation,omitempty"`
+	Action     string `json:"action,omitempty"`
+	Reason     string `json:"reason"`
+}
+
+// RegistrationRecord is a registration as an admin reads it, with the change
+// log of its generations from FromGeneration on: the entries, newest first,
+// and the gaps and anomalies found there. It carries no quarantine status:
 // observation status is computed from the current registration at each
 // observation read.
 type RegistrationRecord struct {
@@ -149,14 +166,14 @@ type RegistrationRecord struct {
 	Generation         int64           `json:"generation"`
 	State              string          `json:"state"`
 	EnrollmentID       string          `json:"enrollment_id,omitempty"`
-	ChangeCount        int64           `json:"change_count"`
+	FromGeneration     int64           `json:"from_generation"`
 	Changes            []ChangeSummary `json:"changes"`
-	// SegmentStart is the sequence of the recovery entry that starts the
-	// current log segment, absent when the log never needed recovery. Only
-	// that segment is listed. ChangeCount is the newest sequence, which after
-	// a recovery is not a count of stored entries.
-	SegmentStart int64 `json:"segment_start,omitempty"`
+	Gaps               []LogGap        `json:"gaps"`
+	Anomalies          []LogAnomaly    `json:"anomalies"`
 }
+
+// MaxRegistrationAnomalies bounds the anomalies one RegistrationRecord lists.
+const MaxRegistrationAnomalies = 64
 
 // EncodeProvision converts a contract provisioning to its wire form.
 func EncodeProvision(p Provisioning) ProvisionRequest {
@@ -226,7 +243,7 @@ func validState(s string) bool {
 }
 
 func (r AdminReceipt) Validate() error {
-	if r.Schema != Schema || !validEncodedID(r.CollectorID) || r.Generation <= 0 || !validState(r.State) || r.Sequence < 0 || r.Changed != (r.Sequence > 0) {
+	if r.Schema != Schema || !validEncodedID(r.CollectorID) || r.Generation <= 0 || !validState(r.State) {
 		return badResponse()
 	}
 	return nil
@@ -245,7 +262,7 @@ func (a AdminAttribution) validate() error {
 }
 
 func (c ChangeSummary) validate() error {
-	if c.Sequence <= 0 || c.Generation <= 0 || !validState(c.State) || !validTime(c.At) {
+	if c.Generation <= 0 || !validState(c.State) || !validTime(c.At) {
 		return badResponse()
 	}
 	if (c.Action != ChangeProvision && c.Action != ChangeRevoke) || (c.Action == ChangeRevoke) != (c.State == string(collector.Revoked)) {
@@ -263,23 +280,30 @@ func (c ChangeSummary) validate() error {
 	default:
 		return badResponse()
 	}
-	switch c.Recovery {
-	case "":
-	case RecoveryUnreadableHead, RecoveryOccupiedSequence, RecoveryExhaustedHead:
-		if c.Action != ChangeRevoke {
-			return badResponse()
-		}
-	default:
-		return badResponse()
-	}
 	return nil
 }
 
-// Validate checks wire integrity: the registration decodes canonically and
-// the change summaries are well formed, newest first, and no more than the
-// change count.
+// slotOrder orders slots as they happen: by generation, a revoke into g
+// before a provisioning at g.
+func slotOrder(generation int64, action string) [2]int64 {
+	o := int64(1)
+	if action == ChangeRevoke {
+		o = 0
+	}
+	return [2]int64{generation, o}
+}
+
+func before(a, b [2]int64) bool { return a[0] < b[0] || (a[0] == b[0] && a[1] < b[1]) }
+
+// Validate checks wire integrity: the registration decodes canonically, the
+// change summaries are well formed, in slots the registration implies within
+// [FromGeneration, Generation], newest first, and gaps and anomalies are
+// well formed.
 func (r RegistrationRecord) Validate() error {
-	if r.Schema != Schema || !validState(r.State) || r.ChangeCount < 0 || len(r.Changes) > MaxRegistrationChanges || int64(len(r.Changes)) > r.ChangeCount {
+	if r.Schema != Schema || !validState(r.State) || len(r.Changes) > MaxRegistrationChanges || len(r.Anomalies) > MaxRegistrationAnomalies || r.FromGeneration <= 0 || r.FromGeneration > r.Generation || r.Generation-r.FromGeneration >= ViewGenerations {
+		return badResponse()
+	}
+	if r.Changes == nil || r.Gaps == nil || r.Anomalies == nil {
 		return badResponse()
 	}
 	p, e := DecodeProvision(ProvisionRequest{CollectorID: r.CollectorID, Subject: r.Subject, ClientID: r.ClientID, Domain: r.Domain, AuthorityPolicyIDs: r.AuthorityPolicyIDs, Control: r.Control, Mode: r.Mode, Generation: r.Generation})
@@ -294,18 +318,39 @@ func (r RegistrationRecord) Validate() error {
 	if (r.EnrollmentID != "") != (r.State == string(collector.Enrolled)) || (r.EnrollmentID != "" && !validEncodedID(r.EnrollmentID)) {
 		return badResponse()
 	}
-	for i, c := range r.Changes {
-		if c.validate() != nil || c.Sequence > r.ChangeCount || (i > 0 && c.Sequence >= r.Changes[i-1].Sequence) {
-			return badResponse()
+	inRange := func(generation int64, action string) bool {
+		if generation < r.FromGeneration || generation > r.Generation || (action != ChangeProvision && action != ChangeRevoke) {
+			return false
 		}
-		// Only the current segment is listed, and its recovery entry is
-		// exactly the one SegmentStart names.
-		if c.Sequence < r.SegmentStart || (c.Recovery != "") != (r.SegmentStart == c.Sequence) {
+		if action == ChangeRevoke {
+			return generation >= 2
+		}
+		return generation < r.Generation || r.State != string(collector.Revoked)
+	}
+	for i, c := range r.Changes {
+		if c.validate() != nil || !inRange(c.Generation, c.Action) || (i > 0 && !before(slotOrder(c.Generation, c.Action), slotOrder(r.Changes[i-1].Generation, r.Changes[i-1].Action))) {
 			return badResponse()
 		}
 	}
-	if r.SegmentStart < 0 || r.SegmentStart > r.ChangeCount {
-		return badResponse()
+	for _, g := range r.Gaps {
+		if !inRange(g.Generation, g.Action) {
+			return badResponse()
+		}
+		for _, c := range r.Changes {
+			if c.Generation == g.Generation && c.Action == g.Action {
+				return badResponse()
+			}
+		}
+	}
+	for _, a := range r.Anomalies {
+		switch a.Reason {
+		case AnomalyUndecodable, AnomalyUnknownVersion, AnomalyMisplaced, AnomalyUnexpected, AnomalyDuplicate, AnomalyInconsistent:
+		default:
+			return badResponse()
+		}
+		if a.Generation < 0 || (a.Action != "" && a.Action != ChangeProvision && a.Action != ChangeRevoke) {
+			return badResponse()
+		}
 	}
 	return nil
 }

@@ -61,7 +61,7 @@ func TestCollectorAdminSDKEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	admin := f.client(t, "admin").Collectors()
 	receipt, e := admin.ProvisionCollector(ctx, newGrant(1, "authority:logs"))
-	if e != nil || !receipt.Changed || receipt.Sequence != 1 || receipt.State != "provisioned" || receipt.Generation != 1 {
+	if e != nil || !receipt.Changed || receipt.State != "provisioned" || receipt.Generation != 1 {
 		t.Fatalf("provision: %+v %v", receipt, e)
 	}
 	if retry, e := admin.ProvisionCollector(ctx, newGrant(1, "authority:logs")); e != nil || retry.Changed || retry.Generation != 1 {
@@ -114,7 +114,7 @@ func TestCollectorAdminSDKEndToEnd(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if record.State != "revoked" || record.Generation != 2 || record.ChangeCount != 2 || len(record.Changes) != 2 || record.EnrollmentID != "" {
+	if record.State != "revoked" || record.Generation != 2 || len(record.Changes) != 2 || len(record.Gaps) != 0 || len(record.Anomalies) != 0 || record.EnrollmentID != "" {
 		t.Fatalf("record %+v", record)
 	}
 	for _, c := range record.Changes {

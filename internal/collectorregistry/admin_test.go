@@ -59,30 +59,6 @@ func grant(id shoal.ID, subject string, authority ...shoal.ID) Provisioning {
 	return Provisioning{CollectorID: id, Subject: shoal.ID(subject), ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: authority, Control: collector.ExternalControlled, Mode: collector.ServerObserved}
 }
 
-func (v *env) changes(t *testing.T, id shoal.ID) []Change {
-	t.Helper()
-	out, e := v.registry.Changes(context.Background(), id, 0, MaxChangesPage)
-	if e != nil {
-		t.Fatal(e)
-	}
-	return out
-}
-
-func (v *env) wrote(t *testing.T, id shoal.ID) bool {
-	t.Helper()
-	_, e := v.registry.Registration(context.Background(), id)
-	if e == nil {
-		return true
-	}
-	if !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
-		t.Fatal(e)
-	}
-	if head, e := v.registry.readChangeHead(context.Background(), id); e != nil || head.Sequence != 0 {
-		t.Fatalf("change log written without a registration: %+v %v", head, e)
-	}
-	return false
-}
-
 func TestAdminProvisionIsAuditedAndWorksEndToEnd(t *testing.T) {
 	v := newEnv(t)
 	admin := v.admin(t)
@@ -90,7 +66,7 @@ func TestAdminProvisionIsAuditedAndWorksEndToEnd(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if !result.Changed || result.Sequence != 1 || result.Registration.State != collector.Provisioned || result.Registration.Generation != 1 {
+	if !result.Changed || result.Registration.State != collector.Provisioned || result.Registration.Generation != 1 {
 		t.Fatalf("result %+v", result)
 	}
 	// The provisioned principal enrolls within the ceiling and nothing more.
@@ -113,7 +89,7 @@ func TestAdminProvisionIsAuditedAndWorksEndToEnd(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if view.Registration.State != collector.Enrolled || view.EnrollmentID == "" || view.ChangeCount != 1 || len(view.Changes) != 1 {
+	if view.Registration.State != collector.Enrolled || view.EnrollmentID == "" || len(view.Changes) != 1 || len(view.Gaps) != 0 || len(view.Anomalies) != 0 {
 		t.Fatalf("view %+v", view)
 	}
 	// The Go API is audited too, without a caller identity.
@@ -231,7 +207,7 @@ func TestAdminProvisionIsIdempotentAndNeverMerges(t *testing.T) {
 		t.Fatal(e)
 	}
 	again, e := v.registry.AdminProvision(admin, p, 1)
-	if e != nil || again.Changed || again.Sequence != 0 || again.Registration.Generation != 1 {
+	if e != nil || again.Changed || again.Registration.Generation != 1 {
 		t.Fatalf("retry %+v %v", again, e)
 	}
 	for name, change := range map[string]func(*Provisioning, *int64){
@@ -322,7 +298,7 @@ func TestAdminRevokeQuarantinesAtReadTimeAndCannotBeUndoneByRetry(t *testing.T) 
 		t.Fatalf("changes %+v", got)
 	}
 	view, e := v.registry.AdminRegistration(admin, collectorID)
-	if e != nil || view.ChangeCount != 3 || len(view.Changes) != 3 || view.Changes[0].Sequence != 3 || view.Changes[2].Sequence != 1 {
+	if e != nil || len(view.Changes) != 3 || view.Changes[0].Action != ChangeProvision || view.Changes[0].Generation() != 2 || view.Changes[1].Action != ChangeRevoke || view.Changes[2].Generation() != 1 || len(view.Gaps) != 0 || len(view.Anomalies) != 0 {
 		t.Fatalf("view %+v %v", view, e)
 	}
 }
@@ -358,11 +334,7 @@ func TestConcurrentAdminChangesAreSerializedAndEachAudited(t *testing.T) {
 	if int32(len(got)) != created.Load()+revoked.Load() {
 		t.Fatalf("%d changes for %d writes", len(got), created.Load()+revoked.Load())
 	}
-	for i, c := range got {
-		if c.Sequence != int64(i+1) {
-			t.Fatalf("gap at %d: %+v", i, c)
-		}
-	}
+	v.cleanLog(t, collectorID)
 }
 
 // lostAck applies a mutation and then reports that its outcome is unknown.
@@ -372,6 +344,10 @@ type lostAck struct {
 		CompareAndMutate(context.Context, allocator.Mutation) (allocator.Status, error)
 	}
 	drop atomic.Bool
+}
+
+func (l *lostAck) ScanRowPrefix(ctx context.Context, row, family, start, visibility []byte, limit int) ([]allocator.Cell, error) {
+	return l.inner.(rowScanner).ScanRowPrefix(ctx, row, family, start, visibility, limit)
 }
 
 func (l *lostAck) ReadExact(ctx context.Context, c []allocator.Coordinate) ([]allocator.Cell, error) {
@@ -398,171 +374,11 @@ func TestAdminWriteReconcilesALostAcknowledgement(t *testing.T) {
 	}
 	backend.drop.Store(true)
 	result, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1)
-	if e != nil || !result.Changed || result.Sequence != 1 {
+	if e != nil || !result.Changed {
 		t.Fatalf("lost-ack provision %+v %v", result, e)
 	}
 	if got := v.changes(t, collectorID); len(got) != 1 {
 		t.Fatalf("changes %+v", got)
-	}
-}
-
-// The change log is read strictly: a head naming a missing or altered entry
-// fails closed.
-func TestCorruptChangeLogFailsClosed(t *testing.T) {
-	v := newEnv(t)
-	admin := v.admin(t)
-	if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 1); e != nil {
-		t.Fatal(e)
-	}
-	coord := v.registry.changeEntryCoordinate(collectorID, 1)
-	cell, e := v.registry.read(context.Background(), coord)
-	if e != nil {
-		t.Fatal(e)
-	}
-	status, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Value: cell.Value, Timestamp: cell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: cell.Timestamp + 1, Value: bytes.Replace(cell.Value, []byte(`"admin"`), []byte(`"other"`), 1)}}})
-	if e != nil || status != allocator.StatusAccepted {
-		t.Fatal(status, e)
-	}
-	if _, e := v.registry.AdminRegistration(admin, collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("altered entry: %v", e)
-	}
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("altered entry: %v", e)
-	}
-	// A provisioning cannot be appended over a corrupt head; it fails closed.
-	// (Revoke first so that the provisioning below is a real change.)
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatal(e)
-	}
-	corruptHead(t, v, collectorID)
-	if _, e := v.registry.AdminProvision(admin, grant("collector:other", "other", "authority:logs"), 1); e != nil {
-		t.Fatal(e) // another collector's log is independent
-	}
-	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("provision over a corrupt head: %v", e)
-	}
-	if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 2); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("admin provision over a corrupt head: %v", e)
-	}
-	if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
-		t.Fatalf("a change was written without its entry: %+v", reg)
-	}
-}
-
-// corruptHead overwrites id's change-log head with bytes that do not decode
-// and returns the replaced cell.
-func corruptHead(t *testing.T, v *env, id shoal.ID) allocator.Cell {
-	t.Helper()
-	head := v.registry.changeHeadCoordinate(id)
-	cell, e := v.registry.read(context.Background(), head)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if _, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: head.Row, Conditions: []allocator.Condition{{Coordinate: head, Value: cell.Value, Timestamp: cell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: head, Timestamp: cell.Timestamp + 1, Value: []byte("garbage")}}}); e != nil {
-		t.Fatal(e)
-	}
-	stored, _ := v.registry.read(context.Background(), head)
-	return stored
-}
-
-// Revocation is the emergency control: a damaged log never blocks it. It
-// starts a new, recorded segment instead, atomically with the revocation.
-func TestRevocationRecoversADamagedChangeLog(t *testing.T) {
-	for _, viaAdmin := range []bool{true, false} {
-		v := newEnv(t)
-		admin := v.admin(t)
-		if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 1); e != nil {
-			t.Fatal(e)
-		}
-		damaged := corruptHead(t, v, collectorID)
-		if _, e := v.registry.AdminRegistration(admin, collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-			t.Fatalf("read over a corrupt head: %v", e)
-		}
-		var e error
-		if viaAdmin {
-			var result AdminResult
-			result, e = v.registry.AdminRevoke(admin, collectorID, 1)
-			if e == nil && (!result.Changed || result.Sequence != 2) {
-				t.Fatalf("recovery result %+v", result)
-			}
-		} else {
-			_, e = v.registry.Revoke(context.Background(), collectorID)
-		}
-		if e != nil {
-			t.Fatalf("revoke over a corrupt head (admin %v): %v", viaAdmin, e)
-		}
-		if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked || reg.Generation != 2 {
-			t.Fatalf("not revoked: %+v", reg)
-		}
-		view, e := v.registry.AdminRegistration(admin, collectorID)
-		if e != nil {
-			t.Fatalf("read after recovery: %v", e)
-		}
-		if len(view.Changes) != 1 || view.SegmentStart != 2 || view.ChangeCount != 2 {
-			t.Fatalf("view %+v", view)
-		}
-		c := view.Changes[0]
-		if c.Recovery == nil || c.Recovery.Reason != RecoveryUnreadableHead || c.Recovery.HeadTimestamp != damaged.Timestamp || c.Recovery.HeadSHA256 != digestBytes(damaged.Value) || c.Action != ChangeRevoke {
-			t.Fatalf("recovery entry %+v %+v", c, c.Recovery)
-		}
-		// The wire projection carries the segment.
-		provider, _ := NewAdminProvider(v.registry)
-		record, e := provider.ReadRegistration(admin, collectorID)
-		if e != nil || record.SegmentStart != view.SegmentStart || len(record.Changes) != 1 || record.Changes[0].Recovery != api.RecoveryUnreadableHead {
-			t.Fatalf("wire record %+v %v", record, e)
-		}
-		// The new segment reads through Changes, and the log appends
-		// normally again.
-		if got, e := v.registry.Changes(context.Background(), collectorID, view.SegmentStart-1, MaxChangesPage); e != nil || len(got) != 1 {
-			t.Fatalf("segment %+v %v", got, e)
-		}
-		if r, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 2); e != nil || r.Sequence != view.SegmentStart+1 {
-			t.Fatalf("append after recovery %+v %v", r, e)
-		}
-	}
-}
-
-// An entry already present where the head says the next one goes is also
-// damage a revocation recovers from, and a provisioning refuses.
-func TestRevocationRecoversAnOccupiedSequence(t *testing.T) {
-	v := newEnv(t)
-	admin := v.admin(t)
-	if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 1); e != nil {
-		t.Fatal(e)
-	}
-	for _, sequence := range []int64{2, 3} {
-		coord := v.registry.changeEntryCoordinate(collectorID, sequence)
-		if _, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Absent: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: 1, Value: []byte("stray")}}}); e != nil {
-			t.Fatal(e)
-		}
-	}
-	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs", "authority:more")); e == nil {
-		t.Fatal("a conflicting provision succeeded")
-	}
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatalf("revoke over an occupied sequence: %v", e)
-	}
-	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
-		t.Fatalf("provision after recovery: %v", e)
-	}
-	view, e := v.registry.AdminRegistration(admin, collectorID)
-	if e != nil || view.SegmentStart != 4 || len(view.Changes) != 2 || view.Changes[1].Recovery == nil || view.Changes[1].Recovery.Reason != RecoveryOccupiedSequence || view.Changes[1].Recovery.HeadTimestamp <= 0 {
-		t.Fatalf("view %+v %v", view, e)
-	}
-}
-
-// A provisioning over an occupied sequence fails closed and writes nothing.
-func TestProvisionOverAnOccupiedSequenceFailsClosed(t *testing.T) {
-	v := newEnv(t)
-	coord := v.registry.changeEntryCoordinate(collectorID, 1)
-	if _, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Absent: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: 1, Value: []byte("stray")}}}); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("provision: %v", e)
-	}
-	if _, e := v.registry.Registration(context.Background(), collectorID); !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
-		t.Fatalf("provision wrote: %v", e)
 	}
 }
 
@@ -676,7 +492,6 @@ func TestAdminRegistrationIsCoherent(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	backend.skip.Store(1) // past the domain check, into the coherent loop
 	backend.armed.Store(true)
 	view, e := r.AdminRegistration(admin, collectorID)
 	if e != nil {
@@ -685,51 +500,8 @@ func TestAdminRegistrationIsCoherent(t *testing.T) {
 	if backend.armed.Load() {
 		t.Fatal("the revocation did not interleave; the test is vacuous")
 	}
-	if view.Registration.State != collector.Revoked || view.Changes[0].Action != ChangeRevoke || view.ChangeCount != 2 {
+	if view.Registration.State != collector.Revoked || len(view.Changes) != 2 || view.Changes[0].Action != ChangeRevoke || len(view.Gaps) != 0 || len(view.Anomalies) != 0 {
 		t.Fatalf("torn view: %+v", view)
-	}
-}
-
-// Defense in depth on the read: an entry that claims a recovery on a
-// provisioning, or a registration that disagrees with the newest entry
-// (written outside the logged paths), fails closed.
-func TestLogInconsistenciesFailClosed(t *testing.T) {
-	v := newEnv(t)
-	admin := v.admin(t)
-	if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 1); e != nil {
-		t.Fatal(e)
-	}
-	// A registration change that bypassed the log.
-	if _, e := v.registry.updateRegistration(context.Background(), collectorID, false, func(row *registrationRow, _ bool) (bool, error) {
-		row.Registration.Generation++
-		return true, nil
-	}); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := v.registry.AdminRegistration(admin, collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("registration ahead of its log: %v", e)
-	}
-
-	w := newEnv(t)
-	if _, e := w.registry.AdminProvision(w.admin(t), grant(collectorID, "tail", "authority:logs"), 1); e != nil {
-		t.Fatal(e)
-	}
-	entries := w.changes(t, collectorID)
-	forged := entries[0]
-	forged.Sequence = 2
-	forged.Recovery = &ChangeRecovery{Reason: RecoveryUnreadableHead, HeadTimestamp: 1, HeadSHA256: digestBytes(nil)}
-	value, e := encode(forged)
-	if e != nil {
-		t.Fatal(e)
-	}
-	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 2})
-	headCoord, entry := w.registry.changeHeadCoordinate(collectorID), w.registry.changeEntryCoordinate(collectorID, 2)
-	headCell, _ := w.registry.read(context.Background(), headCoord)
-	if status, e := w.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: headCoord.Row, Conditions: []allocator.Condition{{Coordinate: headCoord, Value: headCell.Value, Timestamp: headCell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: headCoord, Timestamp: headCell.Timestamp + 1, Value: head}, {Coordinate: entry, Timestamp: 1, Value: value}}}); e != nil || status != allocator.StatusAccepted {
-		t.Fatal(status, e)
-	}
-	if _, e := w.registry.Changes(context.Background(), collectorID, 1, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("recovery on a provisioning: %v", e)
 	}
 }
 
@@ -749,47 +521,6 @@ func put(t *testing.T, v *env, coord allocator.Coordinate, timestamp int64, valu
 	}
 }
 
-// deleteHead removes the change-log head.
-func deleteHead(t *testing.T, v *env, id shoal.ID) {
-	t.Helper()
-	coord := v.registry.changeHeadCoordinate(id)
-	cell, e := v.registry.read(context.Background(), coord)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if status, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Value: cell.Value, Timestamp: cell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: cell.Timestamp, Delete: true}}}); e != nil || status != allocator.StatusAccepted {
-		t.Fatal(status, e)
-	}
-}
-
-// revokeRecovers revokes id through the Go API, then checks the recovery
-// entry is the current segment's start at want, and that provisioning
-// appends normally afterwards.
-func revokeRecovers(t *testing.T, v *env, r *Registry, want int64, reason RecoveryReason) {
-	t.Helper()
-	if _, e := r.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatalf("revoke: %v", e)
-	}
-	if reg, _ := r.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
-		t.Fatalf("not revoked: %+v", reg)
-	}
-	view, e := r.AdminRegistration(v.admin(t), collectorID)
-	if e != nil {
-		t.Fatalf("read after recovery: %v", e)
-	}
-	if view.SegmentStart != want || len(view.Changes) != 1 || view.Changes[0].Recovery == nil || view.Changes[0].Recovery.Reason != reason {
-		t.Fatalf("view %+v", view)
-	}
-	if got, e := r.Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil || len(got) != 1 || got[0].Sequence != want {
-		t.Fatalf("Changes reads beyond the current segment: %d %v", len(got), e)
-	}
-	reg, _ := r.Registration(context.Background(), collectorID)
-	result, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), reg.Generation)
-	if e != nil || result.Sequence != want+1 {
-		t.Fatalf("append after recovery: %+v %v", result, e)
-	}
-}
-
 func provisionedEnv(t *testing.T) *env {
 	t.Helper()
 	v := newEnv(t)
@@ -797,117 +528,6 @@ func provisionedEnv(t *testing.T) *env {
 		t.Fatal(e)
 	}
 	return v
-}
-
-// Every reachable shape of log damage leaves revocation working, and the
-// log appending normally afterwards (#656 review round 3).
-func TestRevocationRecoversEveryLogDamage(t *testing.T) {
-	t.Run("deleted head over a long log", func(t *testing.T) {
-		v := provisionedEnv(t)
-		for range 35 {
-			if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-				t.Fatal(e)
-			}
-			if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
-				t.Fatal(e)
-			}
-		}
-		deleteHead(t, v, collectorID) // 71 entries remain
-		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-			t.Fatalf("an absent head over entries read as an empty log: %v", e)
-		}
-		if _, e := v.registry.Changes(context.Background(), collectorID, 0, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-			t.Fatalf("Changes over a deleted head: %v", e)
-		}
-		revokeRecovers(t, v, v.registry, 72, RecoveryOccupiedSequence)
-	})
-	t.Run("strays with a gap", func(t *testing.T) {
-		v := provisionedEnv(t)
-		for _, sequence := range []int64{2, 4} {
-			put(t, v, v.registry.changeEntryCoordinate(collectorID, sequence), 1, []byte("stray"))
-		}
-		revokeRecovers(t, v, v.registry, 5, RecoveryOccupiedSequence)
-	})
-	t.Run("malformed stray entry", func(t *testing.T) {
-		v := provisionedEnv(t)
-		put(t, v, v.registry.changeEntryCoordinate(collectorID, 2), 0, []byte("stray"))
-		revokeRecovers(t, v, v.registry, 3, RecoveryOccupiedSequence)
-	})
-	t.Run("garbage head at timestamp 0 with no log", func(t *testing.T) {
-		v := newEnv(t)
-		if _, e := v.registry.updateRegistration(context.Background(), collectorID, true, func(row *registrationRow, _ bool) (bool, error) {
-			*row = registrationRow{Registration: collector.Registration{CollectorID: collectorID, Subject: "tail", ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved, Generation: 1, State: collector.Provisioned}}
-			return true, nil
-		}); e != nil {
-			t.Fatal(e)
-		}
-		put(t, v, v.registry.changeHeadCoordinate(collectorID), 0, []byte("garbage"))
-		revokeRecovers(t, v, v.registry, 1, RecoveryUnreadableHead)
-	})
-	t.Run("garbage head at a huge timestamp", func(t *testing.T) {
-		v := provisionedEnv(t)
-		put(t, v, v.registry.changeHeadCoordinate(collectorID), 1<<62+1, []byte("garbage"))
-		revokeRecovers(t, v, v.registry, 2, RecoveryUnreadableHead)
-	})
-	t.Run("no store without a row scan", func(t *testing.T) {
-		v := provisionedEnv(t)
-		for _, sequence := range []int64{2, 3, 4} {
-			put(t, v, v.registry.changeEntryCoordinate(collectorID, sequence), 1, []byte("stray"))
-		}
-		config := v.registry.config
-		config.Backend = &lostAck{inner: v.registry.config.Backend} // no ScanRowPrefix
-		r, e := New(config)
-		if e != nil {
-			t.Fatal(e)
-		}
-		revokeRecovers(t, v, r, 5, RecoveryOccupiedSequence)
-	})
-	t.Run("head at the largest timestamp", func(t *testing.T) {
-		v := provisionedEnv(t)
-		put(t, v, v.registry.changeHeadCoordinate(collectorID), math.MaxInt64, []byte("garbage"))
-		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-			t.Fatalf("revoke: %v", e)
-		}
-		if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
-			t.Fatalf("not revoked: %+v", reg)
-		}
-		// The entry is recorded; no head can supersede the damaged one, so
-		// the log reads as unavailable rather than as healthy.
-		cell, e := v.registry.read(context.Background(), v.registry.changeEntryCoordinate(collectorID, 2))
-		var c Change
-		if e != nil || decode(cell.Value, &c) != nil || c.Recovery == nil || c.Recovery.HeadTimestamp != math.MaxInt64 || c.Action != ChangeRevoke {
-			t.Fatalf("recovery entry %+v %v", c, e)
-		}
-		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-			t.Fatalf("read: %v", e)
-		}
-	})
-	t.Run("no representable sequence", func(t *testing.T) {
-		v := provisionedEnv(t)
-		put(t, v, v.registry.changeEntryCoordinate(collectorID, math.MaxInt64-1), 1, []byte("stray"))
-		corruptHead(t, v, collectorID) // a far stray is damage only once the log is
-		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-			t.Fatalf("revoke: %v", e)
-		}
-		if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
-			t.Fatalf("not revoked: %+v", reg)
-		}
-		scanner := v.registry.config.Backend.(rowScanner)
-		cells, e := scanner.ScanRowPrefix(context.Background(), v.registry.registrationCoordinate(collectorID).Row, []byte(changeFamily), []byte(overflowPrefix), nil, 10)
-		var overflow []allocator.Cell
-		for _, cell := range cells {
-			if strings.HasPrefix(string(cell.Coordinate.Qualifier), overflowPrefix) {
-				overflow = append(overflow, cell)
-			}
-		}
-		if e != nil || len(overflow) != 1 {
-			t.Fatalf("overflow entries: %d %v", len(overflow), e)
-		}
-		var c Change
-		if decode(overflow[0].Value, &c) != nil || c.Recovery == nil || c.Action != ChangeRevoke || validChange(c, collectorID) != nil {
-			t.Fatalf("overflow entry %+v", c)
-		}
-	})
 }
 
 // deleteCell removes the newest cell at coord.
@@ -922,64 +542,6 @@ func deleteCell(t *testing.T, v *env, coord allocator.Coordinate) {
 	}
 }
 
-// With the head and the first entry gone, the log looks empty at sequence 1
-// but later entries exist. Appending there would shadow them: a provisioning
-// fails closed and a revocation recovers above them.
-func TestAbsentHeadOverLaterEntriesIsDamage(t *testing.T) {
-	v := provisionedEnv(t)
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatal(e)
-	}
-	deleteCell(t, v, v.registry.changeHeadCoordinate(collectorID))
-	deleteCell(t, v, v.registry.changeEntryCoordinate(collectorID, 1))
-	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 3); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("provision over hidden entries: %v", e)
-	}
-	if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
-		t.Fatalf("provisioned over hidden entries: %+v", reg)
-	}
-
-	w := provisionedEnv(t)
-	if _, e := w.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := w.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
-		t.Fatal(e)
-	}
-	deleteCell(t, w, w.registry.changeHeadCoordinate(collectorID))
-	deleteCell(t, w, w.registry.changeEntryCoordinate(collectorID, 1))
-	revokeRecovers(t, w, w.registry, 4, RecoveryOccupiedSequence)
-}
-
-// A head naming a segment start whose entry is not a recovery entry is not a
-// log this registry wrote.
-func TestSegmentStartMustBeARecoveryEntry(t *testing.T) {
-	v := provisionedEnv(t)
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatal(e)
-	}
-	entries := v.changes(t, collectorID)
-	forged := entries[1]
-	forged.Sequence = 3
-	value, e := encode(forged)
-	if e != nil {
-		t.Fatal(e)
-	}
-	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 3, SegmentStart: 3})
-	put(t, v, v.registry.changeEntryCoordinate(collectorID, 3), 1, value)
-	headCell, _ := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
-	put(t, v, v.registry.changeHeadCoordinate(collectorID), headCell.Timestamp+1, head)
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("segment start without recovery: %v", e)
-	}
-}
-
 // tombstone leaves a delete marker at coord and timestamp, whether or not a
 // cell exists there, conditioned on the collector's registration cell.
 func tombstone(t *testing.T, v *env, coord allocator.Coordinate, timestamp int64) {
@@ -990,323 +552,6 @@ func tombstone(t *testing.T, v *env, coord allocator.Coordinate, timestamp int64
 	}
 	if status, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: reg.Coordinate, Value: reg.Value, Timestamp: reg.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: timestamp, Delete: true}}}); e != nil || status != allocator.StatusAccepted {
 		t.Fatal(status, e)
-	}
-}
-
-// Delete markers hide every write at or below their timestamp from reads,
-// scans and conditions alike. Audited writes check that what they wrote reads
-// back, and write it again higher until it does, so an accepted change is
-// never reported with an invisible entry.
-func TestDeleteMarkersNeverHideAnAuditedChange(t *testing.T) {
-	t.Run("head and entry deleted at their own timestamps", func(t *testing.T) {
-		v := provisionedEnv(t)
-		deleteCell(t, v, v.registry.changeHeadCoordinate(collectorID))
-		deleteCell(t, v, v.registry.changeEntryCoordinate(collectorID, 1))
-		result, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1)
-		if e != nil || !result.Changed {
-			t.Fatalf("revoke %+v %v", result, e)
-		}
-		view, e := v.registry.AdminRegistration(v.admin(t), collectorID)
-		if e != nil || len(view.Changes) != 1 || view.Changes[0].Sequence != result.Sequence || view.Changes[0].Action != ChangeRevoke {
-			t.Fatalf("view %+v %v", view, e)
-		}
-		// A marker just at the clock costs a small jump, not a leap towards
-		// the largest timestamp.
-		head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
-		if e != nil || head.Timestamp > v.registry.nanos()+1<<20 {
-			t.Fatalf("head repaired at %d (clock %d): %v", head.Timestamp, v.registry.nanos(), e)
-		}
-	})
-	t.Run("markers far above the clock", func(t *testing.T) {
-		v := provisionedEnv(t)
-		tombstone(t, v, v.registry.changeEntryCoordinate(collectorID, 2), math.MaxInt64/2)
-		tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), math.MaxInt64/2)
-		result, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1)
-		if e != nil || !result.Changed {
-			t.Fatalf("revoke %+v %v", result, e)
-		}
-		view, e := v.registry.AdminRegistration(v.admin(t), collectorID)
-		if e != nil || len(view.Changes) != 1 || view.Changes[0].Sequence != result.Sequence || view.Changes[0].Action != ChangeRevoke {
-			t.Fatalf("view %+v %v", view, e)
-		}
-	})
-	t.Run("marker at the largest timestamp", func(t *testing.T) {
-		v := provisionedEnv(t)
-		tombstone(t, v, v.registry.changeEntryCoordinate(collectorID, 2), math.MaxInt64)
-		_, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1)
-		if !errors.Is(e, api.ErrIndeterminate) {
-			t.Fatalf("an unrepairable invisible entry was not reported: %v", e)
-		}
-		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-			t.Fatalf("read: %v", e)
-		}
-	})
-}
-
-// shortPages is a store whose row scan returns at most two cells per call,
-// as a store that applies the limit before filtering may.
-type shortPages struct {
-	lostAck
-	scanner rowScanner
-}
-
-func (s *shortPages) ScanRowPrefix(ctx context.Context, row, family, start, visibility []byte, limit int) ([]allocator.Cell, error) {
-	cells, e := s.scanner.ScanRowPrefix(ctx, row, family, start, visibility, limit)
-	return cells[:min(len(cells), 2)], e
-}
-
-// A short page does not end the scan: recovery still lands above every
-// stored entry.
-func TestRecoveryScansPastShortPages(t *testing.T) {
-	v := provisionedEnv(t)
-	for _, sequence := range []int64{2, 3, 4, 5, 6} {
-		put(t, v, v.registry.changeEntryCoordinate(collectorID, sequence), 1, []byte("stray"))
-	}
-	inner := v.registry.config.Backend
-	config := v.registry.config
-	config.Backend = &shortPages{lostAck: lostAck{inner: inner}, scanner: inner.(rowScanner)}
-	r, e := New(config)
-	if e != nil {
-		t.Fatal(e)
-	}
-	revokeRecovers(t, v, r, 7, RecoveryOccupiedSequence)
-}
-
-// A healthy head at the largest timestamp can never be superseded, so the
-// log cannot be appended to: provisioning fails closed, and revocation is
-// recorded with an exhausted_head recovery entry while the head stays.
-func TestExhaustedHeadIsDamage(t *testing.T) {
-	v := provisionedEnv(t)
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatal(e)
-	}
-	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 2})
-	put(t, v, v.registry.changeHeadCoordinate(collectorID), math.MaxInt64, head)
-	// The log is still complete, so it reads; it just cannot grow.
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
-		t.Fatalf("read over an exhausted head: %v", e)
-	}
-	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("provision over an exhausted head: %v", e)
-	}
-	// Reactivate out of band so there is something to revoke.
-	if _, e := v.registry.updateRegistration(context.Background(), collectorID, false, func(row *registrationRow, _ bool) (bool, error) {
-		row.Registration.State = collector.Provisioned
-		return true, nil
-	}); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatalf("revoke over an exhausted head: %v", e)
-	}
-	cell, e := v.registry.read(context.Background(), v.registry.changeEntryCoordinate(collectorID, 3))
-	var c Change
-	if e != nil || decode(cell.Value, &c) != nil || c.Recovery == nil || c.Recovery.Reason != RecoveryExhaustedHead {
-		t.Fatalf("recovery entry %+v %v", c, e)
-	}
-	// Neither read presents the log without that entry.
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("Changes over an exhausted head: %v", e)
-	}
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("read over an exhausted head with a change beyond it: %v", e)
-	}
-}
-
-// visible compares exact bytes, not mere presence.
-func TestVisibleComparesBytes(t *testing.T) {
-	v := provisionedEnv(t)
-	coord := v.registry.changeEntryCoordinate(collectorID, 1)
-	cell, e := v.registry.read(context.Background(), coord)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if ok, e := v.registry.visible(context.Background(), coord, cell.Value); e != nil || !ok {
-		t.Fatalf("own bytes: %v %v", ok, e)
-	}
-	if ok, e := v.registry.visible(context.Background(), coord, append(bytes.Clone(cell.Value), ' ')); e != nil || ok {
-		t.Fatalf("other bytes: %v %v", ok, e)
-	}
-}
-
-// onTop runs hook once, right after the first accepted mutation that writes
-// the change log, so another audited write commits on top of it before its
-// read-back.
-type onTop struct {
-	lostAck
-	armed atomic.Bool
-	hook  func()
-}
-
-func (o *onTop) CompareAndMutate(ctx context.Context, m allocator.Mutation) (allocator.Status, error) {
-	status, e := o.inner.CompareAndMutate(ctx, m)
-	logs := false
-	for _, u := range m.Updates {
-		logs = logs || string(u.Coordinate.Family) == changeFamily
-	}
-	if e == nil && status == allocator.StatusAccepted && logs && o.armed.CompareAndSwap(true, false) {
-		o.hook()
-	}
-	return status, e
-}
-
-// A change that is superseded by a later audited write before it reads back
-// is still a clean change.
-func TestAChangeSupersededBeforeReadBackIsClean(t *testing.T) {
-	v := newEnv(t)
-	backend := &onTop{lostAck: lostAck{inner: v.registry.config.Backend}}
-	backend.hook = func() {
-		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-			t.Error(e)
-		}
-	}
-	config := v.registry.config
-	config.Backend = backend
-	r, e := New(config)
-	if e != nil {
-		t.Fatal(e)
-	}
-	backend.armed.Store(true)
-	result, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1)
-	if e != nil || !result.Changed || result.Sequence != 1 {
-		t.Fatalf("superseded provision %+v %v", result, e)
-	}
-	if got := v.changes(t, collectorID); len(got) != 2 || got[1].Action != ChangeRevoke {
-		t.Fatalf("changes %+v", got)
-	}
-}
-
-// A marker far above the clock costs a bounded jump, never the largest
-// timestamp: the log keeps appending afterwards.
-func TestRepairsNeverExhaustTheHead(t *testing.T) {
-	v := provisionedEnv(t)
-	tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), 7_500_000_000_000_000_000)
-	if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1); e != nil {
-		t.Fatalf("revoke: %v", e)
-	}
-	head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
-	if e != nil || head.Timestamp >= maxWriteTimestamp {
-		t.Fatalf("head at %d: %v", head.Timestamp, e)
-	}
-	for range 3 {
-		reg, _ := v.registry.Registration(context.Background(), collectorID)
-		if reg.State == collector.Revoked {
-			if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), reg.Generation); e != nil {
-				t.Fatalf("provision after repair: %v", e)
-			}
-		} else if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, reg.Generation); e != nil {
-			t.Fatalf("revoke after repair: %v", e)
-		}
-	}
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
-		t.Fatalf("read after repairs: %v", e)
-	}
-}
-
-// An entry right after the head's sequence is a change the head does not
-// describe: both reads fail closed rather than present the log without it.
-func TestEntriesBeyondTheHeadFailClosed(t *testing.T) {
-	v := provisionedEnv(t)
-	put(t, v, v.registry.changeEntryCoordinate(collectorID, 2), 1, []byte("stray"))
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("Changes: %v", e)
-	}
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("read: %v", e)
-	}
-}
-
-// afterHeadRead runs hook once, right after the first armed read of the
-// change-log head, so a concurrent audited write commits between a reader's
-// head read and its next probe.
-type afterHeadRead struct {
-	lostAck
-	armed atomic.Bool
-	hook  func()
-}
-
-func (a *afterHeadRead) ReadExact(ctx context.Context, c []allocator.Coordinate) ([]allocator.Cell, error) {
-	cells, e := a.inner.ReadExact(ctx, c)
-	if len(c) == 1 && string(c[0].Qualifier) == "change-head" && a.armed.CompareAndSwap(true, false) {
-		a.hook()
-	}
-	return cells, e
-}
-
-// A write that commits between a reader's head read and its probe of the
-// next entry is concurrency, not damage: reads and provisioning retry.
-func TestConcurrentWritesAreNotDamage(t *testing.T) {
-	for _, step := range []string{"changes", "read", "provision"} {
-		v := provisionedEnv(t)
-		backend := &afterHeadRead{lostAck: lostAck{inner: v.registry.config.Backend}}
-		backend.hook = func() {
-			if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-				t.Error(e)
-			}
-		}
-		if step == "provision" {
-			// Start revoked; the concurrent write is the operator
-			// reactivating the same terms.
-			if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-				t.Fatal(e)
-			}
-			backend.hook = func() {
-				if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
-					t.Error(e)
-				}
-			}
-		}
-		config := v.registry.config
-		config.Backend = backend
-		r, e := New(config)
-		if e != nil {
-			t.Fatal(e)
-		}
-		backend.armed.Store(true)
-		switch step {
-		case "changes":
-			if got, e := r.Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil || len(got) != 2 {
-				t.Fatalf("changes %d %v", len(got), e)
-			}
-		case "read":
-			if view, e := r.AdminRegistration(v.admin(t), collectorID); e != nil || view.Registration.State != collector.Revoked {
-				t.Fatalf("read %+v %v", view, e)
-			}
-		case "provision":
-			// The operator reactivates while this provisioning decides; it
-			// is not refused as damage, but re-evaluated: the same terms
-			// are now in place, a no-op.
-			result, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2)
-			if e != nil || result.Changed {
-				t.Fatalf("provision racing the operator: %+v %v", result, e)
-			}
-		}
-		if backend.armed.Load() {
-			t.Fatalf("%s: the write did not interleave", step)
-		}
-	}
-}
-
-// A change superseded by a recovery whose segment starts past it is not
-// readable, so it is not reported clean.
-func TestAChangeLeftOutsideTheSegmentIsNotClean(t *testing.T) {
-	v := newEnv(t)
-	backend := &onTop{lostAck: lostAck{inner: v.registry.config.Backend}}
-	backend.hook = func() {
-		tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), v.registry.nanos()+1000)
-		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-			t.Error(e)
-		}
-	}
-	config := v.registry.config
-	config.Backend = backend
-	r, e := New(config)
-	if e != nil {
-		t.Fatal(e)
-	}
-	backend.armed.Store(true)
-	if _, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1); !errors.Is(e, api.ErrIndeterminate) {
-		t.Fatalf("provision left outside the segment: %v", e)
 	}
 }
 
@@ -1342,8 +587,12 @@ func TestChurnIsNeverReportedAsDamage(t *testing.T) {
 					_, e := v.registry.AdminRegistration(admin, collectorID)
 					report(e)
 				case 2:
-					_, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage)
+					log, e := v.registry.Changes(context.Background(), collectorID, 1, MaxChangesGenerations)
 					report(e)
+					if e == nil && (len(log.Gaps) != 0 || len(log.Anomalies) != 0) {
+						bad.Add(1)
+						t.Logf("gaps %v anomalies %v", log.Gaps, log.Anomalies)
+					}
 				}
 			}
 		}()
@@ -1352,80 +601,7 @@ func TestChurnIsNeverReportedAsDamage(t *testing.T) {
 	if bad.Load() != 0 {
 		t.Fatalf("%d outcomes reported damage under ordinary churn", bad.Load())
 	}
-}
-
-// A marker near the top uses up the headroom, as documented: the writes it
-// leaves room for stay clean and readable, then the log is exhausted —
-// provisioning fails closed, revocation is still recorded.
-func TestAMarkerNearTheTopExhaustsTheLogHonestly(t *testing.T) {
-	v := provisionedEnv(t)
-	tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), maxWriteTimestamp-2)
-	if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1); e != nil {
-		t.Fatalf("revoke: %v", e)
-	}
-	toggle := func() (collector.Registration, error) {
-		reg, _ := v.registry.Registration(context.Background(), collectorID)
-		var e error
-		if reg.State == collector.Revoked {
-			_, e = v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), reg.Generation)
-		} else {
-			_, e = v.registry.AdminRevoke(v.admin(t), collectorID, reg.Generation)
-		}
-		return reg, e
-	}
-	for writes := 0; ; writes++ {
-		head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
-		if e != nil {
-			t.Fatal(e)
-		}
-		if head.Timestamp >= maxWriteTimestamp {
-			break
-		}
-		if writes > 4 {
-			t.Fatal("the headroom was never used up; the test is vacuous")
-		}
-		if _, e := toggle(); e != nil {
-			t.Fatalf("write within the headroom: %v", e)
-		}
-		if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
-			t.Fatalf("a clean write left the log unreadable: %v", e)
-		}
-	}
-	// Exhausted: the complete log still reads; then the next change is
-	// either refused (provisioning) or recorded beyond the head
-	// (revocation), after which reads fail closed.
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil {
-		t.Fatalf("an exhausted complete log: %v", e)
-	}
-	reg, e := toggle()
-	if reg.State == collector.Revoked {
-		if !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-			t.Fatalf("provision over an exhausted log: %v", e)
-		}
-		return
-	}
-	if e != nil {
-		t.Fatalf("revoke over an exhausted log: %v", e)
-	}
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("read after a revocation beyond the head: %v", e)
-	}
-}
-
-// everyHeadRead runs hook on every change-head read, up to times.
-type everyHeadRead struct {
-	lostAck
-	times atomic.Int32
-	skip  atomic.Int32
-	hook  func()
-}
-
-func (a *everyHeadRead) ReadExact(ctx context.Context, c []allocator.Coordinate) ([]allocator.Cell, error) {
-	cells, e := a.inner.ReadExact(ctx, c)
-	if len(c) == 1 && string(c[0].Qualifier) == "change-head" && a.skip.Add(-1) < 0 && a.times.Add(-1) >= 0 {
-		a.hook()
-	}
-	return cells, e
+	v.cleanLog(t, collectorID)
 }
 
 func wrapped(t *testing.T, v *env, backend interface {
@@ -1442,300 +618,377 @@ func wrapped(t *testing.T, v *env, backend interface {
 	return r
 }
 
-// With no head yet, a first logged change committing between the head read
-// and the probe for hidden entries is concurrency, not damage.
-func TestAFirstChangeRacingAnAbsentHeadReadIsNotDamage(t *testing.T) {
-	v := newEnv(t)
-	backend := &everyHeadRead{lostAck: lostAck{inner: v.registry.config.Backend}}
-	backend.times.Store(1)
-	backend.hook = func() {
-		if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
-			t.Error(e)
+// changes returns id's whole change log, oldest first, failing the test on
+// a read error.
+func (v *env) changes(t *testing.T, id shoal.ID) []Change {
+	t.Helper()
+	log, e := v.registry.Changes(context.Background(), id, 1, MaxChangesGenerations)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return log.Entries
+}
+
+// cleanLog asserts id's log has no gaps and no anomalies.
+func (v *env) cleanLog(t *testing.T, id shoal.ID) ChangeLog {
+	t.Helper()
+	log, e := v.registry.Changes(context.Background(), id, 1, MaxChangesGenerations)
+	if e != nil || len(log.Gaps) != 0 || len(log.Anomalies) != 0 {
+		t.Fatalf("log of %s: gaps %v anomalies %v err %v", id, log.Gaps, log.Anomalies, e)
+	}
+	return log
+}
+
+// logCells lists every change-log cell stored for id.
+func (v *env) logCells(t *testing.T, id shoal.ID) []allocator.Cell {
+	t.Helper()
+	cells, e := v.registry.config.Backend.(rowScanner).ScanRowPrefix(context.Background(), v.registry.registrationCoordinate(id).Row, []byte(changeFamily), nil, nil, 1000)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return cells
+}
+
+// wrote reports whether id has a registration, and fails if a log exists
+// without one.
+func (v *env) wrote(t *testing.T, id shoal.ID) bool {
+	t.Helper()
+	_, e := v.registry.Registration(context.Background(), id)
+	if e == nil {
+		return true
+	}
+	if !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
+		t.Fatal(e)
+	}
+	if cells := v.logCells(t, id); len(cells) != 0 {
+		t.Fatalf("change log written without a registration: %d cells", len(cells))
+	}
+	return false
+}
+
+// entryCoordinate is the coordinate of the stored entry for a slot.
+func (v *env) entryCoordinate(t *testing.T, id shoal.ID, generation int64, action ChangeAction) allocator.Coordinate {
+	t.Helper()
+	for _, cell := range v.logCells(t, id) {
+		if g, a, _, ok := parseQualifier(cell.Coordinate.Qualifier); ok && g == generation && a == action {
+			return cell.Coordinate
 		}
 	}
-	if got, e := wrapped(t, v, backend).Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil || len(got) != 1 {
-		t.Fatalf("Changes racing the first change: %d %v", len(got), e)
-	}
+	t.Fatalf("no entry at (%d, %s)", generation, action)
+	return allocator.Coordinate{}
+}
 
-	// A legacy row (no log) whose first logged change lands at the read's
-	// second head read.
-	w := newEnv(t)
-	if _, e := w.registry.updateRegistration(context.Background(), collectorID, true, func(row *registrationRow, _ bool) (bool, error) {
-		*row = registrationRow{Registration: collector.Registration{CollectorID: collectorID, Subject: "tail", ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved, Generation: 1, State: collector.Provisioned}}
+// cycled provisions id and revokes and reactivates it until it sits at
+// generation g, provisioned.
+func cycled(t *testing.T, g int64) *env {
+	t.Helper()
+	v := provisionedEnv(t)
+	for range g - 1 {
+		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+			t.Fatal(e)
+		}
+		if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
+			t.Fatal(e)
+		}
+	}
+	return v
+}
+
+// The slots a registration implies, and an entry per change in each.
+func TestTheLogIsOneEntryPerSlot(t *testing.T) {
+	v := cycled(t, 3)
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatal(e)
+	}
+	log := v.cleanLog(t, collectorID)
+	want := []slot{{1, ChangeProvision}, {2, ChangeRevoke}, {2, ChangeProvision}, {3, ChangeRevoke}, {3, ChangeProvision}, {4, ChangeRevoke}}
+	if len(log.Entries) != len(want) {
+		t.Fatalf("entries %d", len(log.Entries))
+	}
+	for i, c := range log.Entries {
+		if (slot{c.Generation(), c.Action}) != want[i] {
+			t.Fatalf("entry %d at (%d, %s), want %v", i, c.Generation(), c.Action, want[i])
+		}
+	}
+	if cells := v.logCells(t, collectorID); len(cells) != len(want) {
+		t.Fatalf("%d cells for %d changes", len(cells), len(want))
+	}
+	// Ranges.
+	part, e := v.registry.Changes(context.Background(), collectorID, 3, 1)
+	if e != nil || len(part.Entries) != 2 || part.Entries[0].Generation() != 3 || len(part.Gaps) != 0 {
+		t.Fatalf("range %+v %v", part, e)
+	}
+}
+
+// No cell in the log, whatever it holds, can block a write: every write
+// lands at its own nonce-qualified cell and reads nothing else.
+func TestNoLogDamageBlocksAWrite(t *testing.T) {
+	v := provisionedEnv(t)
+	g1 := v.entryCoordinate(t, collectorID, 1, ChangeProvision)
+	// Damage of every kind: garbage at the existing entry, strays shaped like
+	// the next slots' qualifiers, garbage and markers anywhere in the family.
+	put(t, v, g1, 7, []byte("garbage"))
+	for _, q := range []string{
+		entryQualifier(2, ChangeRevoke, strings.Repeat("0", 32)),
+		entryQualifier(2, ChangeProvision, strings.Repeat("f", 32)),
+		"change-head", "entry:", "entry:zzz", "\xff\xff",
+	} {
+		put(t, v, v.registry.changeCoordinate(collectorID, q), 1, []byte("stray"))
+	}
+	tombstone(t, v, v.registry.changeCoordinate(collectorID, entryQualifier(2, ChangeRevoke, strings.Repeat("1", 32))), math.MaxInt64)
+	if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1); e != nil {
+		t.Fatalf("revoke over a damaged log: %v", e)
+	}
+	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2); e != nil {
+		t.Fatalf("provision over a damaged log: %v", e)
+	}
+	// Reads report the damage and the real entries alike.
+	view, e := v.registry.AdminRegistration(v.admin(t), collectorID)
+	if e != nil {
+		t.Fatalf("read: %v", e)
+	}
+	if len(view.Changes) != 2 || len(view.Gaps) != 1 || view.Gaps[0] != (LogGap{1, ChangeProvision}) || len(view.Anomalies) == 0 {
+		t.Fatalf("view changes %d gaps %v anomalies %v", len(view.Changes), view.Gaps, view.Anomalies)
+	}
+	reasons := map[AnomalyReason]bool{}
+	for _, a := range view.Anomalies {
+		reasons[a.Reason] = true
+	}
+	if !reasons[AnomalyUndecodable] {
+		t.Fatalf("anomalies %v", view.Anomalies)
+	}
+}
+
+// A store without row scans still takes every write; only reads need scans.
+func TestWritesNeedNoRowScan(t *testing.T) {
+	v := newEnv(t)
+	r := wrapped(t, v, &noScan{inner: v.registry.config.Backend})
+	if _, e := r.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := r.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := r.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("read without scans: %v", e)
+	}
+	v.cleanLog(t, collectorID)
+}
+
+// noScan hides the store's row scan.
+type noScan struct {
+	inner interface {
+		ReadExact(context.Context, []allocator.Coordinate) ([]allocator.Cell, error)
+		CompareAndMutate(context.Context, allocator.Mutation) (allocator.Status, error)
+	}
+}
+
+func (n *noScan) ReadExact(ctx context.Context, c []allocator.Coordinate) ([]allocator.Cell, error) {
+	return n.inner.ReadExact(ctx, c)
+}
+func (n *noScan) CompareAndMutate(ctx context.Context, m allocator.Mutation) (allocator.Status, error) {
+	return n.inner.CompareAndMutate(ctx, m)
+}
+
+// A missing entry is a gap: reported, never a reason to refuse a write, and
+// later changes are logged normally.
+func TestAMissingEntryIsAReportedGap(t *testing.T) {
+	v := cycled(t, 2)
+	deleteCell(t, v, v.entryCoordinate(t, collectorID, 2, ChangeRevoke))
+	tombstone(t, v, v.entryCoordinate(t, collectorID, 1, ChangeProvision), math.MaxInt64)
+	if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, 2); e != nil {
+		t.Fatalf("revoke: %v", e)
+	}
+	log, e := v.registry.Changes(context.Background(), collectorID, 1, MaxChangesGenerations)
+	if e != nil || len(log.Entries) != 2 || !slices.Equal(log.Gaps, []LogGap{{1, ChangeProvision}, {2, ChangeRevoke}}) || len(log.Anomalies) != 0 {
+		t.Fatalf("log %+v %v", log, e)
+	}
+}
+
+// A registration from before the log existed reads with gaps for every slot
+// it implies, and its first logged change is recorded like any other.
+func TestALegacyRegistrationReadsWithGaps(t *testing.T) {
+	v := newEnv(t)
+	if _, e := v.registry.updateRegistration(context.Background(), collectorID, true, func(row *registrationRow, _ bool) (bool, error) {
+		*row = registrationRow{Registration: collector.Registration{CollectorID: collectorID, Subject: "tail", ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved, Generation: 2, State: collector.Provisioned}}
 		return true, nil
 	}); e != nil {
 		t.Fatal(e)
 	}
-	legacy := &everyHeadRead{lostAck: lostAck{inner: w.registry.config.Backend}}
-	legacy.skip.Store(1)
-	legacy.times.Store(1)
-	legacy.hook = func() {
-		if _, e := w.registry.Revoke(context.Background(), collectorID); e != nil {
-			t.Error(e)
-		}
+	view, e := v.registry.AdminRegistration(v.admin(t), collectorID)
+	if e != nil || len(view.Changes) != 0 || len(view.Gaps) != 3 || len(view.Anomalies) != 0 {
+		t.Fatalf("legacy view %+v %v", view, e)
 	}
-	if view, e := wrapped(t, w, legacy).AdminRegistration(w.admin(t), collectorID); e != nil || view.Registration.State != collector.Revoked {
-		t.Fatalf("read racing a legacy row's first change: %+v %v", view, e)
+	if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, 2); e != nil {
+		t.Fatal(e)
+	}
+	log, e := v.registry.Changes(context.Background(), collectorID, 1, MaxChangesGenerations)
+	if e != nil || len(log.Entries) != 1 || log.Entries[0].Generation() != 3 || len(log.Gaps) != 3 {
+		t.Fatalf("log %+v %v", log, e)
 	}
 }
 
-// A log that keeps moving under a read is answered with a retryable
-// conflict, never unavailable.
-func TestPersistentChurnUnderAReadIsAConflict(t *testing.T) {
+// forge writes a copy of the entry at a slot, with fields changed, under a
+// fresh attempt, as an outside writer could.
+func forge(t *testing.T, v *env, generation int64, action ChangeAction, change func(*Change)) {
+	t.Helper()
+	cell, e := v.registry.read(context.Background(), v.entryCoordinate(t, collectorID, generation, action))
+	if e != nil {
+		t.Fatal(e)
+	}
+	c, e := decodeChange(cell.Value)
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.Attempt = strings.Repeat("9", 32)
+	change(&c)
+	value, e := encode(c)
+	if e != nil {
+		t.Fatal(e)
+	}
+	put(t, v, v.registry.changeCoordinate(collectorID, entryQualifier(c.Generation(), c.Action, c.Attempt)), 1, value)
+}
+
+// Cells that are not exactly one valid entry for their slot are anomalies,
+// each named, and none is presented as an entry.
+func TestAnomaliesAreReportedNotPresented(t *testing.T) {
+	cases := map[AnomalyReason]func(*env){
+		AnomalyDuplicate: func(v *env) { forge(t, v, 1, ChangeProvision, func(*Change) {}) },
+		AnomalyUnexpected: func(v *env) {
+			forge(t, v, 1, ChangeProvision, func(c *Change) { c.Registration.Generation = 2 })
+		},
+		AnomalyInconsistent: func(v *env) {
+			coord := v.entryCoordinate(t, collectorID, 1, ChangeProvision)
+			forge(t, v, 1, ChangeProvision, func(c *Change) { c.Registration.Control = collector.RegistryControlled })
+			deleteCell(t, v, coord)
+		},
+		AnomalyUnknownVersion: func(v *env) {
+			value, _ := encode(struct{ Version int }{2})
+			put(t, v, v.registry.changeCoordinate(collectorID, entryQualifier(1, ChangeRevoke, strings.Repeat("2", 32))), 1, value)
+		},
+		AnomalyMisplaced: func(v *env) {
+			cell, _ := v.registry.read(context.Background(), v.entryCoordinate(t, collectorID, 1, ChangeProvision))
+			put(t, v, v.registry.changeCoordinate(collectorID, entryQualifier(1, ChangeRevoke, strings.Repeat("3", 32))), 1, cell.Value)
+		},
+	}
+	for reason, damage := range cases {
+		v := provisionedEnv(t)
+		damage(v)
+		view, e := v.registry.AdminRegistration(v.admin(t), collectorID)
+		if e != nil {
+			t.Fatalf("%s: %v", reason, e)
+		}
+		found := false
+		for _, a := range view.Anomalies {
+			found = found || a.Reason == reason
+		}
+		if !found {
+			t.Fatalf("%s not reported: %+v", reason, view.Anomalies)
+		}
+		for _, c := range view.Changes {
+			if c.Attempt == strings.Repeat("9", 32) && reason != AnomalyInconsistent {
+				t.Fatalf("%s: forged entry presented", reason)
+			}
+		}
+		// The wire projection carries them too.
+		provider, _ := NewAdminProvider(v.registry)
+		if record, e := provider.ReadRegistration(v.admin(t), collectorID); e != nil || len(record.Anomalies) == 0 {
+			t.Fatalf("%s: wire %+v %v", reason, record, e)
+		}
+		// And writes go on.
+		if _, e := v.registry.AdminRevoke(v.admin(t), collectorID, 1); e != nil {
+			t.Fatalf("%s: revoke: %v", reason, e)
+		}
+	}
+}
+
+// Entry formats are versioned: a known version decodes strictly, an unknown
+// or missing one is refused explicitly, not guessed.
+func TestEntryVersions(t *testing.T) {
 	v := provisionedEnv(t)
-	backend := &everyHeadRead{lostAck: lostAck{inner: v.registry.config.Backend}}
-	backend.times.Store(40)
-	backend.hook = func() {
-		reg, _ := v.registry.Registration(context.Background(), collectorID)
-		if reg.State == collector.Revoked {
-			_, _ = v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs"))
-		} else {
-			_, _ = v.registry.Revoke(context.Background(), collectorID)
+	cell, e := v.registry.read(context.Background(), v.entryCoordinate(t, collectorID, 1, ChangeProvision))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if c, e := decodeChange(cell.Value); e != nil || c.Version != 1 {
+		t.Fatalf("v1: %+v %v", c, e)
+	}
+	for _, version := range []int{0, 2, -1} {
+		value, _ := encode(struct{ Version int }{version})
+		if _, e := decodeChange(value); !errors.Is(e, errUnknownVersion) {
+			t.Fatalf("version %d: %v", version, e)
 		}
 	}
-	r := wrapped(t, v, backend)
-	if _, e := r.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorConflict) {
-		t.Fatalf("read: %v", e)
-	}
-	backend.times.Store(40)
-	if _, e := r.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorConflict) {
-		t.Fatalf("Changes: %v", e)
+	if _, e := decodeChange([]byte("garbage")); e == nil || errors.Is(e, errUnknownVersion) {
+		t.Fatalf("garbage: %v", e)
 	}
 }
 
-// gate holds the first change-log mutation until released.
-type gate struct {
+// beforeWrite runs hook once, just before the first armed change-log
+// mutation reaches the store.
+type beforeWrite struct {
 	lostAck
-	armed   atomic.Bool
-	reached chan struct{}
-	release chan struct{}
+	armed atomic.Bool
+	hook  func()
 }
 
-func (g *gate) CompareAndMutate(ctx context.Context, m allocator.Mutation) (allocator.Status, error) {
+func (b *beforeWrite) CompareAndMutate(ctx context.Context, m allocator.Mutation) (allocator.Status, error) {
 	logs := false
 	for _, u := range m.Updates {
 		logs = logs || string(u.Coordinate.Family) == changeFamily
 	}
-	if logs && g.armed.CompareAndSwap(true, false) {
-		close(g.reached)
-		<-g.release
+	if logs && b.armed.CompareAndSwap(true, false) {
+		b.hook()
 	}
-	return g.inner.CompareAndMutate(ctx, m)
+	return b.inner.CompareAndMutate(ctx, m)
 }
 
-// A recovery judged against a head that then becomes healthy (a concurrent
-// write repairing its own head above a delete marker) must not commit: it is
-// pinned to the head it judged, re-evaluates, and appends normally, so the
-// concurrent write's entry stays in the readable segment.
-func TestAStaleRecoveryCannotOrphanACleanChange(t *testing.T) {
-	v := provisionedEnv(t)
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatal(e)
-	}
-	held := &gate{lostAck: lostAck{inner: v.registry.config.Backend}, reached: make(chan struct{}), release: make(chan struct{})}
-	revoker := wrapped(t, v, held)
-	done := make(chan error, 1)
-	first := &onTop{lostAck: lostAck{inner: v.registry.config.Backend}}
-	first.hook = func() {
-		head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
-		if e != nil {
-			t.Error(e)
-			return
-		}
-		tombstone(t, v, v.registry.changeHeadCoordinate(collectorID), head.Timestamp+3)
-		held.armed.Store(true)
-		go func() {
-			_, e := revoker.Revoke(context.Background(), collectorID)
-			done <- e
-		}()
-		<-held.reached // the revoker has judged the head absent and is at its CAS
-	}
-	first.armed.Store(true)
-	result, e := wrapped(t, v, first).AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2)
-	close(held.release)
-	if e != nil || !result.Changed || result.Sequence != 3 {
-		t.Fatalf("provision %+v %v", result, e)
-	}
-	if e := <-done; e != nil {
-		t.Fatalf("revoke: %v", e)
-	}
-	got, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage)
-	if e != nil || len(got) != 4 || got[2].Sequence != 3 || got[3].Action != ChangeRevoke || got[3].Recovery != nil {
-		t.Fatalf("changes %+v %v", got, e)
-	}
-}
-
-// Sequences up to the largest are read without wrapping around.
-func TestChangesReadsUpToTheLargestSequence(t *testing.T) {
-	v := provisionedEnv(t)
-	put(t, v, v.registry.changeEntryCoordinate(collectorID, math.MaxInt64-2), 1, []byte("stray"))
-	corruptHead(t, v, collectorID)
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatalf("revoke: %v", e)
-	}
-	result, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 2)
-	if e != nil || result.Sequence != math.MaxInt64 {
-		t.Fatalf("provision %+v %v", result, e)
-	}
-	got, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage)
-	if e != nil || len(got) != 2 || got[1].Sequence != math.MaxInt64 {
-		t.Fatalf("changes %d %v", len(got), e)
-	}
-	if got, e := v.registry.Changes(context.Background(), collectorID, math.MaxInt64, MaxChangesPage); e != nil || len(got) != 0 {
-		t.Fatalf("changes after the last %d %v", len(got), e)
-	}
-	if view, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil || len(view.Changes) != 2 {
-		t.Fatalf("view %+v %v", view, e)
-	}
-	// Nothing follows the largest sequence, so the next revocation goes to
-	// overflow; neither read may then present the log without it.
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatalf("revoke into overflow: %v", e)
-	}
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("Changes with an overflow entry: %v", e)
-	}
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("read with an overflow entry: %v", e)
-	}
-}
-
-// An entry anywhere above the head (where the store can scan) is a change
-// the head does not describe: reads fail closed, a provisioning fails
-// closed, and a revocation recovers above it so the log reads again.
-func TestEntriesFarAboveTheHeadAreDamage(t *testing.T) {
-	v := provisionedEnv(t)
-	put(t, v, v.registry.changeEntryCoordinate(collectorID, 1000), 1, []byte("stray"))
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("Changes: %v", e)
-	}
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("read: %v", e)
-	}
-	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs", "authority:more")); e == nil {
-		t.Fatal("conflicting provision accepted")
-	}
-	revokeRecovers(t, v, v.registry, 1001, RecoveryOccupiedSequence)
-
-	// An exhausted head with a stray above the next sequence: the
-	// recovery entry lands above the stray with no head, and Changes does
-	// not present the log without it.
-	w := provisionedEnv(t)
-	put(t, w, w.registry.changeEntryCoordinate(collectorID, 5), 1, []byte("stray"))
-	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 1})
-	put(t, w, w.registry.changeHeadCoordinate(collectorID), math.MaxInt64, head)
-	if _, e := w.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatalf("revoke: %v", e)
-	}
-	if _, e := w.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("Changes over an exhausted head with a recorded revocation: %v", e)
-	}
-}
-
-// A stray overflow cell is damage a revocation recovers from: the recovery
-// accounts for it in the new head, so the log reads and provisions again.
-func TestRevocationAcknowledgesStrayOverflow(t *testing.T) {
-	v := provisionedEnv(t)
-	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"x"), 1, []byte("stray"))
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("Changes over a stray overflow: %v", e)
-	}
-	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs", "authority:more")); e == nil {
-		t.Fatal("conflicting provision accepted")
-	}
-	revokeRecovers(t, v, v.registry, 2, RecoveryOccupiedSequence)
-	got, e := v.registry.Changes(context.Background(), collectorID, 1, 1)
-	if e != nil || len(got) != 1 || got[0].Recovery == nil || got[0].Recovery.AcknowledgedOverflowTimestamp != 1 {
-		t.Fatalf("recovery entry %+v %v", got, e)
-	}
-	// A further overflow cell written after the acknowledgement (above its
-	// timestamp) is damage again.
-	head, _ := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
-	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"y"), head.Timestamp+1, []byte("stray"))
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("Changes over a new overflow: %v", e)
-	}
-}
-
-// An overflow entry the registry writes after an acknowledgement is always
-// above it, so it is never hidden, whatever its qualifier sorts as.
-func TestAcknowledgementNeverHidesALaterOverflowRevocation(t *testing.T) {
-	v := provisionedEnv(t)
-	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"z"), 1, []byte("stray"))
-	revokeRecovers(t, v, v.registry, 2, RecoveryOccupiedSequence)
-	stray := v.registry.changeEntryCoordinate(collectorID, math.MaxInt64-1)
-	put(t, v, stray, 1, []byte("stray"))
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatalf("revoke into overflow: %v", e)
-	}
-	deleteCell(t, v, stray) // the operator cleans up the high stray
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("Changes hid the overflow revocation: %v", e)
-	}
-	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("read hid the overflow revocation: %v", e)
-	}
-	// A later revocation can write a head again and acknowledges it.
-	if _, e := v.registry.updateRegistration(context.Background(), collectorID, false, func(row *registrationRow, _ bool) (bool, error) {
-		row.Registration.State = collector.Provisioned
-		return true, nil
-	}); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
-		t.Fatalf("revoke: %v", e)
-	}
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil {
-		t.Fatalf("Changes after the overflow was acknowledged: %v", e)
-	}
-}
-
-// Only canonical entry qualifiers count, for recovery and readers alike.
-func TestOddEntryQualifiersAreIgnoredConsistently(t *testing.T) {
-	for _, q := range []string{entryPrefix + "0000000000000000000005", entryPrefix + "+9223372036854775807", entryPrefix + "5", entryPrefix + "00000000000000000000"} {
-		if _, ok := canonicalSequence(q); ok {
-			t.Fatalf("%q accepted", q)
+// A writer that loses the race to an identical change (same admin, same
+// instant, so byte-identical registrations) is told apart by its own
+// attempt's cell: it reports no change of its own, and there is one entry.
+func TestAnIdenticalWinnerIsNotMistakenForOurWrite(t *testing.T) {
+	v := newEnv(t)
+	admin := v.admin(t)
+	p := grant(collectorID, "tail", "authority:logs")
+	backend := &beforeWrite{lostAck: lostAck{inner: v.registry.config.Backend}}
+	backend.hook = func() {
+		if r, e := v.registry.AdminProvision(admin, p, 1); e != nil || !r.Changed {
+			t.Errorf("winner %+v %v", r, e)
 		}
 	}
-	if n, ok := canonicalSequence(entryPrefix + "00000000000000000005"); !ok || n != 5 {
-		t.Fatal("canonical qualifier refused")
+	backend.armed.Store(true)
+	result, e := wrapped(t, v, backend).AdminProvision(admin, p, 1)
+	if e != nil || result.Changed {
+		t.Fatalf("loser reported %+v %v", result, e)
 	}
-	v := provisionedEnv(t)
-	put(t, v, v.registry.changeCoordinate(collectorID, entryPrefix+"+9223372036854775807"), 1, []byte("stray"))
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); e != nil {
-		t.Fatalf("Changes: %v", e)
-	}
-	highest, _, e := v.registry.highestEntry(context.Background(), collectorID)
-	if e != nil || highest != 1 {
-		t.Fatalf("highest %d %v", highest, e)
+	if got := v.changes(t, collectorID); len(got) != 1 {
+		t.Fatalf("%d entries", len(got))
 	}
 }
 
-// An overflow stray at a timestamp far above the clock is acknowledged, and
-// the recovery lands above it, so later registry writes do too.
-func TestRecoveryLandsAboveAnAcknowledgedOverflow(t *testing.T) {
+// validChange holds the slot invariants: a revocation enters a generation
+// of at least 2 and leaves the registration revoked; a provisioning leaves it
+// provisioned; the version is this build's.
+func TestValidChangeHoldsSlotInvariants(t *testing.T) {
 	v := provisionedEnv(t)
-	const far = 5_000_000_000_000_000_000
-	put(t, v, v.registry.changeCoordinate(collectorID, overflowPrefix+"x"), far, []byte("stray"))
-	revokeRecovers(t, v, v.registry, 2, RecoveryOccupiedSequence)
-	head, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
-	if e != nil || head.Timestamp <= far {
-		t.Fatalf("head at %d, below the acknowledged overflow at %d: %v", head.Timestamp, int64(far), e)
+	good := v.changes(t, collectorID)[0]
+	if validChange(good, collectorID) != nil {
+		t.Fatal("a stored entry is invalid")
 	}
-}
-
-// A head whose acknowledgement is not below its own timestamp was not
-// written by the registry: it is damage, not an acknowledgement.
-func TestAForgedAcknowledgementIsDamage(t *testing.T) {
-	v := provisionedEnv(t)
-	cell, e := v.registry.read(context.Background(), v.registry.changeHeadCoordinate(collectorID))
-	if e != nil {
-		t.Fatal(e)
+	for name, mutate := range map[string]func(*Change){
+		"other version":       func(c *Change) { c.Version = 2 },
+		"revoke into 1":       func(c *Change) { c.Action = ChangeRevoke; c.Registration.State = collector.Revoked },
+		"revoke not revoked":  func(c *Change) { c.Action = ChangeRevoke; c.Registration.Generation = 2 },
+		"provision revoked":   func(c *Change) { c.Registration.State = collector.Revoked },
+		"provision enrolled":  func(c *Change) { c.Registration.State = collector.Enrolled },
+		"short attempt":       func(c *Change) { c.Attempt = "00" },
+		"other collector":     func(c *Change) { c.CollectorID = "collector:other" },
+		"operator with admin": func(c *Change) { c.Source = SourceOperatorAPI },
+	} {
+		c := good
+		mutate(&c)
+		if validChange(c, collectorID) == nil {
+			t.Fatalf("%s accepted", name)
+		}
 	}
-	forged, _ := encode(changeHead{CollectorID: collectorID, Sequence: 1, OverflowAck: math.MaxInt64 - 2})
-	put(t, v, v.registry.changeHeadCoordinate(collectorID), cell.Timestamp+1, forged)
-	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("Changes over a forged acknowledgement: %v", e)
-	}
-	revokeRecovers(t, v, v.registry, 2, RecoveryUnreadableHead)
 }

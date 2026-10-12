@@ -38,7 +38,7 @@ func (p *AdminProvider) RevokeCollector(ctx context.Context, id shoal.ID, genera
 }
 
 func adminReceipt(r AdminResult) api.AdminReceipt {
-	return api.AdminReceipt{Schema: api.Schema, CollectorID: api.EncodeID(r.Registration.CollectorID), Generation: r.Registration.Generation, State: string(r.Registration.State), Changed: r.Changed, Sequence: r.Sequence}
+	return api.AdminReceipt{Schema: api.Schema, CollectorID: api.EncodeID(r.Registration.CollectorID), Generation: r.Registration.Generation, State: string(r.Registration.State), Changed: r.Changed}
 }
 
 func (p *AdminProvider) ReadRegistration(ctx context.Context, id shoal.ID) (api.RegistrationRecord, error) {
@@ -47,7 +47,7 @@ func (p *AdminProvider) ReadRegistration(ctx context.Context, id shoal.ID) (api.
 		return api.RegistrationRecord{}, e
 	}
 	reg := view.Registration
-	out := api.RegistrationRecord{Schema: api.Schema, CollectorID: api.EncodeID(reg.CollectorID), Subject: api.EncodeID(reg.Subject), Domain: api.EncodeKey(reg.Domain), AuthorityPolicyIDs: []string{}, Control: string(reg.Control), Mode: string(reg.Mode), Generation: reg.Generation, State: string(reg.State), ChangeCount: view.ChangeCount, Changes: []api.ChangeSummary{}, SegmentStart: view.SegmentStart}
+	out := api.RegistrationRecord{Schema: api.Schema, CollectorID: api.EncodeID(reg.CollectorID), Subject: api.EncodeID(reg.Subject), Domain: api.EncodeKey(reg.Domain), AuthorityPolicyIDs: []string{}, Control: string(reg.Control), Mode: string(reg.Mode), Generation: reg.Generation, State: string(reg.State), FromGeneration: view.FromGeneration, Changes: []api.ChangeSummary{}, Gaps: []api.LogGap{}, Anomalies: []api.LogAnomaly{}}
 	if reg.ClientID != "" {
 		out.ClientID = api.EncodeID(reg.ClientID)
 	}
@@ -58,10 +58,7 @@ func (p *AdminProvider) ReadRegistration(ctx context.Context, id shoal.ID) (api.
 		out.EnrollmentID = api.EncodeID(view.EnrollmentID)
 	}
 	for _, c := range view.Changes {
-		summary := api.ChangeSummary{Sequence: c.Sequence, Action: string(c.Action), Source: string(c.Source), Generation: c.Registration.Generation, State: string(c.Registration.State), At: c.At}
-		if c.Recovery != nil {
-			summary.Recovery = string(c.Recovery.Reason)
-		}
+		summary := api.ChangeSummary{Action: string(c.Action), Source: string(c.Source), Generation: c.Registration.Generation, State: string(c.Registration.State), At: c.At}
 		if a := c.Admin; a != nil {
 			by := api.AdminAttribution{Subject: api.EncodeID(a.Subject), Actor: api.EncodeID(a.Actor), RequestID: api.EncodeID(a.RequestID), AuthorizationFingerprint: a.AuthorizationFingerprint}
 			if a.ClientID != "" {
@@ -73,6 +70,15 @@ func (p *AdminProvider) ReadRegistration(ctx context.Context, id shoal.ID) (api.
 			summary.By = &by
 		}
 		out.Changes = append(out.Changes, summary)
+	}
+	for _, g := range view.Gaps {
+		out.Gaps = append(out.Gaps, api.LogGap{Generation: g.Generation, Action: string(g.Action)})
+	}
+	for _, a := range view.Anomalies {
+		if len(out.Anomalies) == api.MaxRegistrationAnomalies {
+			break
+		}
+		out.Anomalies = append(out.Anomalies, api.LogAnomaly{Generation: a.Generation, Action: string(a.Action), Reason: string(a.Reason)})
 	}
 	if out.Validate() != nil {
 		return api.RegistrationRecord{}, ErrUnavailable
