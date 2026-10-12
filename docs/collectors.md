@@ -8,6 +8,8 @@ authority rules of #419.
 
 Nothing here is mounted in an existing binary. A host constructs the registry
 and calls `MountCollectors` itself, as for decisions (`docs/decision-http-api.md`).
+Collector administration over HTTP (slice 5, [Administration](#administration))
+is a separate, opt-in mount, `MountCollectorAdmin`.
 
 ## Packages
 
@@ -20,17 +22,19 @@ and calls `MountCollectors` itself, as for decisions (`docs/decision-http-api.md
 | `pkg/sdk` | Versioned facade: `sdk.New(...).Collectors()`, `.Decisions()`, `.Admission()` and `.Attestation()`; `sdk.ProtocolVersion = 1` | `pkg/shoal`, `*/api` |
 | `internal/collectorregistry` | Engine-backed registry, `Provider` wire adapter, `Source` adapter | core |
 | `internal/collectorattest` | Attestation verifiers | core |
-| `pkg/explorer/webapi` (`collectors.go`) | HTTP routes | core |
+| `pkg/explorer/webapi` (`collectors.go`, `collector_admin.go`) | HTTP routes | core |
 
 `pkg/decision` itself is not an extension dependency: it pulls `internal/`
 packages transitively. Extensions use `pkg/decision/api`.
 
 ## Authority
 
-Authority is assigned in one place: `Registry.Provision`, a trusted Go API with
-no HTTP route. It binds a collector ID to one authenticated principal (subject,
-client ID and authorization domain), an authority ceiling (a set of authority
-policy IDs), a `Control` and a `Mode`.
+Authority is assigned only by provisioning: `Registry.Provision`, a trusted Go
+API, or its HTTP counterpart `Registry.AdminProvision` behind
+`auth.OperationCollectorAdmin` ([Administration](#administration)). Either
+binds a collector ID to one authenticated principal (subject, client ID and
+authorization domain), an authority ceiling (a set of authority policy IDs), a
+`Control` and a `Mode`.
 
 - `Control` mirrors `decision.Control` by value (`candidate_controlled`,
   `external_controlled`, `registry_controlled`, `unknown`). It says who
@@ -55,8 +59,8 @@ same identity.
 Only the provisioned principal can enroll or submit for a collector. Any other
 principal, including a delegated decision for the right subject, gets
 `404 not_found`, as if the collector did not exist. Writes require
-`auth.OperationIngest`; reads require `auth.OperationRead`. No new operation was
-added.
+`auth.OperationIngest`; reads require `auth.OperationRead`. Collector admin
+implies neither: an admin token cannot enroll or submit.
 
 ## Artifacts and observations
 
@@ -88,8 +92,8 @@ its input, not a judgement about the content.
 
 ## Revocation and quarantine
 
-`Registry.Revoke` (trusted Go API) increments the collector's generation and
-marks it revoked. Every artifact and observation records the generation it was
+`Registry.Revoke` (trusted Go API) or `Registry.AdminRevoke` (HTTP, below)
+increments the collector's generation and marks it revoked. Every artifact and observation records the generation it was
 written under. `GET /api/v1/collectors/observations/{id}` computes
 `status` from the collector's current registration: `quarantined` when the
 collector is revoked or the generation differs, otherwise `active`. Rows are
@@ -132,6 +136,113 @@ receipt. Below the size of a particular receipt, a write that committed
 reports indeterminate: safe, because a retry returns the same receipt, but
 unreadable under that budget. Content is read back with the GET route, which
 commits nothing and is not listed.
+
+## Administration
+
+Slice 5 adds HTTP provisioning, revocation and reads, for hosts that mount
+them with `MountCollectorAdmin(collectorregistry.NewAdminProvider(registry),
+resolver)`. Without that call the admin paths answer `404` from the
+collector handler, exactly as before, and no collector route changes. Through
+the SDK: `sdk.New(...).Collectors()` gains `ProvisionCollector`,
+`RevokeCollector` and `CollectorRegistration`.
+
+| Route | Body / result |
+| --- | --- |
+| `POST /api/v1/collectors/admin/provision` | `ProvisionRequest` (collector ID, subject, optional client ID, domain, authority policy IDs, control, mode, generation) → `AdminReceipt` |
+| `POST /api/v1/collectors/admin/revoke` | `RevokeRequest` (collector ID, generation) → `AdminReceipt` |
+| `GET /api/v1/collectors/admin/registrations/{id}` | `RegistrationRecord`: the registration, its current enrollment ID, the change count and the 16 most recent changes, newest first |
+
+IDs and the domain are base64url without padding, as on the collector routes;
+bodies are decoded with the same strict rules.
+
+### The operation, and how an operator obtains it
+
+Every route requires `auth.OperationCollectorAdmin` (`collector_admin`) in the
+caller's own authorization domain. It assigns every collector's authority, so
+nothing that grants anything else grants it:
+
+- no OIDC mapping (reader, contributor, fleet), the approver audience, the
+  executor mint or the `-dev-auth` principal of `shoal-explore-web` mints it;
+- `shoal-mcp`'s `-identity-operations` refuses it explicitly (that process
+  serves no collector route);
+- no service role allows it, including migration's legacy wildcard, so no
+  service decision can hold it;
+- workspace narrowing can only remove operations, so a workspace setting
+  cannot add it;
+- a delegated decision (any on-behalf-of chain), a service decision and an
+  executor-bound decision are refused as admins even if they hold it.
+
+**The operator path** is the host itself. A host that calls
+`MountCollectorAdmin` authenticates its admins with an authenticator it
+configures and mints their decisions with the operation. That is the same
+trust boundary as the Go `Provision` API: operator-controlled code, not a
+claim value an identity provider or a token holder can choose.
+`cmd/shoal-explore-web/oidc_collector_admin_grant_test.go` pins all of the
+above: an inventory of every operation list the command defines, a go/types
+scan proving the command's code denotes the operation nowhere, and a mint of
+every token kind with `collector_admin` smuggled into its claims. The auth
+inventory tests, `cmd/shoal-mcp` and `pkg/explorer/workspace` each assert
+their part.
+
+### Rules
+
+- **Own domain only.** `domain` must be the admin's authorization domain
+  (`403` otherwise, decided before anything is read). Revoking or reading a
+  collector in another domain answers exactly like a collector that does not
+  exist (`404`). Collector IDs are a single namespace, so provisioning an ID
+  already taken in another domain is a `409`, answered exactly like an identity
+  mismatch in the admin's own domain: it reveals only that the ID is taken.
+- **No self-provisioning.** A request whose subject is the admin's subject or
+  actor is refused (`403`) before anything is read, under any client ID. So an
+  admin can neither make itself a collector nor raise, confirm or reactivate a
+  registration bound to itself.
+- **The request decides the outcome; nothing is merged.** `generation` is the
+  generation the registration holds afterwards. Provisioning creates only at
+  generation 1, reactivates a revoked registration only at its current
+  generation (with new terms allowed, as in the Go API), and otherwise must
+  match an active registration exactly, which is a no-op. Revocation names the
+  generation being revoked; revoking it again is a no-op. Everything else is
+  `409`: different terms on an active registration (revoke first, which
+  quarantines), a different identity, a stale or future generation. So a
+  retried provisioning cannot undo a revocation that happened in between.
+- **Concurrency** is the registry's existing compare-and-set on the
+  registration row; concurrent admins serialize, and the loser of a race
+  re-evaluates against what won.
+- **Quarantine stays read-time.** Revocation bumps the generation exactly as
+  `Revoke` does. Observation status is still computed from the current
+  registration at each observation read; nothing caches it, and the admin
+  read carries no status.
+
+### Audit
+
+Every provisioning and revocation that changes a registration, through either
+API, appends one immutable entry to that collector's change log **in the same
+one-row mutation** as the registration write, so neither is durable without
+the other. An entry records the action, the registration as written, the time,
+and its source: `collector_admin` with the admin's subject, actor, client ID,
+domain, request ID, correlation ID and authorization fingerprint, or
+`operator_api` for the Go API, which has no caller identity. No-op retries and
+refused requests change nothing and write no entry. A lost acknowledgement is
+reconciled by reading the exact entry back (each attempt carries a random
+nonce, so two identical concurrent requests cannot both claim the change).
+`Registry.Changes` is a trusted Go read of the whole log; the HTTP read returns
+the 16 most recent entries.
+
+The log lives in its own column family (`a`) of the registration's row. The
+cells the existing flows write are unchanged byte for byte
+(`internal/collectorregistry/testdata/persisted_rows.golden.json`, captured
+before this slice).
+
+### Retries and budgets
+
+Provision and revoke are idempotent and listed in `requestMayCommit`, so an
+over-budget or uncertain response reports `indeterminate`; retry with the
+identical request. `AdminReceipt.Changed` says whether this call made the
+change, so a retry of a change that already applied reports `false` with the
+same registration. Receipts carry only the collector ID, generation, state,
+`changed` and the entry's sequence: at most 1498 bytes with a maximal ID, within
+`api.MaxAdminReceiptBytes` (2048). The largest registration record is about
+166 KB, within `api.MaxResponseBytes`.
 
 ## Attestation
 
@@ -372,8 +483,6 @@ SHOAL_TOKEN=... go run ./extensions/example-collector \
   `cmd/shoal-llm-gateway` onto it (after #443/#451).
 - Policy requiring verified attestation for `EffectMutatesExternal` executors
   (with ATPL `runtime`, #457); hardware and code attestation verifiers.
-- HTTP provisioning and revocation. These need an admin operation kept out of
-  every OIDC-minted mapping, as `OperationExecute` is.
 - Raw artifact byte retention (#447).
 - Building picture sources from observations (#418) and propagating quarantine
   into datasets, calibrations and releases (#419).
