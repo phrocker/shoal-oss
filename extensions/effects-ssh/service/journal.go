@@ -78,6 +78,11 @@ const (
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
+// syncFile is every fsync the journal makes, of its file and of its
+// directory. It is a variable so tests can observe the order of syncs
+// against the dial (TestSyncsPrecedeTheDial); nothing else replaces it.
+var syncFile = (*os.File).Sync
+
 // ErrJournalCorrupt is returned by OpenJournal for a journal it will not trust.
 var ErrJournalCorrupt = errors.New("journal is corrupt")
 
@@ -262,7 +267,7 @@ func (j *Journal) load() error {
 			j.closeFile()
 			return fmt.Errorf("journal tail cannot be truncated: %w", err)
 		}
-		if err := file.Sync(); err != nil {
+		if err := syncFile(file); err != nil {
 			j.closeFile()
 			return fmt.Errorf("journal cannot be synced: %w", err)
 		}
@@ -580,7 +585,7 @@ func (j *Journal) append(r record) (span, error) {
 		err = io.ErrShortWrite
 	}
 	if err == nil {
-		err = j.file.Sync()
+		err = syncFile(j.file)
 	}
 	if err != nil {
 		return span{}, j.fail(fmt.Errorf("journal write: %w", err))
@@ -686,7 +691,7 @@ func (j *Journal) compact() error {
 		newSpans[index] = span{offset: offset, length: m.which.length}
 		offset += m.which.length
 	}
-	if err := out.Sync(); err != nil {
+	if err := syncFile(out); err != nil {
 		return cleanup(err)
 	}
 	if err := os.Rename(temporary, j.path()); err != nil {
@@ -713,7 +718,7 @@ func syncDir(dir string) error {
 		return fmt.Errorf("journal directory cannot be opened: %w", err)
 	}
 	defer handle.Close()
-	if err := handle.Sync(); err != nil {
+	if err := syncFile(handle); err != nil {
 		return fmt.Errorf("journal directory cannot be synced: %w", err)
 	}
 	return nil

@@ -98,6 +98,23 @@ func TestRunWithoutAnExitStatusIsUnknown(t *testing.T) {
 	}
 }
 
+// TestExecWhoseReplyIsNotSuccessIsUnknown: once the exec request has been
+// sent, a refusal or a lost reply is unknown, never not_run: the host may
+// have started the command either way.
+func TestExecWhoseReplyIsNotSuccessIsUnknown(t *testing.T) {
+	for _, answer := range []sshtest.ExecAnswer{sshtest.ExecRefuse, sshtest.ExecDrop} {
+		server := sshtest.New(t)
+		server.AnswerExec(answer)
+		result := sshclient.Run(context.Background(), target(t, server), "uptime", limits)
+		if result.Outcome != sshclient.OutcomeUnknown || result.Reason != sshclient.ReasonStart {
+			t.Fatalf("answer %d: %+v", answer, result)
+		}
+		if server.Execs("uptime") != 1 {
+			t.Fatalf("answer %d: the exec request did not reach the host", answer)
+		}
+	}
+}
+
 func TestRunTimesOutAsUnknown(t *testing.T) {
 	server := sshtest.New(t)
 	server.Handle(func(_ string, _, _ io.Writer, closed <-chan struct{}) sshtest.Exit {

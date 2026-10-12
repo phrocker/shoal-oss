@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -337,6 +338,61 @@ func TestStartedIsDurableBeforeTheRun(t *testing.T) {
 	e.post("restart-web", testKey("durable")).is(t, loadAnswers(t), "completed")
 	if !onDisk {
 		t.Fatal("the run began before its started record was on disk")
+	}
+}
+
+// TestSyncsPrecedeTheDial: the journal's directory entry is synced when the
+// journal opens, the file is synced after the started record and before the
+// run, and again after the finished record.
+func TestSyncsPrecedeTheDial(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	note := func(event string) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	}
+	original := syncFile
+	syncFile = func(f *os.File) error {
+		info, err := f.Stat()
+		if err == nil && info.IsDir() {
+			note("sync dir")
+		} else {
+			note("sync " + filepath.Base(f.Name()))
+		}
+		return original(f)
+	}
+	t.Cleanup(func() { syncFile = original })
+	e := newEnv(t, func(o *Options, _ *JournalOptions) {
+		o.Run = func(ctx context.Context, command *Command) sshclient.Result {
+			note("dial")
+			return runOverSSH(ctx, command)
+		}
+	})
+	e.post("restart-web", testKey("order")).is(t, loadAnswers(t), "completed")
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"sync dir", "sync " + JournalFileName, "dial", "sync " + JournalFileName}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Fatalf("events %q, want %q", events, want)
+	}
+}
+
+// TestSyncFailureBeforeTheDialRunsNothing: a started record whose fsync
+// fails is not a run.
+func TestSyncFailureBeforeTheDialRunsNothing(t *testing.T) {
+	e := newEnv(t)
+	original := syncFile
+	syncFile = func(*os.File) error { return errors.New("injected fsync failure") }
+	t.Cleanup(func() { syncFile = original })
+	e.post("restart-web", testKey("fsync")).is(t, loadAnswers(t), "refused_journal_unavailable")
+	if e.host.ssh.Accepts() != 0 {
+		t.Fatal("dialed after a failed fsync")
+	}
+	select {
+	case <-e.journal.Failed():
+	default:
+		t.Fatal("the journal did not fail")
 	}
 }
 

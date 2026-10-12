@@ -335,23 +335,34 @@ func newSSHHarness(t *testing.T, clock *timerClock, explorer *fakeExplorer, targ
 	}
 	h := &sshHarness{t: t, clock: clock, explorer: explorer, target: target, route: route,
 		worker: worker, log: log}
-	ctx, cancel := context.WithCancel(context.Background())
-	h.cancel, h.done = cancel, make(chan error, 1)
-	go func() { h.done <- worker.Run(ctx) }()
 	t.Cleanup(func() {
-		cancel()
-		worker.Kill()
-		select {
-		case <-h.done:
-		case <-time.After(10 * time.Second):
+		if h.cancel != nil {
+			h.cancel()
+			worker.Kill()
+			select {
+			case <-h.done:
+			case <-time.After(10 * time.Second):
+			}
 		}
 		_ = log.Close()
 	})
 	return h
 }
 
+// start runs the worker. Work is enqueued first: the worker's first pull
+// then finds it, rather than waiting on a pull backoff the hand-advanced
+// clock would have to release.
+func (h *sshHarness) start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel, h.done = cancel, make(chan error, 1)
+	worker := h.worker
+	go func() { h.done <- worker.Run(ctx) }()
+}
+
+// enqueue adds an action and starts the worker.
 func (h *sshHarness) enqueue(id string) {
 	h.explorer.enqueueFor(id, testAgent, sshCapability, h.route.Action(), `{}`, workerEpoch.Add(time.Hour))
+	h.start()
 }
 
 // until advances the clock in steps until cond holds.
@@ -580,7 +591,7 @@ func TestEffectsSSHEndToEndWorkerRestart(t *testing.T) {
 		return ""
 	}
 	first := newSSHHarness(t, clock, explorer, target)
-	explorer.enqueueFor("a1", testAgent, sshCapability, first.route.Action(), `{}`, workerEpoch.Add(time.Hour))
+	first.enqueue("a1")
 	eventually(t, "the first request", func() bool { requests, _ := target.stats(); return requests == 1 })
 	first.worker.Kill()
 	select {
@@ -589,6 +600,7 @@ func TestEffectsSSHEndToEndWorkerRestart(t *testing.T) {
 		t.Fatal("the first worker did not stop")
 	}
 	second := newSSHHarness(t, clock, explorer, target)
+	second.start()
 	second.until("the action to succeed", func() bool {
 		return explorer.record("a1").State == dispatchapi.DispatchSucceeded
 	})

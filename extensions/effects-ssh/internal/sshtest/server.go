@@ -46,12 +46,13 @@ type Server struct {
 	ClientKeyFile string
 	User          string
 
-	mu       sync.Mutex
-	handler  Handler
-	accepts  int
-	execs    map[string]int
-	requests []string
-	opened   []string
+	mu         sync.Mutex
+	handler    Handler
+	execAnswer ExecAnswer
+	accepts    int
+	execs      map[string]int
+	requests   []string
+	opened     []string
 	// ReverseChannels are channel types the server tries to open towards the
 	// client after each exec; the result of each is recorded in Reverse.
 	reverse  []string
@@ -122,6 +123,24 @@ func (s *Server) AuthorizedHostKey() string {
 func (s *Server) Handle(handler Handler) {
 	s.mu.Lock()
 	s.handler = handler
+	s.mu.Unlock()
+}
+
+// ExecAnswer is how the server answers an exec request it has received (and
+// counted): normally, by refusing it, or by dropping the connection before
+// any reply, as a lost reply would look.
+type ExecAnswer int
+
+const (
+	ExecAccept ExecAnswer = iota
+	ExecRefuse
+	ExecDrop
+)
+
+// AnswerExec sets how exec requests are answered.
+func (s *Server) AnswerExec(answer ExecAnswer) {
+	s.mu.Lock()
+	s.execAnswer = answer
 	s.mu.Unlock()
 }
 
@@ -252,7 +271,16 @@ func (s *Server) handleSession(conn net.Conn, server *ssh.ServerConn, channel ss
 		s.execs[payload.Command]++
 		handler := s.handler
 		reverse := append([]string(nil), s.reverse...)
+		answer := s.execAnswer
 		s.mu.Unlock()
+		switch answer {
+		case ExecRefuse:
+			_ = request.Reply(false, nil)
+			return
+		case ExecDrop:
+			_ = conn.Close()
+			return
+		}
 		_ = request.Reply(true, nil)
 		for _, channelType := range reverse {
 			_, _, err := server.OpenChannel(channelType, nil)

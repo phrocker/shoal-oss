@@ -508,6 +508,17 @@ func TestShutdownJournalsCancelledRunsAsUnknown(t *testing.T) {
 	}
 }
 
+// TestNoRunStartsAfterShutdown: once Shutdown has begun, a new key is
+// refused and nothing is dialed, so Shutdown's wait covers every run.
+func TestNoRunStartsAfterShutdown(t *testing.T) {
+	e := newEnv(t)
+	e.server.Shutdown(expiredContext())
+	e.post("restart-web", testKey("late")).is(t, loadAnswers(t), "refused_journal_unavailable")
+	if e.host.ssh.Accepts() != 0 || e.journal.Len() != 0 {
+		t.Fatal("a run started after shutdown")
+	}
+}
+
 func TestNewServerRefusals(t *testing.T) {
 	e := newEnv(t)
 	base := e.options
