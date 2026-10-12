@@ -951,10 +951,13 @@ func (c *Client) post(
 
 func statusError(op string, response *http.Response, body []byte) error {
 	result := &Error{Op: op, Status: response.StatusCode}
+	// The code is read leniently, as the effects gateway always read it: it
+	// decides nothing (the status does) and wellFormedCode bounds what is
+	// kept, so a proxy's odd error body costs the code at most.
 	var envelope struct {
 		Code string `json:"code"`
 	}
-	if decodeResponse(body, &envelope) == nil && wellFormedCode(envelope.Code) {
+	if json.Unmarshal(body, &envelope) == nil && wellFormedCode(envelope.Code) {
 		result.Code = envelope.Code
 	}
 	switch response.StatusCode {

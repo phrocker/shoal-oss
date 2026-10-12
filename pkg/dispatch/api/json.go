@@ -34,7 +34,8 @@ const maxResponseDepth = 16
 // direction where a newer explorer may legitimately say more than an older
 // client understands, and a deployed worker must keep working when the
 // explorer it talks to is upgraded. Requests are the opposite: the explorer
-// refuses unknown request fields.
+// refuses unknown request fields. The one exception is a descriptor's action,
+// whose unknown field may be a gate (see DescriptorAction.UnmarshalJSON).
 //
 // Raw JSON values (an action's input and output, a descriptor's schemas) are
 // the payload, not the envelope, and are passed through as the explorer sent
