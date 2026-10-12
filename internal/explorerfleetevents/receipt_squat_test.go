@@ -57,10 +57,10 @@ func deletionTokenFor(subscriberID shoal.ID, id []byte, expected uint64) []byte 
 // every later subscription Delete conflicted on a head that belonged to
 // dispatch. No subscriber could revoke.
 //
-// The attacker here occupies every legacy receipt entity under dispatch's
-// policy. The victim's slot is occupied through the real dispatch service,
-// and the rest are occupied directly under fleet/dispatch/v1, as an enqueue
-// would. Delete and DeleteWithAudit still revoke, and the squatted heads are
+// The attacker here occupies legacy receipt entities under dispatch's
+// policy: the first victim's slot through the real dispatch service, and the
+// second victim's slot plus squattedSlots others directly under
+// fleet/dispatch/v1, as an enqueue would. Delete and DeleteWithAudit still revoke, and the squatted heads are
 // untouched, still dispatch's.
 func TestDispatchCannotSquatSubscriptionRevocation(t *testing.T) {
 	now := time.Date(2026, 9, 6, 9, 0, 0, 0, time.UTC)
