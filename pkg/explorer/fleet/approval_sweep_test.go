@@ -528,7 +528,7 @@ func TestApprovalSweepActsOnlyAsTheSystemObserver(t *testing.T) {
 				narrowed:    func(context.Context) bool { return false },
 				generations: fixedGenerations{generation: 3},
 				window:      DefaultApprovalWindow, sweeper: probe.binder,
-				terminal:    true,
+				terminal: true,
 			}
 			result, err := service.Sweep(context.Background(), ApprovalSweepRequest{
 				Limit: MaxApprovalListResults,

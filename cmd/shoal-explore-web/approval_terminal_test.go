@@ -210,7 +210,6 @@ func TestTheSweepCoversAStoreLargerThanOnePass(t *testing.T) {
 	}
 }
 
-
 // TestTheSweepServesErrorCountersOnly: the health surface gains the sweep's
 // two error counters and nothing that tracks tenant workload.
 func TestTheSweepServesErrorCountersOnly(t *testing.T) {

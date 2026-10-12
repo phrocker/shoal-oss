@@ -728,9 +728,9 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		clock:     time.Now,
 		// #655: off until the operator says every replica can read them.
 		terminalStates: *approvalTerminalStates,
-		backfill:  backfill,
-		ontology:  activeOntology,
-		executors: executors,
+		backfill:       backfill,
+		ontology:       activeOntology,
+		executors:      executors,
 		approverMapping: func(context.Context) (auth.Digest, error) {
 			return approverMapping, nil
 		},
