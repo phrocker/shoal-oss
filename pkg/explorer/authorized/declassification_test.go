@@ -127,7 +127,7 @@ func TestDeclassificationAuditsLabelRemoval(t *testing.T) {
 		}
 		intent, commit := records[0], records[1]
 		if intent.Phase != authorized.DeclassificationIntent ||
-			commit.Phase != authorized.DeclassificationCommit {
+			commit.Phase != authorized.DeclassificationPreCommit {
 			t.Fatalf("phases = %q, %q", intent.Phase, commit.Phase)
 		}
 		if intent.AttemptID == "" || intent.AttemptID != commit.AttemptID {
@@ -443,7 +443,7 @@ func TestDeclassificationCommitFailureBlocksTheRegistration(t *testing.T) {
 			t.Fatalf("records after the retry = %+v", records)
 		}
 		retry := records[1]
-		if retry.Phase != authorized.DeclassificationCommit ||
+		if retry.Phase != authorized.DeclassificationPreCommit ||
 			retry.Subject != "retrier" ||
 			retry.AttemptID == records[0].AttemptID ||
 			retry.DocumentID != second.Document.ID ||
@@ -618,7 +618,7 @@ func TestDeclassificationAuditsPendingClaimRetry(t *testing.T) {
 		if len(records) != 3 || records[1].Phase != authorized.DeclassificationIntent ||
 			records[1].ReasonCode != "retry" ||
 			!reflect.DeepEqual(records[1].RemovedLabels(), []string{"secret"}) ||
-			records[2].Phase != authorized.DeclassificationCommit ||
+			records[2].Phase != authorized.DeclassificationPreCommit ||
 			records[2].AttemptID != records[1].AttemptID {
 			t.Fatalf("records after the retry = %+v", records)
 		}
@@ -662,7 +662,7 @@ func TestDeclassificationReconciliationIsRecordedNotRefused(t *testing.T) {
 	if len(records) != 2 ||
 		records[0].Phase != authorized.DeclassificationIntent ||
 		records[0].Subject != "owner" || records[0].ReasonCode != "r1" ||
-		records[1].Phase != authorized.DeclassificationCommit ||
+		records[1].Phase != authorized.DeclassificationPreCommit ||
 		records[1].Subject != "nobody" || records[1].ReasonCode != "" ||
 		records[1].AttemptID == records[0].AttemptID ||
 		records[1].RevisionID != reconciled.Revision.ID ||
@@ -731,5 +731,148 @@ func TestDeclassificationRecordsAreAppendOnly(t *testing.T) {
 		if len(records) != 1 || records[0].ReasonCode != "first" {
 			t.Fatalf("records after reopen = %+v", records)
 		}
+	}
+}
+
+// TestDeclassificationDivergedCatalogIsAnIntent covers a URI with no source
+// claim and no base document whose catalog still holds a current labelled
+// registration (the catalog and base diverged, for example a base restored
+// from backup). The claim-time check has nothing to compare with, so the
+// pre-commit check is the narrowing's first check: it must authorize the
+// principal under the registration it replaces and apply the reason policy,
+// not treat it as a reconciliation.
+func TestDeclassificationDivergedCatalogIsAnIntent(t *testing.T) {
+	f := newFixture(t)
+	const uri = "file:///declassify/diverged.txt"
+	labelled, err := f.base.Ingest(context.Background(),
+		labelledSource(uri, "labelled before the catalog", "secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.clientA.BackfillExistingDocumentsForDevelopment(
+		f.labelIngester(t, "operator", "secret"), devbackfill.NewCapability()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := f.store.SourceClaim(context.Background(), uri); err != nil || ok {
+		t.Fatalf("backfill created a claim (%v)", err)
+	}
+	// A fresh base that does not know the document: the catalog diverges.
+	restored, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restored.Close() })
+	client := f.declassificationClientOver(t, restored, f.store, true)
+	public := labelledSource(uri, "public", "")
+	registered := func() shoal.ID {
+		t.Helper()
+		current, ok, err := f.store.CurrentRevision(context.Background(), labelled.Document.ID)
+		if err != nil || !ok {
+			t.Fatalf("current registration: %v %v", ok, err)
+		}
+		return current.RevisionID
+	}
+
+	if _, err := client.Ingest(f.labelIngester(t, "outsider"), public); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("outsider replacing a diverged labelled registration = %v, want not found", err)
+	}
+	// The outsider's refused attempt still left a committed claim under the
+	// narrow rule (the claim commits on the base write, #665). That claim
+	// passed no reason check, so it must not turn the holder's narrowing
+	// into a reason-free reconciliation.
+	if claim, ok, err := f.store.SourceClaim(context.Background(), uri); err != nil || !ok || claim.Pending {
+		t.Fatalf("claim after the outsider = %+v %v %v", claim, ok, err)
+	}
+	if _, err := client.Ingest(f.labelIngester(t, "holder", "secret"), public); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("holder without a reason = %v, want invalid argument", err)
+	}
+	if got := registered(); got != labelled.Revision.ID {
+		t.Fatalf("a refused narrowing replaced the registration: %s", got)
+	}
+	if records := declassifications(t, f.store); len(records) != 0 {
+		t.Fatalf("refused narrowings were recorded: %+v", records)
+	}
+	result, err := client.Ingest(withReason(t, f.labelIngester(t, "holder", "secret"), "restore"), public)
+	if err != nil {
+		t.Fatalf("holder with a reason: %v", err)
+	}
+	records := declassifications(t, f.store)
+	if len(records) != 1 || records[0].Phase != authorized.DeclassificationPreCommit ||
+		records[0].Subject != "holder" || records[0].ReasonCode != "restore" ||
+		records[0].RevisionID != result.Revision.ID ||
+		records[0].PriorRevisionID != labelled.Revision.ID ||
+		!reflect.DeepEqual(records[0].RemovedLabels(), []string{"secret"}) {
+		t.Fatalf("records = %+v", records)
+	}
+}
+
+// TestDeclassificationReconciliationNeedsAMatchingIntent pins that only an
+// intent for the same URI, the same new rule and the current registration's
+// rule makes a pre-commit narrowing a reason-free reconciliation. An intent
+// that differs in either rule must not lift the reason policy in the
+// diverged-catalog state.
+func TestDeclassificationReconciliationNeedsAMatchingIntent(t *testing.T) {
+	policy, err := auth.NewPolicy(auth.PolicyConfig{
+		AuthorizationDomain: []byte("domain-one"), SourceID: []byte("source-a"),
+		GrantPolicyID: []byte("policy-a"), Epoch: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := func(labels ...string) authorized.AccessRule {
+		t.Helper()
+		built, err := authorized.LabelRule(policy, labels)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return built
+	}
+	const uri = "file:///declassify/unmatched-intent.txt"
+	for _, seed := range []struct {
+		name        string
+		prior, next authorized.AccessRule
+		reconciles  bool
+	}{
+		{"other prior rule", rule("x"), rule(), false},
+		{"other new rule", rule("secret", "y"), rule("y"), false},
+		{"other new rule, same prior", rule("secret"), rule("y"), false},
+		{"matching", rule("secret"), rule(), true},
+	} {
+		t.Run(seed.name, func(t *testing.T) {
+			f := newFixture(t)
+			if err := f.store.RecordDeclassification(context.Background(),
+				authorized.DeclassificationRecord{
+					AttemptID: "seeded", Phase: authorized.DeclassificationIntent,
+					OccurredAt: f.clock.Now(), SourceURI: uri,
+					PriorRules: []authorized.AccessRule{seed.prior}, Rule: seed.next,
+				}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.base.Ingest(context.Background(),
+				labelledSource(uri, "labelled before the catalog", "secret")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.clientA.BackfillExistingDocumentsForDevelopment(
+				f.labelIngester(t, "operator", "secret"), devbackfill.NewCapability()); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := explorer.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = restored.Close() })
+			client := f.declassificationClientOver(t, restored, f.store, true)
+			_, err = client.Ingest(f.labelIngester(t, "holder", "secret"),
+				labelledSource(uri, "public", ""))
+			if seed.reconciles {
+				if err != nil {
+					t.Fatalf("narrowing covered by a matching intent = %v, want reconciliation", err)
+				}
+				return
+			}
+			if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+				t.Fatalf("narrowing with no matching intent and no reason = %v, want invalid argument", err)
+			}
+		})
 	}
 }

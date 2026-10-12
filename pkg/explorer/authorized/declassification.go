@@ -30,14 +30,23 @@ package authorized
 // # What counts as narrowing
 //
 // An AccessRule is a conjunction of structured policies, and a reader is
-// allowed iff it is granted every component (AccessRule.Authorize). Grants
-// are independent per logical component (domain, source, grant policy ID,
-// service role; epochs never participate), so a decision can hold any subset
-// of them. Under that model, rule N admits some reader that rule P does not
-// iff some component of P is not a component of N. That is the test used
-// here (removedComponents), and it is exact, not merely conservative: a
-// removed label, a swapped label ("x" for "secret"), a changed source policy
-// and a dropped service role all count; adding components (widening the label
+// allowed iff it is granted every component (AccessRule.Authorize). The test
+// used here (ruleNarrows) reports a narrowing iff some logical component of
+// the replaced rule P (domain, source, grant policy ID, service role; epochs
+// never participate) is not a component of the new rule N.
+//
+// The test is conservative: it never misses a narrowing, because a rule that
+// keeps every component of P requires at least what P requires. It is exact
+// for LabelRule-shaped rules (one source policy plus one policy per label),
+// where every component is an independently granted policy, so any subset of
+// them can be held. For other shapes it can over-report. For example, a rule
+// whose single component already stands for {S, X} replaced by the rule {S}
+// AND {X} is reported although it admits nobody new. Such a false positive is
+// harmless to the audit, but with RequireDeclassificationReason on it refuses
+// that ingest unless a reason is given.
+//
+// A removed label, a swapped label ("x" for "secret"), a changed source policy
+// and a dropped service role all count. Adding components (widening the label
 // set, which narrows the readers) never does. Components are compared by
 // their canonical logical keys, which are exact bytes: labels are never
 // folded or trimmed (LabelPolicyID), so "Secret" and "secret" are different
@@ -56,18 +65,22 @@ package authorized
 //     the claim is swapped or the base is written. It compares the new rule
 //     with the claim's rule (and a pending claim's PreviousRule), or with a
 //     legacy unclaimed document's current registration.
-//   - DeclassificationCommit, immediately before the PutRevision that makes
-//     the narrowed revision current, which is the write that actually lets
-//     the new readers in. It compares the new rule with the document's
-//     current registration as well, so a narrowing is caught at the
-//     visibility commit even if the claim and the registration ever
-//     disagreed (for example a retry after an earlier attempt registered
-//     nothing). It carries the document and revision identities.
+//   - DeclassificationPreCommit, immediately before the PutRevision that
+//     makes the narrowed revision current, which is the write that actually
+//     lets the new readers in. It is written BEFORE that registration, so
+//     it records that the narrowing was about to be committed, not that it
+//     was. It compares the new rule with the document's current
+//     registration as well, so a narrowing is caught at the visibility
+//     commit even if the claim and the registration ever disagreed (for
+//     example a retry after an earlier attempt registered nothing). It
+//     carries the document and revision identities.
 //
 // If either audit write fails, the ingest fails before the step it guards, so
 // no narrowing becomes visible without at least one durable record of it. A
 // crash after an audit and before its step leaves an attempt record with no
-// matching outcome, never the reverse.
+// matching outcome, never the reverse. The outcome is the catalog's revision
+// registration: a narrowing took effect iff the record's RevisionID is (or
+// was) the document's current registration.
 //
 // # Who can read it
 //
@@ -83,15 +96,34 @@ package authorized
 // # Reason codes
 //
 // Config.RequireDeclassificationReason makes a narrowing that carries no
-// reason (WithDeclassificationReason) fail with InvalidArgument at the intent
-// check, before anything is written and only after the principal has been
-// authorized under the replaced and the new rule, so it tells them nothing
-// new. The claim reaches a narrow rule only through that check. A narrowing
-// first seen at the commit check is the reconciliation of such an attempt
-// (the claim already holds the narrow rule while the registration lags); it
-// is recorded but not refused, because the claim holder completing it need
-// not be authorized under the lagging registration and a refusal would
-// disclose that it carries labels.
+// reason (WithDeclassificationReason) fail with InvalidArgument at its first
+// check. The refusal always comes after the principal has been authorized
+// under the replaced and the new rule, so it tells them nothing new.
+//
+//   - Normally the first check is the intent check, before anything is
+//     written. It compares against the claim, a pending claim's previous
+//     rule, or an unclaimed URI's registration found through the base.
+//   - A narrowing first seen at the pre-commit check, with no recorded
+//     intent covering it, is also a first check. The claim-time check had
+//     nothing to compare with because the catalog and the base diverged:
+//     for example, a base restored from backup no longer holds a document
+//     the catalog still registers, or such a state let an attempt create a
+//     claim without passing this check. The principal is first authorized
+//     under the registration it replaces (NotFound otherwise), and then the
+//     reason policy applies, after the base write and before the
+//     registration.
+//   - A narrowing first seen at the pre-commit check that IS covered by a
+//     recorded intent (same URI, same new rule, the current registration's
+//     rule among its replaced rules) is a reconciliation. The claim already
+//     holds the narrow rule while the registration lags (#665), and that
+//     intent already passed the reason policy. It is recorded but not
+//     refused. The claim is the mutation authority, so the claim holder
+//     completing it need not be authorized under the lagging registration,
+//     and a refusal would disclose that the registration carries labels.
+//
+// The invariant: a narrowing never becomes current unless the reason policy
+// was applied at its first check. That check is either an earlier attempt's
+// recorded intent or a check this ingest makes itself.
 
 import (
 	"context"
@@ -110,9 +142,9 @@ const (
 	// DeclassificationIntent precedes the source-claim swap and the base
 	// write.
 	DeclassificationIntent DeclassificationPhase = "intent"
-	// DeclassificationCommit precedes the registration that makes the
+	// DeclassificationPreCommit precedes the registration that makes the
 	// narrowed revision current.
-	DeclassificationCommit DeclassificationPhase = "commit"
+	DeclassificationPreCommit DeclassificationPhase = "pre_commit"
 )
 
 const (
@@ -127,7 +159,7 @@ const (
 // Validate refuses an unknown phase.
 func (p DeclassificationPhase) Validate() error {
 	switch p {
-	case DeclassificationIntent, DeclassificationCommit:
+	case DeclassificationIntent, DeclassificationPreCommit:
 		return nil
 	default:
 		return shoal.NewError(
@@ -136,8 +168,9 @@ func (p DeclassificationPhase) Validate() error {
 }
 
 // DeclassificationRecord is the durable audit of one relabel narrowing
-// attempt (#630). AttemptID groups the intent and commit records of one
-// Ingest call.
+// attempt (#630). AttemptID groups the intent and pre-commit records of one
+// Ingest call. A record is written before the step it guards and so records
+// an attempt; the catalog's revision registration is the outcome.
 type DeclassificationRecord struct {
 	AttemptID  shoal.ID
 	Phase      DeclassificationPhase
@@ -146,8 +179,8 @@ type DeclassificationRecord struct {
 	// is held under.
 	SourceURI string
 	// DocumentID and PriorRevisionID name the replaced current revision when
-	// it is known (always on a commit record). RevisionID is the narrowed
-	// revision, set only on a commit record.
+	// it is known (always on a pre-commit record). RevisionID is the
+	// narrowed revision, set only on a pre-commit record.
 	DocumentID      shoal.ID
 	PriorRevisionID shoal.ID
 	RevisionID      shoal.ID
@@ -241,7 +274,7 @@ func (r DeclassificationRecord) validate() error {
 			return err
 		}
 	}
-	if r.Phase == DeclassificationCommit {
+	if r.Phase == DeclassificationPreCommit {
 		if err := shoal.ValidateRequiredID(
 			"declassification document ID", r.DocumentID); err != nil {
 			return err
@@ -314,7 +347,7 @@ func cloneDeclassificationRecord(
 
 // ruleNarrows reports whether next admits a reader prior does not: whether
 // some logical component of prior is missing from next. See the file comment
-// for why this is exact for conjunctive rules.
+// for why this is conservative, and exact for LabelRule-shaped rules.
 func ruleNarrows(prior, next AccessRule) bool {
 	for _, key := range prior.keys {
 		if !ruleHasKey(next, key) {
@@ -382,7 +415,7 @@ type declassificationAttempt struct {
 	reason     string
 	documentID shoal.ID
 	priorRev   shoal.ID
-	// reconciliation marks a narrowing first seen at the commit check,
+	// reconciliation marks a narrowing first seen at the pre-commit check,
 	// which completes an earlier, already-audited attempt.
 	reconciliation bool
 }
@@ -464,20 +497,48 @@ func (c *Client) declassificationCommit(
 		return nil
 	}
 	if attempt == nil {
-		// A narrowing first seen here is the reconciliation of an earlier
-		// attempt: the claim already holds the narrow rule while the
-		// registration lags (an earlier commit audit or PutRevision
-		// failed after the base write). The claim is the mutation
-		// authority, so any claim holder may complete it, exactly as
-		// before #630; the claim only reached the narrow rule through an
-		// intent check that recorded the narrowing and enforced the reason
-		// policy. So the reason policy is not re-applied here: refusing
-		// would tell a claim holder outside the registration's rule that
-		// the registration carries labels it lacks. The record names the
-		// principal whose ingest makes the narrowing current.
-		attempt = &declassificationAttempt{
-			reason:         declassificationReason(ctx),
-			reconciliation: true,
+		reconciliation, err := c.reconcilesRecordedIntent(
+			ctx, sourceURI, selected, current.Rule)
+		if err != nil {
+			return err
+		}
+		if reconciliation {
+			// The claim already holds the narrow rule while the
+			// registration lags (an earlier pre-commit audit or
+			// PutRevision failed after the base write, #665), and that
+			// earlier attempt's intent, recorded under the reason policy,
+			// is on file. The claim is the mutation authority, so any
+			// claim holder may complete it, exactly as before #630. The
+			// reason policy is not re-applied: refusing would tell a
+			// claim holder outside the registration's rule that the
+			// registration carries labels it lacks. The record names the
+			// principal whose ingest makes the narrowing current.
+			attempt = &declassificationAttempt{
+				reason:         declassificationReason(ctx),
+				reconciliation: true,
+			}
+		} else {
+			// No recorded intent covers this narrowing, so this is its
+			// first check: the claim-time check had nothing to compare
+			// with because the catalog and the base diverged (a current
+			// registration for a URI whose base document is gone, for
+			// example a base restored from backup, or whose claim was
+			// created by an attempt that never passed this check). It is
+			// treated as an intent: the principal must be authorized
+			// under the registration it replaces (NotFound otherwise, so
+			// nothing about its labels is disclosed) and the reason policy
+			// applies.
+			allowed, err := ruleAllows(
+				current.Rule, decision, auth.OperationIngest, now)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return auth.ObjectNotFound()
+			}
+			attempt = &declassificationAttempt{
+				reason: declassificationReason(ctx),
+			}
 		}
 	}
 	attempt.priorRules = priorRules
@@ -486,8 +547,36 @@ func (c *Client) declassificationCommit(
 		attempt.priorRev = priorRevision
 	}
 	return c.recordDeclassification(
-		ctx, decision, now, DeclassificationCommit, sourceURI, selected,
+		ctx, decision, now, DeclassificationPreCommit, sourceURI, selected,
 		attempt, revisionID)
+}
+
+// reconcilesRecordedIntent reports whether a recorded intent already covers
+// narrowing the registration rule prior to selected on sourceURI: an intent
+// with exactly the selected rule whose replaced rules include prior. Only such
+// an intent passed the reason policy for this narrowing. It is read only on
+// the rare path of a narrowing first seen at the pre-commit check.
+func (c *Client) reconcilesRecordedIntent(
+	ctx context.Context,
+	sourceURI string,
+	selected, prior AccessRule,
+) (bool, error) {
+	records, err := c.policyStore.Declassifications(ctx)
+	if err != nil {
+		return false, policyCatalogReadError(ctx, err)
+	}
+	for _, record := range records {
+		if record.Phase != DeclassificationIntent ||
+			record.SourceURI != sourceURI || !record.Rule.equal(selected) {
+			continue
+		}
+		for _, replaced := range record.PriorRules {
+			if replaced.equal(prior) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func appendDistinctRule(rules []AccessRule, rule AccessRule) []AccessRule {

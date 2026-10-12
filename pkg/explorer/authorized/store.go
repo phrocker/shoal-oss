@@ -187,6 +187,9 @@ type PolicyStore interface {
 	RecordDeclassification(context.Context, DeclassificationRecord) error
 	// Declassifications returns every recorded declassification audit, in
 	// recording order. It is an operator read that no Client method exposes.
+	// Each record is written before the step it guards, so it records an
+	// attempt; whether the narrowing took effect is the catalog's revision
+	// registration (a pre_commit record's RevisionID being current).
 	Declassifications(context.Context) ([]DeclassificationRecord, error)
 }
 
