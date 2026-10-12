@@ -148,6 +148,9 @@ func (s *DurablePolicyStore) TightenRule(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.diverged.Load() {
+		return false, catalogUnavailable()
+	}
 	changes, err := s.memory.tightenRule(ctx, index, tightening)
 	if err != nil {
 		return false, err
@@ -155,6 +158,14 @@ func (s *DurablePolicyStore) TightenRule(
 	if !changes.changed() {
 		return false, nil
 	}
+	// The memory store has changed; any failure from here on leaves it
+	// ahead of the engine.
+	persistedAll := false
+	defer func() {
+		if !persistedAll {
+			s.markDiverged()
+		}
+	}()
 	rows := make([]policyRow, 0,
 		len(changes.revisions)+len(changes.nodes)+len(changes.edges)+2)
 	for _, key := range changes.revisions {
@@ -192,6 +203,7 @@ func (s *DurablePolicyStore) TightenRule(
 	if err := s.writeRows(rows); err != nil {
 		return false, err
 	}
+	persistedAll = true
 	return true, nil
 }
 
@@ -252,8 +264,8 @@ func (s *DurablePolicyStore) PutLabelMigration(
 			Reason:            entry.Reason,
 		})
 	}
-	return s.writeRow(
-		[]byte(policyRowLabelMigration), policyKindLabelMigration, persisted)
+	return s.persisted(s.writeRow(
+		[]byte(policyRowLabelMigration), policyKindLabelMigration, persisted))
 }
 
 func labelMigrationFromPersisted(
@@ -371,6 +383,9 @@ func (s *DurablePolicyStore) sourceClaimRows(sourceURI string) ([]policyRow, err
 // writeRows encodes every row first and then writes them in one engine
 // write, so an encoding failure writes nothing.
 func (s *DurablePolicyStore) writeRows(rows []policyRow) error {
+	if s.diverged.Load() {
+		return catalogUnavailable()
+	}
 	mutations := make([]*cclient.Mutation, 0, len(rows))
 	for _, row := range rows {
 		encoded, err := encodePolicyRecord(row.kind, row.value)

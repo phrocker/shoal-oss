@@ -29,6 +29,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/phrocker/shoal-oss/internal/cclient"
@@ -65,6 +66,59 @@ type DurablePolicyStore struct {
 	engine *engine.Engine
 	seq    uint64
 	closed bool
+	// diverged is set once a write-through fails after the memory store was
+	// already mutated, so memory may hold state the engine does not. From
+	// then on the store fails closed: every read and write reports the
+	// catalog unavailable until the process reopens it from the engine.
+	// Serving the in-memory state would let authorization rely on a
+	// registration or claim that is not durable (#665: a registration
+	// that never persisted could otherwise stand in for the rule it
+	// replaced).
+	diverged atomic.Bool
+	// divergedOnce runs the OnDiverged hook at most once; divergedHook is
+	// what OnDiverged registered.
+	divergedOnce sync.Once
+	divergedMu   sync.Mutex
+	divergedHook func()
+}
+
+// Diverged reports whether a failed write-through has made the store fail
+// closed. It is the operational signal for "this process must restart": the
+// state on disk is intact, and reopening reloads it.
+func (s *DurablePolicyStore) Diverged() bool {
+	return s != nil && s.diverged.Load()
+}
+
+// OnDiverged registers hook to run once, the first time the store diverges,
+// or immediately if it already has. Hosts use it to log the event and drop
+// readiness, so an orchestrator restarts or drains an instance whose catalog
+// now refuses every request. The hook must not call back into the store.
+func (s *DurablePolicyStore) OnDiverged(hook func()) {
+	if s == nil || hook == nil {
+		return
+	}
+	s.divergedMu.Lock()
+	s.divergedHook = hook
+	s.divergedMu.Unlock()
+	if s.diverged.Load() {
+		s.fireDiverged()
+	}
+}
+
+// markDiverged makes the store fail closed and signals it once.
+func (s *DurablePolicyStore) markDiverged() {
+	s.diverged.Store(true)
+	s.fireDiverged()
+}
+
+func (s *DurablePolicyStore) fireDiverged() {
+	s.divergedMu.Lock()
+	hook := s.divergedHook
+	s.divergedMu.Unlock()
+	if hook == nil {
+		return
+	}
+	s.divergedOnce.Do(hook)
 }
 
 const (
@@ -253,7 +307,6 @@ func (s *DurablePolicyStore) load() error {
 	coOccurrences := make(map[string]persistedCoOccurrence)
 	var declassifications []sequencedDeclassification
 	declassificationSeqs := make(map[string]struct{})
-	var declassificationClaims []persistedDeclassificationClaim
 	var (
 		versionRecord   persistedSourceVersion
 		haveVersion     bool
@@ -300,18 +353,18 @@ func (s *DurablePolicyStore) load() error {
 				haveMigration = true
 			}
 			maxSeq = maxUint64(maxSeq, record.Seq)
-		case bytes.HasPrefix(row, []byte(policyRowDeclassificationClaim)):
-			var record persistedDeclassificationClaim
+		case bytes.HasPrefix(row, []byte(retiredPolicyRowDeclassificationClaim)):
+			// Retired lineage rows (see retiredPolicyKindDeclassificationClaim):
+			// validated strictly, then ignored.
+			var record retiredPersistedDeclassificationClaim
 			if err := decodePolicyRecord(
-				value, policyKindDeclassificationClaim, &record,
+				value, retiredPolicyKindDeclassificationClaim, &record,
 			); err != nil {
-				return corruptPolicyRecord("declassification claim binding", err)
+				return corruptPolicyRecord("retired declassification claim binding", err)
 			}
-			if string(policyDeclassificationClaimRowFor(record)) != rowStr {
-				return corruptPolicyRecord("declassification claim binding",
-					fmt.Errorf("declassification claim binding row does not match its record"))
+			if err := validateRetiredDeclassificationClaim(rowStr, record); err != nil {
+				return corruptPolicyRecord("retired declassification claim binding", err)
 			}
-			declassificationClaims = append(declassificationClaims, record)
 			maxSeq = maxUint64(maxSeq, record.Seq)
 		case bytes.HasPrefix(row, []byte(policyRowDeclassification)):
 			var record persistedDeclassification
@@ -430,11 +483,7 @@ func (s *DurablePolicyStore) load() error {
 		}
 		s.memory.labelMigration = &migration
 	}
-	if err := s.memory.restoreDeclassifications(
-		orderDeclassifications(declassifications), declassificationClaims,
-	); err != nil {
-		return corruptPolicyRecord("declassification claim binding", err)
-	}
+	s.memory.declassifications = orderDeclassifications(declassifications)
 	s.seq = maxSeq + 1
 	return nil
 }
@@ -612,7 +661,7 @@ func (s *DurablePolicyStore) CompareAndSwapSourceClaim(
 	if err != nil {
 		return SourcePolicyClaim{}, err
 	}
-	if err := s.persistSourceClaim(sourceURI); err != nil {
+	if err := s.persisted(s.persistSourceClaim(sourceURI)); err != nil {
 		return SourcePolicyClaim{}, err
 	}
 	return token, nil
@@ -632,7 +681,7 @@ func (s *DurablePolicyStore) CommitSourceClaim(
 	if err := s.memory.CommitSourceClaim(ctx, claim); err != nil {
 		return err
 	}
-	return s.persistSourceClaim(claim.SourceURI)
+	return s.persisted(s.persistSourceClaim(claim.SourceURI))
 }
 
 // PendSourceClaim finalizes the claim in memory and persists the pending state.
@@ -648,7 +697,7 @@ func (s *DurablePolicyStore) PendSourceClaim(
 	if err := s.memory.PendSourceClaim(ctx, claim); err != nil {
 		return err
 	}
-	return s.persistSourceClaim(claim.SourceURI)
+	return s.persisted(s.persistSourceClaim(claim.SourceURI))
 }
 
 // RollbackSourceClaim reverts the claim in memory and persists the reverted
@@ -665,7 +714,7 @@ func (s *DurablePolicyStore) RollbackSourceClaim(
 	if err := s.memory.RollbackSourceClaim(ctx, claim); err != nil {
 		return err
 	}
-	return s.persistSourceClaim(claim.SourceURI)
+	return s.persisted(s.persistSourceClaim(claim.SourceURI))
 }
 
 // PutRevision registers the revision in memory and persists the revision record
@@ -682,7 +731,7 @@ func (s *DurablePolicyStore) PutRevision(
 	if err := s.memory.PutRevision(ctx, registration); err != nil {
 		return err
 	}
-	return s.persistRevision(registration.DocumentID, registration.RevisionID)
+	return s.persisted(s.persistRevision(registration.DocumentID, registration.RevisionID))
 }
 
 // PutNode registers an extracted graph node in memory and persists the node
@@ -700,7 +749,7 @@ func (s *DurablePolicyStore) PutNode(
 	if err := s.memory.PutNode(ctx, nodeID, registration); err != nil {
 		return err
 	}
-	return s.persistNode(nodeID)
+	return s.persisted(s.persistNode(nodeID))
 }
 
 // Revision is a pure read delegated to the memory store.
@@ -758,7 +807,7 @@ func (s *DurablePolicyStore) ReserveEdge(
 	if err := s.memory.ReserveEdge(ctx, registration); err != nil {
 		return err
 	}
-	return s.persistEdgeClaim(registration.Edge.ID)
+	return s.persisted(s.persistEdgeClaim(registration.Edge.ID))
 }
 
 // RollbackEdgeReservation removes the reservation in memory and persists a
@@ -775,7 +824,7 @@ func (s *DurablePolicyStore) RollbackEdgeReservation(
 	if err := s.memory.RollbackEdgeReservation(ctx, registration); err != nil {
 		return err
 	}
-	return s.persistEdgeClaim(registration.Edge.ID)
+	return s.persisted(s.persistEdgeClaim(registration.Edge.ID))
 }
 
 // PutEdge registers an application edge in memory and persists the edge while
@@ -792,10 +841,10 @@ func (s *DurablePolicyStore) PutEdge(
 	if err := s.memory.PutEdge(ctx, registration); err != nil {
 		return err
 	}
-	if err := s.persistApplicationEdge(registration.Edge.ID); err != nil {
+	if err := s.persisted(s.persistApplicationEdge(registration.Edge.ID)); err != nil {
 		return err
 	}
-	return s.persistEdgeClaim(registration.Edge.ID)
+	return s.persisted(s.persistEdgeClaim(registration.Edge.ID))
 }
 
 // Edge is a pure read delegated to the memory store.
@@ -841,11 +890,20 @@ func (s *DurablePolicyStore) StoreCoOccurrence(
 	if err := s.memory.StoreCoOccurrence(ctx, key, record); err != nil {
 		return err
 	}
-	return s.persistCoOccurrence(key)
+	return s.persisted(s.persistCoOccurrence(key))
+}
+
+// persisted marks the store diverged when the write-through of a change the
+// memory store already applied failed, at any step.
+func (s *DurablePolicyStore) persisted(err error) error {
+	if err != nil {
+		s.markDiverged()
+	}
+	return err
 }
 
 func (s *DurablePolicyStore) memoryStore() *MemoryPolicyStore {
-	if s == nil {
+	if s == nil || s.diverged.Load() {
 		return nil
 	}
 	return s.memory
@@ -1005,7 +1063,28 @@ func (s *DurablePolicyStore) persistEdgeClaim(edgeID shoal.ID) error {
 	return s.writeRow(policyEdgeClaimRow(edgeID), policyKindEdgeClaim, record)
 }
 
+// writeRow persists one record whose change the memory store has already
+// applied, so any failure here marks the store diverged, and it fails closed
+// from then on (see DurablePolicyStore.diverged).
 func (s *DurablePolicyStore) writeRow(row []byte, kind byte, value any) error {
+	if err := s.writeRowBeforeApply(row, kind, value); err != nil {
+		if !s.diverged.Load() {
+			s.markDiverged()
+		}
+		return err
+	}
+	return nil
+}
+
+// writeRowBeforeApply persists one record before the memory store applies
+// it, so a failure leaves memory and disk in agreement and is only an error.
+// A store that has already diverged refuses.
+func (s *DurablePolicyStore) writeRowBeforeApply(
+	row []byte, kind byte, value any,
+) error {
+	if s.diverged.Load() {
+		return catalogUnavailable()
+	}
 	encoded, err := encodePolicyRecord(kind, value)
 	if err != nil {
 		return catalogUnavailable()
