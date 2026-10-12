@@ -102,6 +102,9 @@ func (h *approvalHarness) tryOpen() error {
 		backend: "embedded", data: filepath.Join(h.root, "corpus"),
 		policyDir: filepath.Join(h.root, "policy"),
 		resolver:  h.authority.Resolver(), clock: h.now,
+		// The authority's binder, as run passes it, so the approval sweep's
+		// system observer (#655) is composed as in the shipped binary.
+		binder:              h.authority.Binder(),
 		executors:           h.configuredExecutors(),
 		generationReader:    h.reader,
 		wrapApprovalStore:   h.wrap,
@@ -866,9 +869,18 @@ func TestApprovalCoversOneExactRequest(t *testing.T) {
 	); !errors.Is(err, fleet.ErrApprovalConflict) {
 		t.Fatalf("requester re-request under a new generation = %v", err)
 	}
+	// The approver on the newer generation observed that the request's
+	// policy has moved on, and recorded it as stranded (#655): a request
+	// under a superseded generation can never be decided again, and moving
+	// the generation back does not revive it. Every other refused change
+	// left it untouched until then.
 	h.reader.value.Store(workspacePolicyGeneration)
-	if state := h.status(request.id).State; state != fleet.ApprovalPending {
-		t.Fatalf("after refused changes the request is %q", state)
+	status := h.status(request.id)
+	if status.State != fleet.ApprovalStranded ||
+		status.Condition != fleet.ApprovalConditionPolicyMoved ||
+		status.Approval.State != fleet.ApprovalStranded {
+		t.Fatalf("after the policy moved the request is %q/%q stored %q",
+			status.State, status.Condition, status.Approval.State)
 	}
 }
 

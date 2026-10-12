@@ -287,6 +287,13 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Window over which the -mosaic-budget distinct-domain count accumulates "+
 			"for an identity before it resets",
 	)
+	approvalSweepInterval := flags.Duration(
+		"approval-sweep-interval", 10*time.Minute,
+		"How often the host's system observer sweeps held approval requests, "+
+			"recording as expired or stranded every one that can no longer "+
+			"progress (#655). Zero disables the sweep; requests are then "+
+			"recorded only when a party touches them",
+	)
 	oidcIssuer := flags.String(
 		"oidc-issuer", "",
 		"Exact OIDC token issuer. Required for OIDC authentication; "+
@@ -697,6 +704,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		remote:    *remote,
 		embedder:  embedding,
 		resolver:  authority.Resolver(),
+		binder:    authority.Binder(),
 		clock:     time.Now,
 		backfill:  backfill,
 		ontology:  activeOntology,
@@ -720,6 +728,17 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	}
 	service, cleanup := opened.service, opened.close
 	defer cleanup()
+	if *approvalSweepInterval < 0 {
+		listener.Close()
+		return errors.New("-approval-sweep-interval must not be negative")
+	}
+	if *approvalSweepInterval > 0 && opened.approvalService != nil {
+		// Deferred after cleanup, so it runs first: a pass in flight
+		// finishes before the stores it writes are closed.
+		stopSweeps := startApprovalSweeps(
+			ctx, opened.approvalService, *approvalSweepInterval, output)
+		defer stopSweeps()
+	}
 
 	// The host-authority allow-list defaults to the resolved listen address,
 	// preserving the local-first posture: a loopback bind serves only requests
@@ -1189,6 +1208,11 @@ type serviceConfig struct {
 	// in, or checked against, the coordination store before anything is
 	// served. Nil for an authenticator that is not OIDC.
 	identityScheme *identitySchemeConfig
+	// binder is the binder of the authority behind resolver. With it the
+	// approval service's sweep is configured (#655): the host mints its
+	// system observer's decisions and binds them with it. Nil configures no
+	// sweep.
+	binder auth.Binder
 }
 
 // openedService is the constructed workspace service together with what the
@@ -1202,6 +1226,9 @@ type openedService struct {
 	fleetEvents   webapi.FleetEventService
 	admission     webapi.AdmissionProvider
 	approvals     webapi.FleetApprovalProvider
+	// approvalService is the unbound approval service, held so the host can
+	// run its sweep (#655). Nothing serves it.
+	approvalService *fleet.ApprovalService
 	// approvalOutbox is the durable approval event outbox (#653), held so
 	// tests can confirm a transition's row against the ledger. Nothing
 	// serves it.
@@ -1532,6 +1559,17 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
+		var approvalSweeper fleet.ApprovalSweepBinder
+		if config.binder != nil {
+			minter, err := newApprovalSweepMinter(
+				config.binder, generationReader, config.clock)
+			if err != nil {
+				store.Close()
+				embedded.Close()
+				return closed, err
+			}
+			approvalSweeper = minter.bind
+		}
 		approvalService, err := fleet.NewApprovalService(fleet.ApprovalConfig{
 			Dispatch: fleetDispatch, Store: approvalStore,
 			Recorder: approvalRecorder,
@@ -1554,6 +1592,9 @@ func openService(
 			// Lifecycle events (#653): the durable store is the outbox,
 			// whatever wraps it for the service.
 			Outbox: durableApprovals, Events: approvalEvents,
+			// The host's system observer (#655), when this host can bind
+			// one.
+			Sweeper: approvalSweeper,
 		})
 		if err != nil {
 			store.Close()
@@ -1626,19 +1667,20 @@ func openService(
 			return closed, err
 		}
 		return openedService{
-			service:        service,
-			settings:       settingsProvider,
-			fleetRegistry:  boundFleetRegistry,
-			fleetDispatch:  boundFleetDispatch,
-			fleetEvents:    fleetEvents,
-			admission:      boundAdmissionService,
-			approvals:      boundApprovalService,
-			approvalOutbox: durableApprovals,
-			attestation:    optionalAttestation(attestationService),
-			teamOverview:   teamOverview,
-			client:         client,
-			backfilled:     backfilled,
-			labelMigration: labelMigration,
+			service:         service,
+			settings:        settingsProvider,
+			fleetRegistry:   boundFleetRegistry,
+			fleetDispatch:   boundFleetDispatch,
+			fleetEvents:     fleetEvents,
+			admission:       boundAdmissionService,
+			approvals:       boundApprovalService,
+			approvalService: approvalService,
+			approvalOutbox:  durableApprovals,
+			attestation:     optionalAttestation(attestationService),
+			teamOverview:    teamOverview,
+			client:          client,
+			backfilled:      backfilled,
+			labelMigration:  labelMigration,
 			close: func() {
 				settingsStore.Close()
 				store.Close()
