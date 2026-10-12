@@ -232,11 +232,7 @@ func (s *DurablePolicyStore) PutLabelMigration(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.memory.PutLabelMigration(ctx, record); err != nil {
-		return err
-	}
 	persisted := persistedLabelMigration{
-		Seq:                 s.nextSeq(),
 		Version:             record.Version,
 		Documents:           record.Documents,
 		Unregistered:        record.Unregistered,
@@ -264,6 +260,14 @@ func (s *DurablePolicyStore) PutLabelMigration(
 			Reason:            entry.Reason,
 		})
 	}
+	// Admit the report before memory changes; see admitPolicyRecord.
+	if err := admitPolicyRecord(policyKindLabelMigration, persisted); err != nil {
+		return err
+	}
+	if err := s.memory.PutLabelMigration(ctx, record); err != nil {
+		return err
+	}
+	persisted.Seq = s.nextSeq()
 	return s.persisted(s.writeRow(
 		[]byte(policyRowLabelMigration), policyKindLabelMigration, persisted))
 }

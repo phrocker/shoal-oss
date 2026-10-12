@@ -1851,6 +1851,15 @@ func refuseSplitBrainStateDirectory(
 	corpusDir string,
 	policyDir string,
 ) error {
+	// A catalog that diverged while starting (a failed write-through, for
+	// example during the label migration) reports no registrations because
+	// it serves no reads. Name that, not a lost policy volume.
+	if store.Diverged() {
+		return fmt.Errorf(
+			"refusing to serve: the durable policy catalog %s failed a write "+
+				"during startup and now refuses every request; restart the "+
+				"process to reload it from disk", policyDir)
+	}
 	if store.HasRegistrations() {
 		return nil
 	}

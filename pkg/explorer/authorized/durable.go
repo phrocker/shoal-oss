@@ -733,6 +733,9 @@ func (s *DurablePolicyStore) PutRevision(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := admitRevision(registration); err != nil {
+		return err
+	}
 	if err := s.memory.PutRevision(ctx, registration); err != nil {
 		return err
 	}
@@ -751,6 +754,15 @@ func (s *DurablePolicyStore) PutNode(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := admitPolicyRecord(policyKindNode, persistedNode{
+		NodeID: string(nodeID), DocumentID: string(registration.DocumentID),
+		RevisionID: string(registration.RevisionID),
+		Node:       graphNodeToPersisted(registration.Node),
+		Rule:       ruleToPersistedOrEmpty(registration.Rule),
+		Kind:       uint8(registration.Kind),
+	}); err != nil {
+		return err
+	}
 	if err := s.memory.PutNode(ctx, nodeID, registration); err != nil {
 		return err
 	}
@@ -809,6 +821,9 @@ func (s *DurablePolicyStore) ReserveEdge(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := admitEdge(registration); err != nil {
+		return err
+	}
 	if err := s.memory.ReserveEdge(ctx, registration); err != nil {
 		return err
 	}
@@ -843,6 +858,9 @@ func (s *DurablePolicyStore) PutEdge(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := admitEdge(registration); err != nil {
+		return err
+	}
 	if err := s.memory.PutEdge(ctx, registration); err != nil {
 		return err
 	}
@@ -892,6 +910,12 @@ func (s *DurablePolicyStore) StoreCoOccurrence(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := admitPolicyRecord(policyKindCoOccurrence, persistedCoOccurrence{
+		Key: key, WindowStartUnixNano: record.WindowStart.UnixNano(),
+		Domains: record.Domains,
+	}); err != nil {
+		return err
+	}
 	if err := s.memory.StoreCoOccurrence(ctx, key, record); err != nil {
 		return err
 	}
@@ -1202,12 +1226,78 @@ func (s *MemoryPolicyStore) snapshotEdgeClaim(
 
 // --- serialization ---
 
+// Admission. The diverged mode means only "memory changed and the disk write
+// genuinely failed". It must never be the outcome of input that could have
+// been validated first, or one oversized ingest would take the whole catalog
+// down until restart. So every write that applies to memory before it
+// persists first encodes the record its input will persist as, and refuses
+// it with an ordinary per-request error when it cannot be encoded or does not
+// fit.
+//
+// The admission bound is below the persistence bound by a headroom. A record
+// that is later rewritten from memory with a grown rule (TightenRule conjoins
+// a label policy into a revision's, node's or edge's rule; a rule is at most
+// auth.MaxPolicyTerms components of bounded size, far below the headroom)
+// therefore still fits when it is persisted. Source-claim records hold only
+// rules, so they are bounded by construction and need no admission.
+//
+// Both are variables only so tests can lower them together.
+var (
+	// policyRecordPersistBytes is the bound encodePolicyRecord enforces on
+	// write. Load always accepts up to maxPolicyRecordBytes.
+	policyRecordPersistBytes      = maxPolicyRecordBytes
+	policyRecordAdmissionHeadroom = uint64(1 << 20)
+)
+
+func policyRecordAdmissionBytes() uint64 {
+	return policyRecordPersistBytes - policyRecordAdmissionHeadroom
+}
+
+func admitPolicyRecord(kind byte, value any) error {
+	encoded, err := encodePolicyRecord(kind, value)
+	if err != nil || uint64(len(encoded)-policyEnvelopeHeader) > policyRecordAdmissionBytes() {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"the policy catalog record for this write exceeds its size bound")
+	}
+	return nil
+}
+
+func admitRevision(registration RevisionRegistration) error {
+	return admitPolicyRecord(policyKindRevision, persistedRevision{
+		DocumentID:     string(registration.DocumentID),
+		RevisionID:     string(registration.RevisionID),
+		NodeIDs:        stringsFromIDs(registration.NodeIDs),
+		IntrinsicEdges: edgesToPersisted(registration.IntrinsicEdges),
+		ContentDigest:  [32]byte(registration.ContentDigest),
+		Rule:           ruleToPersistedOrEmpty(registration.Rule),
+	})
+}
+
+func admitEdge(registration EdgeRegistration) error {
+	record, err := edgeToPersisted(registration, 0, false)
+	if err != nil {
+		// An invalid registration is the memory store's to refuse.
+		return nil
+	}
+	return admitPolicyRecord(policyKindEdge, record)
+}
+
+// ruleToPersistedOrEmpty is ruleToPersisted for admission: an invalid rule is
+// the memory store's to refuse, so it measures as empty here.
+func ruleToPersistedOrEmpty(rule AccessRule) persistedRule {
+	persisted, err := ruleToPersisted(rule)
+	if err != nil {
+		return persistedRule{}
+	}
+	return persisted
+}
+
 func encodePolicyRecord(kind byte, value any) ([]byte, error) {
 	var payload bytes.Buffer
 	if err := gob.NewEncoder(&payload).Encode(value); err != nil {
 		return nil, fmt.Errorf("encode payload: %w", err)
 	}
-	if uint64(payload.Len()) > maxPolicyRecordBytes {
+	if uint64(payload.Len()) > policyRecordPersistBytes {
 		return nil, fmt.Errorf("payload exceeds policy record bound")
 	}
 	encoded := make([]byte, policyEnvelopeHeader+payload.Len())

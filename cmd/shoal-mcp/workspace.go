@@ -201,6 +201,14 @@ func refuseUnregisteredCorpus(
 	corpusDir string,
 	policyDir string,
 ) error {
+	// A catalog that diverged while starting reports no registrations
+	// because it serves no reads; name that, not a lost policy volume.
+	if store.Diverged() {
+		return fmt.Errorf(
+			"refusing to serve: policy catalog %s failed a write during "+
+				"startup and now refuses every request; restart the process "+
+				"to reload it from disk", policyDir)
+	}
 	if store.HasRegistrations() {
 		return nil
 	}
