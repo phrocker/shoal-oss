@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
@@ -87,7 +89,65 @@ type ApprovalSweepResult struct {
 	// Failed counts records the sweep could not judge or write. They are
 	// left as they were.
 	Failed int
-	Next   []byte
+	// Undecodable counts stored records the scan skipped because they do
+	// not decode: corrupt, or written by a newer build. They are left as
+	// they are, and no longer end the page they are on.
+	Undecodable int
+	// Settled counts enqueued records skipped because an earlier pass
+	// found their materialization and nothing can change them again.
+	Settled int
+	Next    []byte
+}
+
+// ApprovalTolerantScanner is the optional scan the sweep prefers: a page of
+// approvals that skips, and counts, any stored record that does not decode,
+// instead of failing the page. Pending keeps the strict ScanApprovals, which
+// fails closed. The durable store implements both.
+type ApprovalTolerantScanner interface {
+	ScanApprovalsTolerant(context.Context, []byte, int) (ApprovalPage, error)
+}
+
+// maxSettledApprovals bounds the sweep's memory of enqueued approvals it has
+// found materialized. Past it the memory is cleared and those records are
+// checked once more, which is correct and only costs a read each.
+const maxSettledApprovals = 1 << 16
+
+// approvalSweepState is what the sweep remembers across pages and passes.
+//
+// settled holds enqueued approvals whose action has been read and is their
+// materialization. Nothing can change such a record again: enqueued may only
+// become stranded, and only when its identity is taken or its action never
+// written, and an action is never deleted while isMaterializationOf compares
+// only fields an action keeps for life. So once seen, it need never be read
+// again. The memory is per process and bounded; losing it costs a read.
+type approvalSweepState struct {
+	mu          sync.Mutex
+	settled     map[string]struct{}
+	undecodable atomic.Uint64
+	failed      atomic.Uint64
+}
+
+func (s *approvalSweepState) isSettled(id []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.settled[string(id)]
+	return ok
+}
+
+func (s *approvalSweepState) settle(id []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settled == nil || len(s.settled) >= maxSettledApprovals {
+		s.settled = make(map[string]struct{})
+	}
+	s.settled[string(id)] = struct{}{}
+}
+
+// ApprovalSweepCounters reports the sweep's error counts since the process
+// started: records skipped as undecodable, and records it could not judge or
+// write. They count this process's own failures, never tenant workload.
+func (s *ApprovalService) ApprovalSweepCounters() (undecodable, failed uint64) {
+	return s.sweep.undecodable.Load(), s.sweep.failed.Load()
 }
 
 // Sweep examines one page of approvals and records, as the system observer,
@@ -102,15 +162,31 @@ func (s *ApprovalService) Sweep(
 		return ApprovalSweepResult{}, shoal.NewError(
 			shoal.ErrorUnavailable, "the approval sweep is not configured")
 	}
+	// Every outbox row the sweep writes names it as observer, which a build
+	// before #655 cannot read, so it is a terminal-states writer like the
+	// rest (ApprovalConfig.TerminalStates).
+	if !s.terminal {
+		return ApprovalSweepResult{}, terminalStatesDisabled()
+	}
 	if request.Limit <= 0 || request.Limit > MaxApprovalListResults {
 		return ApprovalSweepResult{}, shoal.NewError(
 			shoal.ErrorInvalidArgument, "approval sweep limit is outside its bound")
 	}
-	page, err := s.store.ScanApprovals(ctx, request.After, request.Limit)
+	var page ApprovalPage
+	var err error
+	if tolerant, ok := s.store.(ApprovalTolerantScanner); ok {
+		page, err = tolerant.ScanApprovalsTolerant(ctx, request.After, request.Limit)
+	} else {
+		page, err = s.store.ScanApprovals(ctx, request.After, request.Limit)
+	}
 	if err != nil {
 		return ApprovalSweepResult{}, err
 	}
-	result := ApprovalSweepResult{Next: append([]byte(nil), page.Next...)}
+	result := ApprovalSweepResult{
+		Next: append([]byte(nil), page.Next...), Undecodable: page.Undecodable,
+	}
+	s.sweep.undecodable.Add(uint64(page.Undecodable))
+	defer func() { s.sweep.failed.Add(uint64(result.Failed)) }()
 	for _, record := range page.Approvals {
 		if err := ctx.Err(); err != nil {
 			return result, err
@@ -141,6 +217,17 @@ func (s *ApprovalService) sweepOne(
 			s.drainApprovalEventsQuietly(bound, record.ID)
 		}
 		return
+	}
+	if record.State == ApprovalEnqueued {
+		if s.sweep.isSettled(record.ID) {
+			result.Settled++
+			return
+		}
+		action, err := s.dispatch.store.GetAction(ctx, record.ID)
+		if err == nil && isMaterializationOf(action, record) {
+			s.sweep.settle(record.ID)
+			return
+		}
 	}
 	state, cause, err := s.approvalStrandable(ctx, record, now)
 	if err != nil {

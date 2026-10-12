@@ -98,6 +98,13 @@ var (
 	// become work.
 	ErrApprovalStranded = errors.New(
 		"fleet approval: the request can no longer progress")
+	// ErrApprovalTerminalStatesDisabled reports a withdrawal, or a sweep, on
+	// a host whose operator has not enabled the withdrawn and stranded
+	// states (ApprovalConfig.TerminalStates, #655). A build before #655
+	// cannot read either state, so they are written only once the operator
+	// says every replica can.
+	ErrApprovalTerminalStatesDisabled = errors.New(
+		"fleet approval: withdrawal and stranding are not enabled on this host")
 )
 
 // approvalRequired is what enqueue and invoke return for an action that
@@ -636,6 +643,9 @@ type ApprovalMutation struct {
 type ApprovalPage struct {
 	Approvals []ApprovalRecord
 	Next      []byte
+	// Undecodable is set by ApprovalTolerantScanner only: the stored records
+	// on this page it skipped because they do not decode.
+	Undecodable int
 }
 
 // ApprovalStore is the durable approval key space. ApplyApproval must refuse,
@@ -726,6 +736,15 @@ type ApprovalConfig struct {
 	// (#655). Optional: nil configures no sweep, and Sweep refuses. See
 	// ApprovalSweepBinder.
 	Sweeper ApprovalSweepBinder
+	// TerminalStates enables the withdrawn and stranded states (#655): the
+	// requester's withdrawal, the lazy stranding Decide and Status write,
+	// and the sweep. Off, nothing writes either state, by any path: Withdraw
+	// refuses with ErrApprovalTerminalStatesDisabled, Status and Decide
+	// report what they always reported and write nothing new, and Sweep
+	// refuses. A build before #655 cannot read either state, nor an outbox
+	// row the sweep writes, so the operator turns this on only once every
+	// replica runs a build that can; until then rolling back is safe.
+	TerminalStates bool
 }
 
 // IdentityScheme describes the identity scheme in force (#526).
@@ -884,6 +903,8 @@ type ApprovalService struct {
 	scheme      IdentityScheme
 	events      *approvalEvents
 	sweeper     ApprovalSweepBinder
+	terminal    bool
+	sweep       approvalSweepState
 }
 
 func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
@@ -913,7 +934,7 @@ func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
 		recorder: config.Recorder, narrowed: config.Narrowed,
 		generations: config.Generations, mapping: config.ApproverMapping,
 		window: window, scheme: cloneIdentityScheme(config.IdentityScheme),
-		sweeper: config.Sweeper,
+		sweeper: config.Sweeper, terminal: config.TerminalStates,
 	}
 	if config.Outbox != nil {
 		service.events = &approvalEvents{
@@ -1616,6 +1637,11 @@ func (s *ApprovalService) settleObserved(
 	current ApprovalRecord,
 	now time.Time,
 ) (ApprovalRecord, bool, error) {
+	// Off, Status and Decide answer exactly as before #655 and write
+	// nothing a party did not already write (TerminalStates).
+	if !s.terminal {
+		return ApprovalRecord{}, false, nil
+	}
 	state, cause, err := s.approvalStrandable(ctx, current, now)
 	if err != nil || state == "" {
 		return ApprovalRecord{}, false, nil
@@ -1643,6 +1669,13 @@ func approvalStranded(cause ApprovalCondition) error {
 	return shoal.WrapError(
 		shoal.ErrorConflict,
 		"the request can no longer progress ("+string(cause)+")", sentinel)
+}
+
+func terminalStatesDisabled() error {
+	return shoal.WrapError(
+		shoal.ErrorConflict,
+		"withdrawal and stranding are not enabled on this host",
+		ErrApprovalTerminalStatesDisabled)
 }
 
 func approvalWithdrawn() error {
@@ -1738,6 +1771,11 @@ func (s *ApprovalService) Withdraw(
 	}
 	if err := validateOpaque("approval ID", request.ID, false); err != nil {
 		return ApprovalRecord{}, err
+	}
+	// Refused before any record is read, so the answer is the host's and
+	// says nothing about which approval IDs exist.
+	if !s.terminal {
+		return ApprovalRecord{}, terminalStatesDisabled()
 	}
 	reason, err := interaction.NewReason(
 		request.Context.ReasonCode, request.Context.ReasonDetail)
@@ -2542,6 +2580,14 @@ func (s *ApprovalService) commit(
 ) (ApprovalRecord, error) {
 	if err := record.Validate(); err != nil {
 		return ApprovalRecord{}, err
+	}
+	// The one place every transition passes: whatever path built it, a
+	// withdrawn or stranded record is not written unless the operator has
+	// enabled them (TerminalStates). Every path also refuses earlier, with
+	// its own answer; this is the guarantee, not the answer.
+	if !s.terminal &&
+		(record.State == ApprovalWithdrawn || record.State == ApprovalStranded) {
+		return ApprovalRecord{}, terminalStatesDisabled()
 	}
 	fingerprint, err := auth.AuthorizationFingerprint(decision)
 	if err != nil {

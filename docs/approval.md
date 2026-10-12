@@ -144,10 +144,36 @@ requester gets one queued record, which still runs only through its own
 principal and the claim fence. Nothing reads the approval fields to authorize a
 claim or an execution.
 
+### The terminal-states switch
+
+Everything below that writes `withdrawn` or `stranded` — withdrawal, the
+stranding Decide and Status record, and the sweep — is behind one operator
+flag, **`-approval-terminal-states`** (`ApprovalConfig.TerminalStates`),
+**off by default in this release**. A build before #655 cannot read either
+state, nor an outbox row the sweep writes (see "Storage and compatibility"),
+so the operator turns it on only once every replica runs this build. While
+it is off:
+
+- Withdraw refuses with `409` `ErrApprovalTerminalStatesDisabled`
+  ("withdrawal and stranding are not enabled on this host"), after
+  authentication and before any record is read, so the answer is the same
+  for an ID that exists and one that does not.
+- Status and Decide answer exactly as before #655: a moved target or policy
+  is reported `unresolvable`, a closed window `expired` / `window_closed`,
+  and nothing new is written (Decide still writes the closed-window expiry
+  it always wrote).
+- `-approval-sweep-interval` above zero refuses to start; `Sweep` refuses.
+- `commit`, which every transition passes, refuses a withdrawn or stranded
+  record whatever path built it.
+
+So rolling back past this build is safe for as long as the switch has been
+off. **Rollout:** upgrade every replica, then turn the switch on (and, if
+wanted, the sweep).
+
 ### Withdrawal
 
 Issue #655. `POST /api/v1/fleet/approvals/{id}/withdraw` with a request
-context (`ApprovalService.Withdraw`):
+context (`ApprovalService.Withdraw`), with `-approval-terminal-states` on:
 
 - **Only the requester.** The rule is Status's: the request's own principal
   (subject, actor, client and delegation chain), still holding `dispatch` on
@@ -256,15 +282,32 @@ party:
   `approval_strand`, with the observer's identity) and published through the
   same per-transition outbox, under the observer's own live decision, with
   observer `sweeper`.
-- `-approval-sweep-interval` (default `0`, disabled, for this release; for
-  example `10m` once every replica runs this build, see "Storage and
-  compatibility") runs a pass over the
-  whole approval key space, a page at a time, bounded by the interval. Sweeps
-  on several replicas may run at once: every write is a compare-and-set from
-  the version read, so one writer wins, and a sweep that loses counts the race
-  and leaves the record. A pass also publishes the observer's own pending
-  event rows on recently final records, so a publication that failed is
-  retried by the next pass inside #653's window.
+- `-approval-sweep-interval` (default `0`, disabled; for example `10m`; it
+  requires `-approval-terminal-states`) runs a pass every interval, a page at
+  a time, bounded by the interval. **A pass resumes where the last stopped**
+  and wraps to the beginning at the end of the key space, so a store too
+  large for one pass is covered over several; a page that fails is retried
+  by the next pass. Sweeps on several replicas may run at once: every write
+  is a compare-and-set from the version read, so one writer wins, and a
+  sweep that loses counts the race and leaves the record. A pass also
+  publishes the observer's own pending event rows on records that became
+  final in the last 23h, so a publication that failed is retried inside
+  #653's window; that set is bounded by recent change, not by the store.
+- **What cannot change is not read again.** A final record costs the scan
+  and nothing else (except the recent ones above). An enqueued approval
+  whose action has been read and is its materialization is remembered and
+  skipped: enqueued may only become stranded, which needs its identity taken
+  or its action never written, and an action is never deleted, so such a
+  record can never change. The memory is per process and bounded (65,536
+  records, cleared when full); losing it costs one read each.
+- **An undecodable record does not stop the sweep.** It reads the approval
+  key space through a tolerant scan that skips and counts a stored record
+  that does not decode (corrupt, or written by a newer build); Pending keeps
+  the strict scan, which fails closed. The health surface's `/metrics`
+  serves two error-only counters,
+  `shoal_fleet_approval_sweep_undecodable_total` and
+  `shoal_fleet_approval_sweep_failed_total`, counts of this process's own
+  failures and never of tenant workload, as that surface requires.
 - It never decides, re-enables or materializes anything; the table above
   refuses any write that would.
 
@@ -870,13 +913,10 @@ be shorter than the heartbeat interval.
   `ApprovalTransition.Validate` knows only the requester and approver
   observers, so that approval's event outbox read fails, and the older
   replica answers a re-request or a replayed decision on it `503` until it is
-  replaced. Any replica on this build can write the new states — a
-  withdrawal, a Decide or Status that records a stranding — so during a
-  rolling upgrade the older replicas fail those reads until they are
-  replaced. Nothing is lost or wrongly admitted; the older replicas only
-  refuse. The sweep is therefore off by default in this release
-  (`-approval-sweep-interval=0`): enable it once no replica runs an older
-  build. Rolling back past this build is safe only while nothing has been
+  replaced. So nothing writes either, by any path, until the operator turns
+  on `-approval-terminal-states` ("The terminal-states switch"). **Upgrade
+  every replica, then turn it on.** Rolling back past this build is safe
+  while it has been off; once it has been on, only while nothing has been
   withdrawn, stranded, or recorded by the sweep.
 - `auth.OperationApprovalSweep` (`approval_sweep`) is a new operation. A
   build without it refuses it as unknown; nothing outside the sweeping host
@@ -1117,10 +1157,12 @@ tests remain the right tool for service-level properties below the transport.
   policy generation that is moved forward and then back again does not revive
   a request stranded in between: the request was refused by every party while
   the generation differed, and a final state is final. With the sweep
-  disabled (`-approval-sweep-interval=0`, the default in this release), a
-  request nobody touches is recorded only when a party next touches it:
-  Decide or Status record a stranding or an expiry, Withdraw and Request an
-  expiry only. That is #653's original residual.
+  disabled (`-approval-sweep-interval=0`, the default), a request nobody
+  touches is recorded only when a party next touches it: Decide or Status
+  record a stranding or an expiry, Withdraw and Request an expiry only. With
+  `-approval-terminal-states` off as well, nothing records a stranding, and
+  stranded rows stay `unresolvable` as before #655. That is #653's original
+  residual.
 - **A materialization can land after a `deadline_passed` stranding.** The
   grace bounds every call that can write the action, not a write that call
   already handed to the coordination runtime: a materialization whose publish

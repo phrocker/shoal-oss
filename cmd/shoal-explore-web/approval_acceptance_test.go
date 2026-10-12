@@ -61,6 +61,10 @@ type approvalHarness struct {
 	// attestation is the executor attestation trust the service is opened
 	// with (-fleet-executor-attestation); nil means none.
 	attestation *executorattest.Trust
+	// withoutTerminalStates opens the service as the shipped default does,
+	// without -approval-terminal-states (#655). Every other test enables
+	// them, since they exercise the states.
+	withoutTerminalStates bool
 }
 
 func newApprovalHarness(t *testing.T) *approvalHarness {
@@ -105,6 +109,7 @@ func (h *approvalHarness) tryOpen() error {
 		// The authority's binder, as run passes it, so the approval sweep's
 		// system observer (#655) is composed as in the shipped binary.
 		binder:              h.authority.Binder(),
+		terminalStates:      !h.withoutTerminalStates,
 		executors:           h.configuredExecutors(),
 		generationReader:    h.reader,
 		wrapApprovalStore:   h.wrap,

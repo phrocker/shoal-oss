@@ -287,14 +287,21 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		"Window over which the -mosaic-budget distinct-domain count accumulates "+
 			"for an identity before it resets",
 	)
+	approvalTerminalStates := flags.Bool(
+		"approval-terminal-states", false,
+		"Enable the withdrawn and stranded approval states (#655): requester "+
+			"withdrawal, recording a request that can no longer progress, and "+
+			"the approval sweep. A build before #655 cannot read them, so turn "+
+			"this on only once every replica runs this build; while it is off, "+
+			"nothing writes them and rolling back is safe",
+	)
 	approvalSweepInterval := flags.Duration(
 		"approval-sweep-interval", 0,
 		"How often the host's system observer sweeps held approval requests, "+
 			"recording as expired or stranded every one that can no longer "+
-			"progress (#655), for example 10m. Zero, the default for this "+
-			"release, disables the sweep; requests are then recorded only when "+
-			"a party touches them. Enable it once no replica runs a build "+
-			"before #655, which cannot read what the sweep writes",
+			"progress (#655), for example 10m. Requires "+
+			"-approval-terminal-states. Zero, the default, disables the sweep; "+
+			"requests are then recorded only when a party touches them",
 	)
 	oidcIssuer := flags.String(
 		"oidc-issuer", "",
@@ -698,6 +705,17 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	// nothing else.
 	backfill := newDevelopmentBackfill(
 		authenticator, listener.Addr().String(), authority.Binder())
+	if *approvalSweepInterval < 0 {
+		listener.Close()
+		return errors.New("-approval-sweep-interval must not be negative")
+	}
+	if *approvalSweepInterval > 0 && !*approvalTerminalStates {
+		listener.Close()
+		return errors.New("-approval-sweep-interval requires " +
+			"-approval-terminal-states: what the sweep writes cannot be read " +
+			"by a build before #655, so it runs only once the operator has " +
+			"enabled those states")
+	}
 	corpusDir, policyDir := resolveWorkspacePaths(*stateDir, *data, *policyDirFlag)
 	opened, err := openService(ctx, serviceConfig{
 		backend:   *backend,
@@ -708,6 +726,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		resolver:  authority.Resolver(),
 		binder:    authority.Binder(),
 		clock:     time.Now,
+		// #655: off until the operator says every replica can read them.
+		terminalStates: *approvalTerminalStates,
 		backfill:  backfill,
 		ontology:  activeOntology,
 		executors: executors,
@@ -730,10 +750,6 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	}
 	service, cleanup := opened.service, opened.close
 	defer cleanup()
-	if *approvalSweepInterval < 0 {
-		listener.Close()
-		return errors.New("-approval-sweep-interval must not be negative")
-	}
 	if *approvalSweepInterval > 0 && opened.approvalService != nil {
 		// Deferred after cleanup, so it runs first: a pass in flight
 		// finishes before the stores it writes are closed.
@@ -1048,7 +1064,9 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	state := &healthsurface.State{}
 	if address := strings.TrimSpace(*healthAddress); address != "" {
 		health, err = healthsurface.StartWithConfig(address, state,
-			healthsurface.Config{Metrics: dispatchMetrics(opened.fleetDispatch)})
+			healthsurface.Config{Metrics: combineMetrics(
+				dispatchMetrics(opened.fleetDispatch),
+				approvalSweepMetrics(opened.approvalService))})
 		if err != nil {
 			listener.Close()
 			return fmt.Errorf("listen on %s: %w", address, err)
@@ -1215,6 +1233,9 @@ type serviceConfig struct {
 	// system observer's decisions and binds them with it. Nil configures no
 	// sweep.
 	binder auth.Binder
+	// terminalStates is -approval-terminal-states (#655): whether anything
+	// may write the withdrawn and stranded states.
+	terminalStates bool
 }
 
 // openedService is the constructed workspace service together with what the
@@ -1596,7 +1617,8 @@ func openService(
 			Outbox: durableApprovals, Events: approvalEvents,
 			// The host's system observer (#655), when this host can bind
 			// one.
-			Sweeper: approvalSweeper,
+			Sweeper:        approvalSweeper,
+			TerminalStates: config.terminalStates,
 		})
 		if err != nil {
 			store.Close()

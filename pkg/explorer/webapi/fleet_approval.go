@@ -258,6 +258,7 @@ func fleetApprovalError(err error) error {
 	case errors.Is(err, fleet.ErrApprovalConflict),
 		errors.Is(err, fleet.ErrApprovalExpired),
 		errors.Is(err, fleet.ErrApprovalWithdrawn),
+		errors.Is(err, fleet.ErrApprovalTerminalStatesDisabled),
 		errors.Is(err, fleet.ErrApprovalStranded),
 		errors.Is(err, fleet.ErrApprovalSuperseded),
 		errors.Is(err, fleet.ErrApproverMappingMoved):

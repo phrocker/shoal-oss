@@ -381,6 +381,22 @@ func rewrittenApproval(field string) error {
 func (s *ApprovalStore) ScanApprovals(
 	ctx context.Context, after []byte, limit int,
 ) (fleet.ApprovalPage, error) {
+	return s.scanApprovals(ctx, after, limit, false)
+}
+
+// ScanApprovalsTolerant is ScanApprovals that skips, and counts, a stored
+// record that does not decode instead of failing the page (#655): corrupt,
+// or written by a newer build. The approval sweep uses it, so one such
+// record cannot end every pass at its page. Pending keeps the strict scan.
+func (s *ApprovalStore) ScanApprovalsTolerant(
+	ctx context.Context, after []byte, limit int,
+) (fleet.ApprovalPage, error) {
+	return s.scanApprovals(ctx, after, limit, true)
+}
+
+func (s *ApprovalStore) scanApprovals(
+	ctx context.Context, after []byte, limit int, tolerant bool,
+) (fleet.ApprovalPage, error) {
 	if len(after) > 0 {
 		if err := dispatchID(after); err != nil {
 			return fleet.ApprovalPage{}, err
@@ -413,6 +429,10 @@ func (s *ApprovalStore) ScanApprovals(
 	}
 	for _, cell := range page.Cells {
 		record, decodeErr := decodeApproval(cell.Cell.Value)
+		if decodeErr != nil && tolerant {
+			result.Undecodable++
+			continue
+		}
 		if decodeErr != nil {
 			return fleet.ApprovalPage{}, shoal.WrapError(
 				shoal.ErrorInternal, "invalid committed fleet approval", decodeErr)
@@ -473,4 +493,7 @@ func decodeApproval(value []byte) (fleet.ApprovalRecord, error) {
 	return record, nil
 }
 
-var _ fleet.ApprovalStore = (*ApprovalStore)(nil)
+var (
+	_ fleet.ApprovalStore           = (*ApprovalStore)(nil)
+	_ fleet.ApprovalTolerantScanner = (*ApprovalStore)(nil)
+)
