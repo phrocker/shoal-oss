@@ -118,7 +118,12 @@ func (c *Coordinator) Publish(ctx context.Context, request Publication) (Result,
 	}
 	for attempt := 0; ; attempt++ {
 		result, resumeErr := c.resume(ctx, request, stored, unchanged)
-		if resumeErr == nil || !errors.Is(resumeErr, ErrConflict) || attempt >= c.maxRetries {
+		// A guard refusing a head another store owns is permanent, so it is
+		// returned as it is rather than retried. A retry would also lose it:
+		// the root is conflicted by then, and stateError reports only the
+		// bare conflict, which a caller cannot tell from a race.
+		if resumeErr == nil || !errors.Is(resumeErr, ErrConflict) ||
+			errors.Is(resumeErr, guard.ErrForeignHead) || attempt >= c.maxRetries {
 			return result, resumeErr
 		}
 		stored, err = c.readTxn(ctx, request.TXN)
