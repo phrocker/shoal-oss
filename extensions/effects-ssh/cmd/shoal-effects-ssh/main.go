@@ -57,6 +57,9 @@ func run(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int {
 		return serve(args[1:], stderr, stop)
 	case "journal":
 		return journal(args[1:], stdout, stderr)
+	case "help", "-h", "-help", "--help":
+		fmt.Fprintln(stdout, "usage: shoal-effects-ssh serve|journal init|list|show ...; see docs/effects-ssh.md")
+		return exitOK
 	}
 	fmt.Fprintf(stderr, "unknown subcommand %q; use serve or journal\n", args[0])
 	return exitUsage
