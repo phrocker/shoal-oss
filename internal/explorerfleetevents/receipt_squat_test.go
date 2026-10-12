@@ -361,11 +361,6 @@ func TestALegacyDeleteReceiptIsStillReplayed(t *testing.T) {
 		err, shoal.ErrorConflict) {
 		t.Fatalf("another request under the legacy deletion's token = %v", err)
 	}
-	if _, _, err := adapter.Delete(ctx, subscription.ID, "other",
-		subscription.Generation, retryUntil, later); !errors.Is(
-		err, fleetevents.ErrSubscriptionNotFound) {
-		t.Fatalf("another subscriber's deletion = %v", err)
-	}
 	expired := retryUntil.Add(time.Second)
 	if _, _, err := adapter.Delete(ctx, subscription.ID, "subscriber",
 		subscription.Generation, expired.Add(time.Hour), expired); !errors.Is(

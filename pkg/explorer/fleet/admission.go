@@ -884,9 +884,14 @@ func reservedAdmissionID(id []byte) bool {
 // store is read, as the admission check does. So a retried enqueue or
 // request at such an ID is refused too. Validate does not check the document
 // shape. An action or approval stored at such an ID before #669 still
-// decodes, and it can still be read, claimed, completed, canceled or decided.
-// A replica built before #669 still accepts the shape during a rolling
-// upgrade.
+// decodes, and an action can still be read, claimed, completed or canceled.
+// An approval at such an ID can still be read and decided, but an approved
+// one never becomes work. Materialization runs only on the requester's
+// Request retry, and Request is now refused. Re-enqueueing such an action, or
+// the Invoke replay that reports its outcome, is refused too; Status still
+// answers. A replica built before #669 still accepts the shape during a
+// rolling upgrade. All of this needs a record created at "doc_" and 32
+// lowercase hex, which no client is expected to have chosen.
 func reservedActionID(id []byte) bool {
 	return reservedAdmissionID(id) || explorer.IsDocumentID(id)
 }
