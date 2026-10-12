@@ -89,6 +89,13 @@ func TestAdminWireRoundTripAndValidation(t *testing.T) {
 	if e := record.Validate(); e != nil {
 		t.Fatalf("valid record refused: %v", e)
 	}
+	recovered := record
+	recovered.Changes = []ChangeSummary{record.Changes[0]}
+	recovered.Changes[0].Recovery = RecoveryUnreadableHead
+	recovered.SegmentStart = 2
+	if e := recovered.Validate(); e != nil {
+		t.Fatalf("valid recovered record refused: %v", e)
+	}
 	for name, mutate := range map[string]func(*RegistrationRecord){
 		"unsorted authority":       func(r *RegistrationRecord) { r.AuthorityPolicyIDs = []string{EncodeID("b"), EncodeID("a")} },
 		"oldest first":             func(r *RegistrationRecord) { r.Changes[0], r.Changes[1] = r.Changes[1], r.Changes[0] },
@@ -97,6 +104,17 @@ func TestAdminWireRoundTripAndValidation(t *testing.T) {
 		"revoke not revoked":       func(r *RegistrationRecord) { r.Changes[0].State = "provisioned" },
 		"more changes than count":  func(r *RegistrationRecord) { r.ChangeCount = 1 },
 		"enrollment while revoked": func(r *RegistrationRecord) { r.EnrollmentID = EncodeID("e") },
+		"recovery on a provision":  func(r *RegistrationRecord) { r.Changes[1].Recovery = RecoveryUnreadableHead; r.SegmentStart = 1 },
+		"recovery not the oldest":  func(r *RegistrationRecord) { r.Changes[0].Recovery = RecoveryUnreadableHead; r.SegmentStart = 2 },
+		"recovery without segment": func(r *RegistrationRecord) { r.Changes = r.Changes[:1]; r.Changes[0].Recovery = RecoveryUnreadableHead },
+		"segment without recovery": func(r *RegistrationRecord) { r.SegmentStart = 1 },
+		"segment beyond changes":   func(r *RegistrationRecord) { r.SegmentStart = 7 },
+		"negative segment":         func(r *RegistrationRecord) { r.SegmentStart = -1 },
+		"unknown recovery": func(r *RegistrationRecord) {
+			r.Changes = r.Changes[:1]
+			r.Changes[0].Recovery = "lost"
+			r.SegmentStart = 2
+		},
 	} {
 		changed := record
 		changed.Changes = append([]ChangeSummary(nil), record.Changes...)

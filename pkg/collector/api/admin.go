@@ -111,8 +111,16 @@ type AdminAttribution struct {
 	AuthorizationFingerprint string `json:"authorization_fingerprint"`
 }
 
+// Recovery reasons, as ChangeSummary reports them.
+const (
+	RecoveryUnreadableHead   = "unreadable_head"
+	RecoveryOccupiedSequence = "occupied_sequence"
+)
+
 // ChangeSummary is one change log entry. By is present exactly when Source is
-// SourceCollectorAdmin; the trusted Go API has no caller identity.
+// SourceCollectorAdmin; the trusted Go API has no caller identity. Recovery
+// is set on a revocation that started a new log segment because the log
+// could not be appended to (docs/collectors.md, "Audit").
 type ChangeSummary struct {
 	Sequence   int64             `json:"sequence"`
 	Action     string            `json:"action"`
@@ -121,6 +129,7 @@ type ChangeSummary struct {
 	State      string            `json:"state"`
 	By         *AdminAttribution `json:"by,omitempty"`
 	At         time.Time         `json:"at"`
+	Recovery   string            `json:"recovery,omitempty"`
 }
 
 // RegistrationRecord is a registration as an admin reads it, with its most
@@ -141,6 +150,10 @@ type RegistrationRecord struct {
 	EnrollmentID       string          `json:"enrollment_id,omitempty"`
 	ChangeCount        int64           `json:"change_count"`
 	Changes            []ChangeSummary `json:"changes"`
+	// SegmentStart is the sequence of the recovery entry that starts the
+	// current log segment when it is among Changes (always the oldest
+	// listed), otherwise absent.
+	SegmentStart int64 `json:"segment_start,omitempty"`
 }
 
 // EncodeProvision converts a contract provisioning to its wire form.
@@ -248,6 +261,15 @@ func (c ChangeSummary) validate() error {
 	default:
 		return badResponse()
 	}
+	switch c.Recovery {
+	case "":
+	case RecoveryUnreadableHead, RecoveryOccupiedSequence:
+		if c.Action != ChangeRevoke {
+			return badResponse()
+		}
+	default:
+		return badResponse()
+	}
 	return nil
 }
 
@@ -274,6 +296,14 @@ func (r RegistrationRecord) Validate() error {
 		if c.validate() != nil || c.Sequence > r.ChangeCount || (i > 0 && c.Sequence >= r.Changes[i-1].Sequence) {
 			return badResponse()
 		}
+		// A recovery entry starts the segment, so it is the oldest listed,
+		// and it is exactly the one SegmentStart names.
+		if (c.Recovery != "") != (r.SegmentStart == c.Sequence) || (c.Recovery != "" && i != len(r.Changes)-1) {
+			return badResponse()
+		}
+	}
+	if r.SegmentStart < 0 || (r.SegmentStart > 0 && (len(r.Changes) == 0 || r.Changes[len(r.Changes)-1].Sequence != r.SegmentStart)) {
+		return badResponse()
 	}
 	return nil
 }

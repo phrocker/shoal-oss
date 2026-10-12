@@ -230,6 +230,41 @@ nonce, so two identical concurrent requests cannot both claim the change).
 `Registry.Changes` is a trusted Go read of the whole log; the HTTP read returns
 the 16 most recent entries.
 
+**Recorded identities.** An admin decision whose subject, actor, client ID or
+request ID is not valid, printable UTF-8 within `shoal.MaxIDBytes`, or whose
+correlation ID fails `interaction.ValidateCorrelationID`, is refused as an
+admin (`401`) before anything is read. Spaces are allowed in the first four,
+as OIDC-mapped subjects contain them. Independently, the registry decodes
+every entry and head it is about to write, under the same rules its readers
+apply, and refuses to write anything that would not read back as itself. So
+the log never holds an entry its own read API refuses.
+
+**A damaged log never blocks revocation.** Revocation is the emergency
+control. If the log head does not decode, or the entry it would append already
+exists, a provisioning fails closed (`503`), but a revocation, through either
+API, starts a new segment of the log:
+- Its entry carries a recovery marker: `unreadable_head` or
+  `occupied_sequence`, with the damaged head cell's timestamp and the SHA-256
+  of its exact stored bytes.
+- It takes the first free sequence above the damaged head.
+- It is written in the same mutation as the revocation and a new head, and
+  that mutation is pinned to the damaged head's exact cell.
+
+The revocation stays audited, and the damage stays identifiable after the head
+is replaced. Reads then show the current segment: the HTTP read stops at the
+recovery entry and reports it as `segment_start`. `Registry.Changes` with
+`after = segment_start - 1` reads the segment; older entries are left as they
+are, for forensics. A head that cannot be read at all, because the store
+failed, still fails a revocation, since nothing can be written then either.
+
+**Coherent reads.** The HTTP read takes the registration between two reads of
+the head that agree (retrying a bounded number of times), and checks that the
+registration matches the newest entry's generation, revocation, authority,
+control and mode. A provisioning or revocation that lands mid-read therefore
+cannot produce a registration that lags `changes[0]`. Enrollment is not a
+logged change, so `state` may read `enrolled` where the newest entry says
+`provisioned`.
+
 The log lives in its own column family (`a`) of the registration's row. The
 cells the existing flows write are unchanged byte for byte
 (`internal/collectorregistry/testdata/persisted_rows.golden.json`, captured

@@ -435,16 +435,303 @@ func TestCorruptChangeLogFailsClosed(t *testing.T) {
 	if _, e := v.registry.Changes(context.Background(), collectorID, 0, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("rewritten entry: %v", e)
 	}
-	// And a further change cannot be appended over a corrupt head.
-	head := v.registry.changeHeadCoordinate(collectorID)
-	headCell, _ := v.registry.read(context.Background(), head)
-	if _, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: head.Row, Conditions: []allocator.Condition{{Coordinate: head, Value: headCell.Value, Timestamp: headCell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: head, Timestamp: headCell.Timestamp + 1, Value: []byte("garbage")}}}); e != nil {
+	// A provisioning cannot be appended over a corrupt head; it fails closed.
+	// (Revoke first so that the provisioning below is a real change.)
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := v.registry.AdminRevoke(admin, collectorID, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
-		t.Fatalf("revoke over a corrupt head: %v", e)
+	corruptHead(t, v, collectorID)
+	if _, e := v.registry.AdminProvision(admin, grant("collector:other", "other", "authority:logs"), 1); e != nil {
+		t.Fatal(e) // another collector's log is independent
 	}
-	if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Provisioned {
+	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("provision over a corrupt head: %v", e)
+	}
+	if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 2); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("admin provision over a corrupt head: %v", e)
+	}
+	if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked {
 		t.Fatalf("a change was written without its entry: %+v", reg)
+	}
+}
+
+// corruptHead overwrites id's change-log head with bytes that do not decode
+// and returns the replaced cell.
+func corruptHead(t *testing.T, v *env, id shoal.ID) allocator.Cell {
+	t.Helper()
+	head := v.registry.changeHeadCoordinate(id)
+	cell, e := v.registry.read(context.Background(), head)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: head.Row, Conditions: []allocator.Condition{{Coordinate: head, Value: cell.Value, Timestamp: cell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: head, Timestamp: cell.Timestamp + 1, Value: []byte("garbage")}}}); e != nil {
+		t.Fatal(e)
+	}
+	stored, _ := v.registry.read(context.Background(), head)
+	return stored
+}
+
+// Revocation is the emergency control: a damaged log never blocks it. It
+// starts a new, recorded segment instead, atomically with the revocation.
+func TestRevocationRecoversADamagedChangeLog(t *testing.T) {
+	for _, viaAdmin := range []bool{true, false} {
+		v := newEnv(t)
+		admin := v.admin(t)
+		if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 1); e != nil {
+			t.Fatal(e)
+		}
+		damaged := corruptHead(t, v, collectorID)
+		if _, e := v.registry.AdminRegistration(admin, collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+			t.Fatalf("read over a corrupt head: %v", e)
+		}
+		var e error
+		if viaAdmin {
+			var result AdminResult
+			result, e = v.registry.AdminRevoke(admin, collectorID, 1)
+			if e == nil && (!result.Changed || result.Sequence != damaged.Timestamp+1) {
+				t.Fatalf("recovery result %+v", result)
+			}
+		} else {
+			_, e = v.registry.Revoke(context.Background(), collectorID)
+		}
+		if e != nil {
+			t.Fatalf("revoke over a corrupt head (admin %v): %v", viaAdmin, e)
+		}
+		if reg, _ := v.registry.Registration(context.Background(), collectorID); reg.State != collector.Revoked || reg.Generation != 2 {
+			t.Fatalf("not revoked: %+v", reg)
+		}
+		view, e := v.registry.AdminRegistration(admin, collectorID)
+		if e != nil {
+			t.Fatalf("read after recovery: %v", e)
+		}
+		if len(view.Changes) != 1 || view.SegmentStart != damaged.Timestamp+1 || view.ChangeCount != damaged.Timestamp+1 {
+			t.Fatalf("view %+v", view)
+		}
+		c := view.Changes[0]
+		if c.Recovery == nil || c.Recovery.Reason != RecoveryUnreadableHead || c.Recovery.HeadTimestamp != damaged.Timestamp || c.Recovery.HeadSHA256 != digestBytes(damaged.Value) || c.Action != ChangeRevoke {
+			t.Fatalf("recovery entry %+v %+v", c, c.Recovery)
+		}
+		// The wire projection carries the segment.
+		provider, _ := NewAdminProvider(v.registry)
+		record, e := provider.ReadRegistration(admin, collectorID)
+		if e != nil || record.SegmentStart != view.SegmentStart || len(record.Changes) != 1 || record.Changes[0].Recovery != api.RecoveryUnreadableHead {
+			t.Fatalf("wire record %+v %v", record, e)
+		}
+		// The new segment reads through Changes, and the log appends
+		// normally again.
+		if got, e := v.registry.Changes(context.Background(), collectorID, view.SegmentStart-1, MaxChangesPage); e != nil || len(got) != 1 {
+			t.Fatalf("segment %+v %v", got, e)
+		}
+		if r, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 2); e != nil || r.Sequence != view.SegmentStart+1 {
+			t.Fatalf("append after recovery %+v %v", r, e)
+		}
+	}
+}
+
+// An entry already present where the head says the next one goes is also
+// damage a revocation recovers from, and a provisioning refuses.
+func TestRevocationRecoversAnOccupiedSequence(t *testing.T) {
+	v := newEnv(t)
+	admin := v.admin(t)
+	if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 1); e != nil {
+		t.Fatal(e)
+	}
+	for _, sequence := range []int64{2, 3} {
+		coord := v.registry.changeEntryCoordinate(collectorID, sequence)
+		if _, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Absent: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: 1, Value: []byte("stray")}}}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs", "authority:more")); e == nil {
+		t.Fatal("a conflicting provision succeeded")
+	}
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatalf("revoke over an occupied sequence: %v", e)
+	}
+	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs")); e != nil {
+		t.Fatalf("provision after recovery: %v", e)
+	}
+	view, e := v.registry.AdminRegistration(admin, collectorID)
+	if e != nil || view.SegmentStart != 4 || len(view.Changes) != 2 || view.Changes[1].Recovery == nil || view.Changes[1].Recovery.Reason != RecoveryOccupiedSequence || view.Changes[1].Recovery.HeadTimestamp != 1 {
+		t.Fatalf("view %+v %v", view, e)
+	}
+}
+
+// A provisioning over an occupied sequence fails closed and writes nothing.
+func TestProvisionOverAnOccupiedSequenceFailsClosed(t *testing.T) {
+	v := newEnv(t)
+	coord := v.registry.changeEntryCoordinate(collectorID, 1)
+	if _, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Absent: true}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: 1, Value: []byte("stray")}}}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("provision: %v", e)
+	}
+	if _, e := v.registry.Registration(context.Background(), collectorID); !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
+		t.Fatalf("provision wrote: %v", e)
+	}
+}
+
+// An admin identity that cannot be recorded faithfully is refused before
+// anything is written, so no entry exists that its own read API would
+// refuse.
+func TestUnrecordableAdminIdentitiesAreRefused(t *testing.T) {
+	for name, p := range map[string]principal{
+		"actor not UTF-8":           {subject: "admin", actor: "adm\xff"},
+		"actor all 0xff":            {subject: "admin", actor: string(bytes.Repeat([]byte{0xff}, 1000))},
+		"subject not UTF-8":         {subject: "adm\xffin"},
+		"client not UTF-8":          {subject: "admin", client: "cli\xff"},
+		"subject control character": {subject: "adm\x01in"},
+	} {
+		v := newEnv(t)
+		if _, e := v.registry.AdminProvision(v.bind(t, p), grant(collectorID, "tail", "authority:logs"), 1); !shoal.IsErrorCode(e, shoal.ErrorUnauthorized) {
+			t.Fatalf("%s: %v", name, e)
+		}
+		if v.wrote(t, collectorID) {
+			t.Fatalf("%s: wrote", name)
+		}
+	}
+	for name, d := range map[string]auth.DecisionConfig{
+		"request ID not UTF-8":     {RequestID: "req\xff"},
+		"correlation ID not UTF-8": {RequestID: "request", CorrelationID: "corr\xff"},
+		"correlation ID space":     {RequestID: "request", CorrelationID: "corr elation"},
+	} {
+		v := newEnv(t)
+		d.Subject, d.Actor, d.ClientID, d.AuthorizationDomain, d.AllowedOperations, d.PolicyGeneration, d.AuthenticationExpires = "admin", "admin", "client", []byte("domain"), []auth.Operation{auth.OperationCollectorAdmin}, 1, v.clock.Now().Add(time.Hour)
+		decision, e := auth.NewDecision(d)
+		if e != nil {
+			t.Fatalf("%s: %v", name, e)
+		}
+		ctx, _ := v.authority.Binder().Bind(context.Background(), decision)
+		if _, e := v.registry.AdminProvision(ctx, grant(collectorID, "tail", "authority:logs"), 1); !shoal.IsErrorCode(e, shoal.ErrorUnauthorized) {
+			t.Fatalf("%s: %v", name, e)
+		}
+		if v.wrote(t, collectorID) {
+			t.Fatalf("%s: wrote", name)
+		}
+	}
+	// An OIDC-style subject with spaces is a valid admin.
+	v := newEnv(t)
+	if _, e := v.registry.AdminProvision(v.bind(t, principal{subject: "oidc:https://issuer#sub# admin 7 "}), grant(collectorID, "tail", "authority:logs"), 1); e != nil {
+		t.Fatalf("spaced subject: %v", e)
+	}
+	if _, e := v.registry.AdminRegistration(v.bind(t, principal{subject: "oidc:https://issuer#sub# admin 7 "}), collectorID); e != nil {
+		t.Fatalf("spaced subject read: %v", e)
+	}
+}
+
+// prepareChange refuses any entry that would not read back as itself, even
+// one validChange accepts: here a timestamp with a monotonic reading and a
+// non-UTC location, which encoding/json does not preserve.
+func TestChangesThatWouldNotReadBackAreNeverWritten(t *testing.T) {
+	v := newEnv(t)
+	at := time.Now().In(time.FixedZone("x", 3600))
+	_, _, e := v.registry.provision(context.Background(), grant(collectorID, "tail", "authority:logs"), 0, attribution{source: SourceOperatorAPI, at: at})
+	if !shoal.IsErrorCode(e, shoal.ErrorInvalidArgument) {
+		t.Fatalf("non-round-tripping entry: %v", e)
+	}
+	if v.wrote(t, collectorID) {
+		t.Fatal("wrote an entry that cannot be read back")
+	}
+	// Below the admin check, validChange refuses an attribution that
+	// round-trips through JSON but is not printable.
+	bad := &AdminAttribution{Subject: "admin", Actor: "a\x01", RequestID: "request", Domain: []byte("domain"), AuthorizationFingerprint: "auth-sha256:00"}
+	_, _, e = v.registry.provision(context.Background(), grant(collectorID, "tail", "authority:logs"), 1, attribution{source: SourceCollectorAdmin, admin: bad, at: v.clock.Now()})
+	if !shoal.IsErrorCode(e, shoal.ErrorInvalidArgument) || v.wrote(t, collectorID) {
+		t.Fatalf("unprintable attribution: %v", e)
+	}
+}
+
+// interleave runs hook once, right after the first armed read of the
+// registration cell returns, so a change lands between that read and the
+// head read that follows it.
+type interleave struct {
+	lostAck
+	armed atomic.Bool
+	hook  func()
+}
+
+func (i *interleave) ReadExact(ctx context.Context, c []allocator.Coordinate) ([]allocator.Cell, error) {
+	cells, e := i.inner.ReadExact(ctx, c)
+	if len(c) == 1 && string(c[0].Qualifier) == "registration" && i.armed.CompareAndSwap(true, false) {
+		i.hook()
+	}
+	return cells, e
+}
+
+// The admin read is coherent: a revocation landing between its registration
+// read and its head read is not returned as a registration that disagrees
+// with the newest change.
+func TestAdminRegistrationIsCoherent(t *testing.T) {
+	v := newEnv(t)
+	admin := v.admin(t)
+	if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 1); e != nil {
+		t.Fatal(e)
+	}
+	backend := &interleave{lostAck: lostAck{inner: v.registry.config.Backend}}
+	backend.hook = func() {
+		if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+			t.Error(e)
+		}
+	}
+	config := v.registry.config
+	config.Backend = backend
+	r, e := New(config)
+	if e != nil {
+		t.Fatal(e)
+	}
+	backend.armed.Store(true)
+	view, e := r.AdminRegistration(admin, collectorID)
+	if e != nil {
+		t.Fatalf("read across a concurrent revoke: %v", e)
+	}
+	if backend.armed.Load() {
+		t.Fatal("the revocation did not interleave; the test is vacuous")
+	}
+	if view.Registration.State != collector.Revoked || view.Changes[0].Action != ChangeRevoke || view.ChangeCount != 2 {
+		t.Fatalf("torn view: %+v", view)
+	}
+}
+
+// Defense in depth on the read: an entry that claims a recovery on a
+// provisioning, or a registration that disagrees with the newest entry
+// (written outside the logged paths), fails closed.
+func TestLogInconsistenciesFailClosed(t *testing.T) {
+	v := newEnv(t)
+	admin := v.admin(t)
+	if _, e := v.registry.AdminProvision(admin, grant(collectorID, "tail", "authority:logs"), 1); e != nil {
+		t.Fatal(e)
+	}
+	// A registration change that bypassed the log.
+	if _, e := v.registry.updateRegistration(context.Background(), collectorID, false, func(row *registrationRow, _ bool) (bool, error) {
+		row.Registration.Generation++
+		return true, nil
+	}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.AdminRegistration(admin, collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("registration ahead of its log: %v", e)
+	}
+
+	w := newEnv(t)
+	if _, e := w.registry.AdminProvision(w.admin(t), grant(collectorID, "tail", "authority:logs"), 1); e != nil {
+		t.Fatal(e)
+	}
+	entries := w.changes(t, collectorID)
+	forged := entries[0]
+	forged.Sequence = 2
+	forged.Recovery = &ChangeRecovery{Reason: RecoveryUnreadableHead, HeadTimestamp: 1, HeadSHA256: digestBytes(nil)}
+	value, e := encode(forged)
+	if e != nil {
+		t.Fatal(e)
+	}
+	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 2})
+	headCoord, entry := w.registry.changeHeadCoordinate(collectorID), w.registry.changeEntryCoordinate(collectorID, 2)
+	headCell, _ := w.registry.read(context.Background(), headCoord)
+	if status, e := w.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: headCoord.Row, Conditions: []allocator.Condition{{Coordinate: headCoord, Value: headCell.Value, Timestamp: headCell.Timestamp, TimestampSet: true}}, Updates: []allocator.Update{{Coordinate: headCoord, Timestamp: 2, Value: head}, {Coordinate: entry, Timestamp: 1, Value: value}}}); e != nil || status != allocator.StatusAccepted {
+		t.Fatal(status, e)
+	}
+	if _, e := w.registry.Changes(context.Background(), collectorID, 1, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("recovery on a provisioning: %v", e)
 	}
 }

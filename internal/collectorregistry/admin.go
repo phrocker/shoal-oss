@@ -5,13 +5,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"reflect"
+	"slices"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/phrocker/shoal-oss/pkg/collector"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/allocator"
+	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -77,6 +83,30 @@ type Change struct {
 	// the same instant); after a lost acknowledgement only the attempt tells
 	// a writer whether the stored entry is its own.
 	Attempt string
+	// Recovery is set on a revocation that started a new segment of the log
+	// because the log could not be appended to normally (see prepareChange).
+	// Entries before it are not part of this segment.
+	Recovery *ChangeRecovery
+}
+
+// RecoveryReason says why a revocation started a new log segment.
+type RecoveryReason string
+
+const (
+	// RecoveryUnreadableHead: the head cell exists but does not decode.
+	RecoveryUnreadableHead RecoveryReason = "unreadable_head"
+	// RecoveryOccupiedSequence: the head decodes, but the entry it would
+	// append is already present.
+	RecoveryOccupiedSequence RecoveryReason = "occupied_sequence"
+)
+
+// ChangeRecovery names the log state a recovery entry replaced: the head
+// cell's timestamp and the SHA-256 of its exact stored bytes, so the damage
+// stays identifiable after the head is overwritten.
+type ChangeRecovery struct {
+	Reason        RecoveryReason
+	HeadTimestamp int64
+	HeadSHA256    string
 }
 
 // AdminResult is the outcome of an admin write. Changed reports whether this
@@ -92,9 +122,14 @@ type AdminResult struct {
 type AdminView struct {
 	Registration collector.Registration
 	EnrollmentID shoal.ID
-	// Changes are the most recent change log entries, newest first.
+	// Changes are the most recent change log entries, newest first, ending
+	// at the start of the current log segment when that is among them.
 	Changes     []Change
 	ChangeCount int64
+	// SegmentStart is the sequence of the recovery entry that starts the
+	// current segment when it is among Changes, otherwise 0. Changes with
+	// after = SegmentStart-1 reads that segment.
+	SegmentStart int64
 }
 
 // MaxViewChanges bounds the entries AdminRegistration returns.
@@ -147,20 +182,42 @@ func (r *Registry) changeEntryCoordinate(id shoal.ID, sequence int64) allocator.
 // readChangeHead returns the latest sequence (0 when the log is empty) and
 // the condition that pins it.
 func (r *Registry) readChangeHead(ctx context.Context, id shoal.ID) (int64, allocator.Condition, error) {
+	sequence, condition, _, e := r.readChangeHeadCell(ctx, id)
+	return sequence, condition, e
+}
+
+// readChangeHeadCell is readChangeHead that also returns the stored cell.
+// When the cell was read but does not decode, it returns ErrUnavailable with
+// the cell set, so a revocation can pin and replace it (prepareChange); a
+// failed read returns no cell.
+func (r *Registry) readChangeHeadCell(ctx context.Context, id shoal.ID) (int64, allocator.Condition, *allocator.Cell, error) {
 	coord := r.changeHeadCoordinate(id)
 	cell, e := r.read(ctx, coord)
 	if shoal.IsErrorCode(e, shoal.ErrorNotFound) {
-		return 0, allocator.Condition{Coordinate: coord, Absent: true}, nil
+		return 0, allocator.Condition{Coordinate: coord, Absent: true}, nil, nil
 	}
 	if e != nil {
-		return 0, allocator.Condition{}, e
+		return 0, allocator.Condition{}, nil, e
 	}
+	pin := allocator.Condition{Coordinate: coord, Value: bytes.Clone(cell.Value), Timestamp: cell.Timestamp, TimestampSet: true}
 	var head changeHead
 	if decode(cell.Value, &head) != nil || head.CollectorID != id || head.Sequence <= 0 || head.Sequence != cell.Timestamp {
-		return 0, allocator.Condition{}, ErrUnavailable
+		return 0, pin, &cell, ErrUnavailable
 	}
-	return head.Sequence, allocator.Condition{Coordinate: coord, Value: cell.Value, Timestamp: cell.Timestamp, TimestampSet: true}, nil
+	return head.Sequence, pin, &cell, nil
 }
+
+// entryPresent reports whether a change entry exists at sequence.
+func (r *Registry) entryPresent(ctx context.Context, id shoal.ID, sequence int64) (bool, error) {
+	_, e := r.read(ctx, r.changeEntryCoordinate(id, sequence))
+	if shoal.IsErrorCode(e, shoal.ErrorNotFound) {
+		return false, nil
+	}
+	return e == nil, e
+}
+
+// maxRecoveryProbes bounds the search for a free sequence when recovering.
+const maxRecoveryProbes = 64
 
 type auditWrite struct {
 	sequence   int64
@@ -171,16 +228,61 @@ type auditWrite struct {
 
 // prepareChange builds the conditions and updates that append next's change
 // entry to id's log.
+//
+// A damaged log never blocks a revocation, the emergency control. When the
+// head does not decode, or the entry it would append already exists, a
+// provisioning fails closed but a revocation starts a new segment: its entry
+// carries a ChangeRecovery naming the head it replaced (timestamp and digest
+// of its exact bytes), takes the first free sequence above both the head's
+// timestamp and its sequence, and is written in the same mutation as the
+// revocation and the new head, pinned to the damaged head's exact cell. A
+// head that cannot be read at all (a store failure) still fails: nothing can
+// be written then anyway.
 func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registrationRow, record func(registrationRow) (Change, error)) (auditWrite, error) {
-	previous, headCondition, e := r.readChangeHead(ctx, id)
-	if e != nil {
-		return auditWrite{}, e
-	}
 	change, e := record(next)
 	if e != nil {
 		return auditWrite{}, e
 	}
+	previous, headCondition, cell, e := r.readChangeHeadCell(ctx, id)
+	if e != nil && (cell == nil || change.Action != ChangeRevoke) {
+		return auditWrite{}, e
+	}
+	if e != nil {
+		change.Recovery = &ChangeRecovery{Reason: RecoveryUnreadableHead, HeadTimestamp: cell.Timestamp, HeadSHA256: digestBytes(cell.Value)}
+		previous = cell.Timestamp
+	} else if occupied, e := r.entryPresent(ctx, id, previous+1); e != nil {
+		return auditWrite{}, e
+	} else if occupied {
+		if change.Action != ChangeRevoke {
+			return auditWrite{}, ErrUnavailable
+		}
+		recovery := &ChangeRecovery{Reason: RecoveryOccupiedSequence, HeadTimestamp: previous}
+		if cell != nil {
+			recovery.HeadTimestamp, recovery.HeadSHA256 = cell.Timestamp, digestBytes(cell.Value)
+		} else {
+			recovery.HeadSHA256 = digestBytes(nil)
+		}
+		change.Recovery = recovery
+	}
+	if previous < 0 || previous > 1<<62 {
+		return auditWrite{}, ErrUnavailable
+	}
 	change.Sequence = previous + 1
+	if change.Recovery != nil {
+		for probes := 0; ; probes++ {
+			occupied, e := r.entryPresent(ctx, id, change.Sequence)
+			if e != nil {
+				return auditWrite{}, e
+			}
+			if !occupied {
+				break
+			}
+			if probes == maxRecoveryProbes {
+				return auditWrite{}, ErrUnavailable
+			}
+			change.Sequence++
+		}
+	}
 	var attempt [16]byte
 	if _, e := rand.Read(attempt[:]); e != nil {
 		return auditWrite{}, ErrUnavailable
@@ -195,6 +297,14 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 	}
 	head, e := encode(changeHead{CollectorID: id, Sequence: change.Sequence})
 	if e != nil {
+		return auditWrite{}, invalid()
+	}
+	// Never write what the readers would refuse: both cells must decode back
+	// to exactly what was meant, under the same rules readChange and
+	// readChangeHead apply.
+	var readBack Change
+	var headBack changeHead
+	if decode(value, &readBack) != nil || validChange(readBack, id) != nil || !reflect.DeepEqual(readBack, change) || decode(head, &headBack) != nil || headBack != (changeHead{CollectorID: id, Sequence: change.Sequence}) {
 		return auditWrite{}, invalid()
 	}
 	entry := r.changeEntryCoordinate(id, change.Sequence)
@@ -240,13 +350,65 @@ func validChange(c Change, id shoal.ID) error {
 			return invalid()
 		}
 	case SourceCollectorAdmin:
-		if c.Admin == nil || shoal.ValidateRequiredID("admin subject", c.Admin.Subject) != nil || !bytes.Equal(c.Admin.Domain, c.Registration.Domain) || c.Admin.AuthorizationFingerprint == "" {
+		if c.Admin == nil || validAttribution(*c.Admin) != nil || !bytes.Equal(c.Admin.Domain, c.Registration.Domain) {
 			return invalid()
 		}
 	default:
 		return invalid()
 	}
+	if c.Recovery != nil {
+		switch {
+		case c.Action != ChangeRevoke,
+			c.Recovery.Reason != RecoveryUnreadableHead && c.Recovery.Reason != RecoveryOccupiedSequence,
+			c.Recovery.HeadTimestamp < 0, c.Recovery.HeadTimestamp >= c.Sequence,
+			!collector.ValidDigest(c.Recovery.HeadSHA256):
+			return invalid()
+		}
+	}
 	return nil
+}
+
+// validAttribution applies one rule to every recorded admin identity:
+// required where the decision requires it, within shoal.MaxIDBytes, valid
+// UTF-8 and printable. encoding/json would silently rewrite invalid UTF-8 to
+// U+FFFD, producing an entry that no longer decodes to itself, and the wire
+// validator refuses such IDs. The correlation ID uses the interaction rule
+// verbatim (interaction.ValidateCorrelationID). Subjects, actors, clients and
+// request IDs may contain an ASCII space, as OIDC-mapped subjects do, so they
+// use the same rule without the no-space clause.
+func validAttribution(a AdminAttribution) error {
+	for _, field := range []struct {
+		id       shoal.ID
+		required bool
+	}{{a.Subject, true}, {a.Actor, true}, {a.ClientID, false}, {a.RequestID, true}} {
+		if !printableID(field.id, field.required) {
+			return invalid()
+		}
+	}
+	if interaction.ValidateCorrelationID(a.CorrelationID) != nil || a.AuthorizationFingerprint == "" || !printableID(shoal.ID(a.AuthorizationFingerprint), true) || len(a.Domain) == 0 || len(a.Domain) > shoal.MaxIDBytes {
+		return invalid()
+	}
+	return nil
+}
+
+func printableID(id shoal.ID, required bool) bool {
+	if id == "" {
+		return !required
+	}
+	if len(id) > shoal.MaxIDBytes || !utf8.ValidString(string(id)) {
+		return false
+	}
+	for _, r := range string(id) {
+		if !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func digestBytes(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func (r *Registry) readChange(ctx context.Context, id shoal.ID, sequence int64) (Change, error) {
@@ -293,10 +455,16 @@ func (r *Registry) admin(ctx context.Context) (auth.Decision, auth.Fingerprint, 
 	if len(d.OnBehalfOf()) != 0 || d.TrustedService() || d.ExecutorBinding() != "" {
 		return auth.Decision{}, auth.Fingerprint{}, attribution{}, unauthorized()
 	}
-	return d, fp, attribution{source: SourceCollectorAdmin, at: now, admin: &AdminAttribution{
+	admin := &AdminAttribution{
 		Subject: d.Subject(), Actor: d.Actor(), ClientID: d.ClientID(), Domain: d.AuthorizationDomain(),
 		RequestID: d.RequestID(), CorrelationID: d.CorrelationID(), AuthorizationFingerprint: fp.String(),
-	}}, nil
+	}
+	// An admin whose identity cannot be recorded faithfully is not an admin:
+	// it is refused before anything is read or written.
+	if validAttribution(*admin) != nil {
+		return auth.Decision{}, auth.Fingerprint{}, attribution{}, unauthorized()
+	}
+	return d, fp, attribution{source: SourceCollectorAdmin, at: now, admin: admin}, nil
 }
 
 // selfProvisioning reports whether p would make the admin a collector: its
@@ -370,6 +538,41 @@ func (r *Registry) AdminRevoke(ctx context.Context, id shoal.ID, generation int6
 	return r.finishAdmin(ctx, fp, row, sequence, e)
 }
 
+// coherentRegistration reads id's registration between two reads of its log
+// head that agree, retrying a bounded number of times, so the registration
+// and the head describe the same logged state. A registration outside domain
+// reads as not found before the head is read.
+func (r *Registry) coherentRegistration(ctx context.Context, id shoal.ID, domain []byte) (registrationRow, int64, error) {
+	for range maxCASAttempts {
+		before, pinBefore, e := r.readChangeHead(ctx, id)
+		if e != nil {
+			// Corruption elsewhere in the table is not disclosed across
+			// domains: check the domain first when the head is unreadable.
+			if row, _, readErr := r.readRegistration(ctx, id); readErr != nil {
+				return registrationRow{}, 0, readErr
+			} else if !bytes.Equal(row.Registration.Domain, domain) {
+				return registrationRow{}, 0, auth.ObjectNotFound()
+			}
+			return registrationRow{}, 0, e
+		}
+		row, _, e := r.readRegistration(ctx, id)
+		if e != nil {
+			return registrationRow{}, 0, e
+		}
+		if !bytes.Equal(row.Registration.Domain, domain) {
+			return registrationRow{}, 0, auth.ObjectNotFound()
+		}
+		after, pinAfter, e := r.readChangeHead(ctx, id)
+		if e != nil {
+			return registrationRow{}, 0, e
+		}
+		if before == after && pinBefore.Timestamp == pinAfter.Timestamp && bytes.Equal(pinBefore.Value, pinAfter.Value) {
+			return row, after, nil
+		}
+	}
+	return registrationRow{}, 0, ErrUnavailable
+}
+
 // AdminRegistration reads a registration in the admin's own authorization
 // domain with its most recent change log entries. Quarantine is not part of
 // it: observation status is computed from the current registration at every
@@ -382,14 +585,7 @@ func (r *Registry) AdminRegistration(ctx context.Context, id shoal.ID) (AdminVie
 	if e != nil {
 		return AdminView{}, e
 	}
-	row, _, e := r.readRegistration(ctx, id)
-	if e != nil {
-		return AdminView{}, e
-	}
-	if !bytes.Equal(row.Registration.Domain, d.AuthorizationDomain()) {
-		return AdminView{}, auth.ObjectNotFound()
-	}
-	head, _, e := r.readChangeHead(ctx, id)
+	row, head, e := r.coherentRegistration(ctx, id, d.AuthorizationDomain())
 	if e != nil {
 		return AdminView{}, e
 	}
@@ -403,6 +599,23 @@ func (r *Registry) AdminRegistration(ctx context.Context, id shoal.ID) (AdminVie
 			return AdminView{}, ErrUnavailable
 		}
 		view.Changes = append(view.Changes, c)
+		if c.Recovery != nil {
+			// The start of the current segment; older entries belong to a
+			// log this registry could not append to.
+			view.SegmentStart = c.Sequence
+			break
+		}
+	}
+	// Coherence: every provisioning and revocation writes the registration
+	// and the head in one mutation, so a registration read between two
+	// identical head reads is the state the newest entry describes (apart
+	// from enrollment, which is not a logged change).
+	if len(view.Changes) > 0 {
+		newest := view.Changes[0].Registration
+		current := row.Registration
+		if newest.Generation != current.Generation || (newest.State == collector.Revoked) != (current.State == collector.Revoked) || !slices.Equal(newest.AuthorityPolicyIDs, current.AuthorityPolicyIDs) || newest.Control != current.Control || newest.Mode != current.Mode {
+			return AdminView{}, ErrUnavailable
+		}
 	}
 	if e := r.recheck(ctx, auth.OperationCollectorAdmin, fp); e != nil {
 		return AdminView{}, auth.ObjectNotFound()

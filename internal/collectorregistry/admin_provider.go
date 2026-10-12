@@ -47,7 +47,7 @@ func (p *AdminProvider) ReadRegistration(ctx context.Context, id shoal.ID) (api.
 		return api.RegistrationRecord{}, e
 	}
 	reg := view.Registration
-	out := api.RegistrationRecord{Schema: api.Schema, CollectorID: api.EncodeID(reg.CollectorID), Subject: api.EncodeID(reg.Subject), Domain: api.EncodeKey(reg.Domain), AuthorityPolicyIDs: []string{}, Control: string(reg.Control), Mode: string(reg.Mode), Generation: reg.Generation, State: string(reg.State), ChangeCount: view.ChangeCount, Changes: []api.ChangeSummary{}}
+	out := api.RegistrationRecord{Schema: api.Schema, CollectorID: api.EncodeID(reg.CollectorID), Subject: api.EncodeID(reg.Subject), Domain: api.EncodeKey(reg.Domain), AuthorityPolicyIDs: []string{}, Control: string(reg.Control), Mode: string(reg.Mode), Generation: reg.Generation, State: string(reg.State), ChangeCount: view.ChangeCount, Changes: []api.ChangeSummary{}, SegmentStart: view.SegmentStart}
 	if reg.ClientID != "" {
 		out.ClientID = api.EncodeID(reg.ClientID)
 	}
@@ -59,6 +59,9 @@ func (p *AdminProvider) ReadRegistration(ctx context.Context, id shoal.ID) (api.
 	}
 	for _, c := range view.Changes {
 		summary := api.ChangeSummary{Sequence: c.Sequence, Action: string(c.Action), Source: string(c.Source), Generation: c.Registration.Generation, State: string(c.Registration.State), At: c.At}
+		if c.Recovery != nil {
+			summary.Recovery = string(c.Recovery.Reason)
+		}
 		if a := c.Admin; a != nil {
 			by := api.AdminAttribution{Subject: api.EncodeID(a.Subject), Actor: api.EncodeID(a.Actor), RequestID: api.EncodeID(a.RequestID), AuthorizationFingerprint: a.AuthorizationFingerprint}
 			if a.ClientID != "" {
