@@ -896,7 +896,9 @@ func (s *DurablePolicyStore) StoreCoOccurrence(
 // persisted marks the store diverged when the write-through of a change the
 // memory store already applied failed, at any step.
 func (s *DurablePolicyStore) persisted(err error) error {
-	if err != nil {
+	// A write racing Close is refused, not a divergence: the process is
+	// shutting down and the next open reloads from disk anyway.
+	if err != nil && !s.closed {
 		s.markDiverged()
 	}
 	return err
@@ -1068,7 +1070,7 @@ func (s *DurablePolicyStore) persistEdgeClaim(edgeID shoal.ID) error {
 // from then on (see DurablePolicyStore.diverged).
 func (s *DurablePolicyStore) writeRow(row []byte, kind byte, value any) error {
 	if err := s.writeRowBeforeApply(row, kind, value); err != nil {
-		if !s.diverged.Load() {
+		if !s.closed && !s.diverged.Load() {
 			s.markDiverged()
 		}
 		return err
@@ -1078,11 +1080,11 @@ func (s *DurablePolicyStore) writeRow(row []byte, kind byte, value any) error {
 
 // writeRowBeforeApply persists one record before the memory store applies
 // it, so a failure leaves memory and disk in agreement and is only an error.
-// A store that has already diverged refuses.
+// A store that has already diverged, or has been closed, refuses.
 func (s *DurablePolicyStore) writeRowBeforeApply(
 	row []byte, kind byte, value any,
 ) error {
-	if s.diverged.Load() {
+	if s.closed || s.diverged.Load() {
 		return catalogUnavailable()
 	}
 	encoded, err := encodePolicyRecord(kind, value)

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -156,6 +157,35 @@ func divergenceCases(t *testing.T) []divergenceCase {
 				})
 			}
 		}, true},
+		{"reserve edge", func(t *testing.T, store *DurablePolicyStore) func() error {
+			return func() error {
+				return store.ReserveEdge(ctx, EdgeRegistration{
+					Edge: graph.Edge{ID: "reserved", From: "document", To: "node-a",
+						Type: "links", Weight: 1},
+					Rule: rule,
+				})
+			}
+		}, true},
+		{"put edge", func(t *testing.T, store *DurablePolicyStore) func() error {
+			return func() error {
+				return store.PutEdge(ctx, EdgeRegistration{
+					Edge: graph.Edge{ID: "new-edge", From: "document", To: "node-a",
+						Type: "links", Weight: 1},
+					Rule: rule,
+				})
+			}
+		}, true},
+		{"rollback edge reservation", func(t *testing.T, store *DurablePolicyStore) func() error {
+			reservation := EdgeRegistration{
+				Edge: graph.Edge{ID: "to-roll-back", From: "document", To: "node-a",
+					Type: "links", Weight: 1},
+				Rule: rule,
+			}
+			if err := store.ReserveEdge(ctx, reservation); err != nil {
+				t.Fatal(err)
+			}
+			return func() error { return store.RollbackEdgeReservation(ctx, reservation) }
+		}, true},
 		{"declassification record (persisted before applied)", func(t *testing.T, store *DurablePolicyStore) func() error {
 			return func() error {
 				return store.RecordDeclassification(ctx, DeclassificationRecord{
@@ -262,5 +292,32 @@ func TestDivergedStoreRefusesTighteningBeforeChangingMemory(t *testing.T) {
 	}
 	if err := store.writeRows(nil); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("writeRows on a diverged store = %v, want unavailable", err)
+	}
+}
+
+// TestDurablePolicyStoreWriteAfterCloseIsNotADivergence pins that a write
+// racing Close is refused without diverging or signalling: the process is
+// shutting down, and the next open reloads from disk.
+func TestDurablePolicyStoreWriteAfterCloseIsNotADivergence(t *testing.T) {
+	store, err := OpenDurablePolicyStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedDurableStore(t, store)
+	fired := 0
+	store.OnDiverged(func() { fired++ })
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rule := batchTestRule(t, "source", "policy")
+	if err := store.PutEdge(context.Background(), EdgeRegistration{
+		Edge: graph.Edge{ID: "after-close", From: "document", To: "node-a",
+			Type: "links", Weight: 1},
+		Rule: rule,
+	}); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("write after close = %v, want unavailable", err)
+	}
+	if store.Diverged() || fired != 0 {
+		t.Fatalf("a write after close diverged=%v fired=%d", store.Diverged(), fired)
 	}
 }

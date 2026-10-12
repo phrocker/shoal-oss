@@ -22,6 +22,9 @@ package authorized
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -263,25 +266,64 @@ func TestRetiredLineageRowsAreSkippedOnLoad(t *testing.T) {
 
 // TestRetiredLineagePrefixStillFailsClosed pins that the skip is exact: a row
 // under the retired prefix that is not a well-formed record of the retired
-// kind still refuses to open the catalog, as any corrupt row does.
+// kind still refuses to open the catalog, as any corrupt row does. Each case
+// is stored under the row key its record would have, so only the check it
+// names can reject it; a well-formed control row under the same scheme loads.
 func TestRetiredLineagePrefixStillFailsClosed(t *testing.T) {
 	rule := mustPersistRuleForTest(t)
-	for name, value := range map[string][]byte{
-		"wrong kind": mustEncodePolicyRecord(t, policyKindDeclassification,
-			retiredPersistedDeclassificationClaim{Seq: 1, SourceURI: "file:///x", Version: 1}),
-		"other record shape": mustEncodePolicyRecord(t, retiredPolicyKindDeclassificationClaim,
-			persistedRevision{Seq: 1, DocumentID: "d", RevisionID: "r", Rule: rule}),
-		"truncated": []byte("SHOALP1\x00"),
-		"row does not match the record": mustEncodePolicyRecord(t, retiredPolicyKindDeclassificationClaim,
-			retiredPersistedDeclassificationClaim{Seq: 1, SourceURI: "file:///x", Version: 1, AttemptID: "a"}),
+	binding := func(uri string, version uint64, attempt string, closed bool) retiredPersistedDeclassificationClaim {
+		return retiredPersistedDeclassificationClaim{
+			Seq: 1, SourceURI: uri, Version: version, AttemptID: attempt, Closed: closed,
+		}
+	}
+	rowFor := func(record retiredPersistedDeclassificationClaim) []byte {
+		digest := sha256.Sum256([]byte(record.SourceURI))
+		row := fmt.Sprintf("%s%s/%020d", retiredPolicyRowDeclassificationClaim,
+			hex.EncodeToString(digest[:]), record.Version)
+		if record.Closed {
+			row += "/closed"
+		}
+		return []byte(row)
+	}
+	valid := binding("file:///x", 7, "a", false)
+	for _, test := range []struct {
+		name     string
+		row      []byte
+		value    []byte
+		accepted bool
+	}{
+		{"well-formed control", rowFor(valid),
+			mustEncodePolicyRecord(t, retiredPolicyKindDeclassificationClaim, valid), true},
+		{"wrong kind", rowFor(valid),
+			mustEncodePolicyRecord(t, policyKindDeclassification, valid), false},
+		{"other record shape", rowFor(binding("", 0, "", false)),
+			mustEncodePolicyRecord(t, retiredPolicyKindDeclassificationClaim,
+				persistedRevision{Seq: 1, DocumentID: "d", RevisionID: "r", Rule: rule}), false},
+		{"truncated", rowFor(valid), []byte("SHOALP1\x00"), false},
+		{"row does not match the record", rowFor(binding("file:///other", 7, "a", false)),
+			mustEncodePolicyRecord(t, retiredPolicyKindDeclassificationClaim, valid), false},
+		{"version zero", rowFor(binding("file:///x", 0, "a", false)),
+			mustEncodePolicyRecord(t, retiredPolicyKindDeclassificationClaim,
+				binding("file:///x", 0, "a", false)), false},
+		{"closure with an attempt", rowFor(binding("file:///x", 7, "a", true)),
+			mustEncodePolicyRecord(t, retiredPolicyKindDeclassificationClaim,
+				binding("file:///x", 7, "a", true)), false},
+		{"binding without an attempt", rowFor(binding("file:///x", 7, "", false)),
+			mustEncodePolicyRecord(t, retiredPolicyKindDeclassificationClaim,
+				binding("file:///x", 7, "", false)), false},
+		{"invalid source URI", rowFor(binding("", 7, "a", false)),
+			mustEncodePolicyRecord(t, retiredPolicyKindDeclassificationClaim,
+				binding("", 7, "a", false)), false},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			dir := copyLineageFixture(t)
-			corruptPolicyRow(t, dir,
-				[]byte(retiredPolicyRowDeclassificationClaim+"forged/00000000000000000001"), value)
-			if store, err := OpenDurablePolicyStore(dir); err == nil {
+			corruptPolicyRow(t, dir, test.row, test.value)
+			store, err := OpenDurablePolicyStore(dir)
+			if err == nil {
 				_ = store.Close()
-				t.Fatal("a malformed retired lineage row was accepted")
+			}
+			if (err == nil) != test.accepted {
+				t.Fatalf("open = %v, want accepted=%v", err, test.accepted)
 			}
 		})
 	}

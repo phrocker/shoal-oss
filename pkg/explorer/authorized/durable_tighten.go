@@ -162,7 +162,7 @@ func (s *DurablePolicyStore) TightenRule(
 	// ahead of the engine.
 	persistedAll := false
 	defer func() {
-		if !persistedAll {
+		if !persistedAll && !s.closed {
 			s.markDiverged()
 		}
 	}()
@@ -383,7 +383,7 @@ func (s *DurablePolicyStore) sourceClaimRows(sourceURI string) ([]policyRow, err
 // writeRows encodes every row first and then writes them in one engine
 // write, so an encoding failure writes nothing.
 func (s *DurablePolicyStore) writeRows(rows []policyRow) error {
-	if s.diverged.Load() {
+	if s.closed || s.diverged.Load() {
 		return catalogUnavailable()
 	}
 	mutations := make([]*cclient.Mutation, 0, len(rows))
