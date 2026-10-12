@@ -185,11 +185,9 @@ func (s *Server) handle(r *http.Request, body []byte, bodyOK bool) (Answer, logL
 		// a known key is answered outcome_unknown instead, which the gateway
 		// records as a possible effect and never as a rejection. It reveals
 		// only that the key is known, to a caller that already holds it.
-		if key, ok := s.idempotencyKey(r.Header); ok {
-			if _, known := s.opts.Journal.Lookup(key); known {
-				line.Key, line.Answer = KeyDigest(key), StateOutcomeUnknown+":"+reason
-				return OutcomeUnknownAnswer(false), line
-			}
+		if key, known := s.knownKeyIn(r.Header); known {
+			line.Key, line.Answer = KeyDigest(key), StateOutcomeUnknown+":"+reason
+			return OutcomeUnknownAnswer(false), line
 		}
 		line.Answer = StateRefused + ":" + reason
 		return Refused(reason), line
@@ -393,6 +391,32 @@ func noParameters(raw []byte) bool {
 	}
 	_, err := decoder.Token()
 	return errors.Is(err, io.EOF)
+}
+
+// knownKeyIn looks for a key the journal holds anywhere in the request's
+// headers, not only the configured one: a resend whose header was renamed
+// or duplicated between attempts still carries the key. Authorization is
+// skipped, and a value is a key only if it decodes to exactly an executor
+// key's length.
+func (s *Server) knownKeyIn(header http.Header) (string, bool) {
+	for name, values := range header {
+		if name == "Authorization" {
+			continue
+		}
+		for _, value := range values {
+			for _, part := range strings.Split(value, ",") {
+				decoded, err := dispatchapi.ParseExecutorKey(strings.TrimSpace(part))
+				if err != nil || len(decoded) != dispatchapi.ExecutorKeyBytes {
+					continue
+				}
+				key := base64.RawURLEncoding.EncodeToString(decoded)
+				if _, known := s.opts.Journal.Lookup(key); known {
+					return key, true
+				}
+			}
+		}
+	}
+	return "", false
 }
 
 // idempotencyKey reads exactly one key in either spelling the platform emits

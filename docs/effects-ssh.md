@@ -214,8 +214,11 @@ Why these statuses:
   Every refusal is for a key the journal does not hold: an unregistered
   command, a credential or input refusal, or a full or failed journal, all
   before any dial. A request the service would refuse whose key the journal
-  does hold (a resend after the credential was rotated, the header renamed or
-  the route changed) is answered `outcome_unknown` instead.
+  does hold, in any header, is answered `outcome_unknown` instead: a resend
+  after the credential was rotated, the key header was renamed or duplicated,
+  or the route's method or path changed. A resend that carries no key at all
+  cannot be recognised, so do not change a route to send no key, or change
+  `-idempotency-header` on both sides, while its actions are in flight.
 - **No hop between the gateway and this service may answer for it.** A proxy
   that answered 502 or 504 after forwarding would be recorded as a
   rejection while the command may have run. The sidecar shape has no such

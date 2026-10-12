@@ -343,6 +343,15 @@ func TestKnownKeyIsNeverRefused(t *testing.T) {
 		"bad path": func() reply { return e.do(http.MethodPost, "/v2/commands/restart-web", key, "", nil) },
 		"query":    func() reply { return e.do(http.MethodPost, path+"?x=1", key, "", nil) },
 		"body":     func() reply { return e.do(http.MethodPost, path, key, `{"a":1}`, nil) },
+		"renamed header": func() reply {
+			return e.do(http.MethodPost, path, "", "", map[string][]string{"X-Executor-Key": {key}})
+		},
+		"duplicated header": func() reply {
+			return e.do(http.MethodPost, path, "", "", map[string][]string{"Idempotency-Key": {key, key}})
+		},
+		"joined header": func() reply {
+			return e.do(http.MethodPost, path, "", "", map[string][]string{"Idempotency-Key": {key + ", " + key}})
+		},
 	} {
 		got := request()
 		if got.status != http.StatusConflict {
