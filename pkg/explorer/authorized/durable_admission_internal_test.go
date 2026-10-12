@@ -268,8 +268,8 @@ func TestOversizeRegistrationFailsOnlyThatIngest(t *testing.T) {
 	}
 	previousPersist, previousHeadroom := policyRecordPersistBytes, policyRecordAdmissionHeadroom
 	lowerPolicyRecordBounds(t, 9<<10)
-	if _, err := client.Ingest(ctx, dense); err == nil {
-		t.Fatal("an oversize registration was accepted")
+	if _, err := client.Ingest(ctx, dense); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("oversize registration = %v, want invalid argument", err)
 	}
 	if store.Diverged() {
 		t.Fatal("an oversize registration diverged the catalog")
@@ -296,5 +296,34 @@ func TestOversizeRegistrationFailsOnlyThatIngest(t *testing.T) {
 	}
 	if claim, _, err := store.SourceClaim(ctx, dense.URI); err != nil || claim.Pending {
 		t.Fatalf("claim after the retry = %+v %v, want committed", claim, err)
+	}
+}
+
+// TestOversizeSourceURIIsRefusedWithoutDiverging pins the claim side of the
+// admission rule: the source URI is caller input carried by the claim
+// record, so a URI too long to persist is refused before the claim CAS
+// changes memory, and the catalog stays healthy.
+func TestOversizeSourceURIIsRefusedWithoutDiverging(t *testing.T) {
+	lowerPolicyRecordBounds(t, 5<<10)
+	store, err := OpenDurablePolicyStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	seedDurableStore(t, store)
+	ctx := context.Background()
+	uri := "file:///" + strings.Repeat("u", 6<<10)
+	rule := batchTestRule(t, "source", "policy")
+	if _, err := store.CompareAndSwapSourceClaim(ctx, uri, nil, rule); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("oversize claim = %v, want invalid argument", err)
+	}
+	if store.Diverged() {
+		t.Fatal("an oversize claim diverged the catalog")
+	}
+	if _, ok, err := store.SourceClaim(ctx, uri); err != nil || ok {
+		t.Fatalf("refused claim recorded: %v %v", ok, err)
+	}
+	if _, err := store.CompareAndSwapSourceClaim(ctx, "file:///fits", nil, rule); err != nil {
+		t.Fatalf("an ordinary claim after the refusal: %v", err)
 	}
 }

@@ -1019,6 +1019,12 @@ func policyCatalogWriteError(ctx context.Context, err error) error {
 	if contextErr := contextFailure(ctx); contextErr != nil {
 		return contextErr
 	}
+	// A record the catalog refused before changing anything is the caller's
+	// input, and retrying it cannot succeed: report it as such.
+	if errors.Is(err, errPolicyRecordTooLarge) {
+		return shoal.NewError(shoal.ErrorInvalidArgument,
+			"this write is too large for the authorization policy catalog")
+	}
 	if shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		return catalogConflict()
 	}

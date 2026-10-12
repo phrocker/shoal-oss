@@ -25,6 +25,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -661,6 +662,22 @@ func (s *DurablePolicyStore) CompareAndSwapSourceClaim(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The claim this CAS persists carries the URI, the desired rule and,
+	// as its previous rule, the expected claim's rule or previous rule.
+	admitted := persistedSourceClaim{
+		SourceURI: sourceURI, Rule: ruleToPersistedOrEmpty(desired),
+		Pending: true,
+	}
+	if expected != nil {
+		previous := ruleToPersistedOrEmpty(expected.Rule)
+		if expected.Pending && expected.PreviousRule != nil {
+			previous = ruleToPersistedOrEmpty(*expected.PreviousRule)
+		}
+		admitted.PreviousRule = &previous
+	}
+	if err := admitPolicyRecord(policyKindSourceClaim, admitted); err != nil {
+		return SourcePolicyClaim{}, err
+	}
 	token, err := s.memory.CompareAndSwapSourceClaim(
 		ctx, sourceURI, expected, desired)
 	if err != nil {
@@ -1238,8 +1255,9 @@ func (s *MemoryPolicyStore) snapshotEdgeClaim(
 // that is later rewritten from memory with a grown rule (TightenRule conjoins
 // a label policy into a revision's, node's or edge's rule; a rule is at most
 // auth.MaxPolicyTerms components of bounded size, far below the headroom)
-// therefore still fits when it is persisted. Source-claim records hold only
-// rules, so they are bounded by construction and need no admission.
+// therefore still fits when it is persisted. A source claim is admitted when
+// it is acquired (its URI is caller input); finishing, pending or rolling it
+// back rewrites it with no more than that.
 //
 // Both are variables only so tests can lower them together.
 var (
@@ -1253,11 +1271,16 @@ func policyRecordAdmissionBytes() uint64 {
 	return policyRecordPersistBytes - policyRecordAdmissionHeadroom
 }
 
+// errPolicyRecordTooLarge marks an admission refusal, so the client can
+// report it as the caller's input rather than an unavailable catalog.
+var errPolicyRecordTooLarge = errors.New("policy catalog record exceeds its size bound")
+
 func admitPolicyRecord(kind byte, value any) error {
 	encoded, err := encodePolicyRecord(kind, value)
 	if err != nil || uint64(len(encoded)-policyEnvelopeHeader) > policyRecordAdmissionBytes() {
-		return shoal.NewError(shoal.ErrorInvalidArgument,
-			"the policy catalog record for this write exceeds its size bound")
+		return shoal.WrapError(shoal.ErrorInvalidArgument,
+			"the policy catalog record for this write exceeds its size bound",
+			errPolicyRecordTooLarge)
 	}
 	return nil
 }
