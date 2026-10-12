@@ -679,9 +679,12 @@ the identity of the principal that made it.
 The materialized action then has its own `action.enqueued`, as before. Each
 event's `action_id` is the approval ID, which is also the action's. Its
 authorization join is the request's source, policy and target object. It
-carries no input, request digest, approver identity or grant provenance:
-Status is where those are, under Status's rules. `occurred_at` is when the
-transition took effect.
+carries no input, request digest, approver identity, grant provenance,
+correlation ID or request reason. Status shows the parties none of the other
+party's correlation or the request's reason digest, and the event shows less
+than Status. The publication audit still carries the publisher's correlation,
+stamped from its live decision (#532). `occurred_at` is when the transition
+took effect.
 
 **The outbox is per transition.** This is what #480's mixed-identity wedge
 required. The approval store writes one outbox row per transition, keyed by
@@ -700,15 +703,21 @@ requester's name, or the other way round.
 **Rows are independent, so nothing wedges.** After its own commit, each
 Request or Decide publishes its own row. It also drains the other pending rows
 of that approval that it is the publisher of, and skips everyone else's.
+Whether a row is the caller's is decided by comparing the row's stored
+publisher with the caller's decision, never inferred from an error.
 
 - A call that committed a transition answers only for that transition. A
   failure on any earlier row, even the caller's own, is counted
   (`ApprovalService.ApprovalEventCounters`) and left pending. A stranded
   approver row therefore never blocks the requester's materialization or its
   answer.
-- A replay that commits nothing answers for the caller's own pending rows,
-  because a replay is the retry an unpublished event asked for. It never
-  answers for another principal's row.
+- A replay that commits nothing answers for any failure on the caller's own
+  pending rows, including an outbox read or authorization lookup that failed,
+  because a replay is the retry an unpublished event asked for. Answering
+  success there would lose the event, since nobody else may publish it. A
+  replay never answers for another principal's row. A committed transition
+  whose own row is not yet readable (the committed-read lag, #633) is answered
+  the same way, not reported as published.
 - An own-row failure is `ErrApprovalEventUnpublished`: HTTP `503`, **not**
   marked indeterminate, since nothing external was contacted. The same
   request replays the transition and publishes its event: a re-request for
@@ -722,18 +731,26 @@ not acknowledged is deduplicated, not repeated. This holds across restart.
 **No row can wedge forever** (#650's review). The backend deduplicates a
 token until its `RetryUntil` and refuses a `RetryUntil` more than 24h ahead of
 its clock. An approval event's `RetryUntil` is fixed by its row:
-`UpdatedAt + 23h`. The missing hour absorbs replica clock skew. Without it, a
-decision written on a replica behind the previous writer (whose timestamps
-clamp forward, see "Clock skew") could not publish until the clocks agreed.
-Past that window a pending row is closed **lapsed** by whoever next drains the
-approval, whoever they are. Closing publishes nothing and attributes nothing,
-so it needs no identity. Publishing then could duplicate an event whose first
-publication landed and whose acknowledgement did not. A lapsed row is
-terminal, never retried and never an error.
+`UpdatedAt + 23h`. The row stops being published an hour before that, at
+`UpdatedAt + 22h`. Both hours are replica clock skew, one on each side:
+
+- A transition written on a replica behind the previous writer has its
+  timestamps clamped forward (see "Clock skew"). With a full 24h,
+  `RetryUntil` would exceed the bound on that replica's clock, and its event
+  could not publish until the clocks agreed.
+- The backend prunes dedup records by the clock of whichever replica next
+  appends. A replica running ahead could prune a token before `RetryUntil` by
+  the publisher's clock, and a retry in between would be appended twice.
+
+From `UpdatedAt + 22h` a pending row is closed **lapsed** by whoever next
+drains the approval, whoever they are. Closing publishes nothing and
+attributes nothing, so it needs no identity. Publishing then could duplicate
+an event whose first publication landed and whose acknowledgement did not. A
+lapsed row is terminal, never retried and never an error.
 
 **The residual is stated, not hidden.** An event is lost only if its own
 publisher's publication failed and that publisher made no further call on the
-approval within 23h. A lapsed row whose publication had in fact landed was
+approval within 22h. A lapsed row whose publication had in fact landed was
 delivered. Either way the approval record, and its audit, remain the durable
 truth. Nobody else may publish the row instead, by design (#480). An operator
 remedy, as #657 proposes for dispatch rows, is not provided here.
@@ -756,7 +773,12 @@ subscriber, asked under the subscriber's own context at delivery. That is
 Status's rule: the requester, or a principal eligible to decide the request
 under every approver rule. A narrowed caller is never shown one, where Status
 answers it `401` only when otherwise eligible. An event has no response to
-vary, so there is nothing to tell it. Every refusal is silent. A host that
+vary, so there is nothing to tell it. Every refusal is silent. So is a
+failure to establish eligibility at all, such as a target whose executor ref
+the host no longer configures: Status answers that `503`, but at delivery an
+error would fail the subscriber's whole page behind one approval event and
+tell a principal that should see nothing that it is there. Only a failed read
+of the approval itself fails a page, and only while it fails. A host that
 configures no rule delivers approval events to nobody.
 
 **Forgery.** The public route refuses the `approval.` namespace. The trusted
@@ -764,7 +786,7 @@ route admits an approval kind only under the one operation that transition is
 made under, and only if the **approval ledger** confirms it. The ledger reads
 the durable outbox and requires a row for the approval named whose derived
 publication equals the request field for field: token, kind, times, producer,
-evidence, correlation, operation and receipt. Holding the lifecycle capability
+evidence, operation and receipt. Holding the lifecycle capability
 proves only that the caller is host code. An `approval.approved` for a request
 nobody approved has no row to match. A host that configures no ledger admits
 no approval event.

@@ -57,7 +57,7 @@ func (p *ApprovalEventPublisher) PublishApprovalEvent(
 		return err
 	}
 	now := p.now().UTC()
-	if !now.Before(request.RetryUntil) {
+	if !now.Before(transition.LapsesAt()) {
 		return fleet.ErrApprovalEventLapsed
 	}
 	decision, err := p.resolver.Resolve(ctx)
@@ -124,9 +124,9 @@ func authorizeApprovalTransition(
 // produces. It is a function of the durable row alone, so the publisher and
 // the ledger cannot disagree about what the event of a transition is.
 //
-// The event carries what the approval routes already show both parties, and
-// less: no input, no request digest, no approver identity and no grant
-// provenance. Its authorization join is the request's source, policy and
+// The event carries less than the approval routes show the parties who may
+// receive it: no input, request digest, approver identity, grant provenance,
+// correlation ID or request reason. Its authorization join is the request's source, policy and
 // target object, as the action events of the work it may become are. That
 // join is the scope's, which is why delivery also asks the approval's own
 // concealment rule (fleetevents.ApprovalVisibility).
@@ -164,18 +164,17 @@ func ApprovalPublication(
 	writeTokenField(transitionHash, version[:])
 	writeTokenField(transitionHash, record.RequestDigest)
 
+	// No reason, except the expiry observer's code. The request's reason
+	// (a code and a digest of its free-form detail) is not on the approval
+	// wire, and its digest would let an approver confirm a guessed detail.
+	// The decision's reason is not stored.
 	occurred := record.UpdatedAt
-	reason := request.Reason
-	switch transition.Kind {
-	case fleet.ApprovalEventExpired:
+	var reason interaction.Reason
+	if transition.Kind == fleet.ApprovalEventExpired {
 		occurred = record.ExpiresAt
 		reason = interaction.Reason{
 			Code: fleet.ApprovalExpiryReasonCode(transition.Publisher.Observer),
 		}
-	case fleet.ApprovalEventApproved, fleet.ApprovalEventRefused:
-		// The decision's own reason is not stored on the approval, and the
-		// request's is not the approver's to give.
-		reason = interaction.Reason{}
 	}
 	publisher := transition.Publisher
 	publication := fleetevents.PublishRequest{
@@ -187,7 +186,11 @@ func ApprovalPublication(
 			ProducerGeneration: request.AgentGeneration,
 			ActionID:           append([]byte(nil), record.ID...),
 			TransitionID:       transitionHash.Sum(nil),
-			CorrelationID:      []byte(publisher.CorrelationID),
+			// No correlation ID. The publisher's is the other party's to
+			// approvers and requesters alike, and the approval wire shows
+			// neither side the other's. The publication audit still carries
+			// the publisher's, stamped by the trusted sink from its live
+			// decision (#532).
 			Reason:             reason,
 			Evidence: []fleetevents.Evidence{{
 				SourceID: append([]byte(nil), request.SourceID...),
@@ -199,7 +202,6 @@ func ApprovalPublication(
 	}
 	receipt := fleetevents.LifecycleReceipt{
 		RequestID:                publisher.RequestID,
-		CorrelationID:            []byte(publisher.CorrelationID),
 		AuthorizationFingerprint: publisher.AuthorizationFingerprint,
 		AuthorizationExpiresAt:   publisher.AuthorizationExpiresAt,
 	}

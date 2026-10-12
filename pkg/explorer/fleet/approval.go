@@ -1763,13 +1763,17 @@ func (s *ApprovalService) VisibleTo(
 		}, now) == nil {
 		return true, nil
 	}
+	// Any failure to establish eligibility is a false answer, whatever its
+	// code. Status may answer 503 where the target's binding cannot be
+	// resolved (an executor ref the host no longer configures, a moved effect
+	// ceiling), but at delivery an error fails the subscriber's whole page and
+	// pins its cursor. That would wedge the stream behind one approval event,
+	// and would tell a subscriber that should see nothing, such as the agent's
+	// registrant, that an approval event is there. Only the approval read
+	// itself, which is not about this subscriber, may fail the page, and only
+	// while it fails.
 	if _, err := s.eligibleApprover(ctx, decision, current, now); err != nil {
-		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) ||
-			shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
-			errors.Is(err, ErrIdentitySchemeMoved) {
-			return false, nil
-		}
-		return false, err
+		return false, nil
 	}
 	return true, nil
 }

@@ -29,8 +29,9 @@ func approverPublisher(record ApprovalRecord) ApprovalPublisher {
 	return ApprovalPublisher{
 		Operation: auth.OperationActionApprove, Subject: record.ApproverSubject,
 		Actor: record.ApproverActor, ClientID: record.ApproverClientID,
-		RequestID: record.DecisionRequestID, CorrelationID: "correlation",
-		AuthorizationFingerprint: auth.Fingerprint{4},
+		RequestID:                record.DecisionRequestID,
+		CorrelationID:            record.DecisionCorrelationID,
+		AuthorizationFingerprint: record.ApproverFingerprint,
 		AuthorizationExpiresAt:   record.RequestedAt.Add(time.Hour),
 	}
 }
@@ -43,6 +44,7 @@ func approverPublisher(record ApprovalRecord) ApprovalPublisher {
 func TestApprovalTransitionBindsItsPublisher(t *testing.T) {
 	pending := validApprovalRecord(t)
 	approved := decided(pending, ApprovalApproved, ApprovalVerdictApprove)
+	approved.DecisionCorrelationID = "decision-correlation"
 	expired := pending
 	expired.Version, expired.State = 2, ApprovalExpired
 	expired.UpdatedAt = pending.ExpiresAt.Add(time.Minute)
@@ -91,6 +93,19 @@ func TestApprovalTransitionBindsItsPublisher(t *testing.T) {
 			otherRequest(approverPublisher(approved)), false},
 		{"approved on someone's behalf", approved,
 			onBehalf(approverPublisher(approved)), false},
+		{"approved under another correlation", approved, func() ApprovalPublisher {
+			p := approverPublisher(approved)
+			p.CorrelationID = "other"
+			return p
+		}(), false},
+		{"approved under another credential", approved, func() ApprovalPublisher {
+			p := approverPublisher(approved)
+			p.AuthorizationFingerprint = auth.Fingerprint{7}
+			return p
+		}(), false},
+		{"expiry observed by the requester posing as an approver", expired,
+			observedBy(asApprove(requesterPublisher(expired)),
+				ApprovalObservedByApprover), false},
 		{"expiry observed by the requester", expired,
 			observedBy(requesterPublisher(expired), ApprovalObservedByRequester), true},
 		{"expiry observed by an approver", expired,
@@ -200,6 +215,7 @@ func (e *scriptedEvents) MayPublishApprovalEvent(
 func TestDrainNeverBlocksOnAnotherRowAndLapsesPastTheWindow(t *testing.T) {
 	pending := validApprovalRecord(t)
 	approved := decided(pending, ApprovalApproved, ApprovalVerdictApprove)
+	approved.DecisionCorrelationID = "decision-correlation"
 	materialized := approved
 	materialized.Version, materialized.State = 3, ApprovalEnqueued
 	materialized.MaterializedAt = approved.DecidedAt.Add(time.Minute)
@@ -211,6 +227,30 @@ func TestDrainNeverBlocksOnAnotherRowAndLapsesPastTheWindow(t *testing.T) {
 		}
 		return StoredApprovalTransition{Transition: transition}
 	}
+	resolverFor := func(caller principalOf) auth.Resolver {
+		decision, err := auth.NewDecision(auth.DecisionConfig{
+			Subject: caller.subject, Actor: caller.actor, ClientID: caller.client,
+			OnBehalfOf: caller.onBehalfOf, RequestID: "drain",
+			AuthorizationDomain:   []byte("domain"),
+			AllowedOperations:     []auth.Operation{auth.OperationDispatch},
+			PolicyGeneration:      3,
+			AuthenticationExpires: time.Now().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolver, err := auth.NewStaticResolver(decision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resolver
+	}
+	alice := principalOf{subject: pending.Request.Subject,
+		actor: pending.Request.Actor, client: pending.Request.ClientID,
+		onBehalfOf: pending.Request.OnBehalfOf}
+	bob := principalOf{subject: approved.ApproverSubject, actor: approved.ApproverActor}
+	someoneElse := principalOf{subject: "someone-else", actor: "someone-else"}
+	caller := alice
 	build := func(now time.Time, events *scriptedEvents) (*ApprovalService, *memoryOutbox) {
 		outbox := &memoryOutbox{rows: []StoredApprovalTransition{
 			row(pending, requesterPublisher(pending)),
@@ -218,8 +258,11 @@ func TestDrainNeverBlocksOnAnotherRowAndLapsesPastTheWindow(t *testing.T) {
 			row(materialized, requesterPublisher(materialized)),
 		}}
 		return &ApprovalService{
-			dispatch: &DispatchService{clock: func() time.Time { return now }},
-			events:   &approvalEvents{outbox: outbox, publisher: events},
+			dispatch: &DispatchService{
+				clock:    func() time.Time { return now },
+				resolver: resolverFor(caller),
+			},
+			events: &approvalEvents{outbox: outbox, publisher: events},
 		}, outbox
 	}
 	inside := materialized.UpdatedAt.Add(time.Minute)
@@ -248,13 +291,15 @@ func TestDrainNeverBlocksOnAnotherRowAndLapsesPastTheWindow(t *testing.T) {
 	); !errors.Is(err, ErrApprovalEventUnpublished) {
 		t.Fatalf("a replay over the caller's own failing row = %v", err)
 	}
-	approverEvents := &scriptedEvents{caller: "mallory", fail: map[uint64]bool{1: true}}
-	service.events.publisher = approverEvents
+	caller = bob
+	approverEvents := &scriptedEvents{caller: "bob", fail: map[uint64]bool{1: true}}
+	service, _ = build(inside, approverEvents)
 	if err := service.drainApprovalEvents(context.Background(), pending.ID, 0); err != nil {
 		t.Fatalf("a replay answered for another principal's row: %v", err)
 	}
 	// And a failure on the caller's own new row is its answer, without
 	// unwrapping into a sentinel the caller would read as a lost race.
+	caller = alice
 	events.fail[3] = true
 	service, _ = build(inside, events)
 	err := service.drainApprovalEvents(context.Background(), pending.ID, 3)
@@ -267,6 +312,7 @@ func TestDrainNeverBlocksOnAnotherRowAndLapsesPastTheWindow(t *testing.T) {
 	// Past the window every pending row lapses, whoever drains it, with
 	// nothing published and no error.
 	past := pending.UpdatedAt.Add(ApprovalEventRetryWindow)
+	caller = someoneElse
 	nobody := &scriptedEvents{caller: "someone-else"}
 	service, outbox = build(past.Add(ApprovalEventRetryWindow), nobody)
 	if err := service.drainApprovalEvents(context.Background(), pending.ID, 0); err != nil {
@@ -280,10 +326,13 @@ func TestDrainNeverBlocksOnAnotherRowAndLapsesPastTheWindow(t *testing.T) {
 	if len(nobody.published) != 0 {
 		t.Fatalf("a lapsed row was published: %v", nobody.published)
 	}
-	// Exactly at the boundary a row is lapsed, not published: the event
-	// backend refuses a publication whose RetryUntil is now.
+	// At LapsesAt, a skew allowance before RetryUntil, a row is lapsed and
+	// not published: a replica that far ahead may already have pruned the
+	// token's dedup record, and publishing could duplicate the event.
+	caller = alice
 	edge := &scriptedEvents{caller: "alice"}
-	service, outbox = build(pending.UpdatedAt.Add(ApprovalEventRetryWindow), edge)
+	service, outbox = build(pending.UpdatedAt.Add(
+		ApprovalEventRetryWindow-ApprovalEventSkewAllowance), edge)
 	if err := service.drainApprovalEvents(context.Background(), pending.ID, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -302,4 +351,84 @@ func TestApprovalEventWindowFitsTheBackendBound(t *testing.T) {
 		t.Fatalf("window %v + skew %v != 24h",
 			ApprovalEventRetryWindow, ApprovalEventSkewAllowance)
 	}
+}
+
+type principalOf struct {
+	subject, actor, client shoal.ID
+	onBehalfOf             []shoal.ID
+}
+
+// TestAReplayAnswersForTheCallersOwnRowWhateverFails: a replay is the retry
+// an unpublished event asked for, so any failure on the caller's own row,
+// including the publisher failing to answer whether it may publish, is the
+// replay's answer. Answering success would leave the row pending with nobody
+// else allowed to publish it. A row at the caller's own version that another
+// principal wrote (two observers of one expiry) is not the caller's, and
+// is never its answer.
+func TestAReplayAnswersForTheCallersOwnRowWhateverFails(t *testing.T) {
+	pending := validApprovalRecord(t)
+	transition, err := NewApprovalTransition(pending, requesterPublisher(pending))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: pending.Request.Subject, Actor: pending.Request.Actor,
+		ClientID: pending.Request.ClientID, OnBehalfOf: pending.Request.OnBehalfOf,
+		RequestID: "drain", AuthorizationDomain: []byte("domain"),
+		AllowedOperations: []auth.Operation{auth.OperationDispatch},
+		PolicyGeneration:  3, AuthenticationExpires: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := auth.NewStaticResolver(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &ApprovalService{
+		dispatch: &DispatchService{
+			clock:    func() time.Time { return pending.UpdatedAt.Add(time.Minute) },
+			resolver: resolver,
+		},
+		events: &approvalEvents{
+			outbox:    &memoryOutbox{rows: []StoredApprovalTransition{{Transition: transition}}},
+			publisher: undecidedEvents{},
+		},
+	}
+	if err := service.drainApprovalEvents(
+		context.Background(), pending.ID, 0,
+	); !errors.Is(err, ErrApprovalEventUnpublished) {
+		t.Fatalf("a replay whose own row could not be asked about = %v", err)
+	}
+	// The same expiry at the caller's own version, written first, byte for
+	// byte, by an approver who observed it too: the transition is theirs.
+	expired := pending
+	expired.Version, expired.State = 2, ApprovalExpired
+	expired.UpdatedAt = pending.ExpiresAt.Add(time.Minute)
+	theirs, err := NewApprovalTransition(expired, ApprovalPublisher{
+		Operation: auth.OperationActionApprove, Subject: "carol", Actor: "carol",
+		RequestID: "carol-request", CorrelationID: "correlation",
+		AuthorizationFingerprint: auth.Fingerprint{5},
+		AuthorizationExpiresAt:   pending.RequestedAt.Add(time.Hour),
+		Observer:                 ApprovalObservedByApprover,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.events.outbox = &memoryOutbox{rows: []StoredApprovalTransition{{Transition: theirs}}}
+	if err := service.drainApprovalEvents(context.Background(), pending.ID, 2); err != nil {
+		t.Fatalf("another principal's row at the caller's version = %v", err)
+	}
+}
+
+type undecidedEvents struct{}
+
+func (undecidedEvents) PublishApprovalEvent(context.Context, ApprovalTransition) error {
+	return nil
+}
+
+func (undecidedEvents) MayPublishApprovalEvent(
+	context.Context, ApprovalTransition,
+) (bool, error) {
+	return false, shoal.NewError(shoal.ErrorUnavailable, "authorization lookup failed")
 }

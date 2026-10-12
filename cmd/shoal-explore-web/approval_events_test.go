@@ -656,3 +656,80 @@ func TestTheLedgerConfirmsOnlyDurableTransitions(t *testing.T) {
 	assertKinds(t, "after the repeat", kinds,
 		fleet.ApprovalEventRequested, fleet.ApprovalEventApproved)
 }
+
+// TestAnUnresolvableTargetDoesNotWedgeTheStream: after the host stops
+// configuring the agent's executor ref, Status answers an approver 503 for
+// the request (the binding cannot be resolved). Delivery must not. An error
+// there would fail every pull of every approve-holder's subscription behind
+// that one event, and would tell the agent's registrant, who may see nothing,
+// that an approval event is there. Every such subscriber is answered with a
+// page that simply lacks it.
+func TestAnUnresolvableTargetDoesNotWedgeTheStream(t *testing.T) {
+	h, _ := newEventHarness(t)
+	request := h.held("events-unresolvable")
+	h.mustRequest(requester, request, fleet.ApprovalPending)
+	h.close()
+	h.executors = configuredFleetExecutors{
+		"other": configuredFleetExecutor{reference: "other"},
+	}
+	if err := h.tryOpen(); err != nil {
+		t.Fatalf("reopen without the agent's executor: %v", err)
+	}
+	owner := principal{subject: registrant.subject, actor: "owner-console",
+		operations: approverSubscriber.operations}
+	for name, who := range map[string]principal{
+		"eligible approver": approverSubscriber, "registrant": owner,
+		"co-tenant": coTenant,
+	} {
+		for _, event := range h.eventsFor(h.as(who)) {
+			if fleetevents.IsApprovalKind(event.Kind) {
+				t.Fatalf("%s was delivered %s for an unresolvable target",
+					name, event.Kind)
+			}
+		}
+	}
+	kinds, _ := h.approvalEventsOf(requesterSubscriber, request.id)
+	assertKinds(t, "requester", kinds, fleet.ApprovalEventRequested)
+}
+
+// TestAnotherApproverCannotPublishTheDecidersRow: carol holds approve on the
+// scope and is eligible, so the operation check alone would admit her. The
+// identity match against the row's stored publisher is what refuses her.
+func TestAnotherApproverCannotPublishTheDecidersRow(t *testing.T) {
+	h, probe := newEventHarness(t)
+	request := h.held("events-other-approver")
+	receipt := h.mustRequest(requester, request, fleet.ApprovalPending)
+	probe.loseBefore(fleet.ApprovalEventApproved, 1)
+	if _, err := h.decide(approver, receipt, fleet.ApprovalVerdictApprove); !errors.Is(
+		err, fleet.ErrApprovalEventUnpublished) {
+		t.Fatalf("decision = %v", err)
+	}
+	rows, err := h.opened.approvalOutbox.ApprovalTransitions(
+		context.Background(), request.id)
+	if err != nil || len(rows) != 2 || rows[1].Outcome != "" {
+		t.Fatalf("rows = %+v, %v", rows, err)
+	}
+	decision := rows[1].Transition
+	if may, err := probe.inner.MayPublishApprovalEvent(
+		h.as(secondApprover), decision); err != nil || may {
+		t.Fatalf("may another approver publish it = %v, %v", may, err)
+	}
+	if err := probe.inner.PublishApprovalEvent(
+		h.as(secondApprover), decision); !shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
+		t.Fatalf("another approver publishing it = %v", err)
+	}
+	// Nor does carol's own decide replay (a conflict: she did not decide it)
+	// drain it on bob's behalf.
+	if _, err := h.decide(secondApprover, receipt, fleet.ApprovalVerdictApprove); !errors.Is(
+		err, fleet.ErrApprovalConflict) {
+		t.Fatalf("carol's decide = %v", err)
+	}
+	kinds, _ := h.approvalEventsOf(requesterSubscriber, request.id)
+	assertKinds(t, "before bob returns", kinds, fleet.ApprovalEventRequested)
+	if _, err := h.decide(approver, receipt, fleet.ApprovalVerdictApprove); err != nil {
+		t.Fatal(err)
+	}
+	kinds, _ = h.approvalEventsOf(requesterSubscriber, request.id)
+	assertKinds(t, "after bob returns", kinds,
+		fleet.ApprovalEventRequested, fleet.ApprovalEventApproved)
+}

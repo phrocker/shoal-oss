@@ -237,9 +237,20 @@ func CloneApprovalTransition(t ApprovalTransition) ApprovalTransition {
 	return t
 }
 
-// RetryUntil is the end of the window in which this event may be published.
+// RetryUntil is the event's publication deadline as the event backend sees
+// it: the backend deduplicates its token until then.
 func (t ApprovalTransition) RetryUntil() time.Time {
 	return t.Record.UpdatedAt.Add(ApprovalEventRetryWindow)
+}
+
+// LapsesAt is when the row stops being published: the skew allowance before
+// RetryUntil. The backend prunes a token's dedup record by the clock of
+// whichever replica next appends. A replica running ahead could prune it
+// before RetryUntil by this replica's clock, and a publication retried in
+// between would be appended a second time. Stopping an allowance early means
+// a replica up to that far ahead cannot have pruned it yet.
+func (t ApprovalTransition) LapsesAt() time.Time {
+	return t.RetryUntil().Add(-ApprovalEventSkewAllowance)
 }
 
 // Validate checks that a row describes a transition that could have been made,
@@ -315,14 +326,22 @@ func (t ApprovalTransition) Validate() error {
 			p.Actor == t.Record.ApproverActor &&
 			p.ClientID == t.Record.ApproverClientID &&
 			len(p.OnBehalfOf) == 0 &&
-			p.RequestID == t.Record.DecisionRequestID
+			p.RequestID == t.Record.DecisionRequestID &&
+			p.CorrelationID == t.Record.DecisionCorrelationID &&
+			p.AuthorizationFingerprint == t.Record.ApproverFingerprint
 	case ApprovalEventExpired:
 		switch p.Observer {
 		case ApprovalObservedByRequester:
 			valid = requester()
 		case ApprovalObservedByApprover:
+			// The record names no observer, so eligibility cannot be
+			// rechecked from the data. What can be is that the approver is
+			// not the requester under another operation.
+			request := t.Record.Request
 			valid = p.Operation == auth.OperationActionApprove &&
-				len(p.OnBehalfOf) == 0
+				len(p.OnBehalfOf) == 0 &&
+				p.Subject != request.Subject && p.Subject != request.Actor &&
+				p.Actor != request.Subject && p.Actor != request.Actor
 		}
 	}
 	if !valid {
@@ -416,20 +435,26 @@ func (s *ApprovalService) ApprovalEventCounters() (skipped, lapsed, failed uint6
 }
 
 // drainApprovalEvents publishes this approval's pending event rows that the
-// caller may publish, and closes those whose window has passed.
+// caller made, and closes those whose window has passed.
 //
 // own is the version this call has just committed, or zero for a call that
 // committed nothing (a replay, which is how a principal reconciles its own
-// earlier transition). The error rule is what keeps a stranded row from
-// blocking anything:
+// earlier transition). Which rows are the caller's is decided by the row's
+// stored publisher, compared with the caller's decision, before anything is
+// asked of the publisher. "Not yours" is therefore an identity fact, never
+// an inference from an error. The error rule is what keeps a stranded row
+// from blocking anything:
 //
 //   - A call that committed a transition answers only for that transition.
-//     A failure on any earlier row, including one of the caller's own, is
-//     counted and left pending. The new transition has landed and its answer
-//     must say so.
-//   - A replay answers for the caller's own pending rows, because a replay
-//     is the retry a failed publication asked for. It never answers for
-//     anyone else's.
+//     A failure on any earlier row, even one of the caller's own, is counted
+//     and left pending. The new transition has landed and its answer must
+//     say so. If the row it just wrote cannot be read yet, that is answered
+//     too, because a committed event must not go silently unpublished.
+//   - A replay answers for every failure on the caller's own pending rows,
+//     including a failed outbox read or a publisher that could not answer.
+//     A replay is the retry a failed publication asked for, and answering
+//     success while the row stays pending would lose the event: nobody else
+//     may publish it. A replay never answers for anyone else's row.
 //
 // Either way every row is attempted. A row is never published under anyone
 // but its publisher.
@@ -440,22 +465,26 @@ func (s *ApprovalService) drainApprovalEvents(
 		return nil
 	}
 	ctx = context.WithoutCancel(ctx)
+	decision, err := s.dispatch.resolver.Resolve(ctx)
+	if err != nil {
+		return approvalEventUnpublished(err)
+	}
 	rows, err := s.events.outbox.ApprovalTransitions(ctx, id)
 	if err != nil {
-		if own != 0 {
-			return approvalEventUnpublished(err)
-		}
-		return nil
+		return approvalEventUnpublished(err)
 	}
 	now := s.dispatch.clock().UTC()
 	var answer error
+	ownSeen := own == 0
 	for _, row := range rows {
+		if own != 0 && row.Transition.Record.Version == own {
+			ownSeen = true
+		}
 		if row.Outcome != "" {
 			continue
 		}
 		transition := row.Transition
-		mine := own != 0 && transition.Record.Version == own
-		if !now.Before(transition.RetryUntil()) {
+		if !now.Before(transition.LapsesAt()) {
 			// Anyone may close a lapsed row: closing it publishes nothing
 			// and attributes nothing, so the identity rule has nothing to
 			// protect here, and requiring the publisher would recreate
@@ -466,14 +495,26 @@ func (s *ApprovalService) drainApprovalEvents(
 			}
 			continue
 		}
-		if !mine {
-			may, err := s.events.publisher.MayPublishApprovalEvent(ctx, transition)
-			if err != nil || !may {
-				s.events.skipped.Add(1)
-				continue
-			}
+		if !publishedBy(decision, transition.Publisher) {
+			// Another principal's row. That includes a row at this call's own
+			// version whose transition another caller wrote byte for byte
+			// first (two observers of one expiry): the transition is theirs.
+			s.events.skipped.Add(1)
+			continue
 		}
-		err := s.events.publisher.PublishApprovalEvent(ctx, transition)
+		mine := own != 0 && transition.Record.Version == own
+		answerable := mine || own == 0
+		may, err := s.events.publisher.MayPublishApprovalEvent(ctx, transition)
+		if err == nil && !may {
+			// The caller made it but no longer holds its operation on the
+			// scope. No retry by this caller can publish it, so it is not an
+			// answer; it lapses.
+			s.events.skipped.Add(1)
+			continue
+		}
+		if err == nil {
+			err = s.events.publisher.PublishApprovalEvent(ctx, transition)
+		}
 		if errors.Is(err, ErrApprovalEventLapsed) {
 			if completeErr := s.events.outbox.CompleteApprovalTransition(
 				ctx, transition, ApprovalEventLapsedOutcome); completeErr == nil {
@@ -488,10 +529,7 @@ func (s *ApprovalService) drainApprovalEvents(
 		if err == nil {
 			continue
 		}
-		// A replay answers for the caller's own rows. MayPublish said this
-		// one is the caller's, and a call that committed something answers
-		// only for that.
-		if mine || own == 0 {
+		if answerable {
 			if answer == nil {
 				answer = approvalEventUnpublished(err)
 			}
@@ -499,5 +537,22 @@ func (s *ApprovalService) drainApprovalEvents(
 		}
 		s.events.failed.Add(1)
 	}
+	if answer == nil && !ownSeen {
+		// The transition committed with its row in the same write, so a row
+		// this read cannot see is a read that has not caught up, not an
+		// absent row. Saying nothing would let a committed event go
+		// unpublished until some later call. The retry this asks for
+		// replays the transition and finds it.
+		answer = approvalEventUnpublished(errors.New(
+			"the transition's event row is not yet readable"))
+	}
 	return answer
+}
+
+// publishedBy reports whether a decision is the principal a row names.
+func publishedBy(decision auth.Decision, publisher ApprovalPublisher) bool {
+	return decision.Subject() == publisher.Subject &&
+		decision.Actor() == publisher.Actor &&
+		decision.ClientID() == publisher.ClientID &&
+		sameIdentityChain(decision.OnBehalfOf(), publisher.OnBehalfOf)
 }
