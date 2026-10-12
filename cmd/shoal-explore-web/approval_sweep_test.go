@@ -395,6 +395,62 @@ func TestASweepAndADecisionRaceAtomically(t *testing.T) {
 	}
 }
 
+// TestStatusRecordsWhatTheAskingPartyObserves: Status writes the final state
+// it reports as the party asking, under that party's own operation, and the
+// event says which party observed it. An approver's Status and a
+// requester's Status of two lapsed requests are two observers.
+func TestStatusRecordsWhatTheAskingPartyObserves(t *testing.T) {
+	h, probe := newEventHarness(t)
+	byApprover := h.held("status-observed-approver")
+	byRequester := h.held("status-observed-requester")
+	h.mustRequest(requester, byApprover, fleet.ApprovalPending)
+	h.mustRequest(requester, byRequester, fleet.ApprovalPending)
+	h.advance(fleet.DefaultApprovalWindow + time.Second)
+	if status := h.statusAs(approver, byApprover.id); status.Approval.State != fleet.ApprovalExpired {
+		t.Fatalf("approver status = %q stored %q", status.State, status.Approval.State)
+	}
+	if status := h.status(byRequester.id); status.Approval.State != fleet.ApprovalExpired {
+		t.Fatalf("requester status = %q stored %q", status.State, status.Approval.State)
+	}
+	for request, observer := range map[string]fleet.ApprovalObserver{
+		string(byApprover.id):  fleet.ApprovalObservedByApprover,
+		string(byRequester.id): fleet.ApprovalObservedByRequester,
+	} {
+		_, events := h.approvalEventsOf(requesterSubscriber, []byte(request))
+		if event := eventOf(t, events, fleet.ApprovalEventExpired); event.Reason.Code !=
+			fleet.ApprovalExpiryReasonCode(observer) {
+			t.Fatalf("%s expiry observed as %q, want %s", request, event.Reason.Code, observer)
+		}
+	}
+	var expiries []publication
+	for _, published := range probe.publications() {
+		if published.kind == fleet.ApprovalEventExpired {
+			expiries = append(expiries, published)
+		}
+	}
+	want := []publication{
+		{fleet.ApprovalEventExpired, approver.subject, approver.actor},
+		{fleet.ApprovalEventExpired, requester.subject, requester.actor},
+	}
+	if fmt.Sprint(expiries) != fmt.Sprint(want) {
+		t.Fatalf("expiries published by %v, want %v", expiries, want)
+	}
+	// A co-tenant asking Status is answered as for a missing ID and writes
+	// nothing.
+	other := h.held("status-observed-cotenant")
+	h.mustRequest(requester, other, fleet.ApprovalPending)
+	h.advance(fleet.DefaultApprovalWindow + time.Second)
+	if _, err := h.opened.approvals.Status(h.as(coTenant), fleet.ApprovalStatusRequest{
+		ID: other.id, Context: h.context(h.now().Add(time.Minute)),
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("co-tenant status = %v", err)
+	}
+	rows, err := h.opened.approvalOutbox.ApprovalTransitions(context.Background(), other.id)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("a co-tenant's Status wrote %d rows, %v", len(rows), err)
+	}
+}
+
 // TestTheSweepRetriesItsOwnUnpublishedEvent: a transition the sweep wrote
 // whose event did not publish is published by the next pass, once.
 func TestTheSweepRetriesItsOwnUnpublishedEvent(t *testing.T) {

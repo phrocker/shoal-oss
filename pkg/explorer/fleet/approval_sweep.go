@@ -4,6 +4,7 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"time"
@@ -43,6 +44,15 @@ import (
 // actor of every decision a sweep acts under, and of every transition it
 // writes. No authenticator names a principal this way.
 const ApprovalSweeperSubject shoal.ID = "shoal-system:approval-sweeper"
+
+// ApprovalSweeperClientID is the client the system observer is minted under,
+// bound like its subject and actor.
+const ApprovalSweeperClientID shoal.ID = "shoal-system:approval-sweeper"
+
+// MaxApprovalSweepDecisionLifetime bounds how far ahead a bound sweep
+// decision may expire. The host mints one per approval, for one write and
+// its event; a longer one is not the observer's decision.
+const MaxApprovalSweepDecisionLifetime = 2 * time.Minute
 
 // ApprovalSweepScope is the one approval a sweep decision is minted for.
 type ApprovalSweepScope struct {
@@ -165,9 +175,11 @@ func (s *ApprovalService) sweepOne(
 }
 
 // sweepDecision binds the system observer for one record and checks that what
-// the host bound is exactly that observer: its identity, on nobody's behalf,
-// holding the sweep and nothing else, on this record's scope. A host that
-// bound anything broader is refused rather than trusted.
+// the host bound is exactly that observer: its identity and client, on
+// nobody's behalf, holding the sweep and nothing else, on exactly this
+// record's source and policy, expiring within
+// MaxApprovalSweepDecisionLifetime. A host that bound anything broader is
+// refused rather than trusted.
 func (s *ApprovalService) sweepDecision(
 	ctx context.Context, record ApprovalRecord, now time.Time,
 ) (context.Context, auth.Decision, error) {
@@ -183,8 +195,13 @@ func (s *ApprovalService) sweepDecision(
 		return nil, auth.Decision{}, err
 	}
 	operations := decision.AllowedOperations()
+	sources, policies := decision.PermittedSourceIDs(), decision.PermittedPolicyIDs()
 	if decision.Subject() != ApprovalSweeperSubject ||
 		decision.Actor() != ApprovalSweeperSubject ||
+		decision.ClientID() != ApprovalSweeperClientID ||
+		len(sources) != 1 || !bytes.Equal(sources[0], record.Request.SourceID) ||
+		len(policies) != 1 || !bytes.Equal(policies[0], record.Request.PolicyID) ||
+		decision.AuthenticationExpires().After(now.Add(MaxApprovalSweepDecisionLifetime)) ||
 		len(decision.OnBehalfOf()) > 0 ||
 		len(operations) != 1 || operations[0] != auth.OperationApprovalSweep {
 		return nil, auth.Decision{}, shoal.NewError(

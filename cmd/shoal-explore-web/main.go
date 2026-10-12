@@ -288,11 +288,13 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"for an identity before it resets",
 	)
 	approvalSweepInterval := flags.Duration(
-		"approval-sweep-interval", 10*time.Minute,
+		"approval-sweep-interval", 0,
 		"How often the host's system observer sweeps held approval requests, "+
 			"recording as expired or stranded every one that can no longer "+
-			"progress (#655). Zero disables the sweep; requests are then "+
-			"recorded only when a party touches them",
+			"progress (#655), for example 10m. Zero, the default for this "+
+			"release, disables the sweep; requests are then recorded only when "+
+			"a party touches them. Enable it once no replica runs a build "+
+			"before #655, which cannot read what the sweep writes",
 	)
 	oidcIssuer := flags.String(
 		"oidc-issuer", "",

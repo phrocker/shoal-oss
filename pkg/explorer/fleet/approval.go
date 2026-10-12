@@ -503,6 +503,14 @@ func (r ApprovalRecord) validateWithdrawal() error {
 // So past the deadline no call that could still write the action is running,
 // on a replica whose clock agrees; the grace is the replica clock skew the
 // event window already allows (ApprovalEventSkewAllowance).
+//
+// What the grace does not bound is a write that call already handed to the
+// coordination runtime. A materialization whose publish was interrupted
+// (indeterminate, a crash) is a durable intent that recovery rolls forward
+// later, with no time check, so its ActionRecord can still land after the
+// approval was recorded stranded/deadline_passed. It lands past its own
+// deadline, which every claim refuses (Claim, ExecuteClaim), so it can never
+// run; docs/approval.md states it as a residual.
 const ApprovalStrandGrace = time.Hour
 
 // strandedAfterMaterializing reports whether a stranding cause applies to a
@@ -1803,16 +1811,23 @@ func (s *ApprovalService) withdraw(
 		}
 		return CloneApprovalRecord(current), nil
 	}
-	// Decided, expired, materialized or stranded: nothing to withdraw. The
-	// requester's own rows are published quietly; this is not the call that
-	// owes them.
-	s.drainApprovalEventsQuietly(ctx, current.ID)
+	// Decided, expired, materialized or stranded: nothing to withdraw.
 	switch current.State {
 	case ApprovalExpired:
+		// A withdrawal that found the window closed wrote this expiry and
+		// may have answered that its event did not publish; this is the
+		// retry it asked for, so it answers for the requester's own rows.
+		if err := s.drainApprovalEvents(ctx, current.ID, 0); err != nil {
+			return ApprovalRecord{}, err
+		}
 		return ApprovalRecord{}, approvalExpired()
 	case ApprovalStranded:
+		s.drainApprovalEventsQuietly(ctx, current.ID)
 		return ApprovalRecord{}, approvalStranded(current.StrandedCause)
 	default:
+		// The requester's own rows are published quietly; this is not the
+		// call that owes them.
+		s.drainApprovalEventsQuietly(ctx, current.ID)
 		return ApprovalRecord{}, shoal.WrapError(
 			shoal.ErrorConflict,
 			"the request has already been decided and cannot be withdrawn",
@@ -2184,7 +2199,9 @@ func (s *ApprovalService) eligibility(
 // stored. Expiry is written lazily, and a request whose target or policy
 // generation has moved, or whose deadline has passed, can never progress
 // although its row still says pending or approved; reporting the row would
-// tell a reader something live that is not. Nothing is written here.
+// tell a reader something live that is not. What it reports as final for a
+// permanent reason it also records, as the asking party (#655); see
+// settleObserved.
 func (s *ApprovalService) Status(
 	ctx context.Context, request ApprovalStatusRequest,
 ) (ApprovalStatus, error) {

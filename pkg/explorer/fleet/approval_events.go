@@ -376,6 +376,7 @@ func (t ApprovalTransition) Validate() error {
 			valid = p.Operation == auth.OperationApprovalSweep &&
 				p.Subject == ApprovalSweeperSubject &&
 				p.Actor == ApprovalSweeperSubject &&
+				p.ClientID == ApprovalSweeperClientID &&
 				len(p.OnBehalfOf) == 0
 		}
 	}

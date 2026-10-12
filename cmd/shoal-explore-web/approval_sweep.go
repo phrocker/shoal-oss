@@ -25,7 +25,8 @@ import (
 // for one approval at a time and binds with its own binder, exactly as the
 // HTTP transport binds a request's decision:
 //
-//   - subject and actor fleet.ApprovalSweeperSubject, client this command;
+//   - subject, actor and client the system observer's
+//     (fleet.ApprovalSweeperSubject, fleet.ApprovalSweeperClientID);
 //   - auth.OperationApprovalSweep and nothing else;
 //   - exactly the approval's source and policy;
 //   - the policy generation in force, and a one-minute expiry;
@@ -43,9 +44,6 @@ type approvalSweepMinter struct {
 	instance    string
 	sequence    atomic.Uint64
 }
-
-// approvalSweepClientID is the client the system observer is minted under.
-const approvalSweepClientID shoal.ID = "shoal-explore-web"
 
 // approvalSweepDecisionTTL bounds one minted decision. A row's write and its
 // event's publication run well inside it.
@@ -81,7 +79,7 @@ func (m *approvalSweepMinter) bind(
 		"approval-sweep-%s-%d", m.instance, m.sequence.Add(1)))
 	decision, err := auth.NewDecision(auth.DecisionConfig{
 		Subject: fleet.ApprovalSweeperSubject, Actor: fleet.ApprovalSweeperSubject,
-		ClientID:              approvalSweepClientID,
+		ClientID:              fleet.ApprovalSweeperClientID,
 		AuthorizationDomain:   workspaceAuthorizationDomain,
 		AllowedOperations:     []auth.Operation{auth.OperationApprovalSweep},
 		PermittedSourceIDs:    [][]byte{scope.SourceID},

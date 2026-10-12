@@ -140,6 +140,11 @@ func TestApprovalRecordValidationOfWithdrawalAndStranding(t *testing.T) {
 			enqueued, ApprovalConditionTargetMoved, enqueued.UpdatedAt), false},
 		{"stranded pending on a taken identity", strandedRecord(
 			pending, ApprovalConditionIdentityTaken, inWindow), false},
+		{"stranded after materializing, never decided", func() ApprovalRecord {
+			r := strandedRecord(pending, ApprovalConditionIdentityTaken, inWindow)
+			r.MaterializedAt = pending.RequestedAt.Add(time.Minute)
+			return r
+		}(), false},
 		{"stranded on a rollout-sensitive cause", strandedRecord(
 			approved, ApprovalConditionApproverMappingMoved, approved.DecidedAt), false},
 		{"stranded on a closed window", strandedRecord(
@@ -165,7 +170,7 @@ func TestApprovalRecordValidationOfWithdrawalAndStranding(t *testing.T) {
 func sweeperPublisher(record ApprovalRecord) ApprovalPublisher {
 	return ApprovalPublisher{
 		Operation: auth.OperationApprovalSweep, Subject: ApprovalSweeperSubject,
-		Actor: ApprovalSweeperSubject, ClientID: "host",
+		Actor: ApprovalSweeperSubject, ClientID: ApprovalSweeperClientID,
 		RequestID: "sweep-request", CorrelationID: "sweep-request",
 		AuthorizationFingerprint: auth.Fingerprint{4},
 		AuthorizationExpiresAt:   record.RequestedAt.Add(time.Hour),
@@ -220,6 +225,21 @@ func TestApprovalTransitionBindsTheNewKindsToTheirMakers(t *testing.T) {
 		{"another principal under the sweep operation", stranded, func() ApprovalPublisher {
 			p := sweeperPublisher(stranded)
 			p.Subject, p.Actor = "mallory", "mallory"
+			return p
+		}(), false},
+		{"another subject behind the observer's actor", stranded, func() ApprovalPublisher {
+			p := sweeperPublisher(stranded)
+			p.Subject = "mallory"
+			return p
+		}(), false},
+		{"another actor behind the observer's subject", stranded, func() ApprovalPublisher {
+			p := sweeperPublisher(stranded)
+			p.Actor = "mallory"
+			return p
+		}(), false},
+		{"the sweeper under another client", stranded, func() ApprovalPublisher {
+			p := sweeperPublisher(stranded)
+			p.ClientID = "host"
 			return p
 		}(), false},
 		{"the sweeper on someone's behalf", stranded, func() ApprovalPublisher {
@@ -431,7 +451,7 @@ func TestApprovalSweepActsOnlyAsTheSystemObserver(t *testing.T) {
 		return func(ctx context.Context, scope ApprovalSweepScope) (context.Context, error) {
 			config := auth.DecisionConfig{
 				Subject: ApprovalSweeperSubject, Actor: ApprovalSweeperSubject,
-				ClientID:              "host",
+				ClientID:              ApprovalSweeperClientID,
 				AuthorizationDomain:   []byte("domain"),
 				AllowedOperations:     []auth.Operation{auth.OperationApprovalSweep},
 				PermittedSourceIDs:    [][]byte{scope.SourceID},
@@ -459,6 +479,12 @@ func TestApprovalSweepActsOnlyAsTheSystemObserver(t *testing.T) {
 		{"a party", mint(func(c *auth.DecisionConfig) {
 			c.Subject, c.Actor = "alice", "alice-agent"
 		}), false},
+		{"another subject behind the observer's actor", mint(func(c *auth.DecisionConfig) {
+			c.Subject = "alice"
+		}), false},
+		{"another actor behind the observer's subject", mint(func(c *auth.DecisionConfig) {
+			c.Actor = "alice-agent"
+		}), false},
 		{"the observer holding dispatch too", mint(func(c *auth.DecisionConfig) {
 			c.AllowedOperations = append(c.AllowedOperations, auth.OperationDispatch)
 		}), false},
@@ -470,6 +496,18 @@ func TestApprovalSweepActsOnlyAsTheSystemObserver(t *testing.T) {
 		}), false},
 		{"the observer for another scope", mint(func(c *auth.DecisionConfig) {
 			c.PermittedPolicyIDs = [][]byte{[]byte("other")}
+		}), false},
+		{"the observer for a wider scope", mint(func(c *auth.DecisionConfig) {
+			c.PermittedPolicyIDs = append(c.PermittedPolicyIDs, []byte("other"))
+		}), false},
+		{"the observer for more sources", mint(func(c *auth.DecisionConfig) {
+			c.PermittedSourceIDs = append(c.PermittedSourceIDs, []byte("other"))
+		}), false},
+		{"the observer under another client", mint(func(c *auth.DecisionConfig) {
+			c.ClientID = "host"
+		}), false},
+		{"a long-lived observer decision", mint(func(c *auth.DecisionConfig) {
+			c.AuthenticationExpires = now.Add(24 * time.Hour)
 		}), false},
 		{"a binder that fails", func(context.Context, ApprovalSweepScope) (context.Context, error) {
 			return nil, errors.New("no")

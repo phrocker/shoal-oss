@@ -195,7 +195,7 @@ have lived. The causes, and the evidence each needs:
 | `target_moved` | pending, approved, window open | the agent's registry row, read successfully, names a **higher** generation than the request, or is revoked. The request's own rebuild is pinned to its generation and generations only grow, so it can never be re-requested. A stale read can show only an older generation; a failed or absent read, and a lapsed lease, are not evidence. |
 | `policy_generation_moved` | pending, approved, window open | the generation authority's generation is **greater** than the request's. Greater, not different: a replica still on an older configuration during a rollout sees a newer request ahead of it and must not strand it. |
 | `identity_taken` | enqueued | an action at the identity exists and is not this approval's materialization, so materialize can never write there. |
-| `deadline_passed` | enqueued, no action | now is at least `Deadline + 1h` (`ApprovalStrandGrace`). A re-request's context deadline *is* the action deadline (the request context's deadline is the action's, and a re-request must name the same one), so past it no call that could still write the action is running on a replica whose clock agrees; the hour is the skew allowance #653 already uses. Before then a moved target or policy is left alone, because a re-request already past its checks may still be landing the action. |
+| `deadline_passed` | enqueued, no action | now is at least `Deadline + 1h` (`ApprovalStrandGrace`). A re-request's context deadline *is* the action deadline (the request context's deadline is the action's, and a re-request must name the same one), so past it no call that could still write the action is running on a replica whose clock agrees; the hour is the skew allowance #653 already uses. A write such a call already handed to the coordination runtime is the exception, stated under Residuals: it can land late, and never run. Before then a moved target or policy is left alone, because a re-request already past its checks may still be landing the action. |
 
 A moved approver mapping or identity scheme is **not** a cause: replicas
 legitimately disagree on both during a rollout, and one replica would be
@@ -212,9 +212,11 @@ reaches `expired` or `stranded`.
   `ErrApprovalSuperseded`, which callers already branch on).
 - **Status** (the requester under `dispatch`, or an eligible approver under
   `action_approve`): writes the final state its effective state reports, for
-  the causes above and for a closed window. It is the one party call that
-  reaches a request whose target moved — the requester's re-request is
-  refused by its pinned rebuild first.
+  the causes above and for a closed window. It is the only call by which the
+  requester reaches a request whose target moved — its re-request is refused
+  by its pinned rebuild first. (An approver's eligibility resolves the agent
+  unpinned, so an approver reaches it through Decide and Status too; only a
+  revocation hides it from approvers.)
 - **Withdraw**: a closed window, as above.
 - **Request** writes the closed-window expiry as before, and nothing else: its
   target cannot have moved (the rebuild just resolved it, pinned), and the
@@ -235,14 +237,16 @@ party is involved in a request nobody touches, so the sweep acts as neither
 party:
 
 - It acts as `fleet.ApprovalSweeperSubject` (`shoal-system:approval-sweeper`),
-  subject and actor, under `auth.OperationApprovalSweep` (`approval_sweep`),
+  subject, actor and client (`fleet.ApprovalSweeperClientID`), under `auth.OperationApprovalSweep` (`approval_sweep`),
   in a decision the host mints **for one approval at a time**: that
   operation alone, on exactly the request's source and policy, under the
   policy generation in force, for a minute, with a request and correlation ID
   of its own. The host binds it with its own binder, as the HTTP transport
   binds a request's. The service refuses anything the binder bound that is
-  not exactly that: another identity, another or an extra operation, a
-  delegation chain, or another scope.
+  not exactly that: another identity or client, another or an extra
+  operation, a delegation chain, any source or policy but exactly the
+  request's, or an expiry more than two minutes out. The generation is the
+  audit's generation guard's to check, as for every decision.
 - No authenticator mints `approval_sweep`, no service role allows it, and
   the command denotes it in one place, the minter
   (`approval_sweep_grant_test.go`, `TestNoServiceRoleOrWildcardImpliesApprovalSweep`).
@@ -252,7 +256,9 @@ party:
   `approval_strand`, with the observer's identity) and published through the
   same per-transition outbox, under the observer's own live decision, with
   observer `sweeper`.
-- `-approval-sweep-interval` (default 10m; `0` disables) runs a pass over the
+- `-approval-sweep-interval` (default `0`, disabled, for this release; for
+  example `10m` once every replica runs this build, see "Storage and
+  compatibility") runs a pass over the
   whole approval key space, a page at a time, bounded by the interval. Sweeps
   on several replicas may run at once: every write is a compare-and-set from
   the version read, so one writer wins, and a sweep that loses counts the race
@@ -278,7 +284,8 @@ asked as an approver:
   any other failure answers `404` exactly as a missing ID does, so a narrowed
   caller cannot use the refusal to learn which approval IDs exist.
 - `action_approve` authorized on the request's scope, and the request's target
-  still resolving at the generation it names. Failing either answers as an
+  still resolving (unpinned: a heartbeat moves the generation, and only a
+  revocation or a lost scope makes it stop resolving). Failing either answers as an
   absent record does.
 - No identity in common with the request. The approver's subject and actor
   must not equal any of: the requester's subject, actor or delegation
@@ -858,11 +865,19 @@ be shorter than the heartbeat interval.
   are additive gob fields, so every record a previous build wrote decodes
   unchanged here. The converse does not hold: a previous build's `Validate`
   refuses an unknown state, so it fails to read a withdrawn or stranded
-  record, and a Pending page that contains one fails as a whole. **Roll this
-  build out to every replica before anything withdraws or sweeps**: start
-  the rollout with `-approval-sweep-interval=0`, and enable the sweep once no
-  replica runs an older build. Rolling back past this build is safe only while
-  no record is withdrawn or stranded.
+  record, and a Pending page that contains one fails as a whole. Nor can it
+  read an outbox row the sweep wrote, even for an `expired` record: its
+  `ApprovalTransition.Validate` knows only the requester and approver
+  observers, so that approval's event outbox read fails, and the older
+  replica answers a re-request or a replayed decision on it `503` until it is
+  replaced. Any replica on this build can write the new states — a
+  withdrawal, a Decide or Status that records a stranding — so during a
+  rolling upgrade the older replicas fail those reads until they are
+  replaced. Nothing is lost or wrongly admitted; the older replicas only
+  refuse. The sweep is therefore off by default in this release
+  (`-approval-sweep-interval=0`): enable it once no replica runs an older
+  build. Rolling back past this build is safe only while nothing has been
+  withdrawn, stranded, or recorded by the sweep.
 - `auth.OperationApprovalSweep` (`approval_sweep`) is a new operation. A
   build without it refuses it as unknown; nothing outside the sweeping host
   ever holds it.
@@ -1070,7 +1085,8 @@ tests remain the right tool for service-level properties below the transport.
   the identity of someone's held request. Found before materialization, the
   approval stays `approved` and the re-request conflicts; landing between that
   check and the commit leaves the approval `enqueued` under someone else's
-  action, which Status reports as `unresolvable` / `identity_taken`. A conflict on request also reveals that something exists at
+  action, which Status reports, and records, as `stranded` / `identity_taken`
+  (#655). A conflict on request also reveals that something exists at
   an identity. Both are the existing dispatch identity properties.
 - **An in-scope approver can learn that an approval ID exists.** Without a
   narrowing, a caller that holds `action_approve` on a request's scope but is
@@ -1101,9 +1117,25 @@ tests remain the right tool for service-level properties below the transport.
   policy generation that is moved forward and then back again does not revive
   a request stranded in between: the request was refused by every party while
   the generation differed, and a final state is final. With the sweep
-  disabled (`-approval-sweep-interval=0`), a request nobody touches is
-  recorded only when a party next calls Decide, Status, Withdraw or Request on
-  it, which is #653's original residual.
+  disabled (`-approval-sweep-interval=0`, the default in this release), a
+  request nobody touches is recorded only when a party next touches it:
+  Decide or Status record a stranding or an expiry, Withdraw and Request an
+  expiry only. That is #653's original residual.
+- **A materialization can land after a `deadline_passed` stranding.** The
+  grace bounds every call that can write the action, not a write that call
+  already handed to the coordination runtime: a materialization whose publish
+  was interrupted (indeterminate, a crash) is a durable intent that recovery
+  rolls forward later, with no time check. Its `ActionRecord`, and its
+  `action.enqueued` event, can then appear after `approval.stranded`. It lands
+  past its own deadline, which every claim refuses (Claim, ExecuteClaim), so it
+  never runs. Closing it would need the strand and the materialization to
+  share a guard across the approval and dispatch stores.
+- **Two observers can write one identical record.** An expiry or a stranding
+  carries no writer identity, so two observers reading the same clock (two
+  sweeps, say) can build byte-identical records at one version. The store
+  answers the second as the same transition: one version, one outbox row
+  (the first writer's), one event. But both wrote an audit, which precedes the
+  write, and both count it.
 - **Status writes (#655).** A Status that records an expiry or a stranding
   is a commit, but its route is not commit-bearing in `requestMayCommit`: the
   write is a fact any later call re-derives, and an over-budget Status must not
@@ -1113,10 +1145,6 @@ tests remain the right tool for service-level properties below the transport.
   event once #653's 22h window passes, as any unretried row does.
 - **A withdrawal reason is recorded, not served.** It is on the record and its
   audit, as the request's own reason is, and no route or event returns it.
-- **Sweep counts are per replica.** Concurrent sweeps that read the same clock
-  can each write the identical record; the store answers the second as the
-  same transition, so there is one version, one row and one event, but both
-  passes count it.
 - **Audits record attempts.** Approval audits precede their write, and each
   attempt has its own session, keyed on the acting principal and request ID, so
   a lost compare-and-set or a crash cannot wedge the record. An audit whose
