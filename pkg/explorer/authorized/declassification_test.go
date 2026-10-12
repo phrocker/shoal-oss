@@ -1477,3 +1477,73 @@ func TestDeclassificationClosedLineageSurvivesReopen(t *testing.T) {
 		t.Fatalf("lagging narrowing's lineage reopened closed: %v %v", ok, err)
 	}
 }
+
+// failCloseOnceStore fails the first CloseDeclassificationClaim.
+type failCloseOnceStore struct {
+	authorized.PolicyStore
+	mu     sync.Mutex
+	failed bool
+}
+
+func (s *failCloseOnceStore) CloseDeclassificationClaim(
+	ctx context.Context, uri string, version uint64,
+) error {
+	s.mu.Lock()
+	first := !s.failed
+	s.failed = true
+	s.mu.Unlock()
+	if first {
+		return shoal.NewError(shoal.ErrorUnavailable, "close down")
+	}
+	return s.PolicyStore.CloseDeclassificationClaim(ctx, uri, version)
+}
+
+// TestDeclassificationFailedCloseHealsAndGrantsNothing pins L1 of the
+// seventh review: when the lineage close fails after the narrowed revision is
+// registered, the ingest reports the catalog failure and the lineage stays
+// open. The next ingest on it closes it, and the open lineage cannot be used
+// to narrow the (now narrow) registration further without its own intent.
+func TestDeclassificationFailedCloseHealsAndGrantsNothing(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, inner authorized.PolicyStore) {
+		f := newFixture(t)
+		store := &failCloseOnceStore{PolicyStore: inner}
+		client := f.declassificationClient(t, store, true)
+		const uri = "file:///declassify/failed-close.txt"
+		owner := f.labelIngester(t, "owner", "secret", "x")
+		first, err := client.Ingest(owner, labelledSource(uri, "secret and x", "secret&x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.Ingest(withReason(t, owner, "r"),
+			labelledSource(uri, "x only", "x")); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("narrowing whose close failed = %v, want unavailable", err)
+		}
+		current, ok, err := inner.CurrentRevision(context.Background(), first.Document.ID)
+		if err != nil || !ok || current.RevisionID == first.Revision.ID {
+			t.Fatalf("narrowed revision not registered: %+v %v %v", current, ok, err)
+		}
+		claim, _, err := inner.SourceClaim(context.Background(), uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, open, err := inner.DeclassificationClaimIntent(context.Background(), uri, claim.Version); err != nil || !open {
+			t.Fatalf("lineage after a failed close = %v %v, want still open", open, err)
+		}
+		// Dropping x too narrows the claim, so it needs its own intent and a
+		// reason; the open lineage does not stand in for it.
+		if _, err := client.Ingest(owner, labelledSource(uri, "public", "")); !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+			t.Fatalf("further narrowing on an open lineage without a reason = %v, want invalid argument", err)
+		}
+		// An ordinary ingest heals it.
+		if _, err := client.Ingest(owner, labelledSource(uri, "x, edited", "x")); err != nil {
+			t.Fatal(err)
+		}
+		claim, _, err = inner.SourceClaim(context.Background(), uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, open, err := inner.DeclassificationClaimIntent(context.Background(), uri, claim.Version); err != nil || open {
+			t.Fatalf("lineage after the healing ingest = %v %v, want closed", open, err)
+		}
+	})
+}

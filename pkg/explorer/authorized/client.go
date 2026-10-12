@@ -401,8 +401,15 @@ func (c *Client) Ingest(
 		// claim version any more: end its lineage, so later ingests
 		// inherit nothing and write nothing (#630).
 		if lineage != "" {
+			// The registration is already current, so a caller's
+			// cancellation must not skip the close (as with the claim
+			// cleanup). A close that still fails only leaves the lineage
+			// open: covering needs the registration to be a rule the
+			// narrowing replaced, which it no longer is, and the next
+			// ingest on this lineage closes it.
 			if err := c.policyStore.CloseDeclassificationClaim(
-				ctx, ownedSource.URI, claim.Version); err != nil {
+				context.WithoutCancel(ctx), ownedSource.URI,
+				claim.Version); err != nil {
 				return explorer.IngestResult{}, policyCatalogWriteError(ctx, err)
 			}
 		}
