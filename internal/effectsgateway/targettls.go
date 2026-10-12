@@ -19,10 +19,14 @@ package effectsgateway
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -97,9 +101,30 @@ func (c *ClientCertificate) load() (*tls.Certificate, error) {
 		// they are not repeated here anyway: the message is the flag's.
 		return nil, errors.New("the client certificate and key are not a usable pair")
 	}
-	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
-	if err != nil {
-		return nil, errors.New("the client certificate cannot be parsed")
+	// tls.X509KeyPair parses only the leaf. Every certificate in the chain
+	// is sent at the handshake, and a target refuses one it cannot parse; in
+	// TLS 1.3 that refusal arrives after the request was written, so every
+	// action would be recorded as a possible effect although nothing ran.
+	// So the whole chain must parse, here, at startup and on every reload.
+	var leaf *x509.Certificate
+	for index, der := range certificate.Certificate {
+		parsed, err := x509.ParseCertificate(der)
+		if err != nil {
+			if index == 0 {
+				return nil, errors.New("the client certificate cannot be parsed")
+			}
+			return nil, fmt.Errorf("certificate %d of the client certificate chain cannot be parsed", index+1)
+		}
+		if index == 0 {
+			leaf = parsed
+		}
+	}
+	// A key type crypto/tls cannot sign a CertificateVerify with would fail
+	// every handshake the same way.
+	switch certificate.PrivateKey.(type) {
+	case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
+	default:
+		return nil, errors.New("the client key is not an RSA, ECDSA or Ed25519 key")
 	}
 	if !usableForClientAuth(leaf) {
 		return nil, errors.New("the client certificate's extended key usage does not " +

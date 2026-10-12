@@ -319,6 +319,45 @@ func TestLoadClientCertificateRefusals(t *testing.T) {
 	}
 }
 
+// TestClientCertificateChainMustParse: tls.X509KeyPair parses only the
+// leaf, but the whole chain is sent and a target refuses a block it cannot
+// parse, in TLS 1.3 after the request was written. A leaf followed by a
+// malformed CERTIFICATE block is refused at startup, and on reload the last
+// good pair is kept rather than the broken chain presented.
+func TestClientCertificateChainMustParse(t *testing.T) {
+	pki := newTestPKI(t, "client-ca")
+	dir := t.TempDir()
+	certPEM, keyPEM, _ := pki.issue("gateway-good", x509.ExtKeyUsageClientAuth)
+	garbage := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte{0x30, 0x03, 0x01, 0x02, 0x03}})
+	badCert := writeFile(t, dir, "bad.crt", append(append([]byte{}, certPEM...), garbage...))
+	key := writeFile(t, dir, "tls.key", keyPEM)
+	if _, err := LoadClientCertificate(badCert, key); err == nil {
+		t.Fatal("a chain with a malformed second certificate was accepted at startup")
+	} else if !strings.Contains(err.Error(), "certificate 2") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cert := writeFile(t, dir, "tls.crt", certPEM)
+	certificate, err := LoadClientCertificate(cert, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reports := 0
+	certificate.OnReloadFailure(func() { reports++ })
+	writeFile(t, dir, "tls.crt", append(append([]byte{}, certPEM...), garbage...))
+	presented, err := certificate.GetClientCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(presented.Certificate) != 1 || presented.Leaf.Subject.CommonName != "gateway-good" {
+		t.Fatalf("the reload presented %d certificates (%s), not the last good pair",
+			len(presented.Certificate), presented.Leaf.Subject.CommonName)
+	}
+	if reports != 1 {
+		t.Fatalf("the failed reload was reported %d times", reports)
+	}
+}
+
 func TestLoadRootCAsRefusals(t *testing.T) {
 	pki := newTestPKI(t, "ca")
 	dir := t.TempDir()
