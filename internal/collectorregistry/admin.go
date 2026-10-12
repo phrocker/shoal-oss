@@ -685,7 +685,7 @@ func (r *Registry) readLog(ctx context.Context, id shoal.ID, domain []byte, from
 // generation), entries oldest first, with the gaps and anomalies in that
 // range.
 func (r *Registry) Changes(ctx context.Context, id shoal.ID, from int64, generations int) (ChangeLog, error) {
-	if shoal.ValidateRequiredID("collector ID", id) != nil || from <= 0 || generations <= 0 || generations > MaxChangesGenerations {
+	if shoal.ValidateRequiredID("collector ID", id) != nil || from <= 0 || generations <= 0 || generations > MaxChangesGenerations || from > math.MaxInt64-int64(generations) {
 		return ChangeLog{}, invalid()
 	}
 	_, log, e := r.readLog(ctx, id, nil, func(collector.Registration) int64 { return from }, func(reg collector.Registration) int64 {

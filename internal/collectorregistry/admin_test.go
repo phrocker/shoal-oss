@@ -1104,3 +1104,27 @@ func TestALostAckIsReconciledAfterTheRowMovedOn(t *testing.T) {
 	}
 	v.cleanLog(t, collectorID)
 }
+
+// The frozen version 1 types carry exactly the live types' fields, so a field
+// added to the live types fails here instead of making every audited write
+// refuse its own entry at run time; such a change takes a new version.
+func TestFrozenV1TypesMatchTheLiveTypes(t *testing.T) {
+	for _, pair := range [][2]reflect.Type{
+		{reflect.TypeFor[Change](), reflect.TypeFor[changeV1]()},
+		{reflect.TypeFor[collector.Registration](), reflect.TypeFor[registrationV1]()},
+		{reflect.TypeFor[AdminAttribution](), reflect.TypeFor[attributionV1]()},
+	} {
+		live, frozen := pair[0], pair[1]
+		if live.NumField() != frozen.NumField() {
+			t.Fatalf("%s has %d fields, %s %d: add a new entry version", live, live.NumField(), frozen, frozen.NumField())
+		}
+		for i := range live.NumField() {
+			if live.Field(i).Name != frozen.Field(i).Name {
+				t.Fatalf("%s field %d is %s, %s has %s: add a new entry version", live, i, live.Field(i).Name, frozen, frozen.Field(i).Name)
+			}
+		}
+	}
+	if _, e := (&Registry{}).Changes(context.Background(), collectorID, math.MaxInt64-1, 2); !shoal.IsErrorCode(e, shoal.ErrorInvalidArgument) {
+		t.Fatalf("overflowing range: %v", e)
+	}
+}

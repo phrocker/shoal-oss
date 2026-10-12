@@ -366,7 +366,9 @@ func (r *Registry) updateRegistrationAudited(ctx context.Context, id shoal.ID, c
 			}
 			if applied, checkErr := r.changeApplied(ctx, id, entry); checkErr == nil && applied {
 				return next, true, nil
-			} else if checkErr != nil {
+			} else if checkErr != nil && !(writeErr == nil && status == allocator.StatusRejected) {
+				// A definite rejection did not apply; only an unknown
+				// outcome with an unreadable own cell needs reconciling.
 				return registrationRow{}, false, indeterminate(writeErr, checkErr)
 			}
 		}
