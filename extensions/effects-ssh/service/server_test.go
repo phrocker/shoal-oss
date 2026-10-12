@@ -616,6 +616,7 @@ func TestNewServerRefusals(t *testing.T) {
 		"no attach wait":     func(o *Options) { o.AttachWait = 0 },
 		"auth header as key": func(o *Options) { o.IdempotencyHeader = "authorization" },
 		"bad header":         func(o *Options) { o.IdempotencyHeader = "Idem Key" },
+		"host header":        func(o *Options) { o.IdempotencyHeader = "host" },
 	} {
 		options := base
 		mutate(&options)

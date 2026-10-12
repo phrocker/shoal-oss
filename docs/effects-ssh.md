@@ -153,10 +153,15 @@ past this: deleting it forgets every key it holds.
   does not stop a command already running on the host. If the exec request may
   have been sent and its reply was lost, the outcome is unknown and the command
   is not run again.
-- **`not_run` is claimed only when no session channel was opened**: the
+- **`not_run` is claimed only when no exec request was sent**: the
   connect, handshake, host key or authentication failed, the session open was
   refused, or the key file could not be loaded. The exec request was never
   sent.
+- **A command that leaves a background child holding stdout** keeps the
+  session open until the run timeout, and is recorded `outcome_unknown` even
+  if it exited. Redirect such children's output on the host.
+- **The lock is a file in the journal directory.** Deleting `LOCK` while the
+  server runs lets a second process lock a new one. Do not.
 - **Once per action, not once per intent.** A new action is a new key. An
   agent that enqueues a second action for the same command runs it again.
 

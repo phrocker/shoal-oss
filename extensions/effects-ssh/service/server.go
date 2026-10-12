@@ -102,9 +102,11 @@ func NewServer(opts Options) (*Server, error) {
 		opts.IdempotencyHeader = DefaultIdempotencyHeader
 	}
 	header := textproto.CanonicalMIMEHeaderKey(opts.IdempotencyHeader)
-	if !validHeaderName(opts.IdempotencyHeader) || header == "Authorization" {
+	if !validHeaderName(opts.IdempotencyHeader) || header == "Authorization" || header == "Host" {
+		// net/http moves Host out of the header map, so a key there would
+		// never be read.
 		return nil, errors.New("idempotency header must be a valid header name " +
-			"other than Authorization")
+			"other than Authorization and Host")
 	}
 	if _, err := readCallerToken(opts.CallerTokenFile); err != nil {
 		return nil, err
@@ -183,8 +185,11 @@ func (s *Server) handle(r *http.Request, body []byte, bodyOK bool) (Answer, logL
 		// be false (the command ran under an earlier attempt, and this one
 		// arrives with a rotated credential, a changed header or route), so
 		// a known key is answered outcome_unknown instead, which the gateway
-		// records as a possible effect and never as a rejection. It reveals
-		// only that the key is known, to a caller that already holds it.
+		// records as a possible effect and never as a rejection. To a caller
+		// without the token it reveals whether a key it presents has an
+		// entry, never the result; executor keys are visible on action
+		// records, so that is accepted as the price of never answering a
+		// rejection for a command that ran.
 		if key, known := s.knownKeyIn(r.Header); known {
 			line.Key, line.Answer = KeyDigest(key), StateOutcomeUnknown+":"+reason
 			return OutcomeUnknownAnswer(false), line
