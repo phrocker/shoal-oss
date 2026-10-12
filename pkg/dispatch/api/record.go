@@ -61,10 +61,83 @@ func (r Record) Correlate(ctx Context) Context {
 	return ctx
 }
 
+// recordWire is the projection of an action record the client decodes: the
+// fields a worker's decisions read, and nothing else. A response field outside
+// it — evidence, the evidence snapshot, request_id, an ambiguity report's
+// reporter — is passed over unread (decodeResponse ignores unknown keys and
+// does not descend into them), so a later explorer that reshapes one cannot
+// fail a decode and turn every completion into a resend. error_code_origin is
+// carried raw and read only if it is a string. Action is the full wire type
+// the explorer encodes; DecodeRecord reads one already decoded.
+type recordWire struct {
+	ID               string                  `json:"id"`
+	Version          uint64                  `json:"version"`
+	State            DispatchState           `json:"state"`
+	AgentID          string                  `json:"agent_id"`
+	AgentGeneration  int64                   `json:"agent_generation"`
+	Capability       string                  `json:"capability"`
+	Action           string                  `json:"action"`
+	Input            json.RawMessage         `json:"input,omitempty"`
+	Output           json.RawMessage         `json:"output,omitempty"`
+	ErrorCode        string                  `json:"error_code,omitempty"`
+	ErrorCodeOrigin  json.RawMessage         `json:"error_code_origin,omitempty"`
+	Effected         *Effected               `json:"effected,omitempty"`
+	CorrelationID    string                  `json:"correlation_id,omitempty"`
+	Deadline         time.Time               `json:"deadline"`
+	CreatedAt        time.Time               `json:"created_at"`
+	UpdatedAt        time.Time               `json:"updated_at"`
+	ExecutorKey      string                  `json:"executor_key,omitempty"`
+	ClaimID          string                  `json:"claim_id,omitempty"`
+	ClaimFence       uint64                  `json:"claim_fence,omitempty"`
+	ClaimLeaseUntil  time.Time               `json:"claim_lease_until,omitempty"`
+	EffectPossible   bool                    `json:"effect_possible"`
+	AmbiguityReports []recordedAmbiguityWire `json:"ambiguity_reports,omitempty"`
+}
+
+// recordedAmbiguityWire is the part of a report a worker matches on.
+type recordedAmbiguityWire struct {
+	ClaimFence uint64           `json:"claim_fence"`
+	Outcome    AmbiguityOutcome `json:"outcome"`
+	Target     string           `json:"target,omitempty"`
+	Reference  string           `json:"reference,omitempty"`
+}
+
+// pageWire is the projection of a pull page.
+type pageWire struct {
+	Actions []recordWire `json:"actions"`
+	Next    string       `json:"next,omitempty"`
+}
+
 // DecodeRecord decodes a wire record. Every ID must be unpadded base64url and
 // the action ID must be present; an executor key, when present, must be
 // exactly ExecutorKeyBytes in either spelling ParseExecutorKey accepts.
 func DecodeRecord(w Action) (Record, error) {
+	reports := make([]recordedAmbiguityWire, len(w.AmbiguityReports))
+	for i, report := range w.AmbiguityReports {
+		reports[i] = recordedAmbiguityWire{
+			ClaimFence: report.ClaimFence, Outcome: report.Outcome,
+			Target: report.Target, Reference: report.Reference,
+		}
+	}
+	if len(reports) == 0 {
+		reports = nil
+	}
+	var origin json.RawMessage
+	if w.ErrorCodeOrigin != "" {
+		origin, _ = json.Marshal(w.ErrorCodeOrigin)
+	}
+	return decodeRecord(recordWire{
+		ID: w.ID, Version: w.Version, State: w.State, AgentID: w.AgentID,
+		AgentGeneration: w.AgentGeneration, Capability: w.Capability, Action: w.Action,
+		Input: w.Input, Output: w.Output, ErrorCode: w.ErrorCode, ErrorCodeOrigin: origin,
+		Effected: w.Effected, CorrelationID: w.CorrelationID, Deadline: w.Deadline,
+		CreatedAt: w.CreatedAt, UpdatedAt: w.UpdatedAt, ExecutorKey: w.ExecutorKey,
+		ClaimID: w.ClaimID, ClaimFence: w.ClaimFence, ClaimLeaseUntil: w.ClaimLeaseUntil,
+		EffectPossible: w.EffectPossible, AmbiguityReports: reports,
+	})
+}
+
+func decodeRecord(w recordWire) (Record, error) {
 	id, err := DecodeID(w.ID)
 	if err != nil || len(id) == 0 {
 		return Record{}, errors.New("action ID is not unpadded base64url")
@@ -85,10 +158,14 @@ func DecodeRecord(w Action) (Record, error) {
 		ID: id, Version: w.Version, State: w.State, AgentID: agent,
 		AgentGeneration: w.AgentGeneration, Capability: w.Capability,
 		Action: w.Action, Input: w.Input, Output: w.Output,
-		ErrorCode: w.ErrorCode, ErrorCodeOrigin: w.ErrorCodeOrigin,
-		Deadline: w.Deadline, CreatedAt: w.CreatedAt,
+		ErrorCode: w.ErrorCode, Deadline: w.Deadline, CreatedAt: w.CreatedAt,
 		UpdatedAt: w.UpdatedAt, ClaimID: claimID, ClaimFence: w.ClaimFence,
 		ClaimLeaseUntil: w.ClaimLeaseUntil, EffectPossible: w.EffectPossible,
+	}
+	// Informational only: read when it is a string, ignored otherwise.
+	var origin string
+	if json.Unmarshal(w.ErrorCodeOrigin, &origin) == nil {
+		record.ErrorCodeOrigin = origin
 	}
 	if len(correlation) > 0 {
 		record.CorrelationID = correlation

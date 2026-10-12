@@ -440,3 +440,53 @@ func TestResolveRefusesAnActionCarryingAFieldItDoesNotKnow(t *testing.T) {
 		}
 	}
 }
+
+// TestAFieldNoDecisionReadsCannotFailTheDecode: the client decodes a record
+// into the fields a worker's decisions read, so a later explorer that
+// reshapes any other field — evidence, the evidence snapshot, request_id,
+// error_code_origin, a report's reporter — cannot turn an answer into a
+// protocol error. On /complete that would make every completion resend and
+// end indeterminate. The envelope checks still hold on those fields.
+func TestAFieldNoDecisionReadsCannotFailTheDecode(t *testing.T) {
+	const succeeded = `{"id":"YQ","version":3,"state":"succeeded","agent_id":"","agent_generation":1,` +
+		`"capability":"c","action":"a","output":{"ok":true},"request_id":"cmVx",` +
+		`"deadline":"2026-09-06T12:30:00Z","created_at":"2026-09-06T12:00:00Z",` +
+		`"updated_at":"2026-09-06T12:00:01Z","claim_id":"Y2xhaW0","claim_fence":1,` +
+		`"effect_possible":true`
+	completion := Completion{Context: testContext(), ExpectedVersion: 2, ClaimID: []byte("claim"),
+		ClaimFence: 1, Output: []byte(`{"ok":true}`)}
+	for name, extra := range map[string]string{
+		"evidence of the wrong type":    `,"evidence":"x"`,
+		"evidence of the wrong shape":   `,"evidence":[{"anchor_id":5,"kind":[],"citation":"c"}]`,
+		"an empty snapshot time":        `,"evidence_snapshot_as_of":""`,
+		"a snapshot ID of another type": `,"evidence_snapshot_id":{"v":1}`,
+		"a request ID of another type":  `,"request_id":7`,
+		"an origin of another type":     `,"error_code_origin":{"by":"service"}`,
+		"a report's reporter reshaped": `,"ambiguity_reports":[{"claim_fence":1,"outcome":"outcome_unknown",` +
+			`"subject":1,"actor":[],"reported_at":"yesterday"}]`,
+	} {
+		body := strings.Replace(succeeded, `,"request_id":"cmVx"`, "", 1) + extra + `}`
+		if !strings.Contains(extra, "request_id") {
+			body = succeeded + extra + `}`
+		}
+		client, transport := testClient(t, respond(200, body), respond(200, body), respond(200, body))
+		record, err := client.Complete(context.Background(), []byte("a"), completion)
+		if err != nil || record.State != DispatchSucceeded || len(transport.requests) != 1 {
+			t.Errorf("%s: %v after %d requests, want the record from one", name, err, len(transport.requests))
+		}
+	}
+	// A key the decisions do not read is still held to the envelope rules.
+	client, _ := testClient(t, respond(200, succeeded+`,"evidence":[],"evidence":[]}`),
+		respond(200, succeeded+`}`))
+	if _, err := client.Complete(context.Background(), []byte("a"), completion); err != nil {
+		t.Fatalf("the resend did not settle a duplicated key: %v", err)
+	}
+	if err := decodeResponse([]byte(succeeded+`,"evidence":[],"evidence":[]}`), &recordWire{}); err == nil {
+		t.Fatal("a duplicated evidence key was accepted")
+	}
+	// The full wire type still decodes typed evidence for a caller that wants it.
+	var full Action
+	if err := decodeResponse([]byte(succeeded+`,"evidence":"x"}`), &full); err == nil {
+		t.Fatal("the full Action type accepted evidence of the wrong type")
+	}
+}

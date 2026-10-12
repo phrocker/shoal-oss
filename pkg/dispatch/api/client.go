@@ -294,7 +294,7 @@ func (c *Client) Pull(ctx context.Context, request Context, after string, limit 
 	if err != nil {
 		return PullResult{}, err
 	}
-	var page Page
+	var page pageWire
 	header, receivedAt, err := c.post(ctx, op, PullRoute, correlation,
 		PullRequest{Context: contextValue, After: after, Limit: limit}, &page)
 	if err != nil {
@@ -305,7 +305,7 @@ func (c *Client) Pull(ctx context.Context, request Context, after string, limit 
 		Date: header.Get("Date"), ReceivedAt: receivedAt,
 	}
 	for _, wire := range page.Actions {
-		record, err := DecodeRecord(wire)
+		record, err := decodeRecord(wire)
 		if err != nil {
 			return PullResult{}, protocolError(op, err.Error())
 		}
@@ -365,7 +365,7 @@ func (c *Client) Claim(ctx context.Context, actionID []byte, request Claim) (Rec
 		Context: contextValue, ExpectedVersion: request.ExpectedVersion,
 		ClaimID: EncodeID(request.ClaimID), Lease: request.Lease,
 	}
-	var response Action
+	var response recordWire
 	if _, _, err := c.post(ctx, op, ActionRoute(actionID, VerbClaim), correlation, body, &response); err != nil {
 		if answerLost(err) {
 			var dispatchErr *Error
@@ -375,7 +375,7 @@ func (c *Client) Claim(ctx context.Context, actionID []byte, request Claim) (Rec
 		}
 		return Record{}, err
 	}
-	record, err := DecodeRecord(response)
+	record, err := decodeRecord(response)
 	if err != nil {
 		return Record{}, protocolError(op, err.Error())
 	}
@@ -444,11 +444,11 @@ func (c *Client) Extend(ctx context.Context, actionID []byte, request Extension)
 	}
 	path := ActionRoute(actionID, VerbExtend)
 	attempt := func() (Record, error) {
-		var response Action
+		var response recordWire
 		if _, _, err := c.post(ctx, op, path, correlation, body, &response); err != nil {
 			return Record{}, err
 		}
-		record, err := DecodeRecord(response)
+		record, err := decodeRecord(response)
 		if err != nil {
 			return Record{}, protocolError(op, err.Error())
 		}
@@ -593,11 +593,11 @@ func (c *Client) Complete(ctx context.Context, actionID []byte, completion Compl
 	// that does not decode or does not describe it is KindProtocol, and only a
 	// 2xx produces that kind here.
 	attempt := func() (Record, error) {
-		var response Action
+		var response recordWire
 		if _, _, err := c.post(ctx, op, path, correlation, body, &response); err != nil {
 			return Record{}, err
 		}
-		record, err := DecodeRecord(response)
+		record, err := decodeRecord(response)
 		if err != nil {
 			return Record{}, protocolError(op, err.Error())
 		}
@@ -761,11 +761,11 @@ func (c *Client) ReportAmbiguity(ctx context.Context, actionID []byte, report Am
 	}
 	path := ActionRoute(actionID, VerbAmbiguity)
 	attempt := func() (Record, error) {
-		var response Action
+		var response recordWire
 		if _, _, err := c.post(ctx, op, path, correlation, body, &response); err != nil {
 			return Record{}, err
 		}
-		record, err := DecodeRecord(response)
+		record, err := decodeRecord(response)
 		if err != nil {
 			return Record{}, protocolError(op, err.Error())
 		}
@@ -846,12 +846,12 @@ func (c *Client) Status(ctx context.Context, actionID []byte, request Context) (
 	if err != nil {
 		return Record{}, err
 	}
-	var response Action
+	var response recordWire
 	if _, _, err := c.post(ctx, op, ActionRoute(actionID, VerbStatus), correlation,
 		contextValue, &response); err != nil {
 		return Record{}, err
 	}
-	record, err := DecodeRecord(response)
+	record, err := decodeRecord(response)
 	if err != nil {
 		return Record{}, protocolError(op, err.Error())
 	}
