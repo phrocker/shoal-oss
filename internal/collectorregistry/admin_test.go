@@ -291,6 +291,11 @@ func TestAdminRevokeQuarantinesAtReadTimeAndCannotBeUndoneByRetry(t *testing.T) 
 	if again, e := v.registry.AdminRevoke(admin, collectorID, 1); e != nil || again.Changed || again.Registration.Generation != 2 {
 		t.Fatalf("revoke retry %+v %v", again, e)
 	}
+	for _, generation := range []int64{2, 3} {
+		if _, e := v.registry.AdminRevoke(admin, collectorID, generation); !shoal.IsErrorCode(e, shoal.ErrorConflict) {
+			t.Fatalf("revoke generation %d of a registration revoked at 1: %v", generation, e)
+		}
+	}
 	// A retried provisioning from before the revocation cannot undo it.
 	if _, e := v.registry.AdminProvision(admin, p, 1); !shoal.IsErrorCode(e, shoal.ErrorConflict) {
 		t.Fatalf("stale provision retry: %v", e)
@@ -421,6 +426,14 @@ func TestCorruptChangeLogFailsClosed(t *testing.T) {
 	}
 	if _, e := v.registry.Changes(context.Background(), collectorID, 0, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
 		t.Fatalf("altered entry: %v", e)
+	}
+	// An entry is written once: a second version, even with the original's
+	// exact bytes, is not an entry this registry wrote.
+	if _, e := v.registry.config.Backend.CompareAndMutate(context.Background(), allocator.Mutation{Row: coord.Row, Conditions: []allocator.Condition{{Coordinate: coord, Timestamp: 2, TimestampSet: true, Value: bytes.Replace(cell.Value, []byte(`"admin"`), []byte(`"other"`), 1)}}, Updates: []allocator.Update{{Coordinate: coord, Timestamp: 3, Value: cell.Value}}}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, 1); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("rewritten entry: %v", e)
 	}
 	// And a further change cannot be appended over a corrupt head.
 	head := v.registry.changeHeadCoordinate(collectorID)

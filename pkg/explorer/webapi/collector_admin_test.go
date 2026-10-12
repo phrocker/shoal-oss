@@ -237,6 +237,24 @@ func TestCollectorAdminRejectsMalformedRequests(t *testing.T) {
 	if _, e := f.registry.Registration(context.Background(), "collector:new"); !shoal.IsErrorCode(e, shoal.ErrorNotFound) {
 		t.Fatalf("a rejected body wrote: %v", e)
 	}
+	// Unknown admin paths and methods.
+	for _, r := range []*http.Request{
+		collectorRequest(t, http.MethodPost, collectorapi.AdminRoute+"/enroll", collectorapi.RevokeRequest{CollectorID: "Yw", Generation: 1}),
+		collectorRequest(t, http.MethodGet, collectorapi.AdminRegistrationsRoute, nil),
+		collectorRequest(t, http.MethodGet, collectorapi.AdminProvisionRoute, nil),
+		collectorRequest(t, http.MethodPost, collectorapi.AdminRegistrationsRoute+"/Yw", collectorapi.RevokeRequest{CollectorID: "Yw", Generation: 1}),
+	} {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r.WithContext(ctx))
+		if w.Code != http.StatusNotFound || w.Header().Get(CommitOutcomeHeader) != "" {
+			t.Fatalf("%s %s: %d %s", r.Method, r.URL.Path, w.Code, w.Body.String())
+		}
+	}
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, collectorRequest(t, http.MethodPut, collectorapi.AdminProvisionRoute, nil).WithContext(ctx))
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT: %d", w.Code)
+	}
 }
 
 // Without MountCollectorAdmin the admin paths answer exactly as any unknown
