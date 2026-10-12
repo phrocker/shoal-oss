@@ -159,7 +159,6 @@ func TestSDKDispatchWorksAnActionThroughTheRealComposition(t *testing.T) {
 	if dispatchapi.Kind(err) != dispatchapi.KindFenceLost {
 		t.Fatalf("extend after completion = %v, want fence_lost", err)
 	}
-
 }
 
 // TestSDKDispatchResolvesTheExecutorsDescriptor: the executor's own

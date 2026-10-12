@@ -307,7 +307,7 @@ func TestStatusAndResolve(t *testing.T) {
 		respond(200, testRecord),
 		respond(200, `{"id":"YWdlbnQ","generation":7,"executor_ref":"gateway","subject":"cw",`+
 			`"capabilities":[{"name":"c","actions":[{"name":"a","input_schema":{},"output_schema":{},`+
-			`"effect":"external","later":1},{"name":"b","input_schema":{},"output_schema":{},`+
+			`"effect":"external"},{"name":"b","input_schema":{},"output_schema":{},`+
 			`"effects":["reads-corpus"],"effect":""}]}]}`),
 		respond(200, `{"id":"YWdlbnQ","capabilities":[{"name":"c","actions":[`+
 			`{"name":"a","effects":["reads-corpus"],"effect":"external"}]}]}`),
@@ -406,5 +406,37 @@ func TestTheTypesReencodeEveryPinnedServerBody(t *testing.T) {
 	}
 	if checked < 200 {
 		t.Fatalf("only %d pinned bodies checked; the fixtures are not where this test looks", checked)
+	}
+}
+
+// TestResolveRefusesAnActionCarryingAFieldItDoesNotKnow: new gates on an
+// action arrive as new fields, so an action field this client cannot read is
+// a gate it cannot honour, and the descriptor is refused rather than served
+// without it. Unknown fields elsewhere in the descriptor are still ignored.
+func TestResolveRefusesAnActionCarryingAFieldItDoesNotKnow(t *testing.T) {
+	descriptor := func(action, top string) string {
+		return `{"id":"YWdlbnQ","generation":1,"executor_ref":"gateway"` + top +
+			`,"capabilities":[{"name":"c","later":true,"actions":[` + action + `]}]}`
+	}
+	const known = `{"name":"a","input_schema":{},"output_schema":{},"effects":["external"]`
+	for name, row := range map[string]struct {
+		body string
+		ok   bool
+	}{
+		"known fields":            {descriptor(known+`}`, ""), true},
+		"unknown top-level field": {descriptor(known+`}`, `,"subject":"cw"`), true},
+		"unknown action field":    {descriptor(known+`,"requires_new_gate":true}`, ""), false},
+		"unknown null field":      {descriptor(known+`,"requires_new_gate":null}`, ""), false},
+	} {
+		client, _ := testClient(t, respond(201, row.body))
+		_, err := client.Resolve(context.Background(), []byte("agent"), testContext())
+		var dispatchErr *Error
+		switch {
+		case row.ok && err != nil:
+			t.Errorf("%s: %v", name, err)
+		case !row.ok && (!errors.As(err, &dispatchErr) || dispatchErr.Kind != KindProtocol ||
+			dispatchErr.Status != 201):
+			t.Errorf("%s: %v, want a protocol error carrying the answer's status", name, err)
+		}
 	}
 }

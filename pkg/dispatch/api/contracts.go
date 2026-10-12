@@ -22,12 +22,13 @@
 //     deadline that is not in UTC, so the client converts it; response times
 //     are in whatever zone the explorer recorded them.
 //
-// This package imports only the standard library, pkg/shoal and
-// pkg/executorref, so an extension may depend on it (internal/importboundary
-// enforces that).
+// This package imports only the standard library and pkg/shoal (the import
+// boundary also admits pkg/executorref), so an extension may depend on it
+// (internal/importboundary enforces that).
 package api
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -351,9 +352,15 @@ type Capability struct {
 }
 
 // DescriptorAction is one declared action. LegacyEffect is the superseded
-// scalar spelling the explorer still emits beside Effects; Resolve folds it
+// scalar spelling the explorer still emits beside Effects; decoding folds it
 // into Effects when only it is present and refuses the two when they
 // disagree, as the explorer does.
+//
+// It is the one response object that refuses fields it does not know. New
+// gates on an action arrive as new fields (requires_approval and
+// requires_attestation did), and a worker that cannot see a gate must refuse
+// the descriptor rather than serve the action without it: the explorer's own
+// decoder for this object refuses unknown fields too.
 type DescriptorAction struct {
 	Name                string          `json:"name"`
 	InputSchema         json.RawMessage `json:"input_schema"`
@@ -362,6 +369,24 @@ type DescriptorAction struct {
 	LegacyEffect        *Effect         `json:"effect,omitempty"`
 	RequiresApproval    bool            `json:"requires_approval,omitempty"`
 	RequiresAttestation bool            `json:"requires_attestation,omitempty"`
+}
+
+// UnmarshalJSON decodes an action strictly: unknown fields are refused, and
+// the two effect spellings are reconciled.
+func (a *DescriptorAction) UnmarshalJSON(data []byte) error {
+	type fields DescriptorAction
+	var decoded fields
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	action := DescriptorAction(decoded)
+	if err := action.normalizeEffects(); err != nil {
+		return err
+	}
+	*a = action
+	return nil
 }
 
 // normalizeEffects applies the explorer's reading of the two spellings.

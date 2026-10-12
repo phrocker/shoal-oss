@@ -503,3 +503,17 @@ func TestPresentAttestationRereadsItsFiles(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+// TestResolveRefusesAGateItCannotSee: an action field the gateway does not
+// know may be a gate (requires_approval and requires_attestation arrived that
+// way), so the descriptor is refused and the gateway does not start.
+func TestResolveRefusesAGateItCannotSee(t *testing.T) {
+	client, _ := opsClient(t, reply(200, `{"id":"YWdlbnQ","generation":1,"executor_ref":"gateway",`+
+		`"capabilities":[{"name":"effects.gateway","actions":[{"name":"charge","input_schema":{},`+
+		`"output_schema":{},"effects":["external"],"requires_new_gate":true}]}]}`))
+	request := opsContext()
+	request.CorrelationID = nil
+	if _, err := client.Resolve(context.Background(), []byte("agent"), request); DispatchKind(err) != DispatchProtocol {
+		t.Fatalf("resolve with an unknown gate = %v, want protocol", err)
+	}
+}

@@ -862,7 +862,9 @@ func (c *Client) Status(ctx context.Context, actionID []byte, request Context) (
 }
 
 // Resolve reads one descriptor. A correlation in request is optional here and
-// is not sent as a header. A descriptor naming another ID is a protocol
+// is not sent as a header. A descriptor naming another ID, an action carrying
+// a field this client does not know (it may be a gate this client cannot
+// honour), or an action whose two effect spellings disagree is a protocol
 // error; which executor ref the descriptor may name is the caller's to check.
 func (c *Client) Resolve(ctx context.Context, agentID []byte, request Context) (Descriptor, error) {
 	const op = "resolve"
@@ -877,14 +879,6 @@ func (c *Client) Resolve(ctx context.Context, agentID []byte, request Context) (
 	if _, _, err := c.post(ctx, op, ResolveRoute(agentID), "", contextValue, &response); err != nil {
 		return Descriptor{}, err
 	}
-	for i := range response.Capabilities {
-		for j := range response.Capabilities[i].Actions {
-			if err := response.Capabilities[i].Actions[j].normalizeEffects(); err != nil {
-				return Descriptor{}, &Error{Op: op, Kind: KindProtocol, Status: http.StatusOK,
-					Reason: "response is not the expected JSON"}
-			}
-		}
-	}
 	id, err := DecodeID(response.ID)
 	if err != nil || !bytes.Equal(id, agentID) {
 		return Descriptor{}, protocolError(op, "resolve response names a different descriptor")
@@ -897,9 +891,6 @@ func (c *Client) Resolve(ctx context.Context, agentID []byte, request Context) (
 func (c *Client) post(
 	ctx context.Context, op, path, correlation string, body, out any,
 ) (http.Header, time.Time, error) {
-	if c == nil {
-		return nil, time.Time{}, refused(op, "nil dispatch client")
-	}
 	token, err := c.token(ctx)
 	if err != nil {
 		// The token source's error may name a file path or a variable; it is
