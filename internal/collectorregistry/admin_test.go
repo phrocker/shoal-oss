@@ -1587,4 +1587,47 @@ func TestChangesReadsUpToTheLargestSequence(t *testing.T) {
 	if view, e := v.registry.AdminRegistration(v.admin(t), collectorID); e != nil || len(view.Changes) != 2 {
 		t.Fatalf("view %+v %v", view, e)
 	}
+	// Nothing follows the largest sequence, so the next revocation goes to
+	// overflow; neither read may then present the log without it.
+	if _, e := v.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatalf("revoke into overflow: %v", e)
+	}
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("Changes with an overflow entry: %v", e)
+	}
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("read with an overflow entry: %v", e)
+	}
+}
+
+// An entry anywhere above the head (where the store can scan) is a change
+// the head does not describe: reads fail closed, a provisioning fails
+// closed, and a revocation recovers above it so the log reads again.
+func TestEntriesFarAboveTheHeadAreDamage(t *testing.T) {
+	v := provisionedEnv(t)
+	put(t, v, v.registry.changeEntryCoordinate(collectorID, 1000), 1, []byte("stray"))
+	if _, e := v.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("Changes: %v", e)
+	}
+	if _, e := v.registry.AdminRegistration(v.admin(t), collectorID); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("read: %v", e)
+	}
+	if _, e := v.registry.Provision(context.Background(), grant(collectorID, "tail", "authority:logs", "authority:more")); e == nil {
+		t.Fatal("conflicting provision accepted")
+	}
+	revokeRecovers(t, v, v.registry, 1001, RecoveryOccupiedSequence)
+
+	// An exhausted head with a stray above the next sequence: the
+	// recovery entry lands above the stray with no head, and Changes does
+	// not present the log without it.
+	w := provisionedEnv(t)
+	put(t, w, w.registry.changeEntryCoordinate(collectorID, 5), 1, []byte("stray"))
+	head, _ := encode(changeHead{CollectorID: collectorID, Sequence: 1})
+	put(t, w, w.registry.changeHeadCoordinate(collectorID), math.MaxInt64, head)
+	if _, e := w.registry.Revoke(context.Background(), collectorID); e != nil {
+		t.Fatalf("revoke: %v", e)
+	}
+	if _, e := w.registry.Changes(context.Background(), collectorID, 0, MaxChangesPage); !shoal.IsErrorCode(e, shoal.ErrorUnavailable) {
+		t.Fatalf("Changes over an exhausted head with a recorded revocation: %v", e)
+	}
 }

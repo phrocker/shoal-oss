@@ -314,8 +314,14 @@ Otherwise (a marker at or above the largest usable timestamp) the call reports
 `indeterminate` rather than a clean change. Entries are immutable in content,
 but a repaired one sits at a later timestamp.
 
-Both reads fail closed (`503`) when the log holds an entry right after the
-head's sequence, that is, a change recorded with no head. Entry and head are
+Both reads fail closed (`503`) when the log holds a change its head does not
+describe:
+- where the store can scan, any entry above the head's sequence or any
+  overflow entry;
+- otherwise, the entry right after the head's sequence.
+
+Writes treat the same states as damage. A provisioning fails closed, and a
+revocation recovers above them, so the log reads again. Entry and head are
 written in one mutation, but the reader's probe of the next entry is a
 separate read. So an entry that appears because a concurrent write committed
 in between is told apart by re-reading the head: the read retries, and only

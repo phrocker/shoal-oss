@@ -336,17 +336,14 @@ func (r *Registry) headStill(ctx context.Context, id shoal.ID, was headState) er
 // An absent head over stored entries hides history and fails closed the
 // same way, with the same re-read: a first logged change that commits
 // between the head read and the probe is concurrency, not damage.
+//
+// Where the store can scan, any entry above the head's sequence (not only
+// the next one) and any overflow entry are such changes too: an
+// exhausted_head recovery lands above the highest stored entry, and an
+// overflow entry has no sequence at all. A store without row scans is
+// limited to the probe of the next sequence.
 func (r *Registry) logBeyondHead(ctx context.Context, id shoal.ID, state headState) error {
-	var beyond bool
-	var e error
-	if state.present {
-		if state.head.Sequence == math.MaxInt64 {
-			return nil // nothing can follow the largest sequence
-		}
-		beyond, e = r.entryPresent(ctx, id, state.head.Sequence+1)
-	} else {
-		beyond, e = r.anyEntry(ctx, id)
-	}
+	beyond, e := r.entriesBeyond(ctx, id, state)
 	if e != nil {
 		return e
 	}
@@ -359,14 +356,36 @@ func (r *Registry) logBeyondHead(ctx context.Context, id shoal.ID, state headSta
 	return ErrUnavailable
 }
 
-// anyEntry reports whether the log has any entry, scanning where the store
-// can and checking the first sequence otherwise.
-func (r *Registry) anyEntry(ctx context.Context, id shoal.ID) (bool, error) {
-	highest, ok, e := r.highestEntry(ctx, id)
-	if e != nil || ok {
-		return highest > 0, e
+// entriesBeyond reports whether the log stores anything the head does not
+// describe: see logBeyondHead.
+func (r *Registry) entriesBeyond(ctx context.Context, id shoal.ID, state headState) (bool, error) {
+	highest, scanned, e := r.highestEntry(ctx, id)
+	if e != nil {
+		return false, e
 	}
-	return r.entryPresent(ctx, id, 1)
+	if scanned {
+		if highest > state.head.Sequence {
+			return true, nil
+		}
+		return r.anyOverflow(ctx, id)
+	}
+	if !state.present {
+		return r.entryPresent(ctx, id, 1)
+	}
+	if state.head.Sequence == math.MaxInt64 {
+		return false, nil
+	}
+	return r.entryPresent(ctx, id, state.head.Sequence+1)
+}
+
+// anyOverflow reports whether any overflow entry is stored. The store can
+// scan rows when this is called.
+func (r *Registry) anyOverflow(ctx context.Context, id shoal.ID) (bool, error) {
+	cells, e := r.config.Backend.(rowScanner).ScanRowPrefix(ctx, r.registrationCoordinate(id).Row, []byte(changeFamily), []byte(overflowPrefix), bytes.Clone(r.config.Visibility), 1)
+	if e != nil {
+		return false, ErrUnavailable
+	}
+	return len(cells) != 0 && strings.HasPrefix(string(cells[0].Coordinate.Qualifier), overflowPrefix), nil
 }
 
 type auditWrite struct {
@@ -426,15 +445,15 @@ func (r *Registry) prepareChange(ctx context.Context, id shoal.ID, next registra
 	case head.head.Sequence == math.MaxInt64:
 		reason = RecoveryOccupiedSequence
 	default:
-		occupied, e := r.entryPresent(ctx, id, head.head.Sequence+1)
+		// Anything stored that the head does not describe (the next
+		// sequence, any higher entry or an overflow entry where the store
+		// can scan, or entries under an absent head) is the damage the
+		// readers fail closed on, so a write treats it the same way: a
+		// provisioning fails closed and a revocation recovers above it,
+		// leaving the log readable again.
+		occupied, e := r.entriesBeyond(ctx, id, head)
 		if e != nil {
 			return auditWrite{}, e
-		}
-		if !occupied && !head.present {
-			// An absent head over existing entries hides history.
-			if occupied, e = r.anyEntry(ctx, id); e != nil {
-				return auditWrite{}, e
-			}
 		}
 		if occupied {
 			// A concurrent write may have committed between the head read
