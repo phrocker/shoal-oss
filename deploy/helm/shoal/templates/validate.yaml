@@ -1670,7 +1670,13 @@
 {{- end -}}
 {{- $_ := set $sshClaims $plan.claim $ssh._index -}}
 {{- range $gateway := fromJsonArray (include "shoal.effectsGateways" $) -}}
-{{- if and $gateway.enabled (eq (toString $gateway.unrecorded.storage) "existingClaim") (eq (toString $gateway.unrecorded.existingClaim) $plan.claim) -}}
+{{- $unrecordedClaim := "" -}}
+{{- if eq (toString $gateway.unrecorded.storage) "existingClaim" -}}
+{{- $unrecordedClaim = toString $gateway.unrecorded.existingClaim -}}
+{{- else if eq (toString $gateway.unrecorded.storage) "persistentVolumeClaim" -}}
+{{- $unrecordedClaim = printf "%s-unrecorded" (include "shoal.effectsGatewayName" (dict "root" $ "gateway" $gateway)) -}}
+{{- end -}}
+{{- if and $gateway.enabled (eq $unrecordedClaim $plan.claim) -}}
 {{- fail (printf "%s's journal claim %q is effectsGateways[%v]'s unrecorded log claim: the journal needs a volume of its own (docs/effects-ssh.md)" $key $plan.claim $gateway._index) -}}
 {{- end -}}
 {{- end -}}
@@ -1679,9 +1685,9 @@
        entry whose Deployment is running is values that lost the ID (an
        upgrade without the values file, say): the Deployment would be
        deleted and the journal-init Job run against the journal it was
-       serving. init refuses an existing journal, but by then the service
+       serving. init only prints an existing journal's identity, but by then the service
        is gone. So it is refused before anything changes. Set replicas: 0
-       and upgrade first if the journal is really to be replaced.
+       and upgrade first if the entry is really to stop.
 
        lookup asks the API server; under `helm template`, `helm lint` and a
        client dry run it returns nothing, so this is silent there, as the
@@ -1691,7 +1697,7 @@
 {{- if $live -}}
 {{- $running := or (gt (int64 (default 0 (dig "spec" "replicas" 0 $live))) 0) (gt (int64 (default 0 (dig "status" "replicas" 0 $live))) 0) -}}
 {{- if $running -}}
-{{- fail (printf "%s.journal.id is empty, and the effects-ssh Deployment %s is running with a pinned journal: this would delete it and run journal init against its claim. Restore journal.id (kubectl get deployment %s -o jsonpath='{.spec.template.spec.containers[0].args}' shows it), or set replicas: 0 and upgrade first if the journal is really to be replaced" $key $plan.name $plan.name) -}}
+{{- fail (printf "%s.journal.id is empty, and the effects-ssh Deployment %s is running with a pinned journal: this would delete it and stop the service the gateway sends its keys to. Restore journal.id (kubectl get deployment %s -o jsonpath='{.spec.template.spec.containers[0].args}' shows it), or set replicas: 0 and upgrade first if the entry is really to stop" $key $plan.name $plan.name) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -442,12 +443,37 @@ func journalInit(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("shoal-effects-ssh journal init", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	dir := flags.String("journal-dir", "", "Existing, empty directory on the journal's volume (required)")
+	printExisting := flags.Bool("print-existing", false,
+		"When the directory already holds a journal with a complete, valid header, print "+
+			"its identity and exit 0 instead of refusing. Nothing is written either way: an "+
+			"existing journal is never replaced. For the chart's init Job, so a rerun shows the "+
+			"identity to pin rather than failing")
 	if err := flags.Parse(args); err != nil {
 		return exitUsage
 	}
 	if *dir == "" || flags.NArg() != 0 {
 		fmt.Fprintln(stderr, "-journal-dir is required")
 		return exitUsage
+	}
+	if *printExisting {
+		if _, err := os.Lstat(filepath.Join(*dir, service.JournalFileName)); err == nil {
+			// The whole file is checked by the server's rules: a corrupt or
+			// headerless journal is an error here too, never a fresh start.
+			records, _, err := service.ReadJournal(*dir)
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return exitRuntime
+			}
+			for _, record := range records {
+				if record.JournalID != "" {
+					fmt.Fprintln(stderr, "the journal already exists; its identity is printed, and nothing was written")
+					fmt.Fprintln(stdout, record.JournalID)
+					return exitOK
+				}
+			}
+			fmt.Fprintln(stderr, "the journal has no header")
+			return exitRuntime
+		}
 	}
 	id, err := service.InitJournal(*dir, nil)
 	if err != nil {

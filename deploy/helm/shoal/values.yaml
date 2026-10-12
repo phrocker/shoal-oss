@@ -933,7 +933,7 @@ effectsGatewayDefaults:
 #   1. Install with journal.id empty. The chart renders the claim and a
 #      one-off Job that runs `journal init` on it, and no Deployment. Read the
 #      identity the Job printed:
-#        kubectl logs job/<release stem>-ssh-<name>-journal-init
+#        kubectl logs job/<the Job NOTES names>   (<stem>-ssh-<name>-init-<digest>)
 #   2. Set journal.id to it and upgrade. The Job is no longer rendered; the
 #      Deployment serves with -journal-id pinned. A volume that is lost, empty
 #      or replaced is then refused at startup, and nothing re-initializes it.
@@ -1027,7 +1027,10 @@ effectsSshDefaults:
     # There is no emptyDir: a journal that dies with the pod forgets every
     # key, and a command whose outcome was unknown would run again.
     storage: persistentVolumeClaim
-    size: 1Gi
+    # At least (3 × maxEntries + 1024) × the per-key record bound: the
+    # journal at its declared bound plus a compaction's copy (about 1.4 GB at
+    # the defaults). The chart refuses less.
+    size: 2Gi
     storageClassName: ""
     existingClaim: ""
     # -journal-retention. Empty: the gateway's target.idempotencyRetention +
@@ -1060,3 +1063,8 @@ effectsSshDefaults:
   # name. On by default: this pod holds SSH keys.
   networkPolicy:
     enabled: true
+    # The cluster's DNS pods, reached only when a command's address is a host
+    # name; both selectors are required then.
+    dns:
+      namespaceLabels: {kubernetes.io/metadata.name: kube-system}
+      podLabels: {k8s-app: kube-dns}

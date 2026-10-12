@@ -471,7 +471,9 @@ replica.
 `journal init` writes the first line, a header with a random identity and
 the creation time, fsyncs it and its directory entry, and prints the
 identity; it refuses a directory that already holds a journal file, even an
-empty one. Put the identity in the deployment as `-journal-id`. Then a
+empty one. With `-print-existing`, a directory holding a journal with a valid
+header prints that journal's identity and exits 0 instead, writing nothing; a
+headerless or corrupt one is still an error. Put the identity in the deployment as `-journal-id`. Then a
 volume that fails to mount, leaving the image's empty directory, refuses the
 start instead of serving a fresh journal that has forgotten every key, which
 would re-run a command whose outcome was unknown. A different journal (another
@@ -488,7 +490,10 @@ writes its own policy; the chart's `effectsSsh` entry renders the separate
 shape with a policy of its own.
 
 **Separate Deployment.** Serve TLS (`-tls-cert-file`, `-tls-key-file`) and
-point the gateway at `https://effects-ssh.<namespace>.svc:8443`. Give the
+point the gateway at the Service, for example
+`https://effects-ssh.<namespace>.svc:8443` (the chart's is
+`https://<release stem>-ssh-<name>.<namespace>.svc:<port>`), with
+`-target-allow-private`, since a ClusterIP is a private address. Give the
 gateway the CA that issued the serving certificate with `-target-ca-file`,
 which replaces the system roots for the target only. For mTLS, give the
 gateway `-target-client-cert-file` and `-target-client-key-file`, and this
@@ -527,28 +532,47 @@ Deployment.
 itself.**
 
 1. Install with `journal.id` empty. The chart renders the claim and a one-off
-   Job that runs `journal init` on it (a `post-install,post-upgrade` hook,
-   `backoffLimit: 0`, denied all network), and **no Deployment**. Read the
-   identity it printed: `kubectl logs job/<release stem>-ssh-<name>-init`.
+   Job, `<release stem>-ssh-<name>-init-<digest>`, that runs
+   `journal init -print-existing` on it (`backoffLimit: 0`, denied all
+   network), and **no Deployment**. Read the identity it printed with
+   `kubectl logs job/<the Job's name>`; NOTES prints the exact command.
 2. Set `journal.id` to that identity and upgrade. The Job is no longer
    rendered, and the Deployment serves with `-journal-id` pinned.
+
+The Job is an ordinary resource, not a Helm hook. It is the claim's first
+consumer, so a `WaitForFirstConsumer` claim binds for it, and `helm install
+--wait` (or Argo CD) waits for it rather than for a claim nothing uses.
+Kubernetes does not rerun a finished Job, so an upgrade between the two steps
+leaves it, and its log, in place. A change to its pod template (the image, say)
+gives it a new name, since a Job's template is immutable; the new Job finds
+the journal and, with `-print-existing`, prints that journal's identity and
+writes nothing. A headerless or corrupt journal is an error there too, never a
+fresh start.
 
 `journal init` never appears in the pod's start script. After step 2, a
 claim that is lost, empty or replaced is refused at startup by the pinned
 identity, and nothing re-initializes it: re-running step 1 requires an
-operator to clear `journal.id` on purpose. Even then `journal init` refuses a
-claim that already holds a journal, and the chart refuses an empty
-`journal.id` while the entry's Deployment is running (a `lookup` guard, like
-the gateways' rename guard, silent under `helm template`). A random identity
-also means a re-initialized journal can never match the old pin.
+operator to clear `journal.id` on purpose, and then it prints the identity of
+any journal already on the claim rather than replacing it. The chart refuses
+an empty `journal.id` while the entry's Deployment is running (a `lookup`
+guard, like the gateways' rename guard, silent under `helm template`). A
+random identity also means a re-initialized journal can never match the old
+pin.
 
 **What the chart checks at render time:**
 - **One instance.** One replica (or 0), `Recreate`, and a claim, never an
-  `emptyDir`. Two entries cannot share a claim, a gateway, or the gateway's
-  unrecorded claim.
+  `emptyDir`. Two entries cannot share a claim or a gateway, and a journal
+  cannot be on a gateway's unrecorded claim (chart-created or existing).
+- **Size.** A chart-created claim must hold `(3 × maxEntries + 1024)` of the
+  per-key record bound: the journal at its declared bound plus a compaction's
+  copy. The default is 2Gi, about 1.4 GB needed at the default bounds. Running
+  out is safe for once-only, but the service exits and runs end unknown.
 - **The gateway is wired to this entry.** Its `target.baseURL` must be
   `https://<release stem>-ssh-<name>.<namespace>.svc:<port>`. It must set
-  `target.caSecretName` (the CA of `tls.secretName`). Every route must be a
+  `target.caSecretName` (the CA of `tls.secretName`) and
+  `target.allowPrivate: true`, because the Service's ClusterIP is a private
+  address the gateway's dialer otherwise refuses (link-local and metadata
+  addresses stay refused). Every route must be a
   literal `POST /v1/commands/<registered command>` on `idempotency: key`.
 - **Both halves of caller authentication.**
   - `callerToken` needs the gateway's `target.credentialSecretName`.
@@ -571,7 +595,10 @@ also means a re-initialized journal can never match the old pin.
 - Ingress comes only from the named gateway's pods, on the listener's port.
 - Egress goes to each command's `cidrs` on its address's port. An IP literal
   address defaults to its own `/32` or `/128`; a host name needs `cidrs` and
-  also opens DNS. `0.0.0.0/0` is refused.
+  also opens port 53 to the cluster's DNS pods only (`networkPolicy.dns`,
+  `kube-system`/`k8s-app: kube-dns` by default). A prefix shorter than /8
+  (IPv4) or /32 (IPv6) is refused, as is any malformed CIDR.
+- The journal-init Job's pod is denied all network.
 - The gateway's own policy reaches this entry by pod selector instead of
   `targetCIDRs`.
 

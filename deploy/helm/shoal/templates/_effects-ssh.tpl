@@ -21,11 +21,12 @@ Disabled entries are included; the templates skip them.
 Names. The stem is the effects gateways' 24-character stem, and validate.yaml
 holds an entry name to 24 characters:
 
-  stem 24 + "-ssh-" 5 + name 24  -> 54: Deployment, Service, ServiceAccount,
+  stem 24 + "-ssh-" 5 + name 24  -> 53: Deployment, Service, ServiceAccount,
                                          NetworkPolicy
-  + "-journal" 8                  -> 62: the PersistentVolumeClaim
-  + "-commands" 9                 -> 63: the ConfigMap
-  + "-init" 5                     -> 59: the journal-init Job
+  + "-journal" 8                  -> 61: the PersistentVolumeClaim
+  + "-commands" 9                 -> 62: the ConfigMap
+  + "-init" 5                     -> 58: the init pod's NetworkPolicy
+  + "-init-" 6 + 4 hex digits     -> 63: the journal-init Job
 
 Takes a dict of root and ssh.
 */ -}}
@@ -125,6 +126,12 @@ Takes a dict of root and ssh. Returns JSON.
 {{- $_ := set $plan "baseURL" $baseURL -}}
 {{- if ne (toString $target.baseURL) $baseURL -}}
 {{- fail (printf "%s.target.baseURL is %q, and effectsSsh[%v] (%s) is served at %q: the gateway must be pointed at this entry's Service, by exactly that URL, or the two are not one deployment" $gatewayKey (toString $target.baseURL) $ssh._index $ssh.name $baseURL) -}}
+{{- end -}}
+{{- /* The Service's ClusterIP is a private address, which the gateway's
+       dialer refuses unless -target-allow-private is set. Link-local and
+       metadata addresses stay refused whatever it says. */ -}}
+{{- if not (eq $target.allowPrivate true) -}}
+{{- fail (printf "%s.target.allowPrivate must be true with effectsSsh[%v]: %s resolves to the Service's ClusterIP, a private address the gateway's dialer refuses otherwise, so every action would fail before anything was sent while both pods report ready. Link-local and metadata addresses stay refused regardless" $gatewayKey $ssh._index $baseURL) -}}
 {{- end -}}
 {{- if not $target.caSecretName -}}
 {{- fail (printf "%s.target.caSecretName is required with effectsSsh[%v]: the gateway verifies the target's certificate, which an in-cluster CA issues for %s; with only the system roots every request fails at the handshake while both pods report ready" $gatewayKey $ssh._index $baseURL) -}}
@@ -273,11 +280,21 @@ Takes a dict of root and ssh. Returns JSON.
 {{- fail (printf "%s.cidrs is required with networkPolicy.enabled and a host name address (%q): a NetworkPolicy matches addresses, not names, so with none listed the command can never connect" $at $address) -}}
 {{- end -}}
 {{- range $cidr := $cidrs -}}
-{{- if not (regexMatch `^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$|^[0-9A-Fa-f:]+/[0-9]{1,3}$` (toString $cidr)) -}}
-{{- fail (printf "%s.cidrs holds %q, which is not a CIDR" $at (toString $cidr)) -}}
+{{- $text := toString $cidr -}}
+{{- $v4 := regexMatch `^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}/(0|[1-9][0-9]?)$` $text -}}
+{{- $v6 := regexMatch `^[0-9A-Fa-f:]*:[0-9A-Fa-f:]*/(0|[1-9][0-9]{0,2})$` $text -}}
+{{- if not (or $v4 $v6) -}}
+{{- fail (printf "%s.cidrs holds %q, which is not an IPv4 or IPv6 CIDR" $at $text) -}}
 {{- end -}}
-{{- if has (toString $cidr) (list "0.0.0.0/0" "::/0") -}}
-{{- fail (printf "%s.cidrs holds %q: the policy exists to hold this pod, which holds SSH keys, to the registered hosts. Name the hosts' addresses" $at (toString $cidr)) -}}
+{{- /* The prefix length, parsed: a string comparison with 0.0.0.0/0
+       would pass 1.2.3.4/0, ::0/0 or 0.0.0.0/1. A wide range is refused,
+       because the policy exists to hold this pod, which holds SSH keys, to
+       the registered hosts. */ -}}
+{{- $length := int64 (regexFind `[0-9]+$` $text) -}}
+{{- $floor := ternary 8 32 $v4 -}}
+{{- $ceiling := ternary 32 128 $v4 -}}
+{{- if or (lt $length (int64 $floor)) (gt $length (int64 $ceiling)) -}}
+{{- fail (printf "%s.cidrs holds %q: the prefix length must be %d to %d. The policy exists to hold this pod, which holds SSH keys, to the registered hosts; name the hosts' addresses" $at $text $floor $ceiling) -}}
 {{- end -}}
 {{- end -}}
 {{- $egress = append $egress (dict "cidrs" $cidrs "port" $sshPort) -}}
@@ -286,6 +303,12 @@ Takes a dict of root and ssh. Returns JSON.
 {{- $_ := set $plan "keys" (sortAlpha $keys) -}}
 {{- $_ := set $plan "egress" $egress -}}
 {{- $_ := set $plan "dns" $dns -}}
+{{- if and $dns $ssh.networkPolicy.enabled -}}
+{{- $dnsPolicy := default (dict) $ssh.networkPolicy.dns -}}
+{{- if or (not (kindIs "map" $dnsPolicy.namespaceLabels)) (not $dnsPolicy.namespaceLabels) (not (kindIs "map" $dnsPolicy.podLabels)) (not $dnsPolicy.podLabels) -}}
+{{- fail (printf "%s.networkPolicy.dns.namespaceLabels and podLabels must both name the cluster's DNS pods when a command's address is a host name: an empty selector would open port 53 to every pod" $key) -}}
+{{- end -}}
+{{- end -}}
 
 {{- /* The gateway's routes: each a literal POST to a registered command,
        on idempotency key. A templated path would let the agent's input pick
@@ -335,6 +358,25 @@ Takes a dict of root and ssh. Returns JSON.
 {{- fail (printf "%s.journal.maxEntries %v with a largest maxOutputBytes of %d allows %d bytes of live records, above the 536870912 a compaction may copy while requests wait; the binary refuses it. Lower one of them" $key $maxEntries $largestOutput (mul (int64 $maxEntries) $record)) -}}
 {{- end -}}
 {{- $_ := set $plan "maxEntries" (int64 $maxEntries) -}}
+{{- /* The claim must hold the journal at its declared bound, JournalBound
+       ((2N + 1024) records), plus the copy a compaction writes beside it (N
+       records). Running out is safe for once-only (started is fsync'd
+       before any dial), but the service then exits and its runs end
+       unknown. An existing claim is the operator's to size. */ -}}
+{{- $needed := mul (add (mul 3 (int64 $maxEntries)) 1024) $record -}}
+{{- $_ := set $plan "journalBytes" $needed -}}
+{{- if eq (toString $journal.storage) "persistentVolumeClaim" -}}
+{{- $size := toString $journal.size -}}
+{{- $number := regexFind `^([0-9]+(\.[0-9]*)?|\.[0-9]+)` $size -}}
+{{- $suffix := trimPrefix $number $size -}}
+{{- $factors := dict "" 1.0 "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
+{{- if not (hasKey $factors $suffix) -}}
+{{- fail (printf "%s.journal.size must be a Kubernetes quantity such as 2Gi (got %q)" $key $size) -}}
+{{- end -}}
+{{- if lt (mulf (float64 $number) (get $factors $suffix)) (float64 $needed) -}}
+{{- fail (printf "%s.journal.size %q is below the %d bytes the journal can reach: (3 × journal.maxEntries + 1024) × %d bytes per key, its declared bound plus the copy a compaction writes. Raise the size, or lower maxEntries or the largest maxOutputBytes" $key $size $needed $record) -}}
+{{- end -}}
+{{- end -}}
 
 {{- /* Retention: journal retention ≥ the gateway's idempotency retention +
        clock skew. The gateway sends a key for up to its retention after the
@@ -394,6 +436,13 @@ Takes a dict of root and ssh. Returns JSON.
 {{- $grace = int64 $graceOverride -}}
 {{- end -}}
 {{- $_ := set $plan "grace" $grace -}}
+{{- /* The journal-init Job's name carries a digest of its pod template. A
+       Job's template is immutable, so a fixed name would fail every upgrade
+       that changed the image or scheduling before journal.id is pinned; a
+       new name is a new Job, which (with -print-existing) prints the
+       identity of the journal already there rather than failing. */ -}}
+{{- $initSpec := toJson (list $ssh.image $ssh.resources $ssh.nodeSelector $ssh.tolerations $ssh.affinity (get $plan "claim")) -}}
+{{- $_ := set $plan "initJob" (printf "%s-init-%s" $name (trunc 4 (sha256sum $initSpec))) -}}
 {{- toJson $plan -}}
 {{- end -}}
 
@@ -409,11 +458,11 @@ Takes a dict of root and ssh. Returns JSON.
   empty, so this release rendered the journal-init Job and no Deployment.
 
   1. Read the journal's identity, which the Job printed:
-       kubectl logs -n {{ $.Release.Namespace }} job/{{ $plan.name }}-init
+       kubectl logs -n {{ $.Release.Namespace }} job/{{ $plan.initJob }}
   2. Set effectsSsh[{{ $ssh._index }}].journal.id to it and upgrade.
 
-  The Job refuses a claim that already holds a journal: if it failed, read
-  `shoal-effects-ssh journal list` on the claim before doing anything else.
+  If the claim already held a journal, the Job printed that journal's identity
+  and wrote nothing. Pin it before the next upgrade that changes this entry.
   Never clear journal.id on a running entry; the chart refuses it.
   ******************************************************************************
 {{- else }}

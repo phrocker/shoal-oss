@@ -87,22 +87,21 @@ spec:
 {{- if not $plan.journalID }}
 ---
 # Step 1 of an install: initialize the journal once, on the claim, and print
-# its identity. A helm hook so it runs after the claim exists and again on an
-# upgrade that still has no journal.id; `journal init` refuses a claim that
-# already holds a journal, so a rerun can only fail, never replace one. It is
-# never rendered beside the Deployment: journal.id set removes it.
+# its identity. An ordinary resource, not a hook: it is the claim's first
+# consumer, so a WaitForFirstConsumer claim binds for it, and `helm install
+# --wait` waits for it rather than for a claim nothing uses. Kubernetes does
+# not rerun a finished Job, and its log (the identity) stays readable until
+# journal.id is set. A changed pod template gets a new name (a digest), and
+# that run finds the journal and prints its identity (-print-existing):
+# nothing ever replaces a journal. It is never rendered beside the
+# Deployment: journal.id set removes it.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ printf "%s-init" $name | quote }}
+  name: {{ $plan.initJob | quote }}
   labels:
     {{- include "shoal.labels" $root | nindent 4 }}
     app.kubernetes.io/component: effects-ssh-journal-init
-  annotations:
-    helm.sh/hook: post-install,post-upgrade
-    # Kept after it succeeds, so its log (the identity) can be read; replaced
-    # by the next run.
-    helm.sh/hook-delete-policy: before-hook-creation
 spec:
   backoffLimit: 0
   activeDeadlineSeconds: 600
@@ -131,7 +130,7 @@ spec:
           image: {{ printf "%v:%v" $ssh.image.repository $ssh.image.tag | quote }}
           imagePullPolicy: {{ $ssh.image.pullPolicy | quote }}
           command: ["/usr/local/bin/shoal-effects-ssh"]
-          args: ["journal", "init", {{ printf "-journal-dir=%s" $journalMount | quote }}]
+          args: ["journal", "init", "-print-existing", {{ printf "-journal-dir=%s" $journalMount | quote }}]
           resources: {{ toJson $ssh.resources }}
           securityContext: {{ toJson $containerSecurity }}
           volumeMounts:
@@ -324,7 +323,13 @@ spec:
           protocol: TCP
   egress:
     {{- if $plan.dns }}
-    - ports:
+    # The cluster's DNS pods only (networkPolicy.dns), not port 53 anywhere.
+    - to:
+        - namespaceSelector:
+            matchLabels: {{ toJson $ssh.networkPolicy.dns.namespaceLabels }}
+          podSelector:
+            matchLabels: {{ toJson $ssh.networkPolicy.dns.podLabels }}
+      ports:
         - port: 53
           protocol: UDP
         - port: 53
