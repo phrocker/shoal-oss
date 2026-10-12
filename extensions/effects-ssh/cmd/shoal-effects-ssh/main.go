@@ -4,9 +4,10 @@
 // the effects gateway (#450). The gateway reaches it through an ordinary
 // "key" route; docs/effects-ssh.md is the deployment guide.
 //
+//	shoal-effects-ssh journal init -journal-dir /var/lib/effects-ssh   # once; prints the ID
 //	shoal-effects-ssh serve -config commands.json -listen 127.0.0.1:8443 \
 //	    -allow-plaintext-loopback -caller-token-file /run/token \
-//	    -journal-dir /var/lib/effects-ssh -journal-retention 48h
+//	    -journal-dir /var/lib/effects-ssh -journal-id <ID> -journal-retention 48h
 //	shoal-effects-ssh journal list -journal-dir /var/lib/effects-ssh
 //	shoal-effects-ssh journal show -journal-dir /var/lib/effects-ssh -key <key or digest>
 package main
@@ -82,7 +83,8 @@ func parseServe(args []string, stderr io.Writer) (*serveConfig, error) {
 		"File holding the token the gateway presents as \"Authorization: Bearer <token>\" (required)")
 	idempotencyHeader := flags.String("idempotency-header", service.DefaultIdempotencyHeader,
 		"Header carrying the action's executor key: the gateway's -idempotency-header")
-	journalDir := flags.String("journal-dir", "", "Existing directory for the journal; a persistent volume (required)")
+	journalDir := flags.String("journal-dir", "", "Directory holding an initialized journal (journal init); a persistent volume (required)")
+	journalID := flags.String("journal-id", "", "The journal's identity, as journal init printed it (required); a directory holding another journal, or none, is refused")
 	retention := flags.Duration("journal-retention", 0,
 		"How long a key is remembered after its last record (required). The gateway's "+
 			"-idempotency-retention must not exceed it")
@@ -107,6 +109,9 @@ func parseServe(args []string, stderr io.Writer) (*serveConfig, error) {
 		return nil, errors.New("-caller-token-file is required; there is no unauthenticated mode")
 	case *journalDir == "":
 		return nil, errors.New("-journal-dir is required")
+	case *journalID == "":
+		return nil, errors.New("-journal-id is required: the identity journal init printed, so " +
+			"an empty or different volume is refused rather than served as a fresh journal")
 	case *retention == 0:
 		return nil, errors.New("-journal-retention is required")
 	case *grace <= 0:
@@ -137,8 +142,11 @@ func parseServe(args []string, stderr io.Writer) (*serveConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := service.CheckJournalBounds(*maxEntries, config.MaxOutputBytes()); err != nil {
+		return nil, err
+	}
 	journal, err := service.OpenJournal(*journalDir, service.JournalOptions{
-		Retention: *retention, MaxEntries: *maxEntries})
+		Retention: *retention, MaxEntries: *maxEntries, ID: *journalID})
 	if err != nil {
 		return nil, err
 	}
@@ -268,9 +276,12 @@ func serve(args []string, stderr io.Writer, stop <-chan struct{}) int {
 }
 
 func journal(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || (args[0] != "list" && args[0] != "show") {
-		fmt.Fprintln(stderr, "usage: shoal-effects-ssh journal list|show -journal-dir DIR [-key KEY]")
+	if len(args) == 0 || (args[0] != "list" && args[0] != "show" && args[0] != "init") {
+		fmt.Fprintln(stderr, "usage: shoal-effects-ssh journal init|list|show -journal-dir DIR [-key KEY]")
 		return exitUsage
+	}
+	if args[0] == "init" {
+		return journalInit(args[1:], stdout, stderr)
 	}
 	flags := flag.NewFlagSet("shoal-effects-ssh journal "+args[0], flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -284,7 +295,8 @@ func journal(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	records, torn, err := service.ReadJournal(*dir)
-	if err != nil {
+	var corrupt *service.CorruptError
+	if err != nil && !errors.As(err, &corrupt) {
 		fmt.Fprintln(stderr, err)
 		return exitRuntime
 	}
@@ -301,18 +313,51 @@ func journal(args []string, stdout, stderr io.Writer) int {
 				record.Finished = &finished
 			}
 		case "show":
-			if record.Key != wanted && digest != *key {
+			if record.Key == "" || (record.Key != wanted && digest != *key) {
 				continue
 			}
+		}
+		if record.Key == "" {
+			digest = ""
 		}
 		_ = encoder.Encode(struct {
 			service.JournalRecord
 			Digest string `json:"digest"`
 		}{record, digest})
 	}
+	if corrupt != nil {
+		// Everything before the bad line is above; this is where and why the
+		// server refuses to open the journal.
+		fmt.Fprintf(stderr, "journal is corrupt at line %d (byte offset %d): %s; the records "+
+			"before it are listed above, and nothing after it was read\n",
+			corrupt.Line, corrupt.Offset, corrupt.Reason)
+		return exitRuntime
+	}
 	if torn {
 		fmt.Fprintln(stderr, "the journal ends in an incomplete record; the server drops it on its next start")
 	}
+	return exitOK
+}
+
+// journalInit creates the journal once and prints its identity, which serve
+// must then be given as -journal-id.
+func journalInit(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("shoal-effects-ssh journal init", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dir := flags.String("journal-dir", "", "Existing, empty directory on the journal's volume (required)")
+	if err := flags.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *dir == "" || flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "-journal-dir is required")
+		return exitUsage
+	}
+	id, err := service.InitJournal(*dir, nil)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return exitRuntime
+	}
+	fmt.Fprintln(stdout, id)
 	return exitOK
 }
 

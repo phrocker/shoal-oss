@@ -160,6 +160,9 @@ past this: deleting it forgets every key it holds.
 - **A command that leaves a background child holding stdout** keeps the
   session open until the run timeout, and is recorded `outcome_unknown` even
   if it exited. Redirect such children's output on the host.
+- **Platforms.** The journal runs on Linux and the BSDs. It refuses to open on
+  macOS, whose `fsync` does not flush the drive's write cache (only
+  `F_FULLFSYNC` does), and on any platform without `flock`.
 - **The lock is a file in the journal directory.** Deleting `LOCK` while the
   server runs lets a second process lock a new one. Do not.
 - **Once per action, not once per intent.** A new action is a new key. An
@@ -342,9 +345,10 @@ exists to avoid.
 | `-allow-plaintext-loopback` | false | plaintext HTTP, refused unless `-listen` is a loopback address and the bound address is loopback |
 | `-caller-token-file` | | required; at least 32 printable bytes; read on every request |
 | `-idempotency-header` | `Idempotency-Key` | the gateway's `-idempotency-header` |
-| `-journal-dir` | | required; must exist (it is not created) |
+| `-journal-dir` | | required; must hold a journal made by `journal init` (serve never creates one) |
+| `-journal-id` | | required; the identity `journal init` printed. A directory with no journal, or another journal, is refused |
 | `-journal-retention` | | required, at least `1m`; at least the gateway's `-idempotency-retention` plus clock skew |
-| `-journal-max-entries` | 10000 | 1 to 1048576 keys; a new key beyond it is refused `journal_full` |
+| `-journal-max-entries` | 10000 | 1 to 1048576 keys, and with the largest `max_output_bytes` at most 512 MiB of live records (below); a new key beyond it is refused `journal_full` |
 | `-max-concurrent` | 4 | 1 to 64 runs; a new key beyond it is answered `busy` |
 | `-attach-wait` | `30s` | below the gateway's `-operation-timeout` |
 | `-shutdown-grace` | `60s` | on SIGTERM, how long runs may finish; then their connections are closed and they are journaled `unknown` |
@@ -355,6 +359,14 @@ largest `max_output_bytes` M, one key's records take at most
 a compaction rewrites it. The start line logs both figures
 (`journal_max_entry_bytes`, `journal_bound_bytes`). With the defaults, that is
 about 960 MB at most, and far less in practice.
+
+**Compaction stalls requests, boundedly.** Compaction copies the live records
+to a new file while holding the journal's lock, so requests wait for it. The
+start refuses an `-journal-max-entries` and largest `max_output_bytes` whose
+live records could exceed 512 MiB (`N × (2 × base64(M) + 2 KiB)`), which
+bounds the stall to that copy, about a second on a local SSD. The defaults
+allow about 460 MB. During a stall the gateway sees only latency: a timed-out
+attempt is resent under the same key and answered from the journal.
 
 **Caller authentication is mandatory.** The gateway sends
 `-target-credential-file` verbatim in `-target-auth-header` (`Authorization`).
@@ -388,10 +400,13 @@ The chart does not render this extension; extensions ship their own images
 **Sidecar (recommended).** Run it in the gateway's pod on loopback:
 
 ```
+# once, on the journal's volume; prints the journal's identity
+shoal-effects-ssh journal init -journal-dir /var/lib/effects-ssh
+
 shoal-effects-ssh serve -config /etc/effects-ssh/commands.json \
     -listen 127.0.0.1:8443 -allow-plaintext-loopback \
     -caller-token-file /run/secrets/effects-ssh/token \
-    -journal-dir /var/lib/effects-ssh -journal-retention 48h
+    -journal-dir /var/lib/effects-ssh -journal-id <identity> -journal-retention 48h
 
 shoal-gateway run -capability effects.ssh -surface-name web-fleet \
     -target-base-url http://127.0.0.1:8443 -target-allow-private \
@@ -402,7 +417,19 @@ shoal-gateway run -capability effects.ssh -surface-name web-fleet \
 
 The effects are `{external}`. Give the journal its own `ReadWriteOnce`
 persistent volume, separate from the gateway's `-unrecorded-dir`, and run one
-replica. The pod's egress policy must allow the SSH hosts' addresses and
+replica.
+
+**Initialize the journal once, and pin it.** `serve` never creates a journal.
+`journal init` writes the first line, a header with a random identity and
+the creation time, fsyncs it and its directory entry, and prints the
+identity; it refuses a directory that already holds a journal file, even an
+empty one. Put the identity in the deployment as `-journal-id`. Then a
+volume that fails to mount, leaving the image's empty directory, refuses the
+start instead of serving a fresh journal that has forgotten every key, which
+would re-run a command whose outcome was unknown. A different journal (another
+volume, or a wiped and re-initialized one) is refused by the identity. Run
+`journal init` as a one-off job against the volume, not in the pod's start
+script, or the protection is gone. The pod's egress policy must allow the SSH hosts' addresses and
 ports. The chart's per-entry NetworkPolicy assumes a single target, so a
 sidecar deployment writes its own policy.
 
@@ -421,16 +448,21 @@ shoal-effects-ssh journal list -journal-dir DIR
 shoal-effects-ssh journal show -journal-dir DIR -key <key or 12-hex digest>
 ```
 
-`list` prints every record's metadata: key, digest, command, times, outcome,
-reference, byte counts and truncation. `show` adds the kept output for one
-key. Neither takes the lock or changes the file, so both are safe while the
-server runs.
+`list` prints the header (the journal's identity and creation time) and
+every record's metadata: key, digest, command, times, outcome, reference,
+byte counts and truncation. `show` adds the kept output for one key. Neither
+takes the lock or changes the file, so both are safe while the server runs.
+Both check the records by the same rules the server does. On a corrupt
+journal, which the server refuses to open, they print every record before the
+bad line, then its line number, byte offset and reason, and exit 1: that is
+the operator's view of the journal in the one state where nothing runs until
+someone has looked.
 
 | exit code | meaning |
 |---|---|
 | 0 | stopped cleanly |
 | 1 | the listener failed, or closing the journal failed |
-| 2 | the command line or configuration is wrong, the journal is locked by another process, or it is corrupt |
+| 2 | the command line or configuration is wrong, or the journal is missing, uninitialized, not the pinned one, locked by another process, or corrupt |
 | 3 | a journal write failed. No new key was started after it, and the process drained and exited. A restart re-reads the file |
 
 ## Deferred

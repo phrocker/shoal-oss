@@ -1,6 +1,6 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE and NOTICE.
 
-//go:build linux || darwin || freebsd || netbsd || openbsd || dragonfly
+//go:build linux || freebsd || netbsd || openbsd || dragonfly
 
 package service
 

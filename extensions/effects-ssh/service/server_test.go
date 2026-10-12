@@ -176,8 +176,8 @@ func TestRunOnceAndReplay(t *testing.T) {
 	}
 	// The journal holds the bounded output for the operator.
 	records, torn, err := ReadJournal(e.dir)
-	if err != nil || torn || len(records) != 2 || records[1].Finished == nil ||
-		string(records[1].Finished.Stdout) != "restarted\n" || *records[1].Finished.ExitStatus != 0 {
+	if err != nil || torn || len(records) != 3 || records[2].Finished == nil ||
+		string(records[2].Finished.Stdout) != "restarted\n" || *records[2].Finished.ExitStatus != 0 {
 		t.Fatalf("journal %+v torn %v err %v", records, torn, err)
 	}
 	if strings.Contains(e.logs.String(), key) || strings.Contains(e.logs.String(), "restarted") ||

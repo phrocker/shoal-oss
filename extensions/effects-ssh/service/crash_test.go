@@ -65,6 +65,9 @@ func TestKillBetweenStartedAndFinishedNeverRunsAgain(t *testing.T) {
 	if err := os.Mkdir(journalDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := InitJournal(journalDir, nil); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), testConfigJSON(t, host), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +118,7 @@ func TestKillBetweenStartedAndFinishedNeverRunsAgain(t *testing.T) {
 		t.Fatal("the killed process answered")
 	}
 	records, torn, err := ReadJournal(journalDir)
-	if err != nil || torn || len(records) != 1 || records[0].Op != recordStarted {
+	if err != nil || torn || len(records) != 2 || records[1].Op != recordStarted {
 		t.Fatalf("journal after the kill: %+v torn %v err %v", records, torn, err)
 	}
 

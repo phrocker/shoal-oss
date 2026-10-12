@@ -185,6 +185,7 @@ func newEnv(t *testing.T, options ...envOption) *env {
 
 func (e *env) open(journalOptions JournalOptions) {
 	e.t.Helper()
+	ensureJournal(e.t, e.dir)
 	journal, err := OpenJournal(e.dir, journalOptions)
 	if err != nil {
 		e.t.Fatal(err)
@@ -214,6 +215,28 @@ func (e *env) restart(journalOptions JournalOptions) {
 		e.t.Fatal(err)
 	}
 	e.open(journalOptions)
+}
+
+// ensureJournal initializes dir's journal unless it already holds one.
+func ensureJournal(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, JournalFileName)); err == nil {
+		return
+	}
+	if _, err := InitJournal(dir, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// headerLine is a valid journal header, for tests that write files by hand.
+func headerLine(t *testing.T) []byte {
+	t.Helper()
+	line, err := encodeLine(record{Op: recordHeader, JournalID: "0123456789abcdef0123456789abcdef",
+		At: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return line
 }
 
 func (s *Server) isStopped() bool {

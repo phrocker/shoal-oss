@@ -36,6 +36,7 @@ func (f *fakeNow) Advance(d time.Duration) {
 
 func openTestJournal(t *testing.T, dir string, now *fakeNow, maxEntries int) *Journal {
 	t.Helper()
+	ensureJournal(t, dir)
 	journal, err := OpenJournal(dir, JournalOptions{Retention: time.Hour, MaxEntries: maxEntries, Now: now.Now})
 	if err != nil {
 		t.Fatal(err)
@@ -165,7 +166,20 @@ func TestCorruptionRefusesToOpen(t *testing.T) {
 		"unknown field": []byte("00000000 {\"op\":\"started\",\"extra\":1}\n"),
 		"no checksum":   []byte("{\"op\":\"started\"}\n"),
 		"blank line":    []byte("\n"),
+		"header twice":  headerLine(t),
+		"record with a journal id": line(t, record{Op: recordStarted, JournalID: "0123456789abcdef0123456789abcdef",
+			Key: key, At: journalEpoch, Command: "restart-web", Fingerprint: fp}),
 	}
+	header := headerLine(t)
+	for name, content := range cases {
+		content = append(append([]byte(nil), header...), content...)
+		cases[name] = content
+	}
+	// And journals whose first line is not a valid header.
+	cases["no header"] = started
+	cases["malformed header id"] = line(t, record{Op: recordHeader, JournalID: "ABC", At: journalEpoch})
+	cases["header with a key"] = line(t, record{Op: recordHeader, JournalID: "0123456789abcdef0123456789abcdef",
+		Key: key, At: journalEpoch})
 	for name, content := range cases {
 		dir := t.TempDir()
 		_ = os.WriteFile(filepath.Join(dir, JournalFileName), content, 0o600)
@@ -186,6 +200,186 @@ func TestCorruptionRefusesToOpen(t *testing.T) {
 			t.Errorf("%s: lock not released: %v", name, err)
 		} else {
 			_ = lock.release()
+		}
+	}
+}
+
+// TestServeNeverCreatesAJournal: an existing but empty directory (a volume
+// that failed to mount, leaving the image's directory) is refused, and
+// nothing is created in it. So is a directory holding only a fragment of a
+// header, or an empty journal file.
+func TestServeNeverCreatesAJournal(t *testing.T) {
+	options := JournalOptions{Retention: time.Hour, MaxEntries: 10}
+	empty := t.TempDir()
+	if _, err := OpenJournal(empty, options); !errors.Is(err, ErrJournalUninitialized) {
+		t.Fatalf("empty directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(empty, JournalFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("opening an empty directory created a journal")
+	}
+	header := headerLine(t)
+	for name, content := range map[string][]byte{
+		"empty file":    {},
+		"torn header":   header[:len(header)-1],
+		"header prefix": header[:12],
+	} {
+		dir := t.TempDir()
+		_ = os.WriteFile(filepath.Join(dir, JournalFileName), content, 0o600)
+		if _, err := OpenJournal(dir, options); !errors.Is(err, ErrJournalUninitialized) {
+			t.Errorf("%s: %v", name, err)
+		}
+		if raw, _ := os.ReadFile(filepath.Join(dir, JournalFileName)); string(raw) != string(content) {
+			t.Errorf("%s: the file was changed", name)
+		}
+	}
+}
+
+// TestEmptyVolumeAfterACrashDoesNotRerun is the scenario L1 names: a key
+// started and never finished, then the volume is not mounted and the server
+// starts on an empty directory. It refuses to start, so the resend cannot
+// run the command again; with the volume back, the key answers unknown.
+func TestEmptyVolumeAfterACrashDoesNotRerun(t *testing.T) {
+	volume, now := t.TempDir(), &fakeNow{now: journalEpoch}
+	id, err := InitJournal(volume, now.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := OpenJournal(volume, JournalOptions{Retention: time.Hour, MaxEntries: 10, Now: now.Now, ID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := testKey("in-flight")
+	if begin := j.Begin(key, fp, "restart-web", true, 4); begin.Kind != BeginRun {
+		t.Fatal(begin.Kind)
+	}
+	_ = j.Close() // the crash
+	unmounted := t.TempDir()
+	if _, err := OpenJournal(unmounted, JournalOptions{Retention: time.Hour, MaxEntries: 10, ID: id}); !errors.Is(err, ErrJournalUninitialized) {
+		t.Fatalf("unmounted volume: %v", err)
+	}
+	j, err = OpenJournal(volume, JournalOptions{Retention: time.Hour, MaxEntries: 10, Now: now.Now, ID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	if begin := j.Begin(key, fp, "restart-web", true, 4); begin.Kind != BeginUnknown {
+		t.Fatalf("remounted: %v", begin.Kind)
+	}
+}
+
+// TestPinnedJournalIDRefusesAnotherJournal: an initialized journal that is
+// not the pinned one (another volume, or a re-init after a wipe) is refused.
+func TestPinnedJournalIDRefusesAnotherJournal(t *testing.T) {
+	first, second := t.TempDir(), t.TempDir()
+	id, err := InitJournal(first, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := InitJournal(second, nil)
+	if err != nil || other == id || !ValidJournalID(id) || !ValidJournalID(other) {
+		t.Fatalf("ids %q %q: %v", id, other, err)
+	}
+	if _, err := OpenJournal(second, JournalOptions{Retention: time.Hour, MaxEntries: 10, ID: id}); !errors.Is(err, ErrJournalMismatch) {
+		t.Fatalf("mismatch: %v", err)
+	}
+	if _, err := OpenJournal(second, JournalOptions{Retention: time.Hour, MaxEntries: 10, ID: "not-an-id"}); err == nil {
+		t.Fatal("a malformed pinned ID was accepted")
+	}
+	j, err := OpenJournal(first, JournalOptions{Retention: time.Hour, MaxEntries: 10, ID: id})
+	if err != nil || j.ID() != id {
+		t.Fatalf("match: %v", err)
+	}
+	_ = j.Close()
+	// Compaction keeps the identity.
+	j, err = OpenJournal(first, JournalOptions{Retention: time.Hour, MaxEntries: 10, ID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.mu.Lock()
+	j.records++ // force a rewrite
+	err = j.compact()
+	j.mu.Unlock()
+	_ = j.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j, err = OpenJournal(first, JournalOptions{Retention: time.Hour, MaxEntries: 10, ID: id}); err != nil {
+		t.Fatalf("after compaction: %v", err)
+	}
+	_ = j.Close()
+}
+
+// TestInitJournalOnlyOnce: init refuses a directory that already holds a
+// journal file, even an empty one, and a missing directory.
+func TestInitJournalOnlyOnce(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := InitJournal(dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(filepath.Join(dir, JournalFileName))
+	if _, err := InitJournal(dir, nil); err == nil {
+		t.Fatal("init replaced a journal")
+	}
+	if after, _ := os.ReadFile(filepath.Join(dir, JournalFileName)); string(after) != string(before) {
+		t.Fatal("the second init changed the journal")
+	}
+	emptyFile := t.TempDir()
+	_ = os.WriteFile(filepath.Join(emptyFile, JournalFileName), nil, 0o600)
+	if _, err := InitJournal(emptyFile, nil); err == nil {
+		t.Fatal("init adopted an existing empty journal file")
+	}
+	if _, err := InitJournal(filepath.Join(dir, "missing"), nil); err == nil {
+		t.Fatal("init created a directory")
+	}
+	// A locked directory (a running server) is refused too.
+	j := openTestJournal(t, t.TempDir(), &fakeNow{now: journalEpoch}, 10)
+	_ = os.Remove(filepath.Join(j.dir, JournalFileName))
+	if _, err := InitJournal(j.dir, nil); !errors.Is(err, ErrJournalLocked) {
+		t.Fatalf("locked: %v", err)
+	}
+}
+
+// TestReadJournalReportsWhereItStopped: on corruption the operator's view
+// has every record before the bad line, and the line, offset and reason.
+func TestReadJournalReportsWhereItStopped(t *testing.T) {
+	dir, now := t.TempDir(), &fakeNow{now: journalEpoch}
+	j := openTestJournal(t, dir, now, 10)
+	runAndFinish(t, j, testKey("one"))
+	_ = j.Close()
+	before, _ := os.ReadFile(filepath.Join(dir, JournalFileName))
+	appendRaw(t, dir, []byte("00000000 {\"op\":\"started\"}\n"))
+	runAndFinishLine := line(t, record{Op: recordStarted, Key: testKey("two"), At: journalEpoch,
+		Command: "restart-web", Fingerprint: fp})
+	appendRaw(t, dir, runAndFinishLine)
+	records, _, err := ReadJournal(dir)
+	var corrupt *CorruptError
+	if !errors.As(err, &corrupt) || !errors.Is(err, ErrJournalCorrupt) {
+		t.Fatalf("err %v", err)
+	}
+	if len(records) != 3 || records[0].Op != recordHeader || records[0].JournalID == "" ||
+		records[2].Op != recordFinished {
+		t.Fatalf("records %+v", records)
+	}
+	if corrupt.Line != 4 || corrupt.Offset != int64(len(before)) || corrupt.Reason != "checksum mismatch" {
+		t.Fatalf("corrupt %+v (want line 4 at %d)", corrupt, len(before))
+	}
+	// A contradiction is reported the same way, by the rules OpenJournal uses.
+	dup := t.TempDir()
+	started := line(t, record{Op: recordStarted, Key: testKey("d"), At: journalEpoch, Command: "restart-web", Fingerprint: fp})
+	_ = os.WriteFile(filepath.Join(dup, JournalFileName), append(append(headerLine(t), started...), started...), 0o600)
+	records, _, err = ReadJournal(dup)
+	if !errors.As(err, &corrupt) || len(records) != 2 || corrupt.Line != 3 || corrupt.Reason != "a key is started twice" {
+		t.Fatalf("duplicate: %+v %v", records, err)
+	}
+}
+
+func TestCheckJournalBounds(t *testing.T) {
+	if err := CheckJournalBounds(10000, DefaultMaxOutputBytes); err != nil {
+		t.Fatalf("defaults refused: %v", err)
+	}
+	for _, c := range [][2]int{{MaxJournalEntries, 1}, {10000, MaxOutputBytesLimit}, {3000, 64 << 10 * 2}} {
+		if err := CheckJournalBounds(c[0], c[1]); err == nil {
+			t.Errorf("%d entries x %d bytes accepted", c[0], c[1])
 		}
 	}
 }
@@ -352,7 +546,7 @@ func TestCompactionKeepsEveryLiveRecordByteForByte(t *testing.T) {
 		t.Fatal(err, torn)
 	}
 	// The dead keys expired, so the finishes after them compacted the file.
-	if len(records) != 1+10 {
+	if len(records) != 1+1+10 {
 		t.Fatalf("%d records after compaction", len(records))
 	}
 	if _, err := os.Stat(filepath.Join(dir, JournalFileName+".compact")); !errors.Is(err, os.ErrNotExist) {
@@ -414,7 +608,7 @@ func TestStartedIsDurableBeforeTheRun(t *testing.T) {
 	e := newEnv(t, func(o *Options, _ *JournalOptions) {
 		o.Run = func(ctx context.Context, command *Command) sshclient.Result {
 			records, _, err := ReadJournal(o.Journal.dir)
-			onDisk = err == nil && len(records) == 1 && records[0].Op == recordStarted
+			onDisk = err == nil && len(records) == 2 && records[1].Op == recordStarted
 			return runOverSSH(ctx, command)
 		}
 	})
@@ -455,7 +649,8 @@ func TestSyncsPrecedeTheDial(t *testing.T) {
 	e.post("restart-web", testKey("order")).is(t, loadAnswers(t), "completed")
 	mu.Lock()
 	defer mu.Unlock()
-	want := []string{"sync dir", "sync " + JournalFileName, "dial", "sync " + JournalFileName}
+	// The first two are journal init (file, then directory); open syncs nothing.
+	want := []string{"sync " + JournalFileName, "sync dir", "sync " + JournalFileName, "dial", "sync " + JournalFileName}
 	if strings.Join(events, ",") != strings.Join(want, ",") {
 		t.Fatalf("events %q, want %q", events, want)
 	}

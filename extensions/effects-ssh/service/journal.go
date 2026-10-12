@@ -5,6 +5,7 @@ package service
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"sync"
 	"time"
@@ -64,6 +66,9 @@ const LockFileName = "LOCK"
 const (
 	recordStarted  = "started"
 	recordFinished = "finished"
+	// recordHeader is the first line of every journal, written once by
+	// InitJournal: the journal's identity and creation time.
+	recordHeader = "journal"
 	// maxRecordLine bounds one line read back. The largest record this code
 	// writes, two streams at MaxOutputBytesLimit in base64, is well under it.
 	maxRecordLine = 4 << 20
@@ -87,6 +92,36 @@ var syncFile = (*os.File).Sync
 
 // ErrJournalCorrupt is returned by OpenJournal for a journal it will not trust.
 var ErrJournalCorrupt = errors.New("journal is corrupt")
+
+// ErrJournalUninitialized is returned by OpenJournal for a directory holding
+// no initialized journal. The server never creates one: an empty directory is
+// what a dropped volume mount looks like, and treating it as a fresh journal
+// would forget every key and re-run a command whose outcome was unknown.
+var ErrJournalUninitialized = errors.New("journal is not initialized")
+
+// ErrJournalMismatch is returned by OpenJournal when the journal's identity
+// is not the one the operator pinned.
+var ErrJournalMismatch = errors.New("journal identity does not match")
+
+// CorruptError says where and why a journal stopped being readable.
+type CorruptError struct {
+	// Offset is the byte offset of the line, Line its 1-based number.
+	Offset int64
+	Line   int
+	Reason string
+}
+
+func (e *CorruptError) Error() string {
+	return fmt.Sprintf("%v: line %d at offset %d: %s", ErrJournalCorrupt, e.Line, e.Offset, e.Reason)
+}
+
+// Is makes errors.Is(err, ErrJournalCorrupt) hold.
+func (e *CorruptError) Is(target error) bool { return target == ErrJournalCorrupt }
+
+var journalIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// ValidJournalID reports whether id has the form InitJournal writes.
+func ValidJournalID(id string) bool { return journalIDPattern.MatchString(id) }
 
 // Outcome is a finished run's outcome, as recorded.
 type Outcome string
@@ -117,6 +152,7 @@ type Finished struct {
 
 type record struct {
 	Op          string    `json:"op"`
+	JournalID   string    `json:"journal_id,omitempty"`
 	Key         string    `json:"key"`
 	At          time.Time `json:"at"`
 	Command     string    `json:"command,omitempty"`
@@ -174,6 +210,10 @@ type JournalOptions struct {
 	MaxEntries int
 	// Now is the wall clock; tests substitute one.
 	Now func() time.Time
+	// ID, when set, is the journal identity the operator pinned; a journal
+	// with another identity is refused, so a different volume cannot be
+	// swapped in.
+	ID string
 }
 
 // Journal is the durable once-only record.
@@ -192,7 +232,13 @@ type Journal struct {
 	closed  bool
 	// lastPrune is when keys past retention were last forgotten.
 	lastPrune time.Time
+	// id is the journal's identity, from its header line at header.
+	id     string
+	header span
 }
+
+// ID is the journal's identity.
+func (j *Journal) ID() string { return j.id }
 
 // OpenJournal locks dir, reads the journal, drops a torn tail, prunes keys
 // past retention and compacts.
@@ -205,6 +251,9 @@ func OpenJournal(dir string, opts JournalOptions) (*Journal, error) {
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
+	}
+	if opts.ID != "" && !ValidJournalID(opts.ID) {
+		return nil, errors.New("journal ID must be 32 lowercase hex digits, as journal init prints it")
 	}
 	info, err := os.Stat(dir)
 	if err != nil || !info.IsDir() {
@@ -220,6 +269,12 @@ func OpenJournal(dir string, opts JournalOptions) (*Journal, error) {
 	if err := j.load(); err != nil {
 		_ = lock.release()
 		return nil, err
+	}
+	if opts.ID != "" && opts.ID != j.id {
+		j.closeFile()
+		_ = lock.release()
+		return nil, fmt.Errorf("%w: the directory holds journal %s, and %s was pinned",
+			ErrJournalMismatch, j.id, opts.ID)
 	}
 	j.prune()
 	j.lastPrune = opts.Now()
@@ -242,19 +297,28 @@ func (j *Journal) closeFile() {
 
 // load reads every record, validates the sequence and truncates a torn tail.
 func (j *Journal) load() error {
-	file, err := os.OpenFile(j.path(), os.O_RDWR|os.O_CREATE, 0o600)
+	// Never O_CREATE: only InitJournal makes a journal.
+	file, err := os.OpenFile(j.path(), os.O_RDWR, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: %s has no %s; run `shoal-effects-ssh journal init` "+
+			"once, on the volume meant to hold it", ErrJournalUninitialized, j.dir, JournalFileName)
+	}
 	if err != nil {
 		return fmt.Errorf("journal cannot be opened: %w", err)
 	}
 	j.file = file
-	if err := syncDir(j.dir); err != nil {
-		j.closeFile()
-		return err
-	}
 	good, err := readRecords(file, func(r record, at span) error { return j.apply(r, at) })
 	if err != nil {
 		j.closeFile()
 		return err
+	}
+	if j.id == "" {
+		// Empty, or only a fragment of the header: InitJournal never
+		// finished. Nothing was ever journaled, but nothing proves this is
+		// the journal it should be either, so it is refused, not adopted.
+		j.closeFile()
+		return fmt.Errorf("%w: %s has no complete header; remove it and run journal init "+
+			"only if this volume never held a journal", ErrJournalUninitialized, j.path())
 	}
 	info, err := file.Stat()
 	if err != nil {
@@ -281,13 +345,19 @@ func (j *Journal) load() error {
 // readRecords calls visit for each complete record and returns the offset
 // after the last one. Only an incomplete final line (no LF) is a torn tail;
 // a complete line that fails its checksum is corruption.
+//
+// On corruption the error is a *CorruptError naming the line; every record
+// before it has already been visited.
 func readRecords(file io.ReadSeeker, visit func(record, span) error) (int64, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return 0, err
 	}
 	reader := bufio.NewReaderSize(file, 64<<10)
 	var offset int64
-	for {
+	for number := 1; ; number++ {
+		corrupt := func(err error) error {
+			return &CorruptError{Offset: offset, Line: number, Reason: err.Error()}
+		}
 		line, err := readLine(reader)
 		if errors.Is(err, io.EOF) {
 			return offset, nil
@@ -296,15 +366,15 @@ func readRecords(file io.ReadSeeker, visit func(record, span) error) (int64, err
 			return offset, nil
 		}
 		if err != nil {
-			return 0, fmt.Errorf("%w: at offset %d: %v", ErrJournalCorrupt, offset, err)
+			return offset, corrupt(err)
 		}
 		parsed, err := parseLine(line)
 		if err != nil {
-			return 0, fmt.Errorf("%w: at offset %d: %v", ErrJournalCorrupt, offset, err)
+			return offset, corrupt(err)
 		}
 		at := span{offset: offset, length: int64(len(line))}
 		if err := visit(parsed, at); err != nil {
-			return 0, fmt.Errorf("%w: at offset %d: %v", ErrJournalCorrupt, offset, err)
+			return offset, corrupt(err)
 		}
 		offset += int64(len(line))
 	}
@@ -373,6 +443,23 @@ func parseLine(line []byte) (record, error) {
 
 // apply folds one record into the state, refusing contradictions.
 func (j *Journal) apply(r record, at span) error {
+	if r.Op == recordHeader {
+		if at.offset != 0 || j.id != "" {
+			return errors.New("a journal header appears after the first line")
+		}
+		if !ValidJournalID(r.JournalID) || r.At.IsZero() || r.Key != "" ||
+			r.Command != "" || r.Fingerprint != "" || r.Finished != nil {
+			return errors.New("malformed journal header")
+		}
+		j.id, j.header = r.JournalID, at
+		return nil
+	}
+	if j.id == "" {
+		return errors.New("the first line is not a journal header")
+	}
+	if r.JournalID != "" {
+		return errors.New("a record carries a journal ID")
+	}
 	if !validJournalKey(r.Key) || r.At.IsZero() {
 		return errors.New("record has no valid key or time")
 	}
@@ -696,7 +783,18 @@ func (j *Journal) compact() error {
 	// Order by original offset, so every started record precedes its
 	// finished record in the new file as it did in the old.
 	sort.Slice(moves, func(a, b int) bool { return moves[a].which.offset < moves[b].which.offset })
-	var offset int64
+	// The header is always the first line, copied as it is.
+	header := make([]byte, j.header.length)
+	if _, err := j.file.ReadAt(header, j.header.offset); err != nil {
+		return cleanup(err)
+	}
+	if parsed, err := parseLine(header); err != nil || parsed.Op != recordHeader || parsed.JournalID != j.id {
+		return cleanup(fmt.Errorf("%w: the journal header no longer verifies", ErrJournalCorrupt))
+	}
+	if _, err := out.WriteAt(header, 0); err != nil {
+		return cleanup(err)
+	}
+	offset := int64(len(header))
 	newSpans := make([]span, len(moves))
 	for index, m := range moves {
 		buffer := make([]byte, m.which.length)
@@ -726,6 +824,7 @@ func (j *Journal) compact() error {
 	}
 	j.closeFile()
 	j.file = out
+	j.header = span{offset: 0, length: int64(len(header))}
 	for index, m := range moves {
 		*m.which = newSpans[index]
 	}
@@ -748,6 +847,11 @@ func syncDir(dir string) error {
 // ReadJournal reads a journal file without locking or changing it, for the
 // operator's journal command. Records are returned in file order with their
 // output, and a torn tail is reported, not dropped.
+//
+// The records are checked by the same rules OpenJournal applies. When the
+// file is corrupt, every record before the bad line is returned together with
+// a *CorruptError giving its line, offset and reason: in that state nothing
+// runs until an operator has looked, and this is what they look with.
 func ReadJournal(dir string) ([]JournalRecord, bool, error) {
 	file, err := os.Open(filepath.Join(dir, JournalFileName))
 	if err != nil {
@@ -755,13 +859,17 @@ func ReadJournal(dir string) ([]JournalRecord, bool, error) {
 	}
 	defer file.Close()
 	var out []JournalRecord
-	good, err := readRecords(file, func(r record, _ span) error {
-		out = append(out, JournalRecord{Op: r.Op, Key: r.Key, At: r.At,
-			Command: r.Command, Finished: r.Finished})
+	check := &Journal{entries: map[string]*Entry{}}
+	good, err := readRecords(file, func(r record, at span) error {
+		if err := check.apply(r, at); err != nil {
+			return err
+		}
+		out = append(out, JournalRecord{Op: r.Op, JournalID: r.JournalID, Key: r.Key,
+			At: r.At, Command: r.Command, Finished: r.Finished})
 		return nil
 	})
 	if err != nil {
-		return nil, false, err
+		return out, false, err
 	}
 	info, err := file.Stat()
 	if err != nil {
@@ -787,9 +895,83 @@ func JournalBound(maxEntries, maxOutputBytes int) int64 {
 
 // JournalRecord is one record as ReadJournal returns it.
 type JournalRecord struct {
-	Op       string    `json:"op"`
-	Key      string    `json:"key"`
-	At       time.Time `json:"at"`
-	Command  string    `json:"command,omitempty"`
-	Finished *Finished `json:"finished,omitempty"`
+	Op        string    `json:"op"`
+	JournalID string    `json:"journal_id,omitempty"`
+	Key       string    `json:"key,omitempty"`
+	At        time.Time `json:"at"`
+	Command   string    `json:"command,omitempty"`
+	Finished  *Finished `json:"finished,omitempty"`
+}
+
+// InitJournal creates a journal in dir, which must exist and hold none, and
+// returns its identity. It is the only way a journal comes to exist: the
+// server refuses a directory without one (ErrJournalUninitialized), so a
+// volume that failed to mount presents as an error, not as an empty journal.
+// The header is fsync'd, and so is the directory entry, before it returns.
+func InitJournal(dir string, now func() time.Time) (string, error) {
+	if now == nil {
+		now = time.Now
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("journal directory must exist")
+	}
+	lock, err := lockDir(dir)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = lock.release() }()
+	path := filepath.Join(dir, JournalFileName)
+	if _, err := os.Lstat(path); err == nil {
+		return "", fmt.Errorf("%s already exists; a journal is initialized once, and an "+
+			"existing one is never replaced", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	id := hex.EncodeToString(raw)
+	line, err := encodeLine(record{Op: recordHeader, JournalID: id, At: now().UTC()})
+	if err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := file.Write(line); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := syncFile(file); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	if err := syncDir(dir); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// MaxCompactionBytes bounds what a compaction may copy. Compaction holds the
+// journal lock while it copies the live records, so every request waits for
+// it; bounding the live records bounds that stall to a copy of at most this
+// much (a second or so on a local SSD). The gateway sees only latency, and
+// retries or records unknown, never a wrong answer.
+const MaxCompactionBytes = 512 << 20
+
+// CheckJournalBounds refuses an entry bound and output bound whose live
+// records could exceed MaxCompactionBytes.
+func CheckJournalBounds(maxEntries, maxOutputBytes int) error {
+	if live := int64(maxEntries) * MaxRecordBytes(maxOutputBytes); live > MaxCompactionBytes {
+		return fmt.Errorf("-journal-max-entries %d with a largest max_output_bytes of %d "+
+			"allows %d bytes of live records, above the %d a compaction may copy while "+
+			"requests wait; lower one of them", maxEntries, maxOutputBytes, live, MaxCompactionBytes)
+	}
+	return nil
 }

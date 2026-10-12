@@ -29,10 +29,13 @@ import (
 //	not_run            502     failed/target_rejected_502
 //	refused            4xx/5xx failed/target_rejected_NNN; nothing ran
 //
-// 409 and 503 are the only statuses that need the route's rules, and both
-// fail safe if the rules are missing: without the conflict rule a 409 would
-// read as target_rejected_409, which is why the route must carry it (the
-// gateway test proves the shipped route does).
+// 409 and 503 are the only statuses that need the route's rules. Without
+// them the gateway still never re-runs anything (every repeat goes through
+// the journal), so they fail safe only in that sense: the record would be
+// wrong. A 409 would read as target_rejected_409, a definite failure for a
+// command that may have run, and a 503 as target_rejected_503. That is why
+// the route must carry both rules, and the gateway test proves the shipped
+// route does (TestEffectsSSHRouteWithoutItsRulesIsUnsafe).
 
 // States are the "state" values of an answer body.
 const (

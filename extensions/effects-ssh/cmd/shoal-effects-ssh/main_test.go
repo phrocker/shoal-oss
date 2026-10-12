@@ -32,8 +32,8 @@ import (
 const token = "caller-token-0123456789abcdef0123456789"
 
 type fixture struct {
-	dir, config, token, journal string
-	host                        *sshtest.Server
+	dir, config, token, journal, id string
+	host                            *sshtest.Server
 }
 
 func newFixture(t *testing.T) fixture {
@@ -49,12 +49,72 @@ func newFixture(t *testing.T) fixture {
 	_ = os.WriteFile(f.config, raw, 0o600)
 	_ = os.WriteFile(f.token, []byte(token), 0o600)
 	_ = os.Mkdir(f.journal, 0o700)
+	var stdout bytes.Buffer
+	if code := run([]string{"journal", "init", "-journal-dir", f.journal}, &stdout, io.Discard, nil); code != exitOK {
+		t.Fatalf("journal init exit %d", code)
+	}
+	f.id = strings.TrimSpace(stdout.String())
 	return f
 }
 
 func (f fixture) args(extra ...string) []string {
 	return append([]string{"-config", f.config, "-caller-token-file", f.token,
-		"-journal-dir", f.journal, "-journal-retention", "48h"}, extra...)
+		"-journal-dir", f.journal, "-journal-id", f.id, "-journal-retention", "48h"}, extra...)
+}
+
+// TestServeRefusesAJournalItWasNotGiven: serve never creates a journal and
+// never adopts one other than the pinned one.
+func TestServeRefusesAJournalItWasNotGiven(t *testing.T) {
+	f := newFixture(t)
+	empty := filepath.Join(f.dir, "empty")
+	_ = os.Mkdir(empty, 0o700)
+	other := filepath.Join(f.dir, "other")
+	_ = os.Mkdir(other, 0o700)
+	if code := run([]string{"journal", "init", "-journal-dir", other}, io.Discard, io.Discard, nil); code != exitOK {
+		t.Fatal("init other")
+	}
+	listen := []string{"-listen", "127.0.0.1:0", "-allow-plaintext-loopback"}
+	base := []string{"-config", f.config, "-caller-token-file", f.token, "-journal-retention", "48h"}
+	for name, args := range map[string][]string{
+		"no journal id":    append(append(append([]string{}, base...), "-journal-dir", f.journal), listen...),
+		"empty directory":  append(append(append([]string{}, base...), "-journal-dir", empty, "-journal-id", f.id), listen...),
+		"another journal":  append(append(append([]string{}, base...), "-journal-dir", other, "-journal-id", f.id), listen...),
+		"malformed id":     append(append(append([]string{}, base...), "-journal-dir", f.journal, "-journal-id", "x"), listen...),
+		"compaction bound": append(f.args(listen...), "-journal-max-entries", "1000000"),
+	} {
+		var stderr bytes.Buffer
+		if code := run(append([]string{"serve"}, args...), io.Discard, &stderr, nil); code != exitUsage {
+			t.Errorf("%s: exit %d: %s", name, code, stderr.String())
+		}
+	}
+	if entries, _ := os.ReadDir(empty); len(entries) != 1 || entries[0].Name() != service.LockFileName {
+		t.Fatalf("serve wrote into an empty directory: %v", entries)
+	}
+	// init runs once.
+	var stderr bytes.Buffer
+	if code := run([]string{"journal", "init", "-journal-dir", f.journal}, io.Discard, &stderr, nil); code != exitRuntime {
+		t.Fatalf("second init exit %d", code)
+	}
+}
+
+// TestJournalListShowsRecordsBeforeCorruption: the operator sees every record
+// up to the bad line, and where and why it stopped.
+func TestJournalListShowsRecordsBeforeCorruption(t *testing.T) {
+	f := newFixture(t)
+	file, err := os.OpenFile(filepath.Join(f.journal, service.JournalFileName), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = file.WriteString("deadbeef {\"op\":\"started\"}\n")
+	_ = file.Close()
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"journal", "list", "-journal-dir", f.journal}, &stdout, &stderr, nil); code != exitRuntime {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(stdout.String(), `"journal_id":"`+f.id+`"`) ||
+		!strings.Contains(stderr.String(), "line 2") || !strings.Contains(stderr.String(), "checksum mismatch") {
+		t.Fatalf("stdout %q stderr %q", stdout.String(), stderr.String())
+	}
 }
 
 func TestServeRefusesUnsafeListeners(t *testing.T) {
@@ -142,7 +202,7 @@ func TestServeOverTLSAndStop(t *testing.T) {
 	if code := run([]string{"journal", "list", "-journal-dir", f.journal}, &stdout, io.Discard, nil); code != exitOK {
 		t.Fatalf("list exit %d", code)
 	}
-	if lines := strings.Count(stdout.String(), "\n"); lines != 2 || strings.Contains(stdout.String(), `"stdout":`) {
+	if lines := strings.Count(stdout.String(), "\n"); lines != 3 || strings.Contains(stdout.String(), `"stdout":`) {
 		t.Fatalf("list: %s", stdout.String())
 	}
 	stdout.Reset()
