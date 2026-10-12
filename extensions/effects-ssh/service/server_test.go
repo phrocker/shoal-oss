@@ -323,6 +323,41 @@ func TestUnreadableTokenRefusesEverything(t *testing.T) {
 		map[string][]string{"Authorization": {"Bearer " + rotated}}).is(t, answers, "completed")
 }
 
+// TestKnownKeyIsNeverRefused: a resend of a key whose command ran, refused
+// for its credential, header, method, path, query or body, is answered
+// outcome_unknown, never a refusal that would read as "nothing ran".
+func TestKnownKeyIsNeverRefused(t *testing.T) {
+	e := newEnv(t)
+	answers := loadAnswers(t)
+	key := testKey("ran")
+	e.post("restart-web", key).is(t, answers, "completed")
+	path := PathPrefix + "restart-web"
+	for name, request := range map[string]func() reply{
+		"rotated token": func() reply {
+			return e.do(http.MethodPost, path, key, "", map[string][]string{"Authorization": {"Bearer " + strings.Repeat("z", 40)}})
+		},
+		"no token": func() reply {
+			return e.do(http.MethodPost, path, key, "", map[string][]string{"Authorization": nil})
+		},
+		"method":   func() reply { return e.do(http.MethodPut, path, key, "", nil) },
+		"bad path": func() reply { return e.do(http.MethodPost, "/v2/commands/restart-web", key, "", nil) },
+		"query":    func() reply { return e.do(http.MethodPost, path+"?x=1", key, "", nil) },
+		"body":     func() reply { return e.do(http.MethodPost, path, key, `{"a":1}`, nil) },
+	} {
+		got := request()
+		if got.status != http.StatusConflict {
+			t.Fatalf("%s: %d %s", name, got.status, got.body)
+		}
+		got.is(t, answers, "outcome_unknown")
+	}
+	// An unknown key is still refused.
+	e.do(http.MethodPost, path, testKey("new"), "", map[string][]string{"Authorization": nil}).
+		is(t, answers, "refused_unauthorized")
+	if n := e.host.ssh.Execs("systemctl restart web"); n != 1 {
+		t.Fatalf("ran %d times", n)
+	}
+}
+
 // TestKeyConflictIsRefusedAndRunsNothing: a key first used for one command
 // is refused for another; the first's result is untouched.
 func TestKeyConflictIsRefusedAndRunsNothing(t *testing.T) {

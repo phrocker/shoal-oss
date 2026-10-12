@@ -380,11 +380,14 @@ func (j *Journal) apply(r record, at span) error {
 			return errors.New("malformed started record")
 		}
 		if previous, exists := j.entries[r.Key]; exists {
-			// A key may start again only after the earlier entry passed
-			// retention: the running process had pruned it, and the
-			// records stayed until a compaction. The same rule as prune.
-			if !previous.last().Before(r.At.Add(-j.opts.Retention)) {
-				return errors.New("a key is started twice within retention")
+			// The writer appends a second started record for a key only
+			// after a prune forgot it, and the earlier records stay until a
+			// compaction. The file's order is authoritative: the later
+			// record supersedes. The prune was decided under that process's
+			// retention and clock, so neither is re-judged here; only an
+			// exact repeat of the same record is corruption.
+			if previous.StartedAt.Equal(r.At) {
+				return errors.New("a key is started twice")
 			}
 		}
 		j.entries[r.Key] = &Entry{Key: r.Key, Command: r.Command,

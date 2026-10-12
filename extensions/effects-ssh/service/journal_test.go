@@ -284,6 +284,22 @@ func TestKeyReusedAfterRetentionStillOpens(t *testing.T) {
 	if begin := j.Begin(key, fp, "restart-web", true, 4); begin.Kind != BeginFinished {
 		t.Fatalf("reused key after reopen: %v", begin.Kind)
 	}
+	_ = j.Close()
+	// Raising the retention, or a clock set back, does not re-judge the
+	// earlier prune: the journal still opens.
+	for name, options := range map[string]JournalOptions{
+		"retention raised": {Retention: 48 * time.Hour, MaxEntries: 10, Now: now.Now},
+		"clock set back":   {Retention: time.Hour, MaxEntries: 10, Now: func() time.Time { return journalEpoch }},
+	} {
+		reopened, err := OpenJournal(dir, options)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if begin := reopened.Begin(key, fp, "restart-web", true, 4); begin.Kind != BeginFinished {
+			t.Fatalf("%s: %v", name, begin.Kind)
+		}
+		_ = reopened.Close()
+	}
 }
 
 // TestCompactionKeepsEveryLiveRecordByteForByte: after compaction the file

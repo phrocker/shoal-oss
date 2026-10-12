@@ -179,6 +179,18 @@ func (s *Server) log(line logLine) {
 func (s *Server) handle(r *http.Request, body []byte, bodyOK bool) (Answer, logLine) {
 	var line logLine
 	refuse := func(reason string) (Answer, logLine) {
+		// A refusal says nothing ran. For a key the journal holds that may
+		// be false (the command ran under an earlier attempt, and this one
+		// arrives with a rotated credential, a changed header or route), so
+		// a known key is answered outcome_unknown instead, which the gateway
+		// records as a possible effect and never as a rejection. It reveals
+		// only that the key is known, to a caller that already holds it.
+		if key, ok := s.idempotencyKey(r.Header); ok {
+			if _, known := s.opts.Journal.Lookup(key); known {
+				line.Key, line.Answer = KeyDigest(key), StateOutcomeUnknown+":"+reason
+				return OutcomeUnknownAnswer(false), line
+			}
+		}
 		line.Answer = StateRefused + ":" + reason
 		return Refused(reason), line
 	}

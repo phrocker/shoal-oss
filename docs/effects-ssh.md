@@ -137,7 +137,8 @@ past this: deleting it forgets every key it holds.
   a deployment rule, written down here. Retention uses the wall clock, so a
   clock that jumps forward can prune a key early. A key past retention that
   the process still holds is replayed, not re-run; only a key already
-  forgotten starts again, and its older records are then superseded
+  forgotten starts again, and its older records are then superseded, even if
+  the retention or the clock has changed since
   (`TestKeyReusedAfterRetentionStillOpens`).
 - **The journal is the guarantee.** It does not hold if the journal volume is
   lost or replaced, if the journal is moved aside, or if two instances share
@@ -212,7 +213,13 @@ Why these statuses:
 - **`not_run` and the refusals are definite failures**, because nothing ran.
   Every refusal is for a key the journal does not hold: an unregistered
   command, a credential or input refusal, or a full or failed journal, all
-  before any dial.
+  before any dial. A request the service would refuse whose key the journal
+  does hold (a resend after the credential was rotated, the header renamed or
+  the route changed) is answered `outcome_unknown` instead.
+- **No hop between the gateway and this service may answer for it.** A proxy
+  that answered 502 or 504 after forwarding would be recorded as a
+  rejection while the command may have run. The sidecar shape has no such
+  hop.
 
 ### What reaches `ActionRecord.Output`
 
@@ -353,7 +360,7 @@ the flag, as for the LLM gateway (#424).
 
 ### Timing
 
-- `connect_timeout + run_timeout + a few seconds` must be below the gateway's
+- `2 × connect_timeout + run_timeout + 10s` (connect, then the session open, each bounded by the connect timeout, then the run, the close and the fsyncs) must be below the gateway's
   `-operation-timeout` (T), so the first attempt normally gets the answer.
   If it does not, the resend attaches to the running command (`-attach-wait`)
   and gets the result or `in_progress`. Nothing runs twice, but the gateway
