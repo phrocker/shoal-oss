@@ -72,6 +72,9 @@ fi
 code=0
 run journal init -journal-dir /var/lib/effects-ssh >/dev/null 2>&1 || code=$?
 check "a second journal init exits" "${code}" "1"
+# The chart's init Job runs init with -print-existing: on an existing journal
+# it prints the same identity and exits 0.
+check "journal init -print-existing on the journal" "$(run journal init -print-existing -journal-dir /var/lib/effects-ssh)" "${id}"
 listed="$(run journal list -journal-dir /var/lib/effects-ssh)"
 if ! grep -qF "${id}" <<<"${listed}"; then
   echo "shoal-effects-ssh image: journal list does not show the identity ${id}: ${listed}" >&2

@@ -56,6 +56,17 @@ func TestReadJournalIDReadsOnlyTheHeader(t *testing.T) {
 	if id, err := ReadJournalID(dir); err != nil || id != "0123456789abcdef0123456789abcdef" {
 		t.Fatalf("ReadJournalID = %q %v", id, err)
 	}
+	// A symlinked journal.log is refused, as the server refuses it.
+	elsewhere := filepath.Join(t.TempDir(), "real.log")
+	_ = os.WriteFile(elsewhere, header, 0o600)
+	_ = os.Remove(path)
+	if err := os.Symlink(elsewhere, path); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := ReadJournalID(dir); err == nil || id != "" {
+		t.Fatalf("a symlinked journal answered %q", id)
+	}
+	_ = os.Remove(path)
 	for name, content := range map[string][]byte{
 		"empty":       nil,
 		"torn header": header[:len(header)-1],

@@ -222,8 +222,8 @@ Takes a dict of root and ssh. Returns JSON.
 {{- if not (regexMatch `^[!-~]{1,64}$` (toString $spec.user)) -}}
 {{- fail (printf "%s.user must be 1 to 64 printable bytes with no space (got %q)" $at (toString $spec.user)) -}}
 {{- end -}}
-{{- if regexMatch `[\p{Cc}]` (toString $spec.command) -}}
-{{- fail (printf "%s.command holds a control character or a line break: it is one line, run as written; a multi-line script belongs in a file on the host" $at) -}}
+{{- if regexMatch `[\p{Cc}\p{Cf}\x{2028}\x{2029}\x{FFFD}]` (toString $spec.command) -}}
+{{- fail (printf "%s.command holds a control, format or line-break character (isControl in service/config.go): it is one line, run as written; a multi-line script belongs in a file on the host" $at) -}}
 {{- end -}}
 {{- $address := toString $spec.address -}}
 {{- if not (regexMatch `^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]*):[0-9]{1,5}$` $address) -}}
@@ -237,6 +237,11 @@ Takes a dict of root and ssh. Returns JSON.
 {{- $hostKeys := default (list) $spec.hostKeys -}}
 {{- if or (not (kindIs "slice" $hostKeys)) (lt (len $hostKeys) 1) (gt (len $hostKeys) 8) -}}
 {{- fail (printf "%s.hostKeys must list 1 to 8 pinned host keys: there is no trust on first use" $at) -}}
+{{- end -}}
+{{- range $index, $hostKey := $hostKeys -}}
+{{- if not (regexMatch `^(ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa) [A-Za-z0-9+/]+={0,2}( [ -~]*)?$` (toString $hostKey)) -}}
+{{- fail (printf "%s.hostKeys[%d] must be one authorized_keys line with no options: an ed25519, ECDSA or RSA key type, the base64 key, and an optional comment (got %q). Certificates are refused" $at $index (toString $hostKey)) -}}
+{{- end -}}
 {{- end -}}
 {{- $keyName := toString $spec.privateKeyKey -}}
 {{- if or (gt (len $keyName) 253) (not (regexMatch `^[-._a-zA-Z0-9]+$` $keyName)) (has $keyName (list "." "..")) (hasPrefix ".." $keyName) -}}

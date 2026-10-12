@@ -1701,7 +1701,7 @@
        client dry run it returns nothing, so this is silent there, as the
        gateways' rename guard is. */ -}}
 {{- if $plan.journalID -}}
-{{- $sshServing = append $sshServing $name -}}
+{{- $sshServing = append $sshServing $plan.name -}}
 {{- end -}}
 {{- if not $plan.journalID -}}
 {{- $live := lookup "apps/v1" "Deployment" $.Release.Namespace $plan.name -}}
@@ -1727,7 +1727,9 @@
 {{- if and (eq (toString (get $podLabels "app.kubernetes.io/component")) "effects-ssh") (eq (toString (get $podLabels "app.kubernetes.io/instance")) $.Release.Name) -}}
 {{- $liveName := toString (get $podLabels "shoal.effects-ssh/name") -}}
 {{- $running := or (gt (int64 (default 0 $live.spec.replicas)) 0) (gt (int64 (default 0 (dig "status" "replicas" 0 $live))) 0) -}}
-{{- if and $running (not (has $liveName $sshServing)) -}}
+{{- /* By object name, not entry name: a changed fullnameOverride keeps the
+       entry's name and moves it to another claim all the same. */ -}}
+{{- if and $running (not (has (toString $live.metadata.name) $sshServing)) -}}
 {{- fail (printf "the effects-ssh Deployment %s (entry %q) is running, and no enabled effectsSsh entry with a journal.id names it any more: renaming or removing a running entry, or clearing its ID, starts a different journal that has never seen the keys this one ran, and the gateway's resends would run them again. Keep the journal across a rename: set the old entry's replicas: 0 and upgrade, then name the old claim in the new entry (journal.storage: existingClaim) with the same journal.id" $live.metadata.name $liveName) -}}
 {{- end -}}
 {{- end -}}

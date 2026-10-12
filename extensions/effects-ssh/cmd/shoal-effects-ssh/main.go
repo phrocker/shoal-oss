@@ -462,6 +462,12 @@ func journalInit(args []string, stdout, stderr io.Writer) int {
 			// or malformed header is an error, never a fresh start. The
 			// rest of the file is the server's to check when it opens it.
 			id, err := service.ReadJournalID(*dir)
+			if err == nil {
+				// An init killed between linking journal.log and syncing the
+				// directory left it undurable; make it durable before the
+				// identity is pinned.
+				err = service.SyncJournalDir(*dir)
+			}
 			if err != nil {
 				fmt.Fprintln(stderr, err)
 				return exitRuntime

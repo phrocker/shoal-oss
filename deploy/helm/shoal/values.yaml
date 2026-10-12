@@ -924,7 +924,8 @@ effectsGatewayDefaults:
 # A list, one entry per gateway, empty by default. Each entry is deep-merged
 # over effectsSshDefaults. Each enabled entry renders a Service, a
 # ServiceAccount with no token automount, a ConfigMap holding the command
-# registry, a PersistentVolumeClaim for the journal, a NetworkPolicy, and
+# registry, a PersistentVolumeClaim for the journal (unless journal.storage is
+# existingClaim), a NetworkPolicy, and
 # either the journal-init Job (journal.id empty) or the Deployment (journal.id
 # set), never both.
 #

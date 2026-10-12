@@ -88,8 +88,8 @@ spec:
 ---
 # Step 1 of an install: initialize the journal once, on the claim, and print
 # its identity. An ordinary resource, not a hook: it is the claim's first
-# consumer, so a WaitForFirstConsumer claim binds for it, and `helm install
-# --wait` waits for it rather than for a claim nothing uses. Kubernetes does
+# consumer, so a WaitForFirstConsumer claim binds for it (`helm install
+# --wait --wait-for-jobs` waits for the identity to be printed). Kubernetes does
 # not rerun a finished Job, and its log (the identity) stays readable until
 # journal.id is set. A changed pod template gets a new name (a digest), and
 # that run finds the journal and prints its identity (-print-existing):

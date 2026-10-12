@@ -404,6 +404,11 @@ func readRecords(file io.ReadSeeker, visit func(record, span) error) (int64, err
 
 var errTorn = errors.New("torn tail")
 
+// SyncJournalDir fsyncs the journal directory, so a journal.log an init
+// linked into place and was killed before syncing is durable before its
+// identity is handed to an operator to pin.
+func SyncJournalDir(dir string) error { return syncDir(dir) }
+
 // errStopReading ends a readRecords pass early, without error.
 var errStopReading = errors.New("stop reading")
 
@@ -413,6 +418,15 @@ var errStopReading = errors.New("stop reading")
 // is an error (ErrJournalUninitialized or a *CorruptError), never an empty
 // identity. It takes no lock and writes nothing.
 func ReadJournalID(dir string) (string, error) {
+	// As the server does, refuse anything but a regular file: an identity
+	// printed for a symlink would be pinned and then refused at startup.
+	info, err := os.Lstat(filepath.Join(dir, JournalFileName))
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", filepath.Join(dir, JournalFileName))
+	}
 	file, err := os.Open(filepath.Join(dir, JournalFileName))
 	if err != nil {
 		return "", err

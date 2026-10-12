@@ -597,7 +597,7 @@ pin.
   below the gateway's `timing.operationTimeout`, and `attachWait` below it
   too. `-shutdown-grace` defaults to the longest of those budgets, and
   `terminationGracePeriodSeconds` to it + 10s; overrides may only raise them.
-- **The binary's own bounds.** Command names, host keys, timeouts, output
+- **The binary's own bounds.** Command names, the shape of host keys, users, commands, timeouts, output
   bounds and the compaction bound are checked, and so is every setting name,
   so a misspelling is refused rather than defaulted.
 
@@ -612,11 +612,11 @@ pin.
 - Entry names may not end in a suffix the chart appends to another entry's
   objects (`-init`, `-init-<digest>`, `-journal`, `-commands`), so no two
   entries' objects can share a name and replace each other's policy.
+- The gateway's own policy reaches this entry by pod selector instead of
+  `targetCIDRs`.
 
 The Deployment has a TCP startup probe allowing ten minutes, because `serve`
 replays the journal before it listens.
-- The gateway's own policy reaches this entry by pod selector instead of
-  `targetCIDRs`.
 
 `deploy/helm/validate-chart.sh` asserts each of these: it renders the objects,
 refuses each broken value by its own message, and runs the rendered arguments

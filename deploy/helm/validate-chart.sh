@@ -3465,6 +3465,11 @@ elif check == "init":
         if own.get("readOnlyRootFilesystem") is not True or own.get("capabilities") != {"drop": ["ALL"]}:
             problems.append("the Job's container is not read-only with every capability dropped")
         init_policy = next((p for n, p in policies.items() if n.endswith("-init")), None)
+        job_labels = job["spec"]["template"]["metadata"]["labels"]
+        if init_policy and any(job_labels.get(k) != v for k, v in init_policy.get("podSelector", {}).get("matchLabels", {}).items()):
+            problems.append("the init policy does not select the Job's pod")
+        if init_policy and not init_policy.get("podSelector", {}).get("matchLabels"):
+            problems.append("the init policy's selector is empty")
         if (not init_policy or init_policy.get("policyTypes") != ["Ingress", "Egress"] or init_policy.get("ingress") or init_policy.get("egress")):
             problems.append(f"the Job's pod is not denied all network: {init_policy!r}")
 elif check == "security":
@@ -3544,6 +3549,14 @@ elif check == "policy":
     else:
         if ssh.get("policyTypes") != ["Ingress", "Egress"]:
             problems.append(f"policy types are {ssh.get('policyTypes')!r}")
+        serving = [d for d in deployments]
+        if len(serving) != 1:
+            problems.append("no effects-ssh Deployment to hold the policy against")
+        else:
+            labels = serving[0]["spec"]["template"]["metadata"]["labels"]
+            selected = ssh.get("podSelector", {}).get("matchLabels", {})
+            if not selected or any(labels.get(k) != v for k, v in selected.items()):
+                problems.append(f"the policy's selector {selected} does not select the effects-ssh pod {labels}")
         gateway_labels = {"app.kubernetes.io/name": "shoal-gateway", "app.kubernetes.io/instance": "shoal",
                           "app.kubernetes.io/component": "effects-gateway", "shoal.effects-gateway/name": "web-fleet"}
         if ssh.get("ingress") != [{"from": [{"podSelector": {"matchLabels": gateway_labels}}], "ports": [{"port": "https", "protocol": "TCP"}]}]:
@@ -3571,6 +3584,8 @@ elif check == "policy":
         problems.append("the gateway's NetworkPolicy is not rendered")
     else:
         targets = [rule for rule in gateway["egress"] if any("podSelector" in peer and peer["podSelector"]["matchLabels"].get("shoal.effects-ssh/name") == "web" for peer in rule.get("to", []))]
+        if deployments and targets and targets[0]["to"][0]["podSelector"]["matchLabels"] != deployments[0]["spec"]["selector"]["matchLabels"]:
+            problems.append("the gateway's egress selector is not the effects-ssh Deployment's selector")
         if len(targets) != 1 or targets[0]["ports"] != [{"port": 8443, "protocol": "TCP"}]:
             problems.append(f"the gateway's policy does not reach effects-ssh's pods on 8443 alone: {targets!r}")
         if any("ipBlock" in peer for rule in gateway["egress"] for peer in rule.get("to", [])):
@@ -3701,6 +3716,9 @@ refuses_citing "is not a command setting" "a misspelled field" "${ssh_base[@]}" 
 refuses_citing "hostKeys must list 1 to 8" "no pinned host key" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.hostKeys=null'
 refuses_citing "address must be host:port" "an address with no port" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.address=10.0.4.17'
 refuses_citing "privateKeyKey must be a Secret key" "a key path that climbs" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.privateKeyKey=../x'
+refuses_citing "holds a control, format or line-break character" "a command with a bidi override" "${ssh_base[@]}" --set-string "effectsSsh[0].commands.restart-web.command=sudo systemctl restart web$(printf '‮')"
+refuses_citing "must be one authorized_keys line" "a malformed host key" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.hostKeys={ssh-ed25519}'
+refuses_citing "must be one authorized_keys line" "a host key with options" "${ssh_base[@]}" --set-json 'effectsSsh[0].commands.restart-web.hostKeys=["from=\"10.0.0.1\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIRh5PXk+0rm7CbKyH/ViV5hPII8CP+XNiZ58vWMgteW"]'
 refuses_citing "must be 1 to 64 printable bytes" "a user with a space" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.user=de ploy'
 refuses_citing "not starting with .." "a key name Kubernetes reserves" "${ssh_base[@]}" --set 'effectsSsh[0].commands.restart-web.privateKeyKey=..data'
 for name in web-init web-init-0a1b web-journal web-commands; do
