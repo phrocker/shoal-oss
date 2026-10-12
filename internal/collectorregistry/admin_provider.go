@@ -76,7 +76,8 @@ func (p *AdminProvider) ReadRegistration(ctx context.Context, id shoal.ID) (api.
 	}
 	for _, a := range view.Anomalies {
 		if len(out.Anomalies) == api.MaxRegistrationAnomalies {
-			break
+			out.MoreAnomalies++
+			continue
 		}
 		out.Anomalies = append(out.Anomalies, api.LogAnomaly{Generation: a.Generation, Action: string(a.Action), Reason: string(a.Reason)})
 	}

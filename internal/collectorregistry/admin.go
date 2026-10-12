@@ -279,6 +279,68 @@ type auditWrite struct {
 	updates    []allocator.Update
 }
 
+// changeV1, registrationV1 and attributionV1 are the frozen storage form of
+// version 1 entries. Version 1 decodes into these, not into the live types,
+// so a field added to Change, collector.Registration or AdminAttribution
+// later cannot change how a stored version 1 entry decodes or re-encodes;
+// such a change takes a new version. Their field names and order are the
+// format (testdata/change_v1.golden.json pins it).
+type changeV1 struct {
+	Version      int
+	CollectorID  shoal.ID
+	Action       ChangeAction
+	Source       ChangeSource
+	Registration registrationV1
+	Admin        *attributionV1
+	At           time.Time
+	Attempt      string
+}
+
+type registrationV1 struct {
+	CollectorID        shoal.ID
+	Subject            shoal.ID
+	ClientID           shoal.ID
+	Domain             []byte
+	AuthorityPolicyIDs []shoal.ID
+	Control            collector.Control
+	Mode               collector.Mode
+	Generation         int64
+	State              collector.State
+}
+
+type attributionV1 struct {
+	Subject                  shoal.ID
+	Actor                    shoal.ID
+	ClientID                 shoal.ID
+	Domain                   []byte
+	RequestID                shoal.ID
+	CorrelationID            shoal.ID
+	AuthorizationFingerprint string
+}
+
+func toV1(c Change) changeV1 {
+	r := c.Registration
+	out := changeV1{Version: c.Version, CollectorID: c.CollectorID, Action: c.Action, Source: c.Source, At: c.At, Attempt: c.Attempt,
+		Registration: registrationV1{CollectorID: r.CollectorID, Subject: r.Subject, ClientID: r.ClientID, Domain: r.Domain, AuthorityPolicyIDs: r.AuthorityPolicyIDs, Control: r.Control, Mode: r.Mode, Generation: r.Generation, State: r.State}}
+	if a := c.Admin; a != nil {
+		out.Admin = &attributionV1{Subject: a.Subject, Actor: a.Actor, ClientID: a.ClientID, Domain: a.Domain, RequestID: a.RequestID, CorrelationID: a.CorrelationID, AuthorizationFingerprint: a.AuthorizationFingerprint}
+	}
+	return out
+}
+
+func fromV1(v changeV1) Change {
+	r := v.Registration
+	out := Change{Version: v.Version, CollectorID: v.CollectorID, Action: v.Action, Source: v.Source, At: v.At, Attempt: v.Attempt,
+		Registration: collector.Registration{CollectorID: r.CollectorID, Subject: r.Subject, ClientID: r.ClientID, Domain: r.Domain, AuthorityPolicyIDs: r.AuthorityPolicyIDs, Control: r.Control, Mode: r.Mode, Generation: r.Generation, State: r.State}}
+	if a := v.Admin; a != nil {
+		out.Admin = &AdminAttribution{Subject: a.Subject, Actor: a.Actor, ClientID: a.ClientID, Domain: a.Domain, RequestID: a.RequestID, CorrelationID: a.CorrelationID, AuthorizationFingerprint: a.AuthorizationFingerprint}
+	}
+	return out
+}
+
+// encodeChange stores c in this build's version.
+func encodeChange(c Change) ([]byte, error) { return encode(toV1(c)) }
+
 // errUnknownVersion marks an entry whose format version this build does not
 // know. Readers report it as an anomaly; it is never guessed at.
 var errUnknownVersion = errors.New("collector change entry version unknown")
@@ -298,11 +360,11 @@ func decodeChange(raw []byte) (Change, error) {
 	}
 	switch probe.Version {
 	case 1:
-		var c Change
-		if decode(raw, &c) != nil || c.Version != 1 {
+		var v changeV1
+		if decode(raw, &v) != nil || v.Version != 1 {
 			return Change{}, ErrUnavailable
 		}
-		return c, nil
+		return fromV1(v), nil
 	default:
 		return Change{}, errUnknownVersion
 	}
@@ -324,7 +386,7 @@ func (r *Registry) prepareChange(id shoal.ID, next registrationRow, record func(
 	if validChange(change, id) != nil {
 		return auditWrite{}, invalid()
 	}
-	value, e := encode(change)
+	value, e := encodeChange(change)
 	if e != nil {
 		return auditWrite{}, invalid()
 	}
@@ -356,7 +418,10 @@ func (r *Registry) changeApplied(ctx context.Context, id shoal.ID, w auditWrite)
 }
 
 func validChange(c Change, id shoal.ID) error {
-	if c.Version != ChangeVersion || c.CollectorID != id || c.Registration.CollectorID != id || c.At.IsZero() || len(c.Attempt) != 32 {
+	// The time and attribution bounds are exactly the wire's
+	// (pkg/collector/api), so an entry this accepts is one the HTTP read
+	// can present.
+	if c.Version != ChangeVersion || c.CollectorID != id || c.Registration.CollectorID != id || c.At.IsZero() || c.At.Year() < 1 || c.At.Year() > 9999 || len(c.Attempt) != 32 {
 		return invalid()
 	}
 	if _, e := c.Registration.Canonical(); e != nil {
@@ -402,11 +467,14 @@ func validAttribution(a AdminAttribution) error {
 			return invalid()
 		}
 	}
-	if interaction.ValidateCorrelationID(a.CorrelationID) != nil || a.AuthorizationFingerprint == "" || !printableID(shoal.ID(a.AuthorizationFingerprint), true) || len(a.Domain) == 0 || len(a.Domain) > shoal.MaxIDBytes {
+	if interaction.ValidateCorrelationID(a.CorrelationID) != nil || a.AuthorizationFingerprint == "" || len(a.AuthorizationFingerprint) > maxFingerprintBytes || !printableID(shoal.ID(a.AuthorizationFingerprint), true) || len(a.Domain) == 0 || len(a.Domain) > shoal.MaxIDBytes {
 		return invalid()
 	}
 	return nil
 }
+
+// maxFingerprintBytes is the wire's bound on an authorization fingerprint.
+const maxFingerprintBytes = 128
 
 func printableID(id shoal.ID, required bool) bool {
 	if id == "" {
@@ -537,9 +605,30 @@ func checkLog(id shoal.ID, reg collector.Registration, from, to int64, cells []a
 			log.Entries = append(log.Entries, c)
 		}
 	}
-	slices.SortFunc(log.Anomalies, func(a, b LogAnomaly) int {
+	// The anomalies about entries that are presented or withheld
+	// (inconsistent, duplicate) come first, so a bounded listing never drops
+	// them; then by generation, newest first, and reason.
+	rank := func(a LogAnomaly) int {
+		switch a.Reason {
+		case AnomalyInconsistent:
+			return 0
+		case AnomalyDuplicate:
+			return 1
+		}
+		return 2
+	}
+	slices.SortStableFunc(log.Anomalies, func(a, b LogAnomaly) int {
+		if ra, rb := rank(a), rank(b); ra != rb {
+			return ra - rb
+		}
 		if a.Generation != b.Generation {
-			return int(a.Generation - b.Generation)
+			if a.Generation > b.Generation {
+				return -1
+			}
+			return 1
+		}
+		if c := strings.Compare(string(a.Action), string(b.Action)); c != 0 {
+			return c
 		}
 		return strings.Compare(string(a.Reason), string(b.Reason))
 	})

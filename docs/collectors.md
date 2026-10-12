@@ -282,6 +282,16 @@ The read reports:
   - `inconsistent`: the newest slot's entry describes a registration other
     than the current one.
 
+The HTTP read lists at most 64 anomalies, `inconsistent` and `duplicate`
+first, and counts the rest in `more_anomalies`. An entry is accepted only
+within the wire's own bounds (timestamps in years 1 to 9999, fingerprints of
+at most 128 bytes), so anything the registry presents, the HTTP read can
+carry.
+
+A lost acknowledgement is resolved by the attempt's own cell even if the
+registration has since moved on (an enrollment, say): the cell's presence
+proves the change committed.
+
 Gaps and anomalies are reported, never repaired, and they never block a
 write. A delete marker cannot pre-empt a write either, because the qualifier
 is unknown until the write happens.
@@ -300,8 +310,12 @@ itself. So the log never holds an entry its own read API refuses.
 **Versioned entries.** Every entry carries a format version. The decoder
 reads the version first, then decodes strictly into that version's own
 structure. A version it does not know is refused explicitly and reported as
-`unknown_version`, never guessed at. A later build adds fields by adding a
-version, and entries written in an earlier version stay readable.
+`unknown_version`, never guessed at. Each version decodes into its own frozen storage structure, not into the
+live types, so changing those types cannot move a stored entry. The
+version 1 bytes are pinned by
+`internal/collectorregistry/testdata/change_v1.golden.json`. A later build
+adds fields by adding a version, and entries written in an earlier version
+stay readable.
 
 **Requirements and limits.**
 - Reads need a store with row scans; the engine and Accumulo stores have

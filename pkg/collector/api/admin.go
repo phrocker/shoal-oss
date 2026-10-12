@@ -170,6 +170,9 @@ type RegistrationRecord struct {
 	Changes            []ChangeSummary `json:"changes"`
 	Gaps               []LogGap        `json:"gaps"`
 	Anomalies          []LogAnomaly    `json:"anomalies"`
+	// MoreAnomalies counts anomalies beyond MaxRegistrationAnomalies that
+	// are not listed. Inconsistent and duplicate anomalies are listed first.
+	MoreAnomalies int `json:"more_anomalies,omitempty"`
 }
 
 // MaxRegistrationAnomalies bounds the anomalies one RegistrationRecord lists.
@@ -303,7 +306,7 @@ func (r RegistrationRecord) Validate() error {
 	if r.Schema != Schema || !validState(r.State) || len(r.Changes) > MaxRegistrationChanges || len(r.Anomalies) > MaxRegistrationAnomalies || r.FromGeneration <= 0 || r.FromGeneration > r.Generation || r.Generation-r.FromGeneration >= ViewGenerations {
 		return badResponse()
 	}
-	if r.Changes == nil || r.Gaps == nil || r.Anomalies == nil {
+	if r.Changes == nil || r.Gaps == nil || r.Anomalies == nil || r.MoreAnomalies < 0 || (r.MoreAnomalies > 0 && len(r.Anomalies) != MaxRegistrationAnomalies) {
 		return badResponse()
 	}
 	p, e := DecodeProvision(ProvisionRequest{CollectorID: r.CollectorID, Subject: r.Subject, ClientID: r.ClientID, Domain: r.Domain, AuthorityPolicyIDs: r.AuthorityPolicyIDs, Control: r.Control, Mode: r.Mode, Generation: r.Generation})

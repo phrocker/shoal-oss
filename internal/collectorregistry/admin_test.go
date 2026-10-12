@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -842,7 +845,7 @@ func forge(t *testing.T, v *env, generation int64, action ChangeAction, change f
 	}
 	c.Attempt = strings.Repeat("9", 32)
 	change(&c)
-	value, e := encode(c)
+	value, e := encodeChange(c)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -991,4 +994,113 @@ func TestValidChangeHoldsSlotInvariants(t *testing.T) {
 			t.Fatalf("%s accepted", name)
 		}
 	}
+}
+
+// The version 1 entry format is pinned: a fixed entry encodes to the
+// committed bytes, and those bytes decode back to it. Changing the live
+// types cannot move it; changing the format takes a new version.
+//
+// Regenerate only for a deliberate new version:
+// SHOAL_UPDATE_GOLDEN=1 go test ./internal/collectorregistry -run TestChangeV1FormatIsPinned
+func TestChangeV1FormatIsPinned(t *testing.T) {
+	c := Change{Version: 1, CollectorID: collectorID, Action: ChangeProvision, Source: SourceCollectorAdmin,
+		Registration: collector.Registration{CollectorID: collectorID, Subject: "tail", ClientID: "client", Domain: []byte("domain"), AuthorityPolicyIDs: []shoal.ID{"authority:logs"}, Control: collector.ExternalControlled, Mode: collector.ServerObserved, Generation: 1, State: collector.Provisioned},
+		Admin:        &AdminAttribution{Subject: "admin", Actor: "admin", ClientID: "admin-client", Domain: []byte("domain"), RequestID: "request", CorrelationID: "correlation", AuthorizationFingerprint: "auth-sha256:" + strings.Repeat("0", 64)},
+		At:           time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC), Attempt: strings.Repeat("a", 32)}
+	got, e := encodeChange(c)
+	if e != nil {
+		t.Fatal(e)
+	}
+	path := "testdata/change_v1.golden.json"
+	if os.Getenv("SHOAL_UPDATE_GOLDEN") == "1" {
+		if e := os.WriteFile(path, append(bytes.Clone(got), '\n'), 0o644); e != nil {
+			t.Fatal(e)
+		}
+	}
+	want, e := os.ReadFile(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	want = bytes.TrimSuffix(want, []byte("\n"))
+	if !bytes.Equal(got, want) {
+		t.Fatalf("version 1 encoding changed:\n got %s\nwant %s", got, want)
+	}
+	back, e := decodeChange(want)
+	if e != nil || !reflect.DeepEqual(back, c) {
+		t.Fatalf("decoded %+v %v", back, e)
+	}
+}
+
+// An entry the registry accepts is one the HTTP read can present: cells
+// outside the wire's bounds are anomalies, and the read still succeeds.
+func TestEntriesOutsideTheWireBoundsAreAnomalies(t *testing.T) {
+	for name, change := range map[string]func(*Change){
+		"year 0":           func(c *Change) { c.At = time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC) },
+		"long fingerprint": func(c *Change) { c.Admin.AuthorizationFingerprint = strings.Repeat("f", 129) },
+	} {
+		v := provisionedEnv(t)
+		coord := v.entryCoordinate(t, collectorID, 1, ChangeProvision)
+		forge(t, v, 1, ChangeProvision, change)
+		deleteCell(t, v, coord)
+		provider, _ := NewAdminProvider(v.registry)
+		record, e := provider.ReadRegistration(v.admin(t), collectorID)
+		if e != nil || len(record.Changes) != 0 || len(record.Anomalies) != 1 || record.Anomalies[0].Reason != api.AnomalyUndecodable {
+			t.Fatalf("%s: %+v %v", name, record, e)
+		}
+	}
+}
+
+// A bounded anomaly listing keeps the anomalies about presented or withheld
+// entries, and says how many it left out.
+func TestAnomalyTruncationKeepsTheImportantOnes(t *testing.T) {
+	v := provisionedEnv(t)
+	coord := v.entryCoordinate(t, collectorID, 1, ChangeProvision)
+	forge(t, v, 1, ChangeProvision, func(c *Change) { c.Registration.Control = collector.RegistryControlled })
+	deleteCell(t, v, coord)
+	for i := range 70 {
+		// Strays in later generations, which sort ahead of generation 1 by
+		// generation alone.
+		put(t, v, v.registry.changeCoordinate(collectorID, entryQualifier(int64(2+i), ChangeProvision, fmt.Sprintf("%032x", i))), 1, []byte("stray"))
+	}
+	provider, _ := NewAdminProvider(v.registry)
+	record, e := provider.ReadRegistration(v.admin(t), collectorID)
+	if e != nil || len(record.Anomalies) != api.MaxRegistrationAnomalies || record.MoreAnomalies != 71-api.MaxRegistrationAnomalies || record.Anomalies[0].Reason != api.AnomalyInconsistent {
+		t.Fatalf("record anomalies %d more %d first %+v err %v", len(record.Anomalies), record.MoreAnomalies, record.Anomalies[0], e)
+	}
+}
+
+// afterApply applies a mutation, runs hook, then reports the outcome as
+// unknown.
+type afterApply struct {
+	lostAck
+	armed atomic.Bool
+	hook  func()
+}
+
+func (a *afterApply) CompareAndMutate(ctx context.Context, m allocator.Mutation) (allocator.Status, error) {
+	status, e := a.inner.CompareAndMutate(ctx, m)
+	if e == nil && a.armed.CompareAndSwap(true, false) {
+		a.hook()
+		return allocator.StatusUnknown, allocator.ErrConditionalUnknown
+	}
+	return status, e
+}
+
+// A committed change whose acknowledgement was lost is reported as made
+// even when the registration has moved on since (an enrollment), because
+// the attempt's own entry cell proves it.
+func TestALostAckIsReconciledAfterTheRowMovedOn(t *testing.T) {
+	v := newEnv(t)
+	backend := &afterApply{lostAck: lostAck{inner: v.registry.config.Backend}}
+	backend.hook = func() {
+		if _, e := v.registry.Enroll(v.as(t, "tail"), []byte("k"), enrollRequest(collectorID, "authority:logs")); e != nil {
+			t.Error(e)
+		}
+	}
+	backend.armed.Store(true)
+	result, e := wrapped(t, v, backend).AdminProvision(v.admin(t), grant(collectorID, "tail", "authority:logs"), 1)
+	if e != nil || !result.Changed {
+		t.Fatalf("provision %+v %v", result, e)
+	}
+	v.cleanLog(t, collectorID)
 }

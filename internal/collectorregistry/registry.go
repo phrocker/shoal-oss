@@ -348,6 +348,14 @@ func (r *Registry) updateRegistrationAudited(ctx context.Context, id shoal.ID, c
 		if writeErr == nil && status == allocator.StatusAccepted {
 			return next, true, nil
 		}
+		// With an entry, this attempt's own uniquely qualified cell is proof
+		// that its mutation committed, whatever the registration row has
+		// done since (an enrollment may already have moved it on).
+		if record != nil {
+			if applied, checkErr := r.changeApplied(ctx, id, entry); checkErr == nil && applied {
+				return next, true, nil
+			}
+		}
 		stored, readErr := r.read(ctx, coord)
 		if readErr == nil && stored.Timestamp == timestamp && bytes.Equal(stored.Value, value) {
 			// An identical registration write is not proof that this
