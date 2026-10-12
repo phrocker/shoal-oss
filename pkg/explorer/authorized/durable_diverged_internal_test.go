@@ -320,6 +320,10 @@ func TestDurablePolicyStoreWriteAfterCloseIsNotADivergence(t *testing.T) {
 	if store.Diverged() || fired != 0 {
 		t.Fatalf("a write after close diverged=%v fired=%d", store.Diverged(), fired)
 	}
+	// The refused write is not observable: a closed store serves no reads.
+	if _, _, err := store.Edge(context.Background(), "after-close"); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+		t.Fatalf("read after close = %v, want unavailable", err)
+	}
 }
 
 // TestDivergedStoreRefusesPersistFirstWrites pins that a write which

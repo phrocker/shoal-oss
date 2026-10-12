@@ -75,6 +75,10 @@ type DurablePolicyStore struct {
 	// that never persisted could otherwise stand in for the rule it
 	// replaced).
 	diverged atomic.Bool
+	// shut mirrors closed for the lock-free read path: a closed store
+	// serves no reads, so a write refused because it raced Close (after
+	// changing memory) is never observable.
+	shut atomic.Bool
 	// divergedOnce runs the OnDiverged hook at most once; divergedHook is
 	// what OnDiverged registered.
 	divergedOnce sync.Once
@@ -282,6 +286,7 @@ func (s *DurablePolicyStore) Close() error {
 		return nil
 	}
 	s.closed = true
+	s.shut.Store(true)
 	if err := s.engine.Close(); err != nil {
 		return shoal.WrapError(
 			shoal.ErrorInternal, "close policy catalog storage", err)
@@ -905,7 +910,7 @@ func (s *DurablePolicyStore) persisted(err error) error {
 }
 
 func (s *DurablePolicyStore) memoryStore() *MemoryPolicyStore {
-	if s == nil || s.diverged.Load() {
+	if s == nil || s.diverged.Load() || s.shut.Load() {
 		return nil
 	}
 	return s.memory
