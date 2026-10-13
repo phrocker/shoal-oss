@@ -168,8 +168,8 @@ func (e *Engine) exportDelta(
 	}
 	// The basis is the sent files holding entry's sent leaves. Their cells
 	// must be exactly those leaves' cells, each once: every one wholly
-	// inside entry's lineage, none holding a leaf twice, none sharing a
-	// leaf with another.
+	// inside entry's lineage (so together they hold exactly have), none
+	// holding a leaf twice, none sharing a leaf with another.
 	var basis []RFileExportFile
 	var covered tablet.Lineage
 	for _, s := range sent {
@@ -181,9 +181,6 @@ func (e *Engine) exportDelta(
 		}
 		covered = covered.Union(*s.Lineage)
 		basis = append(basis, s)
-	}
-	if !covered.SameLeaves(have) {
-		return RFileExportFile{}, false, nil
 	}
 	image, err := readVerified(ctx, dst, entry)
 	if err != nil {

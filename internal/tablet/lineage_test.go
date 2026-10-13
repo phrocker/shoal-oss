@@ -518,6 +518,18 @@ func TestRegisterLineageRules(t *testing.T) {
 			removed: []string{"c14d.rf"},
 		},
 		{
+			name: "a delta naming leaves outside its base is not used",
+			incoming: func(b *memory.Backend) []ImportedFile {
+				return []ImportedFile{
+					incoming(b, "c13.rf", "c13", leaves("p", 1, 3), ""),
+					incoming(b, "c13d.rf", "c13d", &Lineage{Leaves: map[string][]LeafRange{"p": {{3, 3}}, "z": {{9, 9}}}}, "c13"),
+				}
+			},
+			// The base is kept; the unused "delta" then counts as a file
+			// with a leaf of its own that is new.
+			want: []string{"p1.rf", "local.rf", "p2.rf", "c13.rf", "c13d.rf"},
+		},
+		{
 			name: "some held without delta ranks above the newest held file",
 			incoming: func(b *memory.Backend) []ImportedFile {
 				return []ImportedFile{incoming(b, "c13.rf", "c13", leaves("p", 1, 3), "")}

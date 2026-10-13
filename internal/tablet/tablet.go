@@ -105,7 +105,9 @@ type Tablet struct {
 	// rely on it to resolve identical keys newest-first (see
 	// iterrt.MergingIterator), and it is persisted as the order of
 	// files.json's "active" list. Flush appends, a compaction output takes
-	// its inputs' place, and imported files are appended as newest.
+	// its inputs' place, and an imported file is appended as newest unless
+	// its lineage shows the tablet already holds some of its data (see
+	// RegisterImmutableFiles).
 	files    []string
 	wal      *localwal.WAL
 	seq      atomic.Int64

@@ -257,7 +257,7 @@ func planRegistration(r registration, files []ImportedFile, newLeaf func() Linea
 			// it is appended as newest and the file itself is held.
 			if j, ok := deltaFor[file.Source]; ok && j > i && !consumed[j] {
 				delta := files[j]
-				if dl, ok := deltaLineage(delta, l, have, held); ok {
+				if dl, ok := deltaLineage(delta, l, have); ok {
 					consumed[j] = true
 					place(delta, dl, len(r.active))
 					r.absorbed[file.Source] = struct{}{}
@@ -288,7 +288,7 @@ func planRegistration(r registration, files []ImportedFile, newLeaf func() Linea
 // deltaLineage validates a delta of an incoming file with lineage l, of
 // which the tablet holds have: the delta must name only leaves of l that
 // the tablet does not hold, and exactly all of them.
-func deltaLineage(delta ImportedFile, l, have, held Lineage) (Lineage, bool) {
+func deltaLineage(delta ImportedFile, l, have Lineage) (Lineage, bool) {
 	if delta.Lineage == nil {
 		return Lineage{}, false
 	}
@@ -296,7 +296,8 @@ func deltaLineage(delta ImportedFile, l, have, held Lineage) (Lineage, bool) {
 	if !ok || dl.IsEmpty() || dl.Size() > MaxLineageEntries {
 		return Lineage{}, false
 	}
-	if !l.Covers(dl) || held.Intersects(dl) || !l.Subtract(dl).SameLeaves(have) {
+	// l \ dl == have also rules out a delta naming a leaf the tablet holds.
+	if !l.Covers(dl) || !l.Subtract(dl).SameLeaves(have) {
 		return Lineage{}, false
 	}
 	return dl, true

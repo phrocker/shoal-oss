@@ -429,6 +429,8 @@ func TestOlderProducerManifestThenLineage(t *testing.T) {
 		m.Deltas = nil
 	}
 	p.put(t, "cell", "producer-old")
+	p.flush(t)
+	p.put(t, "salt", "s")
 	syncNodes(t, p, d, syncOpts{edit: strip})
 	d.put(t, "cell", "local-newer")
 	d.flush(t)

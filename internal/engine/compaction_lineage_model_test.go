@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+
+	"github.com/phrocker/shoal-oss/internal/cclient"
 )
 
 // TestDeltaKeepsLocalWriteBetweenImports: the consumer overwrote a cell
@@ -179,5 +181,36 @@ func runLineageModel(t *testing.T, seed int64) {
 		}
 		trace = append(trace, name)
 		check()
+	}
+}
+
+// TestEmptyDeltaImports: the producer's unsent data was a write and its own
+// delete, which its full compaction dropped together, so the delta holds no
+// cell. It is still a valid file, and using it holds the output.
+func TestEmptyDeltaImports(t *testing.T) {
+	p, d := newLNode(t, "p"), newLNode(t, "d")
+	o := syncOpts{producerID: "p"}
+	p.put(t, "cell", "v")
+	syncNodes(t, p, d, o)
+	d.put(t, "cell", "local")
+	d.flush(t)
+	p.put(t, "gone", "g")
+	m, err := cclient.NewMutation([]byte("gone"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.DeleteLatest([]byte("cf"), []byte("cq"), nil)
+	if err := p.eng.Write(overwriteTable, []*cclient.Mutation{m}); err != nil {
+		t.Fatal(err)
+	}
+	p.flush(t)
+	p.compact(t)
+	manifest := syncNodes(t, p, d, o)
+	if len(manifest.Deltas) != 1 || manifest.Deltas[0].Size == 0 {
+		t.Fatalf("deltas = %+v", manifest.Deltas)
+	}
+	d.expect(t, "cell", "local")
+	if _, ok := d.read(t)["gone"]; ok {
+		t.Fatal("deleted cell visible")
 	}
 }
