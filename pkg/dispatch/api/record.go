@@ -24,11 +24,18 @@ type Record struct {
 	Input           json.RawMessage
 	Output          json.RawMessage
 	OutputWithheld  bool
-	ErrorCode       string
-	ErrorCodeOrigin string
-	Deadline        time.Time
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// AmbiguityReportsWithheld says the reports were removed because the
+	// reader may not see the evidence the action cited (#746). Target and
+	// Reference are target-controlled worker text, so they are withheld
+	// alongside the Output. Unlike an absent Output, an absent report set
+	// is ordinary, so this flag is what tells a principal entitled to a
+	// reference that there is one it is not being shown.
+	AmbiguityReportsWithheld bool
+	ErrorCode                string
+	ErrorCodeOrigin          string
+	Deadline                 time.Time
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
 	// ExecutorKey is the decoded key, ExecutorKeyBytes long, or nil when the
 	// response carried none.
 	ExecutorKey     []byte
@@ -71,29 +78,30 @@ func (r Record) Correlate(ctx Context) Context {
 // carried raw and read only if it is a string. Action is the full wire type
 // the explorer encodes; DecodeRecord reads one already decoded.
 type recordWire struct {
-	ID               string                  `json:"id"`
-	Version          uint64                  `json:"version"`
-	State            DispatchState           `json:"state"`
-	AgentID          string                  `json:"agent_id"`
-	AgentGeneration  int64                   `json:"agent_generation"`
-	Capability       string                  `json:"capability"`
-	Action           string                  `json:"action"`
-	Input            json.RawMessage         `json:"input,omitempty"`
-	Output           json.RawMessage         `json:"output,omitempty"`
-	OutputWithheld   bool                    `json:"output_withheld,omitempty"`
-	ErrorCode        string                  `json:"error_code,omitempty"`
-	ErrorCodeOrigin  json.RawMessage         `json:"error_code_origin,omitempty"`
-	Effected         *Effected               `json:"effected,omitempty"`
-	CorrelationID    string                  `json:"correlation_id,omitempty"`
-	Deadline         time.Time               `json:"deadline"`
-	CreatedAt        time.Time               `json:"created_at"`
-	UpdatedAt        time.Time               `json:"updated_at"`
-	ExecutorKey      string                  `json:"executor_key,omitempty"`
-	ClaimID          string                  `json:"claim_id,omitempty"`
-	ClaimFence       uint64                  `json:"claim_fence,omitempty"`
-	ClaimLeaseUntil  time.Time               `json:"claim_lease_until,omitempty"`
-	EffectPossible   bool                    `json:"effect_possible"`
-	AmbiguityReports []recordedAmbiguityWire `json:"ambiguity_reports,omitempty"`
+	ID                       string                  `json:"id"`
+	Version                  uint64                  `json:"version"`
+	State                    DispatchState           `json:"state"`
+	AgentID                  string                  `json:"agent_id"`
+	AgentGeneration          int64                   `json:"agent_generation"`
+	Capability               string                  `json:"capability"`
+	Action                   string                  `json:"action"`
+	Input                    json.RawMessage         `json:"input,omitempty"`
+	Output                   json.RawMessage         `json:"output,omitempty"`
+	OutputWithheld           bool                    `json:"output_withheld,omitempty"`
+	AmbiguityReportsWithheld bool                    `json:"ambiguity_reports_withheld,omitempty"`
+	ErrorCode                string                  `json:"error_code,omitempty"`
+	ErrorCodeOrigin          json.RawMessage         `json:"error_code_origin,omitempty"`
+	Effected                 *Effected               `json:"effected,omitempty"`
+	CorrelationID            string                  `json:"correlation_id,omitempty"`
+	Deadline                 time.Time               `json:"deadline"`
+	CreatedAt                time.Time               `json:"created_at"`
+	UpdatedAt                time.Time               `json:"updated_at"`
+	ExecutorKey              string                  `json:"executor_key,omitempty"`
+	ClaimID                  string                  `json:"claim_id,omitempty"`
+	ClaimFence               uint64                  `json:"claim_fence,omitempty"`
+	ClaimLeaseUntil          time.Time               `json:"claim_lease_until,omitempty"`
+	EffectPossible           bool                    `json:"effect_possible"`
+	AmbiguityReports         []recordedAmbiguityWire `json:"ambiguity_reports,omitempty"`
 }
 
 // recordedAmbiguityWire is the part of a report a worker matches on.
@@ -132,7 +140,8 @@ func DecodeRecord(w Action) (Record, error) {
 		ID: w.ID, Version: w.Version, State: w.State, AgentID: w.AgentID,
 		AgentGeneration: w.AgentGeneration, Capability: w.Capability, Action: w.Action,
 		Input: w.Input, Output: w.Output, OutputWithheld: w.OutputWithheld,
-		ErrorCode: w.ErrorCode, ErrorCodeOrigin: origin,
+		AmbiguityReportsWithheld: w.AmbiguityReportsWithheld,
+		ErrorCode:                w.ErrorCode, ErrorCodeOrigin: origin,
 		Effected: w.Effected, CorrelationID: w.CorrelationID, Deadline: w.Deadline,
 		CreatedAt: w.CreatedAt, UpdatedAt: w.UpdatedAt, ExecutorKey: w.ExecutorKey,
 		ClaimID: w.ClaimID, ClaimFence: w.ClaimFence, ClaimLeaseUntil: w.ClaimLeaseUntil,
@@ -161,8 +170,9 @@ func decodeRecord(w recordWire) (Record, error) {
 		ID: id, Version: w.Version, State: w.State, AgentID: agent,
 		AgentGeneration: w.AgentGeneration, Capability: w.Capability,
 		Action: w.Action, Input: w.Input, Output: w.Output,
-		OutputWithheld: w.OutputWithheld,
-		ErrorCode:      w.ErrorCode, Deadline: w.Deadline, CreatedAt: w.CreatedAt,
+		OutputWithheld:           w.OutputWithheld,
+		AmbiguityReportsWithheld: w.AmbiguityReportsWithheld,
+		ErrorCode:                w.ErrorCode, Deadline: w.Deadline, CreatedAt: w.CreatedAt,
 		UpdatedAt: w.UpdatedAt, ClaimID: claimID, ClaimFence: w.ClaimFence,
 		ClaimLeaseUntil: w.ClaimLeaseUntil, EffectPossible: w.EffectPossible,
 	}

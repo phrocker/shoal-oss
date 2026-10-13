@@ -664,6 +664,14 @@ func encodeAction(record fleet.ActionRecord) ([]byte, error) {
 			shoal.ErrorInvalidArgument,
 			"a withheld-output marker is a read-path value and is not stored")
 	}
+	// And the same for the ambiguity reports' marker (#746), refused here
+	// for the same reason rather than trusted not to arrive.
+	if record.AmbiguityReportsWithheld {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"a withheld-ambiguity-reports marker is a read-path value and "+
+				"is not stored")
+	}
 	var buffer bytes.Buffer
 	buffer.Write(dispatchMagic)
 	if err := gob.NewEncoder(&buffer).Encode(record); err != nil {

@@ -104,3 +104,44 @@ func contains(haystack, needle string) bool {
 	}
 	return false
 }
+
+// TestTheWithheldReportsMarkerSurvivesJSON is the same pin for #746's
+// marker, and it is here rather than beside the decoder for the same reason:
+// recordWire is unmarshalled directly on the client paths, so the tag is
+// what carries it, and a test that builds the struct in Go would pass with
+// the tag renamed.
+//
+// It matters more here than for the Output's. An absent Output on a
+// succeeded record is a state the service cannot produce, so a client that
+// lost the marker would at least see something impossible; an absent report
+// set is ordinary, so a client that lost this marker sees a record that
+// looks complete and concludes there is no reference to reconcile with the
+// other system.
+func TestTheWithheldReportsMarkerSurvivesJSON(t *testing.T) {
+	const body = `{"id":"YQ","state":"failed",` +
+		`"ambiguity_reports_withheld":true}`
+	var wire recordWire
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if !wire.AmbiguityReportsWithheld {
+		t.Fatalf("the wire did not decode ambiguity_reports_withheld from "+
+			"%s; the tag is what every client reads", body)
+	}
+	record, err := decodeRecord(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.AmbiguityReportsWithheld {
+		t.Fatal("the marker was decoded from JSON and then dropped on the " +
+			"way to the record")
+	}
+
+	encoded, err := json.Marshal(recordWire{ID: "YQ", State: "failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(encoded), "ambiguity_reports_withheld") {
+		t.Fatalf("an unredacted record carries the marker: %s", encoded)
+	}
+}
