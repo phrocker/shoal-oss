@@ -18,11 +18,11 @@ const (
 	// V2TestDigest is the Digest("test") of the sealed split: the SHA-256 of
 	// its decompressed bytes, which are exactly its case lines, each followed
 	// by a newline.
-	V2TestDigest = "5510513c6c0935dff657355503167fd193ad5b0374e7c56f949bcdb83266df53"
+	V2TestDigest = "d68f126050aa387b817f787c026cf6814cc509c5be28f36675779c4683b6030e"
 	// V2TestArchiveSHA256 is the SHA-256 of the committed test.jsonl.gz.
-	V2TestArchiveSHA256 = "a81dbc1e6b8a0cffc1da159b88eef4e52d1369b3d8b254d9659e921f3b76a0b8"
+	V2TestArchiveSHA256 = "e3ffa19b61e12f4b409af9166c8a6308a4e267b12fd8a73a98cd6f917a58895c"
 	// V2TestCases is the number of cases in the sealed split.
-	V2TestCases = 138
+	V2TestCases = 303
 	// V2WorldSHA256 is the SHA-256 of testdata/eval/v2/world.json, which is
 	// byte-equal to v1's world. The sealed labels refer to its node keys and
 	// targets, so it is frozen with them.

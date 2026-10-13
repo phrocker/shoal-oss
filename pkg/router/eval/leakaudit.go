@@ -6,9 +6,12 @@ package eval
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/phrocker/shoal-oss/pkg/lexicon"
@@ -22,13 +25,14 @@ import (
 // Text is compared after lexicon.Tokenize, the router's own normalization.
 // Entity mentions (node names and aliases of the fixture world) are
 // abstracted to a slot token, as are {slot} placeholders in grammar patterns,
-// and optional [..] groups in patterns are expanded.
+// and optional [..] groups in patterns are expanded. Paraphrases,
+// inflections, synonyms and typos of a test phrasing are not caught.
 //
 // A test-derived unit is a leak when it occurs in a cue source and nowhere in
 // the frozen baseline corpus (for a phrase or template: not inside any
-// baseline text or pattern either): the pre-registration corpus that existed before
-// the test split was authored (v1's cases of every split, v1's grammars and
-// the world). Four units are checked:
+// baseline text or pattern either). The baseline is the pre-registration
+// corpus that existed before the test split was authored: v1's cases of
+// every split, v1's grammars and the world. Four units are checked:
 //
 //   - phrase: a whole test text of three or more tokens, verbatim;
 //   - template: a whole test text with its mentions abstracted (at least
@@ -37,8 +41,14 @@ import (
 //   - bigram: an adjacent pair of a test text, mentions abstracted, that the
 //     baseline does not have.
 //
-// Findings name the source, the check, a test case ID and the offending
-// unit, quoting only what the source itself contains.
+// A source marked PhraseOnly (train and dev case texts, general-purpose
+// resources) gets only the phrase and template checks: an independent author
+// writing natural paraphrases would otherwise trip the word and bigram
+// checks by chance, and each trip would tell them a test word.
+//
+// A finding names the source, a location in it, the check and the SHA-256
+// of "<check>:<unit>". It never holds the unit itself, so a CI log is not an
+// oracle for the test vocabulary.
 
 // slotToken stands for an abstracted mention or a {slot} placeholder.
 // Tokenize never produces it.
@@ -51,25 +61,30 @@ const maxExpansions = 4096
 type LeakSource struct {
 	Name    string
 	Strings []string
-	// PhraseOnly marks a general-purpose resource not written for this
-	// evaluation; only the phrase and template checks apply to it.
+	// Locations, when set, names where each string is in the source (for
+	// example "line 12"), index for index with Strings.
+	Locations []string
+	// PhraseOnly limits the source to the phrase and template checks.
 	PhraseOnly bool
 }
 
-// LeakFinding is one leak. Its Token is what the source contains.
+// LeakFinding is one leak. It holds no test text and no test word.
 type LeakFinding struct {
-	Source string
-	Check  string
-	Case   string
-	Token  string
+	Source   string
+	Location string
+	Check    string
+	// Hash is the hex SHA-256 of "<check>:<unit>".
+	Hash string
 }
 
 func (f LeakFinding) String() string {
-	return f.Source + ": " + f.Check + " " + quoteToken(f.Token) + " (test case " + f.Case + ")"
+	return f.Source + " (" + f.Location + "): " + f.Check + " sha256:" + f.Hash
 }
 
-func quoteToken(t string) string {
-	return "\"" + strings.ReplaceAll(t, slotToken, "{slot}") + "\""
+// UnitHash is the hash a finding carries for a unit.
+func UnitHash(check, unit string) string {
+	sum := sha256.Sum256([]byte(check + ":" + unit))
+	return hex.EncodeToString(sum[:])
 }
 
 type auditText struct {
@@ -89,8 +104,8 @@ type LeakAuditor struct {
 	baselineWords    map[string]bool
 	baselineBigrams  map[[2]string]bool
 	baselineTemplate map[string]bool
-	testOnlyWords    map[string]string
-	testOnlyBigrams  map[[2]string]string
+	testOnlyWords    map[string]bool
+	testOnlyBigrams  map[[2]string]bool
 }
 
 // NewLeakAuditor builds an auditor. entities are the world's mention surface
@@ -99,7 +114,7 @@ type LeakAuditor struct {
 func NewLeakAuditor(entities, baselineTexts, baselineSources []string, test []Case) *LeakAuditor {
 	a := &LeakAuditor{
 		baselineWords: map[string]bool{}, baselineBigrams: map[[2]string]bool{}, baselineTemplate: map[string]bool{},
-		testOnlyWords: map[string]string{}, testOnlyBigrams: map[[2]string]string{},
+		testOnlyWords: map[string]bool{}, testOnlyBigrams: map[[2]string]bool{},
 	}
 	for _, e := range entities {
 		if tokens := words(e); len(tokens) > 0 {
@@ -118,8 +133,9 @@ func NewLeakAuditor(entities, baselineTexts, baselineSources []string, test []Ca
 	}
 	for _, s := range baselineSources {
 		for _, seq := range sourceSequences(s) {
-			a.addBaseline(literals(seq), seq)
-			baseRaw, baseAbstract = append(baseRaw, literals(seq)), append(baseAbstract, seq)
+			abstracted := a.abstract(seq)
+			a.addBaseline(literals(seq), abstracted)
+			baseRaw, baseAbstract = append(baseRaw, literals(seq)), append(baseAbstract, abstracted)
 		}
 	}
 	for _, c := range test {
@@ -132,16 +148,12 @@ func NewLeakAuditor(entities, baselineTexts, baselineSources []string, test []Ca
 		a.test = append(a.test, t)
 		for _, w := range raw {
 			if !a.baselineWords[w] {
-				if _, seen := a.testOnlyWords[w]; !seen {
-					a.testOnlyWords[w] = c.ID
-				}
+				a.testOnlyWords[w] = true
 			}
 		}
 		for _, b := range bigrams(t.abstract) {
 			if !a.baselineBigrams[b] {
-				if _, seen := a.testOnlyBigrams[b]; !seen {
-					a.testOnlyBigrams[b] = c.ID
-				}
+				a.testOnlyBigrams[b] = true
 			}
 		}
 	}
@@ -172,39 +184,54 @@ func (a *LeakAuditor) FreshTemplates() (fresh, total int) {
 	return fresh, len(a.test)
 }
 
-// Audit returns every leak of the test split into sources, sorted.
+// TestOnlyBigrams is the number of distinct test-split bigrams (mentions
+// abstracted) the baseline corpus lacks.
+func (a *LeakAuditor) TestOnlyBigrams() int { return len(a.testOnlyBigrams) }
+
+// Audit returns every leak of the test split into sources, sorted, one per
+// (source, check, unit), at the unit's first location in the source.
 func (a *LeakAuditor) Audit(sources []LeakSource) []LeakFinding {
-	seen := map[LeakFinding]bool{}
+	type key struct{ source, check, hash string }
+	seen := map[key]bool{}
 	var out []LeakFinding
-	add := func(f LeakFinding) {
-		if !seen[f] {
-			seen[f] = true
-			out = append(out, f)
-		}
-	}
 	for _, src := range sources {
-		for _, s := range src.Strings {
+		for i, s := range src.Strings {
+			location := "string " + strconv.Itoa(i+1)
+			if i < len(src.Locations) {
+				location = src.Locations[i]
+			}
+			add := func(check, unit string) {
+				k := key{src.Name, check, UnitHash(check, unit)}
+				if !seen[k] {
+					seen[k] = true
+					out = append(out, LeakFinding{Source: src.Name, Location: location, Check: check, Hash: k.hash})
+				}
+			}
 			for _, seq := range sourceSequences(s) {
 				lits := literals(seq)
+				// Mentions in the source (a train text, a lexicon phrase) are
+				// abstracted like the test's, so another entity in the
+				// same phrasing still matches.
+				abstracted := a.abstract(seq)
 				for _, t := range a.test {
 					if len(t.raw) >= 3 && !t.rawKnown && contains(lits, t.raw) {
-						add(LeakFinding{Source: src.Name, Check: "phrase", Case: t.id, Token: strings.Join(t.raw, " ")})
+						add("phrase", strings.Join(t.raw, " "))
 					}
-					if len(t.abstract) >= 3 && countLiteral(t.abstract) >= 2 && !t.abstractKnown && contains(seq, t.abstract) {
-						add(LeakFinding{Source: src.Name, Check: "template", Case: t.id, Token: strings.Join(t.abstract, " ")})
+					if len(t.abstract) >= 3 && countLiteral(t.abstract) >= 2 && !t.abstractKnown && contains(abstracted, t.abstract) {
+						add("template", strings.Join(t.abstract, " "))
 					}
 				}
 				if src.PhraseOnly {
 					continue
 				}
 				for _, w := range seq {
-					if id, ok := a.testOnlyWords[w]; ok {
-						add(LeakFinding{Source: src.Name, Check: "word", Case: id, Token: w})
+					if a.testOnlyWords[w] {
+						add("word", w)
 					}
 				}
-				for _, b := range bigrams(seq) {
-					if id, ok := a.testOnlyBigrams[b]; ok {
-						add(LeakFinding{Source: src.Name, Check: "bigram", Case: id, Token: b[0] + " " + b[1]})
+				for _, b := range bigrams(abstracted) {
+					if a.testOnlyBigrams[b] {
+						add("bigram", b[0]+" "+b[1])
 					}
 				}
 			}
@@ -218,10 +245,7 @@ func (a *LeakAuditor) Audit(sources []LeakSource) []LeakFinding {
 		if x.Check != y.Check {
 			return x.Check < y.Check
 		}
-		if x.Token != y.Token {
-			return x.Token < y.Token
-		}
-		return x.Case < y.Case
+		return x.Hash < y.Hash
 	})
 	return out
 }
