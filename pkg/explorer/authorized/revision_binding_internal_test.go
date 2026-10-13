@@ -25,9 +25,12 @@ package authorized
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
@@ -106,23 +109,68 @@ func requireOldBinaryRefuses(t *testing.T, dir string) {
 	}
 }
 
-// TestFormatFloorIsWrittenOnlyBeforeTheFirstBinding: a catalog with no
-// binding stays openable by older binaries; the first interaction binding
-// writes the floor first, and both survive a reopen.
-func TestFormatFloorIsWrittenOnlyBeforeTheFirstBinding(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
+// preFloorCatalog is a copy of a catalog written before the format floor
+// existed (the #667 lineage fixture), with the lock file a workspace of this
+// version leaves, so an offline listing may open it.
+func preFloorCatalog(t *testing.T) string {
+	t.Helper()
+	dir := copyLineageFixture(t)
+	if err := os.WriteFile(filepath.Join(dir, policyLockFile), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rawPolicyCell(t, dir, []byte(policyRowFormatFloor)); ok {
+		t.Fatal("the pre-floor fixture already holds a format floor")
+	}
+	return dir
+}
+
+// TestFormatFloorIsWrittenAtReadWriteOpen: the first read-write open by this
+// binary writes the floor, so an older binary refuses the catalog from then
+// on whether or not anything was bound yet. An offline listing writes
+// nothing, the floor included.
+func TestFormatFloorIsWrittenAtReadWriteOpen(t *testing.T) {
+	dir := preFloorCatalog(t)
+	before := catalogSnapshot(t, dir)
+	listing, err := OpenExistingDurablePolicyStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeDurableForTest(t, listing)
+	requireUnchanged(t, dir, before)
+	if _, ok := rawPolicyCell(t, dir, []byte(policyRowFormatFloor)); ok {
+		t.Fatal("an offline listing wrote the format floor")
+	}
+
 	store := openDurableForTest(t, dir)
-	seedDurableStore(t, store) // an unbound application edge
-	if err := store.PutInteractionRevisions(ctx, "session", nil); err != nil {
+	closeDurableForTest(t, store)
+	requireOldBinaryRefuses(t, dir)
+	// Reopening keeps the one floor and still opens.
+	closeDurableForTest(t, openDurableForTest(t, dir))
+}
+
+// TestFormatFloorPrecedesABindingWithoutAReadWriteOpen: a store opened
+// without writing the floor still writes it before its first binding.
+func TestFormatFloorPrecedesABindingWithoutAReadWriteOpen(t *testing.T) {
+	dir := preFloorCatalog(t)
+	store, err := OpenExistingDurablePolicyStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutInteractionRevisions(
+		context.Background(), "session", bindingTestRevisions); err != nil {
 		t.Fatal(err)
 	}
 	closeDurableForTest(t, store)
-	if _, ok := rawPolicyCell(t, dir, []byte(policyRowFormatFloor)); ok {
-		t.Fatal("a catalog without bindings was given a format floor")
-	}
+	requireOldBinaryRefuses(t, dir)
+}
 
-	store = openDurableForTest(t, dir)
+// TestInteractionBindingsRoundTrip: bindings are persisted as their union
+// and survive a reopen.
+func TestInteractionBindingsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store := openDurableForTest(t, dir)
+	seedDurableStore(t, store)
 	if err := store.PutInteractionRevisions(
 		ctx, "session", bindingTestRevisions); err != nil {
 		t.Fatal(err)
@@ -132,11 +180,9 @@ func TestFormatFloorIsWrittenOnlyBeforeTheFirstBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeDurableForTest(t, store)
-	requireOldBinaryRefuses(t, dir)
 	if _, ok := rawPolicyCell(t, dir, policyInteractionRevisionsRow("session")); !ok {
 		t.Fatal("the interaction binding was not persisted")
 	}
-
 	store = openDurableForTest(t, dir)
 	defer closeDurableForTest(t, store)
 	got, err := store.InteractionRevisions(ctx, []shoal.ID{"session", "other"})
@@ -152,8 +198,8 @@ func TestFormatFloorIsWrittenOnlyBeforeTheFirstBinding(t *testing.T) {
 	}
 }
 
-// TestBoundEdgeWritesFormatFloorAndRoundTrips: a bound edge reservation
-// writes the floor before itself, and the binding is restored exactly.
+// TestBoundEdgeWritesFormatFloorAndRoundTrips: a bound edge reservation is
+// only ever written after the floor, and the binding is restored exactly.
 func TestBoundEdgeWritesFormatFloorAndRoundTrips(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -304,66 +350,75 @@ func TestRevisionBindingRowsAreDecodedStrictly(t *testing.T) {
 		name     string
 		rows     []row
 		accepted bool
+		preFloor bool
 	}{
 		{"valid interaction binding", []row{floorRow, sessionRow(func(t *testing.T) []byte {
 			return interactionRow(t, "session", a, b)
-		})}, true},
+		})}, true, false},
 		{"valid bound edge", []row{floorRow, rawEdgeRow(func(t *testing.T) []byte {
 			return edgeRow(t, RegistrationApplication, true, a, b)
-		})}, true},
+		})}, true, false},
 		{"valid bound edge with no revisions", []row{floorRow, rawEdgeRow(func(t *testing.T) []byte {
 			return edgeRow(t, RegistrationApplication, true)
-		})}, true},
-		{"floor alone", []row{floorRow}, true},
+		})}, true, false},
+		{"floor alone", []row{floorRow}, true, false},
 		{"unknown floor", []row{{[]byte(policyRowFormatFloor), func(t *testing.T) []byte {
 			return floor(t, 2)
-		}}}, false},
+		}}}, false, false},
 		{"floor of the wrong kind", []row{{[]byte(policyRowFormatFloor), func(t *testing.T) []byte {
 			return mustEncodePolicyRecord(t, policyKindSourceClaim, persistedSourceClaim{
 				Seq: 1, SourceURI: "file:///x", Version: 1, Rule: mustPersistRuleForTest(t),
 			})
-		}}}, false},
+		}}}, false, false},
 		{"interaction binding without floor", []row{sessionRow(func(t *testing.T) []byte {
 			return interactionRow(t, "session", a)
-		})}, false},
+		})}, false, true},
 		{"bound edge without floor", []row{rawEdgeRow(func(t *testing.T) []byte {
 			return edgeRow(t, RegistrationApplication, true, a)
-		})}, false},
+		})}, false, true},
+		{"pre-floor catalog with an unbound edge", []row{rawEdgeRow(func(t *testing.T) []byte {
+			return edgeRow(t, RegistrationApplication, false)
+		})}, true, true},
 		{"empty interaction binding", []row{floorRow, sessionRow(func(t *testing.T) []byte {
 			return interactionRow(t, "session")
-		})}, false},
+		})}, false, false},
 		{"unsorted interaction binding", []row{floorRow, sessionRow(func(t *testing.T) []byte {
 			return interactionRow(t, "session", b, a)
-		})}, false},
+		})}, false, false},
 		{"duplicated interaction binding", []row{floorRow, sessionRow(func(t *testing.T) []byte {
 			return interactionRow(t, "session", a, a)
-		})}, false},
+		})}, false, false},
 		{"interaction binding with an empty revision", []row{floorRow, sessionRow(func(t *testing.T) []byte {
 			return interactionRow(t, "session", persistedRevisionReference{DocumentID: "document"})
-		})}, false},
+		})}, false, false},
 		{"interaction binding under another session's row", []row{floorRow, sessionRow(func(t *testing.T) []byte {
 			return interactionRow(t, "another", a)
-		})}, false},
+		})}, false, false},
 		{"interaction binding of the wrong kind", []row{floorRow, sessionRow(func(t *testing.T) []byte {
 			return mustEncodePolicyRecord(t, policyKindEdge, persistedInteractionRevisions{
 				Seq: 1, SessionID: "session", Revisions: []persistedRevisionReference{a},
 			})
-		})}, false},
+		})}, false, false},
 		{"edge revisions without binding", []row{floorRow, rawEdgeRow(func(t *testing.T) []byte {
 			return edgeRow(t, RegistrationApplication, false, a)
-		})}, false},
+		})}, false, false},
 		{"unsorted edge binding", []row{floorRow, rawEdgeRow(func(t *testing.T) []byte {
 			return edgeRow(t, RegistrationApplication, true, b, a)
-		})}, false},
+		})}, false, false},
 		{"bound materialized edge", []row{floorRow, rawEdgeRow(func(t *testing.T) []byte {
 			return edgeRow(t, RegistrationMaterialized, true, a)
-		})}, false},
+		})}, false, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			dir := t.TempDir()
-			store := openDurableForTest(t, dir)
-			seedDurableStore(t, store)
-			closeDurableForTest(t, store)
+			var dir string
+			if test.preFloor {
+				dir = preFloorCatalog(t)
+			} else {
+				dir = t.TempDir()
+				store := openDurableForTest(t, dir)
+				seedDurableStore(t, store)
+				closeDurableForTest(t, store)
+			}
 			for _, row := range test.rows {
 				corruptPolicyRow(t, dir, row.key, row.value(t))
 			}
@@ -507,4 +562,119 @@ func revisionIDsOf(rules map[shoal.ID][]RevisionRule) map[shoal.ID][]string {
 		}
 	}
 	return rendered
+}
+
+// fakePublications is a PublicationReader with fixed answers.
+type fakePublications struct {
+	revisions map[shoal.ID]map[shoal.ID]time.Time
+	edges     map[shoal.ID]time.Time
+	connected map[shoal.ID]bool
+}
+
+func (f fakePublications) RevisionPublications(
+	_ context.Context, documentIDs []shoal.ID,
+) (map[shoal.ID]map[shoal.ID]time.Time, error) {
+	out := make(map[shoal.ID]map[shoal.ID]time.Time)
+	for _, id := range documentIDs {
+		if revisions, ok := f.revisions[id]; ok {
+			out[id] = revisions
+		}
+	}
+	return out, nil
+}
+
+func (f fakePublications) ConnectedEdgePublications(
+	_ context.Context, edgeIDs []shoal.ID,
+) (map[shoal.ID]time.Time, map[shoal.ID]bool, error) {
+	published := make(map[shoal.ID]time.Time)
+	connected := make(map[shoal.ID]bool)
+	for _, id := range edgeIDs {
+		if at, ok := f.edges[id]; ok {
+			published[id] = at
+		}
+		if f.connected[id] {
+			connected[id] = true
+		}
+	}
+	return published, connected, nil
+}
+
+// TestLegacyEdgesAreBoundByTheirPublication: an unbound application edge is
+// held to its endpoint document's revisions published by the time it was
+// connected, plus the current one; one the corpus never connected (an
+// extracted or materialized edge persisted before RegistrationKind) is left
+// as registered; with no publication time, or no reader, every revision
+// counts.
+func TestLegacyEdgesAreBoundByTheirPublication(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryPolicyStore()
+	labelled := batchTestRule(t, "source", "labelled")
+	open := batchTestRule(t, "source", "policy")
+	for index, revision := range []struct {
+		id   shoal.ID
+		rule AccessRule
+	}{{"r1", labelled}, {"r2", open}} {
+		if err := store.PutRevision(ctx, RevisionRegistration{
+			DocumentID: "document", RevisionID: revision.id,
+			NodeIDs:       []shoal.ID{"document", "node"},
+			ContentDigest: [32]byte{byte(index + 1)},
+			Rule:          revision.rule, Current: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	edgeRule := batchTestRule(t, "source", "edge")
+	edges := map[shoal.ID]EdgeRegistration{}
+	for _, id := range []shoal.ID{"before", "after", "unconnected", "untimed"} {
+		edges[id] = EdgeRegistration{
+			Edge: graph.Edge{ID: id, From: "document", To: "node", Type: "links", Weight: 1},
+			Rule: edgeRule, Kind: RegistrationApplication,
+		}
+	}
+	reader := fakePublications{
+		revisions: map[shoal.ID]map[shoal.ID]time.Time{"document": {
+			"r1": base.Add(time.Hour), "r2": base.Add(2 * time.Hour),
+		}},
+		edges: map[shoal.ID]time.Time{
+			"before": base, "after": base.Add(3 * time.Hour),
+		},
+		connected: map[shoal.ID]bool{"before": true, "after": true, "untimed": true},
+	}
+	conjoin := func(rules ...AccessRule) AccessRule {
+		rule := edgeRule
+		for _, component := range rules {
+			var err error
+			if rule, err = conjoinRules(rule, component); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return rule
+	}
+	everything := conjoin(labelled, open)
+	for name, test := range map[string]struct {
+		client *Client
+		want   map[shoal.ID]AccessRule
+	}{
+		"with a reader": {&Client{policyStore: store, publications: reader},
+			map[shoal.ID]AccessRule{
+				"before": conjoin(open), "after": everything,
+				"unconnected": edgeRule, "untimed": everything,
+			}},
+		"without a reader": {&Client{policyStore: store},
+			map[shoal.ID]AccessRule{
+				"before": everything, "after": everything,
+				"unconnected": everything, "untimed": everything,
+			}},
+	} {
+		got, err := test.client.bindEdgeSourceRevisions(ctx, edges)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for id, want := range test.want {
+			if !got[id].Rule.equal(want) {
+				t.Fatalf("%s: %s rule = %v, want %v", name, id, got[id].Rule, want)
+			}
+		}
+	}
 }

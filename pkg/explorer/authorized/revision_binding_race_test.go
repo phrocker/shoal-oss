@@ -21,6 +21,8 @@ package authorized_test
 
 import (
 	"context"
+	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,5 +119,85 @@ func TestRelabelRacingARecordingNeverOpensTheSession(t *testing.T) {
 		}
 		t.Fatalf("recorded %+v, which omits the labelled revision",
 			recorded[bindingSession])
+	})
+}
+
+// movingCatalog moves one document node to another revision once moved is
+// set: the catalog naming a different revision for the same node at a later
+// read of one recording, as a registration landing mid-recording does.
+type movingCatalog struct {
+	authorized.PolicyStore
+	nodeID, revisionID shoal.ID
+	moved              atomic.Bool
+}
+
+func (s *movingCatalog) Nodes(
+	ctx context.Context, nodeIDs []shoal.ID,
+) (map[shoal.ID]authorized.NodeRegistration, error) {
+	resolved, err := s.PolicyStore.Nodes(ctx, nodeIDs)
+	if err != nil || !s.moved.Load() {
+		return resolved, err
+	}
+	if registration, ok := resolved[s.nodeID]; ok {
+		registration.RevisionID = s.revisionID
+		resolved[s.nodeID] = registration
+	}
+	return resolved, nil
+}
+
+// TestRecordingBindsWhatTheCatalogNamedAtEitherRead: the binding is the
+// union of the revisions the catalog named before the sources were
+// authorized and after the snapshot was validated. Each read alone misses
+// one of them.
+func TestRecordingBindsWhatTheCatalogNamedAtEitherRead(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		w := newBindingWorld(t, newFixture(t), store)
+		inner, ok := trustedSnapshotValidator(w.f.base).(authorized.EvidenceSnapshotValidator)
+		if !ok {
+			t.Fatal("the corpus does not validate evidence snapshots")
+		}
+		moving := &movingCatalog{
+			PolicyStore: store, nodeID: w.closed.Document.ID,
+			revisionID: "revision-registered-mid-recording",
+		}
+		validator := &relabelAfterValidation{inner: inner, after: func() {
+			moving.moved.Store(true)
+		}}
+		selector := w.f.staticSelector(t, w.f.sourceA, w.f.policyA)
+		recorder, err := authorized.NewClient(authorized.Config{
+			Base:              w.f.base,
+			InteractionWriter: trustedInteractionWriter(w.f.base),
+			InteractionReader: trustedInteractionReader(w.f.base),
+			SnapshotValidator: validator,
+			FoldStore:         trustedFoldStore(w.f.base),
+			Resolver:          w.f.authority.Resolver(),
+			PolicySelector:    selector,
+			PolicyStore:       moving,
+			GenerationReader:  w.f.reader,
+			Clock:             w.f.clock.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.record(recorder, bindingSession, w.closed.Document.ID)
+		if !moving.moved.Load() {
+			t.Fatal("the catalog did not move during the recording")
+		}
+		recorded, err := store.InteractionRevisions(
+			context.Background(), []shoal.ID{bindingSession})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []authorized.RevisionReference{
+			{DocumentID: w.closed.Document.ID, RevisionID: moving.revisionID},
+			{DocumentID: w.closed.Document.ID, RevisionID: w.closed.Revision.ID},
+		}
+		if want[1].RevisionID < want[0].RevisionID {
+			want[0], want[1] = want[1], want[0]
+		}
+		if !reflect.DeepEqual(recorded[bindingSession], want) {
+			t.Fatalf("recorded %+v, want both revisions %+v",
+				recorded[bindingSession], want)
+		}
 	})
 }

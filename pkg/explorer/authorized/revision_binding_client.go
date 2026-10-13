@@ -81,6 +81,10 @@ type revisionRuleCache struct {
 	rules      map[shoal.ID][]RevisionRule
 	full       map[shoal.ID]struct{}
 	references map[RevisionReference]struct{}
+	// published is when the corpus published each revision of a fully
+	// loaded document, from the trusted PublicationReader; empty when the
+	// client has none.
+	published map[shoal.ID]map[shoal.ID]time.Time
 }
 
 func (c *Client) newRevisionRuleCache() *revisionRuleCache {
@@ -89,10 +93,12 @@ func (c *Client) newRevisionRuleCache() *revisionRuleCache {
 		rules:      make(map[shoal.ID][]RevisionRule),
 		full:       make(map[shoal.ID]struct{}),
 		references: make(map[RevisionReference]struct{}),
+		published:  make(map[shoal.ID]map[shoal.ID]time.Time),
 	}
 }
 
-// loadDocuments loads every revision of each document.
+// loadDocuments loads every revision of each document, and when the client
+// has a PublicationReader, when each was published.
 func (r *revisionRuleCache) loadDocuments(
 	ctx context.Context, documentIDs []shoal.ID,
 ) error {
@@ -116,9 +122,17 @@ func (r *revisionRuleCache) loadDocuments(
 		if err != nil {
 			return policyCatalogReadError(ctx, err)
 		}
+		var published map[shoal.ID]map[shoal.ID]time.Time
+		if reader := r.client.publications; !isNilDependency(reader) {
+			published, err = reader.RevisionPublications(ctx, chunk)
+			if err != nil {
+				return directBaseError(err)
+			}
+		}
 		for _, documentID := range chunk {
 			r.rules[documentID] = batch[documentID]
 			r.full[documentID] = struct{}{}
+			r.published[documentID] = published[documentID]
 		}
 	}
 	return nil
@@ -210,20 +224,30 @@ func (r *revisionRuleCache) referenceRules(
 	return append([]AccessRule{own.Rule}, current...), true
 }
 
-// documentRules is the rule of every registered revision of a document: what
-// an output recorded before the binding existed is held to. It is false for a
-// document with no current revision.
+// documentRules is what an output recorded before the binding existed is
+// held to: the rule of every registered revision of the document that it
+// could have been derived from. With a bound (the output's SnapshotAsOf, or
+// an edge's first publication), a revision the corpus says it published after
+// the bound is left out: it did not exist when the output was made. The
+// current revision, and every revision with no known publication time, is
+// always kept. A zero bound keeps every revision. It is false for a document
+// with no current revision.
 func (r *revisionRuleCache) documentRules(
-	documentID shoal.ID,
+	documentID shoal.ID, bound time.Time,
 ) ([]AccessRule, bool) {
 	if _, loaded := r.full[documentID]; !loaded {
 		return nil, false
 	}
 	rules := r.rules[documentID]
+	published := r.published[documentID]
 	required := make([]AccessRule, 0, len(rules))
 	hasCurrent := false
 	for _, rule := range rules {
 		hasCurrent = hasCurrent || rule.Current
+		if at, known := published[rule.RevisionID]; !rule.Current && known &&
+			!bound.IsZero() && at.After(bound) {
+			continue
+		}
 		required = append(required, rule.Rule)
 	}
 	return required, hasCurrent
@@ -254,16 +278,24 @@ func (c *Client) bindEdgeSourceRevisions(
 	}
 	endpointDocuments := make(map[shoal.ID]shoal.ID)
 	if len(legacyEndpoints) > 0 {
-		endpoints, err := c.policyStore.Nodes(ctx, legacyEndpoints)
-		if err != nil {
-			return nil, policyCatalogReadError(ctx, err)
-		}
-		for nodeID, endpoint := range endpoints {
-			if reference, ok := nodeRevision(endpoint); ok {
-				endpointDocuments[nodeID] = reference.DocumentID
-				documentIDs = append(documentIDs, reference.DocumentID)
+		for start := 0; start < len(legacyEndpoints); {
+			end := chunkEnd(start, len(legacyEndpoints), maxInteractionAuthorizationIDs)
+			endpoints, err := c.policyStore.Nodes(ctx, legacyEndpoints[start:end])
+			start = end
+			if err != nil {
+				return nil, policyCatalogReadError(ctx, err)
+			}
+			for nodeID, endpoint := range endpoints {
+				if reference, ok := nodeRevision(endpoint); ok {
+					endpointDocuments[nodeID] = reference.DocumentID
+					documentIDs = append(documentIDs, reference.DocumentID)
+				}
 			}
 		}
+	}
+	legacy, err := c.legacyEdgePublications(ctx, registrations)
+	if err != nil {
+		return nil, err
 	}
 	cache := c.newRevisionRuleCache()
 	if err := cache.loadDocuments(ctx, documentIDs); err != nil {
@@ -287,6 +319,15 @@ func (c *Client) bindEdgeSourceRevisions(
 				required = append(required, rules...)
 			}
 		case registration.Kind == RegistrationApplication:
+			publication, connected := legacy.lookup(id)
+			if !connected {
+				// Not a connected edge: the corpus holds no Connect record
+				// for it, so it is an extracted or materialized edge
+				// persisted before RegistrationKind existed
+				// (legacyEdgeKind). Nothing was connected to a revision.
+				effective[id] = registration
+				continue
+			}
 			for _, endpoint := range []shoal.ID{
 				registration.Edge.From, registration.Edge.To,
 			} {
@@ -295,7 +336,7 @@ func (c *Client) bindEdgeSourceRevisions(
 					// Not a document's node: the endpoint check decides it.
 					continue
 				}
-				rules, ok := cache.documentRules(documentID)
+				rules, ok := cache.documentRules(documentID, publication)
 				if !ok {
 					satisfiable = false
 					break
@@ -326,6 +367,60 @@ func (c *Client) bindEdgeSourceRevisions(
 		effective[id] = registration
 	}
 	return effective, nil
+}
+
+// legacyEdgePublications is what the trusted corpus says about the unbound
+// application edges among registrations: which of them it holds a Connect
+// record for, and when each was first published. Without a
+// PublicationReader every such edge counts as connected with no known time.
+type legacyEdgePublications struct {
+	known     bool
+	published map[shoal.ID]time.Time
+	connected map[shoal.ID]bool
+}
+
+func (l legacyEdgePublications) lookup(edgeID shoal.ID) (time.Time, bool) {
+	if !l.known {
+		return time.Time{}, true
+	}
+	return l.published[edgeID], l.connected[edgeID]
+}
+
+func (c *Client) legacyEdgePublications(
+	ctx context.Context, registrations map[shoal.ID]EdgeRegistration,
+) (legacyEdgePublications, error) {
+	reader := c.publications
+	if isNilDependency(reader) {
+		return legacyEdgePublications{}, nil
+	}
+	var edgeIDs []shoal.ID
+	for id, registration := range registrations {
+		if !registration.SourceRevisionsBound &&
+			registration.Kind == RegistrationApplication {
+			edgeIDs = append(edgeIDs, id)
+		}
+	}
+	result := legacyEdgePublications{
+		known:     true,
+		published: make(map[shoal.ID]time.Time),
+		connected: make(map[shoal.ID]bool),
+	}
+	for start := 0; start < len(edgeIDs); {
+		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
+		published, connected, err := reader.ConnectedEdgePublications(
+			ctx, edgeIDs[start:end])
+		start = end
+		if err != nil {
+			return legacyEdgePublications{}, directBaseError(err)
+		}
+		for id, at := range published {
+			result.published[id] = at
+		}
+		for id, ok := range connected {
+			result.connected[id] = ok
+		}
+	}
+	return result, nil
 }
 
 // interactionSourceRevisions is the binding a session records: the revision
@@ -432,7 +527,14 @@ type revisionGate struct {
 	operation  auth.Operation
 	now        time.Time
 	references map[RevisionReference]bool
-	documents  map[shoal.ID]bool
+	documents  map[boundDocument]bool
+}
+
+// boundDocument is a legacy requirement: a document's revisions published
+// at or before bound (zero: all of them).
+type boundDocument struct {
+	documentID shoal.ID
+	bound      int64
 }
 
 func (c *Client) newRevisionGate(
@@ -442,7 +544,7 @@ func (c *Client) newRevisionGate(
 		cache: c.newRevisionRuleCache(), decision: decision,
 		operation: operation, now: now,
 		references: make(map[RevisionReference]bool),
-		documents:  make(map[shoal.ID]bool),
+		documents:  make(map[boundDocument]bool),
 	}
 }
 
@@ -475,11 +577,17 @@ func (g *revisionGate) referenceAllows(
 	return allowed, nil
 }
 
-func (g *revisionGate) documentAllows(documentID shoal.ID) (bool, error) {
-	if allowed, done := g.documents[documentID]; done {
+func (g *revisionGate) documentAllows(
+	documentID shoal.ID, bound time.Time,
+) (bool, error) {
+	key := boundDocument{documentID: documentID}
+	if !bound.IsZero() {
+		key.bound = bound.UnixNano()
+	}
+	if allowed, done := g.documents[key]; done {
 		return allowed, nil
 	}
-	rules, ok := g.cache.documentRules(documentID)
+	rules, ok := g.cache.documentRules(documentID, bound)
 	allowed := false
 	if ok {
 		var err error
@@ -488,7 +596,7 @@ func (g *revisionGate) documentAllows(documentID shoal.ID) (bool, error) {
 			return false, err
 		}
 	}
-	g.documents[documentID] = allowed
+	g.documents[key] = allowed
 	return allowed, nil
 }
 
@@ -621,8 +729,12 @@ func (c *Client) authorizeInteractionRevisionBatch(
 				}
 			}
 		} else {
+			// Bounded by the snapshot the session was validated against
+			// when it was written: a revision published after it cannot be
+			// what the session saw.
+			bound := records[index].Session.SnapshotAsOf
 			for _, documentID := range legacy[index] {
-				ok, err := gate.documentAllows(documentID)
+				ok, err := gate.documentAllows(documentID, bound)
 				if err != nil {
 					return err
 				}

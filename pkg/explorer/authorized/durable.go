@@ -267,12 +267,16 @@ type persistedCoOccurrence struct {
 // replaying, flushing or truncating the owner's WAL (#686). The kernel drops
 // the lock when its holder exits, however it exits, so the lock file a crash
 // leaves behind does not block the next start.
+//
+// It writes the catalog's format floor (revision_binding_durable.go) if the
+// catalog has none, so from the first read-write open by this binary on, a
+// binary from before #695 refuses the catalog.
 func OpenDurablePolicyStore(dir string) (*DurablePolicyStore, error) {
 	lock, err := dirlock.Acquire(dir, policyLockFile)
 	if err != nil {
 		return nil, policyCatalogLockError(dir, err)
 	}
-	return openLockedDurablePolicyStore(dir, lock)
+	return openLockedDurablePolicyStore(dir, lock, true)
 }
 
 // policyLockFile is the catalog directory's ownership lock file. It is a
@@ -299,6 +303,7 @@ func policyCatalogLockError(dir string, err error) error {
 func openLockedDurablePolicyStore(
 	dir string,
 	lock *dirlock.Lock,
+	writeFloor bool,
 ) (*DurablePolicyStore, error) {
 	eng, err := engine.Open(dir, engine.Options{})
 	if err != nil {
@@ -330,6 +335,13 @@ func openLockedDurablePolicyStore(
 		_ = eng.Close()
 		_ = lock.Close()
 		return nil, err
+	}
+	if writeFloor {
+		if err := store.writeFormatFloorAtOpen(dir); err != nil {
+			_ = eng.Close()
+			_ = lock.Close()
+			return nil, err
+		}
 	}
 	return store, nil
 }

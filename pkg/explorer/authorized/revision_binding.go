@@ -52,12 +52,30 @@ import (
 //     recorded revision that is unregistered, or whose document has no current
 //     revision, drops the edge (denied).
 //
-// Outputs recorded before this binding existed carry no recorded revisions,
-// and nothing records which revision was current when they were made (no
-// revision carries a registration time). They are therefore held to the rule
-// of EVERY registered revision of each document their inputs now belong to:
-// never less than before, and closed over any labelled revision whatever its
-// age.
+// Outputs recorded before this binding existed carry no recorded revisions.
+// They are held to the rule of every registered revision of each document
+// their inputs now belong to that could have been what they were derived
+// from: every revision except those the trusted corpus (PublicationReader)
+// says it published after the output was made, plus the current one. A
+// session was made at its SnapshotAsOf, which the corpus validated against a
+// snapshot it took when the session was written, and that snapshot's AsOf is
+// no earlier than the publication of every revision then current. An edge was
+// made when the corpus first published it (its Connect record). An unbound
+// application edge the corpus holds no Connect record for was never
+// connected: it is an extracted or materialized edge persisted before
+// RegistrationKind existed (legacyEdgeKind), and is left as registered.
+// Without a PublicationReader every revision counts. This is never less than
+// before the binding existed. Both bounds are wall-clock times: a clock that
+// stepped backwards between an ingest and a later output can leave out the
+// revision that output was made over, a residual that outputs bound at write
+// do not have.
+//
+// The legacy rule reads a document's whole revision history (once per
+// document per read), so its cost grows with that history; only outputs
+// recorded before this change pay it.
+//
+// Bindings are never removed: a session's binding row outlives its
+// tombstone, which keeps no source content and is not checked against it.
 //
 // Denials are indistinguishable from an object that was never written: every
 // read surface maps them to the same ObjectNotFound (#398).

@@ -22,6 +22,7 @@ package authorized
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -35,8 +36,9 @@ import (
 // A binary that predates them would not refuse either one. gob ignores fields
 // its destination lacks, so it would load a bound edge as an unbound one, and
 // its loader skips row prefixes it does not know. Either way it would serve
-// the very reads this binding closes, silently. So before the first record of
-// either kind is written, the store writes a format floor: a row under the
+// the very reads this binding closes, silently. So the first read-write open
+// by this binary (OpenDurablePolicyStore), and in any case the first record of
+// either kind, writes a format floor first: a row under the
 // source-claim prefix, which every durable binary since the catalog existed
 // decodes strictly as a source claim. Its record kind is not the source-claim
 // kind, so such a binary refuses to open the catalog ("stored policy source
@@ -158,7 +160,29 @@ func (s *DurablePolicyStore) reconstructRevisionBindings(
 	return nil
 }
 
+// writeFormatFloorAtOpen writes the format floor when a read-write open
+// finds none, and says so: from then on an older binary refuses the catalog
+// with a "corrupt" error that is not corruption.
+func (s *DurablePolicyStore) writeFormatFloorAtOpen(dir string) error {
+	if s.formatFloor {
+		return nil
+	}
+	if err := s.ensureFormatFloor(); err != nil {
+		return shoal.WrapError(shoal.ErrorUnavailable,
+			"write the policy catalog format floor", err)
+	}
+	slog.Info("policy catalog format floor written: binaries from before "+
+		"#695 now refuse this catalog (\"stored policy source claim record "+
+		"is corrupt\"); it is not corrupt, and rollback means restoring a "+
+		"backup taken before this upgrade",
+		"dir", dir, "row", policyRowFormatFloor,
+		"floor", formatFloorRevisionBindings)
+	return nil
+}
+
 // ensureFormatFloor writes the format floor before the first bound record.
+// A read-write open already wrote it; this covers a store opened without
+// writing it (OpenExistingDurablePolicyStore) that then binds.
 // It runs under s.mu and before the memory store changes, so a failure is
 // only an error.
 func (s *DurablePolicyStore) ensureFormatFloor() error {

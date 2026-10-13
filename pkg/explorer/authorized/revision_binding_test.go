@@ -337,7 +337,35 @@ func TestRelabelKeepsDerivedOutputsClosed(t *testing.T) {
 		}
 		w.requireDerivedDenied(w.client, "after the relabel")
 		w.requireHolderReads(w.client)
+		// The recorded binding alone closes the session: read through a
+		// catalog that treats a missing binding as open, so an incomplete
+		// or missing recording would show here.
+		open := w.newClient(absentBindingIsOpen{PolicyStore: store})
+		_, err := open.InteractionRecord(reader, bindingSession)
+		assertSameRefusal(t, "recorded binding alone", err, w.neverRecord(open))
 	})
+}
+
+// absentBindingIsOpen reports every session as bound, with no revisions when
+// nothing was recorded, so a reader through it gets no conservative legacy
+// rule: only what the recording bound.
+type absentBindingIsOpen struct {
+	authorized.PolicyStore
+}
+
+func (s absentBindingIsOpen) InteractionRevisions(
+	ctx context.Context, sessionIDs []shoal.ID,
+) (map[shoal.ID][]authorized.RevisionReference, error) {
+	recorded, err := s.PolicyStore.InteractionRevisions(ctx, sessionIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, sessionID := range sessionIDs {
+		if _, ok := recorded[sessionID]; !ok {
+			recorded[sessionID] = nil
+		}
+	}
+	return recorded, nil
 }
 
 // TestRevisionBindingLeavesUnrelatedReadsAlone: a session and an edge over
@@ -449,6 +477,85 @@ func TestLegacyDerivedOutputsAreHeldToEveryRevision(t *testing.T) {
 
 // TestRevisionBindingSurvivesReopen: the bindings are durable. A catalog
 // reopened over the same corpus keeps every derived output closed.
+// TestLegacyOutputsAreHeldOnlyToWhatExistedWhenMade: an output recorded
+// before the binding is held to the revisions published by the time it was
+// made (the session's snapshot, the edge's first publication) and the current
+// one, so a label added and removed after it was made does not close it. One
+// made while the label stood stays closed. Without a trusted publication
+// reader, every revision counts.
+func TestLegacyOutputsAreHeldOnlyToWhatExistedWhenMade(t *testing.T) {
+	const laterURI = "file:///binding/later.txt"
+	const (
+		earlySession shoal.ID = "interaction.session_binding_early"
+		labelSession shoal.ID = "interaction.session_binding_during_label"
+		earlyEdge    shoal.ID = "edge-binding-early"
+	)
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		w := newBindingWorld(t, newFixture(t), store)
+		legacy := w.newClient(preBindingStore{PolicyStore: store})
+		holder := w.as(w.holder)
+		later, err := w.client.Ingest(holder, labelledSource(laterURI, "open at first", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.resnapshot()
+		w.record(legacy, earlySession, later.Document.ID)
+		w.connect(legacy, earlyEdge, w.open.Document.ID, later.Document.ID)
+		holder = w.as(w.holder)
+		if _, err := w.client.Ingest(holder,
+			labelledSource(laterURI, "now secret", "secret")); err != nil {
+			t.Fatal(err)
+		}
+		w.resnapshot()
+		w.record(legacy, labelSession, later.Document.ID)
+		ctx, err := authorized.WithDeclassificationReason(w.as(w.holder), "ticket:SEC-695")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.client.Ingest(ctx,
+			labelledSource(laterURI, "open again", "")); err != nil {
+			t.Fatal(err)
+		}
+		reader := w.as(w.reader)
+		if _, err := w.client.InteractionRecord(reader, earlySession); err != nil {
+			t.Fatalf("a legacy session made before the label is denied: %v", err)
+		}
+		if !w.edgeVisible(w.client, w.reader, earlyEdge) {
+			t.Fatal("a legacy edge connected before the label is denied")
+		}
+		_, err = w.client.InteractionRecord(reader, labelSession)
+		assertSameRefusal(t, "legacy session made under the label", err,
+			w.neverRecord(w.client))
+
+		// Without a publication reader nothing bounds the history.
+		inner, ok := trustedSnapshotValidator(w.f.base).(authorized.EvidenceSnapshotValidator)
+		if !ok {
+			t.Fatal("the corpus does not validate evidence snapshots")
+		}
+		selector := w.f.staticSelector(t, w.f.sourceA, w.f.policyA)
+		unbounded, err := authorized.NewClient(authorized.Config{
+			Base:              w.f.base,
+			InteractionWriter: trustedInteractionWriter(w.f.base),
+			InteractionReader: trustedInteractionReader(w.f.base),
+			SnapshotValidator: &relabelAfterValidation{inner: inner},
+			FoldStore:         trustedFoldStore(w.f.base),
+			Resolver:          w.f.authority.Resolver(),
+			PolicySelector:    selector,
+			PolicyStore:       store,
+			GenerationReader:  w.f.reader,
+			Clock:             w.f.clock.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = unbounded.InteractionRecord(reader, earlySession)
+		assertSameRefusal(t, "unbounded legacy session", err, w.neverRecord(unbounded))
+		if w.edgeVisible(unbounded, w.reader, earlyEdge) {
+			t.Fatal("an unbounded legacy edge is visible")
+		}
+	})
+}
+
 func TestRevisionBindingSurvivesReopen(t *testing.T) {
 	f := newFixture(t)
 	dir := t.TempDir()
