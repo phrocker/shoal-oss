@@ -524,6 +524,8 @@ a known outcome. A batch with such files beside refusals, or before a definite
 failure, keeps its definite status and is **partial**: the
 `Shoal-Commit-Outcome: partial` header and `"partial": true`. A batch where
 nothing took effect (only refused or `historical` files) has neither.
+A failed snapshot read after every file went through is reported the same
+way, with the files' outcomes (partial when any was applied or unchanged).
 `partial` is a new header value, sent only by this route. A client that tests
 the header for `indeterminate` is unaffected by it.
 

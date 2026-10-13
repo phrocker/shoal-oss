@@ -39,6 +39,13 @@ showed one refused file per attempt.
   `files`), a multi-file failure stays indeterminate, over MCP too.
 - The authorized client conceals the no-effect marker on any error it did not
   mark itself, including one from its base.
+- `explorer.Ingest` marks an error after its durable document write (a failed
+  graph rebuild) indeterminate. Graph materialization and extraction do the
+  same after their records are durable. Before, such an error was definite
+  although the revision was published.
+- A snapshot read that fails after every file of an upload went through is
+  reported with the files' outcomes, as partial when any was applied or
+  unchanged. Before, it was a bare `503` with no commit-outcome header.
 - Every error an authorized ingest returns after its base may have written is
   now indeterminate: a failed read, audit, registration or guard after an
   applied write, a commit-time reason refusal, and a failed re-registration.

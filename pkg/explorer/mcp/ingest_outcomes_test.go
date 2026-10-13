@@ -91,6 +91,9 @@ func TestIngestToolReportsPerFileOutcomes(t *testing.T) {
 		{"refused and applied", file("old.txt", "old\n") + "," + file("new.txt", "new\n"),
 			string(shoal.ErrorConflict), []webapi.IngestFileOutcome{refused,
 				{Name: "new.txt", Status: webapi.IngestFileApplied}}},
+		{"stopped at the last file", file("old.txt", "old\n") + "," + file("bad.txt", "bad\n"),
+			"indeterminate", []webapi.IngestFileOutcome{refused,
+				{Name: "bad.txt", Status: webapi.IngestFileFailed}}},
 		{"stopped", file("old.txt", "old\n") + "," + file("bad.txt", "bad\n") + "," +
 			file("later.txt", "later\n"),
 			"indeterminate", []webapi.IngestFileOutcome{refused,

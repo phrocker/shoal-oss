@@ -445,6 +445,113 @@ func TestHTTPIngestSuccessIsUnchanged(t *testing.T) {
 	}
 }
 
+// snapshotFailingClient fails the snapshot read once a file was ingested.
+type snapshotFailingClient struct {
+	*scriptedClient
+	ingested bool
+}
+
+func (c *snapshotFailingClient) Ingest(
+	ctx context.Context, source explorer.Source,
+) (explorer.IngestResult, error) {
+	result, err := c.scriptedClient.Ingest(ctx, source)
+	if err == nil {
+		c.ingested = true
+	}
+	return result, err
+}
+
+func (c *snapshotFailingClient) Snapshot(ctx context.Context) (explorer.Snapshot, error) {
+	if c.ingested {
+		return explorer.Snapshot{}, shoal.NewError(shoal.ErrorUnavailable, "snapshot read unavailable")
+	}
+	return c.scriptedClient.Explorer.Snapshot(ctx)
+}
+
+// lateFailureClient writes the file whose content is "late\n" and then fails,
+// as the base Explorer now reports a failure after its durable write: marked
+// indeterminate (#687).
+type lateFailureClient struct{ *scriptedClient }
+
+func (c *lateFailureClient) Ingest(
+	ctx context.Context, source explorer.Source,
+) (explorer.IngestResult, error) {
+	if source.Content == "late\n" {
+		if _, err := c.scriptedClient.Explorer.Ingest(ctx, source); err != nil {
+			return explorer.IngestResult{}, err
+		}
+		return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(shoal.NewError(
+			shoal.ErrorConflict, "graph rebuild failed after the write"))
+	}
+	return c.scriptedClient.Ingest(ctx, source)
+}
+
+func newClientWorld(t *testing.T, corpus *explorer.Explorer, client explorer.BoundedClient, scripted *scriptedClient) *batchWorld {
+	t.Helper()
+	embedded, err := NewEmbeddedService(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(nil)
+	handler, err := NewHandler(embedded, server.Listener.Addr().String())
+	if err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	server.Config.Handler = handler
+	server.Start()
+	t.Cleanup(server.Close)
+	return &batchWorld{server: server, corpus: corpus, client: scripted}
+}
+
+// TestHTTPIngestSnapshotFailureAfterTheBatchIsPartial pins that a snapshot
+// read failing after every file went through is reported with the files'
+// outcomes, and as partial, so a reader of the status and header does not
+// take a fully applied batch for nothing written.
+func TestHTTPIngestSnapshotFailureAfterTheBatchIsPartial(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	scripted := &scriptedClient{Explorer: corpus}
+	world := newClientWorld(t, corpus, &snapshotFailingClient{scriptedClient: scripted}, scripted)
+	got := world.post(t, [2]string{"one.txt", "one\n"}, [2]string{"two.txt", "two\n"})
+	if got.status != http.StatusServiceUnavailable || got.header != CommitOutcomePartial ||
+		!got.Partial || got.Indeterminate {
+		t.Fatalf("snapshot failure after the batch = %+v", got)
+	}
+	requireFiles(t, got.Files, []IngestFileOutcome{
+		fileStatus("one.txt", IngestFileApplied), fileStatus("two.txt", IngestFileApplied),
+	})
+	if sources := world.sources(t); len(sources) != 2 {
+		t.Fatalf("ingested %v, want both files", sources)
+	}
+}
+
+// TestHTTPIngestPostWriteFailureAfterARefusalIsIndeterminate is the review
+// repro: a refused file, then one the base wrote before failing. The batch is
+// indeterminate and so is that file's entry, although nothing before it
+// committed.
+func TestHTTPIngestPostWriteFailureAfterARefusalIsIndeterminate(t *testing.T) {
+	corpus, err := explorer.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corpus.Close()
+	scripted := &scriptedClient{Explorer: corpus, errs: map[string]error{"old\n": markedHistorical()}}
+	world := newClientWorld(t, corpus, &lateFailureClient{scripted}, scripted)
+	got := world.post(t, [2]string{"old.txt", "old\n"}, [2]string{"late.txt", "late\n"})
+	if got.status != http.StatusServiceUnavailable ||
+		got.header != CommitOutcomeIndeterminate || !got.Indeterminate {
+		t.Fatalf("post-write failure after a refusal = %+v", got)
+	}
+	requireFiles(t, got.Files, []IngestFileOutcome{
+		refusedHistorical("old.txt"),
+		{Name: "late.txt", Status: IngestFileFailed, Indeterminate: true},
+	})
+}
+
 // TestRemoteIngestCarriesPerFileOutcomes drives RemoteService against a
 // workspace that reports per-file outcomes: they reach the caller, an
 // all-refused batch stays definite as it is upstream, and so does a partly

@@ -119,7 +119,12 @@ func (s *EmbeddedService) Ingest(
 	}
 	snapshot, err := s.client.Snapshot(ctx)
 	if err != nil {
-		return IngestResponse{}, err
+		// Every file went through, so the batch's outcomes are known: the
+		// failure is reported with them, partial when files were applied or
+		// unchanged, so the caller does not read it as nothing written.
+		return IngestResponse{}, withIngestFileOutcomes(shoal.WrapError(
+			primaryErrorCode(err), "read the workspace snapshot after the upload", err,
+		), outcomes)
 	}
 	return IngestResponse{Snapshot: fromExplorerSnapshot(snapshot), Files: results}, nil
 }

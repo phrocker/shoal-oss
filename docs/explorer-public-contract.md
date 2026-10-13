@@ -501,6 +501,14 @@ error after an `unchanged` result that fails before the registration. The
 base's own errors are classified by the base, and the client trusts an
 unmarked one as definite, as its claim rollback does.
 
+The base holds to that. Once `explorer.Ingest` has durably written the
+document record, the revision is published: a retry finds it. Any later error
+from the same call, such as a failed graph rebuild, is marked indeterminate
+with its code kept. A graph materialization or extraction whose record is
+durable reports a later rebuild or snapshot-registration failure the same
+way. Interaction and fold writes already mark such failures with
+`MarkCommittedInteraction`.
+
 `pkg/code` retains its existing typed stable-ID algorithms. `Source.Ref` is
 excluded from `Source.ID` and the ingestion key because multiple refs can
 resolve to one immutable revision. Retrying a committed identical ingestion
