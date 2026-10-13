@@ -282,6 +282,11 @@ func (s *RemoteService) Retrieve(
 			shoal.ErrorConflict, "retrieval as_of does not match the pinned snapshot")
 	}
 	request.Query = query
+	if query.Bound != nil {
+		// The remote route cannot carry a source bound (#560); refusing here
+		// keeps the refusal from depending on the encoder's.
+		return RetrievalResponse{}, retrieval.ErrBoundUnsupported()
+	}
 	if query.HasMode(retrieval.ModeVector) &&
 		len(query.Scope.DocumentIDs) == 0 &&
 		len(query.Scope.NodeIDs) == 0 {

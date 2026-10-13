@@ -159,6 +159,30 @@ func TestCacheKeyIsDeterministicDefensiveAndFullyPartitioned(t *testing.T) {
 		t.Fatal("query change did not partition cache")
 	}
 
+	// A retrieval source bound (#560) narrows what a projection may contain,
+	// so it partitions the cache: bounded never shares with unbounded, and
+	// two bounds share only when they normalize to the same scopes.
+	boundKey := func(scopes ...retrieval.BoundScope) auth.CacheKey {
+		t.Helper()
+		config := cacheConfig(decision)
+		config.Request.Bound = &retrieval.SourceBound{Scopes: scopes}
+		key, err := auth.NewCacheKey(config)
+		if err != nil {
+			t.Fatalf("NewCacheKey(bounded) = %v", err)
+		}
+		return key
+	}
+	scopeA := retrieval.BoundScope{SourceID: []byte("source-a"), PolicyID: []byte("policy-a")}
+	scopeB := retrieval.BoundScope{SourceID: []byte("source-b"), PolicyID: []byte("policy-b")}
+	onlyA, onlyB, empty := boundKey(scopeA), boundKey(scopeB), boundKey()
+	if onlyA.Digest() == first.Digest() || empty.Digest() == first.Digest() ||
+		onlyA.Digest() == onlyB.Digest() || onlyA.Digest() == empty.Digest() {
+		t.Fatal("a source bound did not partition the cache")
+	}
+	if boundKey(scopeB, scopeA, scopeA).Digest() != boundKey(scopeA, scopeB).Digest() {
+		t.Fatal("equivalent bounds must share a partition")
+	}
+
 	generationConfig := baseDecisionConfig()
 	generationConfig.PolicyGeneration++
 	generationDecision := mustDecision(t, generationConfig)

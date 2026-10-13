@@ -234,6 +234,18 @@ func digestRequest(request retrieval.Request) Digest {
 		encoder.bytes(encoded)
 	}
 	encoder.boolean(request.Explain)
+	if request.Bound != nil {
+		// A source bound (#560) changes what an authorized projection may
+		// contain, so a bounded request never shares a partition with an
+		// unbounded one or with another bound. Appended only when present,
+		// so every unbounded key is unchanged.
+		encoder.text("source-bound")
+		encoder.uint64(uint64(len(request.Bound.Scopes)))
+		for _, scope := range request.Bound.Scopes {
+			encoder.bytes(scope.SourceID)
+			encoder.bytes(scope.PolicyID)
+		}
+	}
 	return encoder.sum()
 }
 

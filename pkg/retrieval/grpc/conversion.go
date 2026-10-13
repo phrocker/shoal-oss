@@ -36,6 +36,11 @@ func requestToProto(request retrieval.Request) (*knowledgepb.RetrieveRequest, er
 		return nil, err
 	}
 	request = normalized
+	if request.Bound != nil {
+		// The wire request has no field for a source bound, so sending one
+		// would drop it and the server would retrieve unbounded (#560).
+		return nil, retrieval.ErrBoundUnsupported()
+	}
 	if err := validateRequestWire(request); err != nil {
 		return nil, err
 	}

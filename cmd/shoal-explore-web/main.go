@@ -1320,6 +1320,12 @@ type serviceConfig struct {
 	// maxNodeAdjacency is -max-bounded-node-adjacency (#698):
 	// authorized.Config.MaxBoundedNodeAdjacency; zero means the default.
 	maxNodeAdjacency uint32
+	// policySelector is a test seam and nothing else: nil in every
+	// production path, which selects the single static workspace source. A
+	// test sets it to ingest into a second source, which is the only way to
+	// exercise a descriptor scope narrower than the invoking principal's
+	// reach (#560) through the composed service.
+	policySelector authorized.PolicySelector
 }
 
 // openedService is the constructed workspace service together with what the
@@ -1443,10 +1449,10 @@ func openService(
 				generation: workspacePolicyGeneration,
 			}
 		}
-		client, err := authorizedClient(
+		client, err := authorizedClientWithSelector(
 			corpus, store, config.resolver, generationReader,
 			config.clock, config.mosaic, config.requireDeclassificationReason,
-			config.maxNodeAdjacency)
+			config.maxNodeAdjacency, config.policySelector)
 		if err != nil {
 			store.Close()
 			embedded.Close()
@@ -1959,10 +1965,32 @@ func authorizedClient(
 	requireDeclassificationReason bool,
 	maxNodeAdjacency uint32,
 ) (*authorized.Client, error) {
-	selector, err := authorized.NewStaticPolicySelector(
-		workspaceSourceID, workspaceGrantPolicyID)
-	if err != nil {
-		return nil, err
+	return authorizedClientWithSelector(corpus, store, resolver,
+		generationReader, clock, mosaic, requireDeclassificationReason,
+		maxNodeAdjacency, nil)
+}
+
+// authorizedClientWithSelector is authorizedClient with an optional ingest
+// policy selector. Nil — every production path — selects the static
+// workspace source; only a test supplies one (serviceConfig.policySelector).
+func authorizedClientWithSelector(
+	corpus *explorer.Explorer,
+	store authorized.PolicyStore,
+	resolver auth.Resolver,
+	generationReader auth.GenerationReader,
+	clock func() time.Time,
+	mosaic authorized.MosaicBudget,
+	requireDeclassificationReason bool,
+	maxNodeAdjacency uint32,
+	selector authorized.PolicySelector,
+) (*authorized.Client, error) {
+	if selector == nil {
+		static, err := authorized.NewStaticPolicySelector(
+			workspaceSourceID, workspaceGrantPolicyID)
+		if err != nil {
+			return nil, err
+		}
+		selector = static
 	}
 	// No authenticator here mints a trusted-service decision, so no service
 	// account has a ceiling: a trusted service, were one ever to reach this

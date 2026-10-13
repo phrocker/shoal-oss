@@ -70,6 +70,13 @@ func (e *Explorer) retrieve(
 		return retrieval.Response{}, err
 	}
 	request = normalized
+	if request.Bound != nil {
+		// The engine holds no access rules, so it cannot tell which content
+		// a source bound covers. Ignoring the bound would silently widen what
+		// the caller asked to be confined to (#560); the authorized client
+		// honours it and never forwards one here.
+		return retrieval.Response{}, retrieval.ErrBoundUnsupported()
+	}
 	if !request.AsOf.IsZero() {
 		return retrieval.Response{}, shoal.NewError(
 			shoal.ErrorUnavailable,

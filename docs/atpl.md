@@ -100,10 +100,15 @@ is one JSON object:
   scope, rather than run and record evidence from outside it (#370). Where
   the principal can reach no more than the scope — which is how
   `cmd/shoal-explore-web` mints fleet principals — the bound constrains
-  nothing and nothing is refused. Scoped retrieval itself is not implemented:
-  `retrieval.Scope` is document and node identifiers and cannot express a
-  source/policy bound, so a scoped reasoning agent currently refuses rather
-  than reaching wider.
+  nothing and nothing is refused. The reasoning executor (`AskExecutor`)
+  does confine (#560): it asks with a `retrieval.SourceBound` of exactly the
+  action's (source, policy), which the authorized client applies as a filter
+  after authorization to retrieval, document reads, graph expansion and
+  citation hydration, so its record carries evidence from that scope only.
+  The bound only narrows what the principal may already read and never
+  changes its decision or authorization fingerprint. It promises this only
+  when its provider reports `HonoursRetrievalBound` (the real `ChatService`
+  does); with any other provider it is refused as above.
 - **Executors** assert what the host binds a reference to. Ceilings and floors
   are host Go objects with no read API (`executorCeiling`, `executorFloor`,
   `cmd/shoal-explore-web/fleet.go`), so the file declares them and compile

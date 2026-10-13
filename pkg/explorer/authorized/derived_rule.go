@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -50,6 +51,10 @@ type registrationReader struct {
 	decision  auth.Decision
 	operation auth.Operation
 	now       time.Time
+	// bound, when set, also requires the projected owner to be within a
+	// retrieval source bound (#560), so a shared entity is shown through an
+	// owner on a bound source when it has one. Nil is no bound.
+	bound *retrieval.SourceBound
 }
 
 func readerFor(
@@ -224,7 +229,7 @@ func effectiveRegistrations[R any](
 // counts as a denial (see projectOwner).
 func readerAllows(rule AccessRule, reader *registrationReader) bool {
 	allowed, err := ruleAllows(rule, reader.decision, reader.operation, reader.now)
-	return err == nil && allowed
+	return err == nil && allowed && ruleWithinBound(rule, reader.bound)
 }
 
 // firstOwnerRule is the effective rule of a registration's first owner: its

@@ -206,6 +206,16 @@ func (c *Corpus) AbsentNodeID() shoal.ID {
 	return shoal.ID("doc_00000000000000000000000000000000")
 }
 
+// OpenScope and RestrictedScope are the (source, policy) pairs of the two
+// compartments, for a probe that bounds retrieval to one of them (#560).
+func (c *Corpus) OpenScope() (sourceID, policyID []byte) {
+	return append([]byte(nil), c.sourceA...), append([]byte(nil), c.policyA...)
+}
+
+func (c *Corpus) RestrictedScope() (sourceID, policyID []byte) {
+	return append([]byte(nil), c.sourceB...), append([]byte(nil), c.policyB...)
+}
+
 // Clock is the fixture's clock, for a service that must agree with it.
 func (c *Corpus) Clock() func() time.Time { return c.clock }
 

@@ -25,6 +25,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -190,6 +191,14 @@ func (c *Client) Document(
 	ctx context.Context,
 	documentID, revisionID shoal.ID,
 ) (explorer.DocumentView, error) {
+	return c.document(ctx, nil, documentID, revisionID)
+}
+
+func (c *Client) document(
+	ctx context.Context,
+	bound *retrieval.SourceBound,
+	documentID, revisionID shoal.ID,
+) (explorer.DocumentView, error) {
 	if err := shoal.ValidateRequiredID("document ID", documentID); err != nil {
 		return explorer.DocumentView{}, err
 	}
@@ -227,6 +236,16 @@ func (c *Client) Document(
 		return explorer.DocumentView{}, err
 	}
 	if !allowed {
+		return explorer.DocumentView{}, auth.ObjectNotFound()
+	}
+	// Checked only after authorization, and refused with the same shape: a
+	// revision outside the bound is indistinguishable from a hidden or
+	// absent one (#560), whatever the bound names.
+	within, err := c.revisionWithinBound(ctx, registration, bound)
+	if err != nil {
+		return explorer.DocumentView{}, err
+	}
+	if !within {
 		return explorer.DocumentView{}, auth.ObjectNotFound()
 	}
 	view, err := c.base.Document(ctx, documentID, registration.RevisionID)

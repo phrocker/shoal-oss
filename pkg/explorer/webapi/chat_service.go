@@ -21,6 +21,9 @@ package webapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -55,11 +58,31 @@ type AskRequest struct {
 	Reason        json.RawMessage `json:"reason,omitempty"`
 	CorrelationID json.RawMessage `json:"correlation_id,omitempty"`
 	Operation     json.RawMessage `json:"operation,omitempty"`
+	// Bound confines every read the answer makes — the initial retrieval,
+	// each tool retrieval, document read and graph expansion, and the
+	// verification of what it cites — to content governed by the named
+	// (SourceID, PolicyID) scopes (#560). Nil is today's unbounded chat. It
+	// only narrows what the caller's own decision may read and is never
+	// decoded from a request body: it is set in process, by an executor that
+	// carries an invocation's scope, and a provider that cannot honour it
+	// must not report HonoursRetrievalBound.
+	Bound *retrieval.SourceBound `json:"-"`
 }
 
 // AskProvider returns only verified, durably recorded reasoning responses.
 type AskProvider interface {
 	Ask(context.Context, AskRequest) (CitationEnvelope, error)
+}
+
+// BoundedAskProvider is an AskProvider that confines every read an answer
+// makes to AskRequest.Bound. AskExecutor promises fleet that it confines
+// retrieval to an invocation's scope only when its provider reports this
+// (#560); a provider that does not is treated as unable to, so fleet refuses
+// to run it wider than the action's scope rather than trusting a bound the
+// provider might drop.
+type BoundedAskProvider interface {
+	AskProvider
+	HonoursRetrievalBound() bool
 }
 
 type ChatConfig struct {
@@ -105,6 +128,12 @@ func (s *ChatService) EgressesOffHost() bool {
 	}
 	return model.EgressesOffHost(s.generator)
 }
+
+// HonoursRetrievalBound reports that Ask confines every read to
+// AskRequest.Bound: the initial and tool retrievals carry it, and document
+// reads, graph expansions and citation hydration go through the authorized
+// client's bounded reads (#560).
+func (s *ChatService) HonoursRetrievalBound() bool { return s != nil }
 
 type citationDocumentKey struct {
 	documentID shoal.ID
@@ -179,11 +208,20 @@ func (s *ChatService) Ask(ctx context.Context, input AskRequest) (CitationEnvelo
 		len(input.Question) > 32*1024 {
 		return CitationEnvelope{}, chatInvalid("question must be nonempty UTF-8 within 32768 bytes")
 	}
+	bound, err := input.Bound.Normalize()
+	if err != nil {
+		return CitationEnvelope{}, err
+	}
+	if bound != nil && len(bound.Scopes) == 0 {
+		// A bound admitting nothing cannot ground an answer, and running the
+		// model over an empty context would only bill a refusal.
+		return CitationEnvelope{}, chatInvalid("a retrieval bound must name at least one scope")
+	}
 	decision, err := s.resolver.Resolve(ctx)
 	if err != nil {
 		return CitationEnvelope{}, err
 	}
-	if err := s.authorize(decision); err != nil {
+	if err := s.authorize(decision, bound); err != nil {
 		return CitationEnvelope{}, err
 	}
 	productRecorder, err := interaction.NewRecorder(ctx, s.client)
@@ -259,6 +297,7 @@ func (s *ChatService) Ask(ctx context.Context, input AskRequest) (CitationEnvelo
 	request := retrieval.Request{
 		Text: input.Question, TopK: input.TopK,
 		Modes: append([]retrieval.Mode(nil), s.retrievalModes...), Explain: true,
+		Bound: bound.Clone(),
 	}
 	retrieved, err := s.client.Retrieve(ctx, request)
 	if err != nil {
@@ -273,7 +312,7 @@ func (s *ChatService) Ask(ctx context.Context, input AskRequest) (CitationEnvelo
 	if err := retrievalRecorder.Record(ctx, request, retrieved); err != nil {
 		return CitationEnvelope{}, fmt.Errorf("capture initial retrieval: %w", err)
 	}
-	reader := chatContextReader{client: s.client, limits: limits}
+	reader := chatContextReader{client: s.client, limits: limits, bound: bound}
 	builder := contextpack.Builder{Reader: reader, Limits: contextpack.Limits{
 		MaxResults: max(int(input.TopK), budgets.MaxFanout),
 		MaxAnchors: budgets.MaxEvidence, MaxGraphNodes: budgets.MaxGraphNodes,
@@ -308,6 +347,7 @@ func (s *ChatService) Ask(ctx context.Context, input AskRequest) (CitationEnvelo
 	}
 	host, err := harness.NewExplorerToolHost(chatToolClient{
 		Client: s.client, limits: limits, recorder: retrievalRecorder,
+		bound: bound,
 	}, builder)
 	if err != nil {
 		return CitationEnvelope{}, err
@@ -315,7 +355,11 @@ func (s *ChatService) Ask(ctx context.Context, input AskRequest) (CitationEnvelo
 	host.PolicyID = chatPolicyID
 	host.RetrievalModes = request.Modes
 	host.RetrievalExplain = true
-	cacheIdentity := chatCacheIdentity(settingsID, settingsRevision, cacheDimensions)
+	// The bound is part of what a cached run was allowed to read, so it is
+	// part of the identity: a run cached unbounded must never be replayed
+	// for a bounded question, whose tools could not have read what it did.
+	cacheIdentity := chatCacheIdentity(
+		settingsID, settingsRevision, cacheDimensions, bound)
 	host.ClientIdentity = cacheIdentity
 	host.BoundedClientIdentity = cacheIdentity
 	host.BuilderReaderIdentity = cacheIdentity
@@ -376,7 +420,7 @@ func (s *ChatService) Ask(ctx context.Context, input AskRequest) (CitationEnvelo
 		return CitationEnvelope{}, fmt.Errorf("capture verified chat response: %w", err)
 	}
 	response := NewCitationEnvelope(captured)
-	if err := s.hydrateCitationLinks(ctx, &response); err != nil {
+	if err := s.hydrateCitationLinks(ctx, &response, bound); err != nil {
 		return CitationEnvelope{}, explorer.MarkCommittedInteraction(err)
 	}
 	if err := s.client.ValidateAuthorization(ctx, authPin); err != nil {
@@ -420,6 +464,7 @@ func (s *ChatService) Ask(ctx context.Context, input AskRequest) (CitationEnvelo
 
 func (s *ChatService) hydrateCitationLinks(
 	ctx context.Context, response *CitationEnvelope,
+	bound *retrieval.SourceBound,
 ) error {
 	uris := make(map[citationDocumentKey]string)
 	hydrate := func(evidence []CitationEvidence) error {
@@ -434,8 +479,8 @@ func (s *ChatService) hydrateCitationLinks(
 			}
 			uri, ok := uris[key]
 			if !ok {
-				document, err := s.client.Document(
-					ctx, citation.DocumentID, citation.RevisionID)
+				document, err := s.client.DocumentWithin(
+					ctx, bound, citation.DocumentID, citation.RevisionID)
 				if err != nil {
 					return fmt.Errorf("resolve citation source link: %w", err)
 				}
@@ -482,6 +527,7 @@ func chatCacheIdentity(
 	settingsID shoal.ID,
 	revision uint64,
 	dimensions map[string]uint64,
+	bound *retrieval.SourceBound,
 ) string {
 	keys := make([]string, 0, len(dimensions))
 	for key := range dimensions {
@@ -498,6 +544,25 @@ func chatCacheIdentity(
 		value.WriteString(key)
 		value.WriteByte('=')
 		value.WriteString(strconv.FormatUint(dimensions[key], 10))
+	}
+	if bound != nil {
+		// Unbounded identities are unchanged; a bounded one adds a digest of
+		// its canonical (normalized) scopes, length-framed so no two bounds
+		// share an encoding.
+		hash := sha256.New()
+		var length [8]byte
+		write := func(part []byte) {
+			binary.BigEndian.PutUint64(length[:], uint64(len(part)))
+			_, _ = hash.Write(length[:])
+			_, _ = hash.Write(part)
+		}
+		write([]byte("web-chat-retrieval-bound-v1"))
+		for _, scope := range bound.Scopes {
+			write(scope.SourceID)
+			write(scope.PolicyID)
+		}
+		value.WriteString(":bound=")
+		value.WriteString(hex.EncodeToString(hash.Sum(nil)))
 	}
 	return value.String()
 }
@@ -551,10 +616,31 @@ func chatVisibility(labels []string) string {
 	return "public"
 }
 
-func (s *ChatService) authorize(decision auth.Decision) error {
-	return decision.Authorize(auth.OperationRetrieve, auth.ResourceRequest{
-		AuthorizationDomain: decision.AuthorizationDomain(),
-	}, s.clock())
+// authorize admits the request before anything is read. Unbounded chat
+// authorizes retrieval domain-wide, as it always has. A bounded question
+// authorizes retrieval on each scope it is confined to instead (#560), so a
+// scoped invocation is admitted on the scope it will read rather than on the
+// whole domain. This only ever asks the caller's own decision: the bound adds
+// nothing to it, and every read is still authorized object by object.
+func (s *ChatService) authorize(
+	decision auth.Decision, bound *retrieval.SourceBound,
+) error {
+	if bound == nil {
+		return decision.Authorize(auth.OperationRetrieve, auth.ResourceRequest{
+			AuthorizationDomain: decision.AuthorizationDomain(),
+		}, s.clock())
+	}
+	now := s.clock()
+	for _, scope := range bound.Scopes {
+		if err := decision.Authorize(auth.OperationRetrieve, auth.ResourceRequest{
+			AuthorizationDomain: decision.AuthorizationDomain(),
+			SourceID:            scope.SourceID,
+			PolicyID:            scope.PolicyID,
+		}, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func chatProvenance(modelProvenance inference.ModelProvenance) (harness.Provenance, error) {
@@ -565,16 +651,25 @@ func chatProvenance(modelProvenance inference.ModelProvenance) (harness.Provenan
 	return harness.NewProvenance("shoal-recorded-chat-v1", modelProvenance, prompt, string(chatPolicyID))
 }
 
+// chatToolClient is the explorer client the model's tools read through. Under
+// a retrieval bound (#560) every read it serves is the authorized client's
+// bounded read; it embeds the client for the rest of the explorer contract,
+// so any further read it is given must be confined here too, or refused under
+// a bound as Documents is.
 type chatToolClient struct {
 	*authorized.Client
 	limits   workspace.Limits
 	recorder *chatRetrievalRecorder
+	bound    *retrieval.SourceBound
 }
 
 func (c chatToolClient) Retrieve(ctx context.Context, request retrieval.Request) (retrieval.Response, error) {
 	if request.TopK == 0 || request.TopK > c.limits.RetrievalTopK {
 		return retrieval.Response{}, chatInvalid("tool retrieval exceeds workspace limit")
 	}
+	// A tool request names no bound of its own; one that did could only be
+	// narrowed further, never widened past the question's.
+	request.Bound = retrieval.IntersectBounds(request.Bound, c.bound)
 	response, err := c.Client.Retrieve(ctx, request)
 	if err != nil {
 		return retrieval.Response{}, err
@@ -596,16 +691,32 @@ func (c chatToolClient) BoundedNeighborhood(ctx context.Context, request explore
 		request.MaxScannedEdges > c.limits.GraphNodes*c.limits.GraphFanout {
 		return explorer.BoundedNeighborhood{}, chatInvalid("tool graph expansion exceeds workspace limits")
 	}
-	return c.Client.BoundedNeighborhood(ctx, request)
+	return c.Client.BoundedNeighborhoodWithin(ctx, c.bound, request)
 }
 
 func (c chatToolClient) Neighborhood(ctx context.Context, request explorer.NeighborhoodRequest) (explorer.Neighborhood, error) {
-	return (chatContextReader{client: c.Client, limits: c.limits}).Neighborhood(ctx, request)
+	return (chatContextReader{client: c.Client, limits: c.limits, bound: c.bound}).Neighborhood(ctx, request)
 }
 
+func (c chatToolClient) Document(ctx context.Context, documentID, revisionID shoal.ID) (explorer.DocumentView, error) {
+	return c.Client.DocumentWithin(ctx, c.bound, documentID, revisionID)
+}
+
+// Documents lists the corpus, which no tool needs. Under a bound it is refused
+// rather than listed unconfined.
+func (c chatToolClient) Documents(ctx context.Context) ([]explorer.DocumentSummary, error) {
+	if c.bound != nil {
+		return nil, retrieval.ErrBoundUnsupported()
+	}
+	return c.Client.Documents(ctx)
+}
+
+// chatContextReader is what the context builder and the evidence verifier
+// read through. Its document and graph reads carry the question's bound.
 type chatContextReader struct {
 	client *authorized.Client
 	limits workspace.Limits
+	bound  *retrieval.SourceBound
 }
 
 func (r chatContextReader) Snapshot(ctx context.Context) (explorer.Snapshot, error) {
@@ -619,14 +730,14 @@ func (r chatContextReader) ValidateAuthorization(
 }
 
 func (r chatContextReader) Document(ctx context.Context, documentID, revisionID shoal.ID) (explorer.DocumentView, error) {
-	return r.client.Document(ctx, documentID, revisionID)
+	return r.client.DocumentWithin(ctx, r.bound, documentID, revisionID)
 }
 
 func (r chatContextReader) Neighborhood(ctx context.Context, request explorer.NeighborhoodRequest) (explorer.Neighborhood, error) {
 	if request.Depth > r.limits.GraphDepth {
 		return explorer.Neighborhood{}, chatInvalid("graph expansion exceeds workspace depth")
 	}
-	page, err := r.client.BoundedNeighborhood(ctx, explorer.BoundedNeighborhoodRequest{
+	page, err := r.client.BoundedNeighborhoodWithin(ctx, r.bound, explorer.BoundedNeighborhoodRequest{
 		NodeIDs: request.NodeIDs, Depth: request.Depth, EdgeTypes: request.EdgeTypes,
 		Fanout: r.limits.GraphFanout, MaxNodes: r.limits.GraphNodes,
 		MaxScannedEdges: r.limits.GraphNodes * r.limits.GraphFanout,
