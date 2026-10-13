@@ -765,4 +765,51 @@ strings 10 and 14, word), and their hashes are not repeated.
 
 ## Results
 
-Not run.
+### The pre-registered test run (2026-10-13)
+
+The one run of the sealed split, as Rule 3 prescribes: `V2TestRunOpen` set
+to true, and `report-test.md` written by
+`go test -run TestEvaluationV2Test -update`. The run's pull request changes
+nothing else. The numbers below are copied from the harness's report
+(`pkg/router/testdata/eval/v2/report-test.md`), which holds the per-kind
+confusion and the per-tag results in full.
+
+**The harness prints: "Primary outcome: positive. H2: supported. S1 (beats
+frozen v1): true. S2 (coverage at least 96): true. S3 (slot exact-match at
+least 90%): true."**
+
+| Metric | router v2 | baseline (v2 grammars) | frozen v1 | baseline (v1 grammars) |
+|---|---|---|---|---|
+| Target precision (non-abstained) | 112 of 112 (100.0%) | 83 of 84 (98.8%) | 17 of 17 (100.0%) | 79 of 79 (100.0%) |
+| End-to-end accuracy | 224 of 303 (73.9%) | 195 of 303 (64.4%) | 129 of 303 (42.6%) | 191 of 303 (63.0%) |
+| Coverage (answerable) | 112 of 191 (58.6%) | 84 of 191 (44.0%) | 17 of 191 (8.9%) | 79 of 191 (41.4%) |
+| Abstention rate | 191 of 303 (63.0%) | 219 of 303 (72.3%) | 286 of 303 (94.4%) | 224 of 303 (73.9%) |
+| Correct abstention (unanswerable) | 112 of 112 (100.0%) | 112 of 112 (100.0%) | 112 of 112 (100.0%) | 112 of 112 (100.0%) |
+| Slot exact-match (target-correct) | 112 of 112 (100.0%) | 83 of 83 (100.0%) | 17 of 17 (100.0%) | 79 of 79 (100.0%) |
+| Abstention reason agreement (secondary) | 89 of 112 (79.5%) | 78 of 112 (69.6%) | 80 of 112 (71.4%) | 79 of 112 (70.5%) |
+
+Paired comparisons:
+
+| Pair | First only | Second only | Both right | Both wrong | Exact McNemar p |
+|---|---|---|---|---|---|
+| router v2 against the lexical baseline, end-to-end (H1, primary) | 37 | 8 | 187 | 71 | 1.537e-05 |
+| router v2 against frozen v1, end-to-end (S1) | 95 | 0 | 129 | 79 | 5.05e-29 |
+| router v2 against frozen v1, coverage on the answerable cases (H2) | 95 | 0 | 17 | 79 | 5.05e-29 |
+| baseline, v2 grammars against v1 grammars, end-to-end (descriptive) | 19 | 15 | 176 | 93 | 0.608 |
+
+Decision:
+
+- **G1 (precision):** wrong proposals at most 5% of 112, rounded down: holds
+  (0 wrong of 112).
+- **G2 (abstention):** correct abstention at least 105 of 112: holds (112 of
+  112).
+- **Primary outcome (H1): positive.**
+- **H2: supported.**
+- **S1:** met. **S2:** met (112 of 191). **S3:** met (112 of 112).
+
+Frozen v1 ran with the router code at the run commit; it loaded and scored
+without error.
+
+Not part of this pull request: the stale grandfathered entries that Rule 3
+says the split's author lists with `-report-stale-grandfather`, and latency
+(descriptive, on train and dev texts only). Neither is recorded here yet.

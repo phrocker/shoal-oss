@@ -31,7 +31,7 @@ const (
 
 // V2TestRunOpen opens the v2 test split for its one pre-registered run. It
 // is false until the run's own pull request, which changes nothing else.
-const V2TestRunOpen = false
+const V2TestRunOpen = true
 
 // ErrV2Sealed is returned while the v2 test split is sealed.
 var ErrV2Sealed = errors.New("the v2 test split is sealed until its pre-registered run")
