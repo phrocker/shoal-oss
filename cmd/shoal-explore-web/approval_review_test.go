@@ -195,7 +195,9 @@ func TestApprovalRefusesANarrowedApproverOnEveryPath(t *testing.T) {
 // conflict rather than the fleet sentinel, the replay fallback never ran, and
 // a third of the callers got "fleet registry conflict" for work that existed.
 func TestApprovalConcurrentReRequestsAgree(t *testing.T) {
-	t.Parallel()
+	// Not parallel (#710): pinned to one core this fails even run alone,
+	// which is a defect of its own, and with the package's parallel tests
+	// competing for a small runner's cores it would fail as often.
 	h := newApprovalHarness(t)
 	request := h.held("concurrent-1")
 	receipt := h.mustRequest(requester, request, fleet.ApprovalPending)

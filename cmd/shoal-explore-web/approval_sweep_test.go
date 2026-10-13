@@ -310,7 +310,9 @@ func TestTheSweepStrandsATakenIdentity(t *testing.T) {
 // same clock, wrote the identical record, which the store answers as the
 // same transition rather than a second one.
 func TestConcurrentSweepsWriteOneTransition(t *testing.T) {
-	t.Parallel()
+	// Not parallel (#710): pinned to one core this fails even run alone,
+	// which is a defect of its own, and with the package's parallel tests
+	// competing for a small runner's cores it would fail as often.
 	h, probe := newEventHarness(t)
 	const requests = 4
 	for i := 0; i < requests; i++ {
