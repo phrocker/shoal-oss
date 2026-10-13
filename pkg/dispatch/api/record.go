@@ -80,6 +80,7 @@ type recordWire struct {
 	Action           string                  `json:"action"`
 	Input            json.RawMessage         `json:"input,omitempty"`
 	Output           json.RawMessage         `json:"output,omitempty"`
+	OutputWithheld   bool                    `json:"output_withheld,omitempty"`
 	ErrorCode        string                  `json:"error_code,omitempty"`
 	ErrorCodeOrigin  json.RawMessage         `json:"error_code_origin,omitempty"`
 	Effected         *Effected               `json:"effected,omitempty"`
@@ -130,7 +131,8 @@ func DecodeRecord(w Action) (Record, error) {
 	return decodeRecord(recordWire{
 		ID: w.ID, Version: w.Version, State: w.State, AgentID: w.AgentID,
 		AgentGeneration: w.AgentGeneration, Capability: w.Capability, Action: w.Action,
-		Input: w.Input, Output: w.Output, ErrorCode: w.ErrorCode, ErrorCodeOrigin: origin,
+		Input: w.Input, Output: w.Output, OutputWithheld: w.OutputWithheld,
+		ErrorCode: w.ErrorCode, ErrorCodeOrigin: origin,
 		Effected: w.Effected, CorrelationID: w.CorrelationID, Deadline: w.Deadline,
 		CreatedAt: w.CreatedAt, UpdatedAt: w.UpdatedAt, ExecutorKey: w.ExecutorKey,
 		ClaimID: w.ClaimID, ClaimFence: w.ClaimFence, ClaimLeaseUntil: w.ClaimLeaseUntil,
@@ -159,7 +161,8 @@ func decodeRecord(w recordWire) (Record, error) {
 		ID: id, Version: w.Version, State: w.State, AgentID: agent,
 		AgentGeneration: w.AgentGeneration, Capability: w.Capability,
 		Action: w.Action, Input: w.Input, Output: w.Output,
-		ErrorCode: w.ErrorCode, Deadline: w.Deadline, CreatedAt: w.CreatedAt,
+		OutputWithheld: w.OutputWithheld,
+		ErrorCode:      w.ErrorCode, Deadline: w.Deadline, CreatedAt: w.CreatedAt,
 		UpdatedAt: w.UpdatedAt, ClaimID: claimID, ClaimFence: w.ClaimFence,
 		ClaimLeaseUntil: w.ClaimLeaseUntil, EffectPossible: w.EffectPossible,
 	}

@@ -3897,8 +3897,12 @@ func (s *DispatchService) readableRecord(
 //     the action does not exist, because for them a marker would be the
 //     disclosure the marker exists to make.
 func outputReadableBy(decision auth.Decision, record ActionRecord) bool {
-	return sameActionPrincipal(decision, record) ||
-		sameClaimantPrincipal(decision, record)
+	// standingOn asks exactly this: is the caller the action's own principal
+	// or its claimant. Reusing it keeps the two from drifting apart, and
+	// removes a body character-for-character identical to another function —
+	// which already cost a mutation run, where a replace-first patch
+	// mutated standingOn and the surviving mutant read as a passing test.
+	return standingOn(decision, record)
 }
 
 // readableRecords is the one funnel: every dispatch read that returns a

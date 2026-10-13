@@ -96,7 +96,7 @@ func TestAnOutsiderOfOnlyLabelledEvidenceSeesTheWireOfNone(t *testing.T) {
 	// evidence it may not see, and OutputWithheld is that statement. The
 	// concession is deliberate and only to this class of reader; a third
 	// party is answered as though the action does not exist, which
-	// TestAThirdPartyIsNotToldAnOutputExisted covers.
+	// TestAThirdPartyIsNotToldTheActionExists below covers.
 	//
 	// So the parity claim is narrowed to exactly one field and strengthened
 	// everywhere else: nothing *but* the Output pair may vary with whether
@@ -133,9 +133,103 @@ func TestAnOutsiderOfOnlyLabelledEvidenceSeesTheWireOfNone(t *testing.T) {
 				path.name, normalized, path.want)
 		}
 	}
-	// The wire still differs only by the Output pair, so it is compared with
-	// both planes' Output removed rather than not at all.
-	if bytes.Equal(gotWire, wantWire) {
-		t.Fatal("the wire did not change at all; the probe is vacuous")
+	// The wire is compared field by field with the Output pair removed, not
+	// merely asserted to differ. "They differ" would pass if some unrelated
+	// field had drifted too, which is the whole thing this parity test is
+	// for.
+	var gotFields, wantFields map[string]any
+	if err := json.Unmarshal(gotWire, &gotFields); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(wantWire, &wantFields); err != nil {
+		t.Fatal(err)
+	}
+	if gotFields["output_withheld"] != true {
+		t.Fatalf("the wire did not carry the withheld marker: %s", gotWire)
+	}
+	if _, present := gotFields["output"]; present {
+		t.Fatalf("the wire carried an Output alongside the marker: %s", gotWire)
+	}
+	if _, present := wantFields["output"]; !present {
+		t.Fatalf("the unlabelled plane's wire carried no Output, so the "+
+			"comparison has nothing to distinguish: %s", wantWire)
+	}
+	for _, field := range []string{"output", "output_withheld"} {
+		delete(gotFields, field)
+		delete(wantFields, field)
+	}
+	if !reflect.DeepEqual(gotFields, wantFields) {
+		t.Fatalf("the wire differs outside the Output pair:\n%#v\nwant\n%#v",
+			gotFields, wantFields)
+	}
+}
+
+// TestAThirdPartyIsNotToldTheActionExists is the other side of the #696
+// decision, at the plane rather than the unit.
+//
+// The reader above is the action's own principal and keeps the record with
+// the marker. A third party — the TeamActions audience the issue is about —
+// is answered as though the action does not exist, because for it a marker
+// would be exactly the disclosure the marker exists to make.
+//
+// This is where the decision's cost is visible and should stay visible: the
+// action is present in a third party's page while it is queued, and gone once
+// it succeeds carrying evidence that reader cannot see. That is recorded on
+// #696 as a residual, not claimed as indistinguishability.
+func TestAThirdPartyIsNotToldTheActionExists(t *testing.T) {
+	now := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
+	plane := newLabelPlaneWith(t, planeOptions{
+		choose: fullLabels, wireEvents: true, label: "secret",
+		now: now, evidence: "labelled",
+	})
+	stranger := bindPlaneSubjectWith(t, plane.authority, plane.now, "stranger",
+		nil, readerOperations...)
+
+	page, err := plane.dispatch.TeamActions(stranger, fleet.TeamActionListRequest{
+		Limit: 10, SourceIDs: [][]byte{[]byte("source")},
+		PolicyIDs: [][]byte{[]byte("policy")},
+		Context:   integrationRequestContext(plane.now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range page.Actions {
+		if string(action.ID) == string(plane.completed.ID) {
+			t.Fatalf("a third party was served the completed action: "+
+				"output=%q withheld=%v. Its Output was derived from evidence "+
+				"this reader cannot see, and a marker would tell it so",
+				action.Output, action.OutputWithheld)
+		}
+	}
+
+	// And the same read on a plane whose evidence is unlabelled does serve
+	// it. Without this the test would pass on a stranger who can never see
+	// any action, which proves nothing about withholding — and it is also
+	// where the decision's cost is visible: the action is in one page and
+	// not the other.
+	open := newLabelPlaneWith(t, planeOptions{
+		choose: fullLabels, wireEvents: true, label: "secret",
+		now: now, evidence: "none",
+	})
+	openStranger := bindPlaneSubjectWith(t, open.authority, open.now,
+		"stranger", nil, readerOperations...)
+	openPage, err := open.dispatch.TeamActions(openStranger,
+		fleet.TeamActionListRequest{
+			Limit: 10, SourceIDs: [][]byte{[]byte("source")},
+			PolicyIDs: [][]byte{[]byte("policy")},
+			Context:   integrationRequestContext(open.now),
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := false
+	for _, action := range openPage.Actions {
+		if string(action.ID) == string(open.completed.ID) {
+			served = true
+		}
+	}
+	if !served {
+		t.Fatal("a third party sees no completed action even when its " +
+			"evidence is unlabelled, so the probe above is vacuous")
 	}
 }

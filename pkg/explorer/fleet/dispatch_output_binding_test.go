@@ -59,6 +59,7 @@ func TestOutputIsNotServedPastItsEvidence(t *testing.T) {
 	for _, probe := range []struct {
 		name         string
 		enqueuer     bool
+		noResolver   bool
 		subject      string
 		actor        string
 		wantAbsent   bool
@@ -82,6 +83,14 @@ func TestOutputIsNotServedPastItsEvidence(t *testing.T) {
 			name: "a third party", subject: "stranger",
 			actor: "stranger-actor", wantAbsent: true,
 		},
+		{
+			// A service that cannot identify its reader cannot tell whether
+			// this is the action's own principal, so it answers as it would
+			// an outsider. Failing open here would serve the Output to
+			// everyone the moment a resolver broke.
+			name:       "a reader the service cannot identify",
+			noResolver: true, wantAbsent: true,
+		},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
 			fixture := labelledFixture(t)
@@ -91,8 +100,11 @@ func TestOutputIsNotServedPastItsEvidence(t *testing.T) {
 				fixture.dispatchStore.records[string(fixture.queued.ID)])
 			stored.Output = json.RawMessage(`{"answer":"derived from secret"}`)
 
+			if probe.noResolver {
+				fixture.service.resolver = nil
+			}
 			reader := fixture.enqueuer
-			if !probe.enqueuer {
+			if !probe.enqueuer && !probe.noResolver {
 				reader = bindDecision(t, fixture.authority,
 					planeReader(t, fixture, probe.subject, probe.actor))
 			}
@@ -174,5 +186,47 @@ func TestAnUnreadableOutputLeavesThePage(t *testing.T) {
 	}
 	if string(page.Next) != "cursor" {
 		t.Fatalf("Next = %q, want the scan's cursor untouched", page.Next)
+	}
+}
+
+// TestTheWithheldMarkerCannotClaimAnUnredactedOutput pins the two checks that
+// keep the marker honest.
+//
+// Validate refuses a marker alongside a present Output, so a record cannot
+// assert a redaction that did not happen, and the store refuses the marker
+// outright because it is a read-path value — a stored one would make a
+// redaction durable and withhold the Output from the principals the marker
+// exists to serve.
+func TestTheWithheldMarkerCannotClaimAnUnredactedOutput(t *testing.T) {
+	fixture := labelledFixture(t)
+	completedByAnotherPrincipal(t, fixture)
+	base := cloneActionRecord(
+		fixture.dispatchStore.records[string(fixture.queued.ID)])
+	// No evidence: this test is about the marker, and a pinned snapshot
+	// would drag in citation requirements that say nothing about it.
+	base.Evidence = nil
+	base.EvidenceSnapshotID = ""
+	base.EvidenceSnapshotAsOf = time.Time{}
+	base.Output = json.RawMessage(`{"ok":true}`)
+
+	if err := base.Validate(); err != nil {
+		t.Fatalf("the unredacted record is invalid, so this test compares "+
+			"against nothing: %v", err)
+	}
+
+	both := cloneActionRecord(base)
+	both.OutputWithheld = true
+	if err := both.Validate(); err == nil {
+		t.Fatal("a record claiming its Output was withheld while carrying " +
+			"one was accepted")
+	}
+
+	// And the redacted shape itself stays valid, or the read path could not
+	// produce it.
+	redacted := cloneActionRecord(base)
+	redacted.Output = nil
+	redacted.OutputWithheld = true
+	if err := redacted.Validate(); err != nil {
+		t.Fatalf("the redacted shape is not producible: %v", err)
 	}
 }
