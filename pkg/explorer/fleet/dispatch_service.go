@@ -3837,6 +3837,30 @@ func (s *DispatchService) evidencePathsJoin(
 	return nil, valid, err
 }
 
+// MaxActionEvidenceBindingBytes bounds the total of a record's evidence
+// bindings (#738).
+//
+// #722 caps one binding at four mebibytes and nothing capped their sum, but
+// a record holds up to MaxActionEvidence references, so the per-reference
+// cap permits a gibibyte of bindings on a record encodeAction refuses past
+// 3*MaxActionPayloadBytes. A per-reference cap cannot see this: every
+// binding is individually legal and the record is collectively unwritable.
+//
+// Half a payload is what is left to divide. The record's ceiling is three
+// payloads and Input and Output may be one each, so bindings have about one
+// payload of room before anything else on the record is counted. A binding
+// set built from hash-length identifiers runs to roughly three hundred
+// kilobytes, so this sits above realistic use and below what the record
+// cannot hold. TestARecordAtTheBindingBudgetStillEncodes measures the
+// largest record the service can produce with every caller-growable field
+// at its ceiling at once, rather than leaving the arithmetic as an
+// argument: it encodes to 2,640,062 bytes of 3,145,728.
+//
+// It bounds the published event too, which has no byte cap of its own: an
+// event's bindings are the record's. The event is JSON where the record is
+// a binary codec, so base64 adds a third there.
+const MaxActionEvidenceBindingBytes = MaxActionPayloadBytes / 2
+
 // applyEvidenceBindings gives each reference the binding the gate returned
 // for it, index for index — the order result.Evidence was in, which
 // structuredEvidence preserves.
@@ -3848,12 +3872,38 @@ func (s *DispatchService) evidencePathsJoin(
 // what the evidence is held to. The only binding that may reach the record is
 // the one the gate returned. Absent is safe — an unbound reference is held to
 // every registered revision.
+//
+// A binding that does not fit the remaining budget is dropped whole, and
+// that is the decision #738 asked for rather than a fallback nobody chose.
+// The alternative is refusing the completion, which is honest and loses the
+// outcome of work the executor has already performed — bindings are
+// attached at completion, after the external effect. Dropping costs
+// precision and nothing else: an unbound reference is held to the rules of
+// every registered revision of each document its members now belong to,
+// which over-closes and never opens.
+//
+// Whole, and never truncated, which is the part that has to be right. A
+// member of a bound reference is denied unless some entry covers it, so
+// cutting entries off the end of a binding looks closing — but a member can
+// be covered by more than one entry, and dropping the entry that names the
+// labelled registration while a laxer one still covers it opens exactly the
+// evidence #705 closed. Only the whole binding is safe to drop, because
+// only an empty one means "unbound" to the read gate.
+//
+// Smaller later bindings are still kept when they fit. The result depends
+// on the order the executor reported its references in and is deterministic
+// for a given report, which is what a replay needs.
 func applyEvidenceBindings(evidence []EvidenceRef, bindings [][]byte) {
+	remaining := MaxActionEvidenceBindingBytes
 	for index := range evidence {
 		var binding []byte
 		if index < len(bindings) {
 			binding = bindings[index]
 		}
+		if len(binding) > remaining {
+			binding = nil
+		}
+		remaining -= len(binding)
 		evidence[index].Binding = binding
 	}
 }
