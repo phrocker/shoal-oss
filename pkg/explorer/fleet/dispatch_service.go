@@ -1425,7 +1425,26 @@ func (s *DispatchService) applyExecutionResult(
 		next.EvidenceSnapshotID = result.EvidenceSnapshotID
 		next.EvidenceSnapshotAsOf = result.EvidenceSnapshotAsOf.UTC()
 	}
-	if err := validateActionErrorCode(result.ErrorCode); err != nil {
+	// Only a code still attributed to the executor is adjudicated. By here
+	// the service may already have assigned its own — invalid_executor_output
+	// for a bad output, invalid_executor_evidence for bad evidence — and
+	// those are more specific than this adjudication would be. The origin
+	// field is what tells the two apart, which is exactly the distinction
+	// #508 records as unavailable from the code alone.
+	if reportedErrorCodeIsAdjudicated(result.ErrorCode) &&
+		next.ErrorCodeOrigin != ErrorCodeOriginService {
+		// Adjudicated, never refused. By here the executor has done whatever
+		// the action describes, and refusing a code after its effect would
+		// strand the work and lose the outcome — the case ErrActionCommitted
+		// and the ambiguity route exist for. It would also break a replay of
+		// a code committed before the grammar existed.
+		//
+		// executionErr is not set: a misshapen code is not a failed
+		// execution, it is a code the service would not record as the
+		// executor's word. The origin field says which of the two wrote it.
+		result.ErrorCode = "invalid_executor_error"
+		next.ErrorCodeOrigin = ErrorCodeOriginService
+	} else if err := validateActionErrorCode(result.ErrorCode); err != nil {
 		executionErr = err
 		result.ErrorCode = "invalid_executor_error"
 		next.ErrorCodeOrigin = ErrorCodeOriginService
@@ -4095,4 +4114,55 @@ func (s *DispatchService) readablePage(
 	}
 	page.Actions = kept
 	return page, nil
+}
+
+// reportedErrorCodeIsAdjudicated reports whether the service takes a
+// reported failure code away from the executor and assigns its own.
+//
+// A predicate rather than a function returning the replacement, so that the
+// code a record ends up carrying is written as a literal at the one place
+// that assigns it. pkg/narrate enumerates fleet's error vocabulary by
+// reading every assignment to ErrorCode statically and refuses one it
+// cannot resolve to a literal; a code reaching the field through a variable
+// would be absent from the operator-facing text narrate builds for each
+// code, with nothing to say so.
+//
+// ErrorCode was bounded only by length, so up to a kilobyte of executor-
+// written free text rode it into the record and out through every surface
+// that returns one — including to a reader whose evidence references were
+// withheld. It is reachable where Output is not: a failed action carries a
+// code and no Output, so #696's withholding never fires for it.
+//
+// This is phase 1 of #740 and it narrows the channel rather than closing it.
+// A shape rule constrains form, not content: "patient_4471_hiv_positive" is
+// a perfectly good lowercase token, so what this buys is MaxActionErrorBytes
+// reduced to MaxReportedActionErrorCodeBytes — a kilobyte down to sixty-four
+// — and not a channel that cannot carry what the work read. Closing it needs
+// a vocabulary each action declares before the work runs, which is phase 2
+// and is why #740 stays open.
+//
+// Every route that records a reported code reaches here: Invoke through
+// applyExecutionResult directly, CompleteClaim and the admission surface
+// through completeClaim. The remote boundary refuses a *reserved* code
+// before the claim resolves, where the caller is still known to be the
+// caller (#508); a misshapen one is adjudicated here instead, so the routes
+// agree on what a record may carry and none of them strands work over the
+// shape of the word describing its failure.
+//
+// Empty is how a report says there was no error. It is not a code and is
+// left alone.
+func reportedErrorCodeIsAdjudicated(value string) bool {
+	if value == "" {
+		return false
+	}
+	// A code the service assigns is adjudicated rather than recorded as the
+	// executor's word. The remote route refuses one outright before the
+	// claim resolves; this covers the in-process route, which cannot tell a
+	// worker's code from one the service has just assigned, because both
+	// sit in the same field.
+	if _, reserved := reservedActionErrorCodes[value]; reserved {
+		return true
+	}
+	return len(value) > MaxReportedActionErrorCodeBytes ||
+		!reportedActionErrorCode.MatchString(value)
 }
