@@ -103,6 +103,7 @@
     "typed-decisions/tokenizer/tokenizer_config.json": "08d4cf3ac4dca381759441b85b91a6d40e688471dcd33d15d6649eb0a9a854d1"
   },
   "gpu": "NVIDIA GeForce RTX 4070 Ti",
+  "gpu_driver": "580.159.03",
   "health": {
     "checkpoint_devices": {
       "english": "cuda"
