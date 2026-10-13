@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -1562,9 +1563,40 @@ func validateActionRecordError(value string) error {
 	return nil
 }
 
+// MaxReportedActionErrorCodeBytes bounds an executor-reported error code.
+//
+// Far below MaxActionErrorBytes, because a token is not a message. The
+// longest code in the tree is twenty characters.
+const MaxReportedActionErrorCodeBytes = 64
+
+// reportedActionErrorCode is the shape an executor-reported code must take:
+// a lowercase token. It admits every code the tree produces, including the
+// effects gateway's closed vocabulary and its target_rejected_NNN family.
+var reportedActionErrorCode = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
 // validateReportedActionErrorCode is validateActionRecordError plus the
-// reservation, for a code that arrived from an executor rather than from this
-// process.
+// reservation and a token grammar, for a code that arrived from an executor
+// rather than from this process.
+//
+// The grammar closes a disclosure channel. ErrorCode is executor-written and
+// was bounded only by length and trimming, so up to a kilobyte of free text
+// rode it — and readableRecords serves it to a reader whose evidence
+// references are withheld. It is reachable where Output is not: a failed
+// action carries a code and no Output, so #696's rule, which turns on a
+// non-empty Output, never fires for it. An executor that read labelled
+// content could put derived text here and have it served to readers who may
+// not see the evidence (#740).
+//
+// Constrained rather than withheld, deliberately. Applying #696's rule would
+// make another class of record vanish from a third party's page, and that
+// disappearance is already the residual that decision concedes. A token
+// cannot carry derived content, so the channel closes for every reader at
+// once and no record stops being visible to anyone.
+//
+// The same argument AmbiguityOutcome records for itself: a value describing
+// an interaction with a third party is a channel for target-controlled bytes
+// into the durable record and every surface that returns it. ErrorCode
+// predates that reasoning.
 //
 // Refused rather than recorded-and-flagged, because the two defences answer
 // different questions and both are wanted: the reservation stops a worker
