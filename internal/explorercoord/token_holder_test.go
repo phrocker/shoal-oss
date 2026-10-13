@@ -31,39 +31,107 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/coordination/transaction"
 )
 
-// holdFirstIntent opens a runtime whose first publication stops right after
-// its intent is durable, until release is closed: the holder of its token,
-// with its transaction not yet run.
-func holdFirstIntent(
-	t *testing.T, contentionWait time.Duration,
-) (*Runtime, Config, <-chan struct{}, chan struct{}) {
+// tokenHolderHarness opens a runtime whose stage hook can hold or fail the
+// first publication right after its intent is durable — the holder of its
+// token, with its transaction not yet run — and reports when a later
+// publication has lost its token and is resolving the holder.
+type tokenHolderHarness struct {
+	runtime *Runtime
+	config  Config
+	// held is closed when the first publication reaches the hook.
+	held chan struct{}
+	// release lets a held first publication continue.
+	release chan struct{}
+	// resolving receives once per publication that lost its token.
+	resolving chan struct{}
+}
+
+const (
+	holdTheHolder = iota
+	failTheHolder
+)
+
+func newTokenHolderHarness(
+	t *testing.T, contentionWait time.Duration, mode int,
+) *tokenHolderHarness {
 	t.Helper()
-	config := testRuntimeConfig(t, testDirectory(t))
-	config.ContentionWait = contentionWait
-	held := make(chan struct{})
-	release := make(chan struct{})
+	h := &tokenHolderHarness{
+		config:    testRuntimeConfig(t, testDirectory(t)),
+		held:      make(chan struct{}),
+		release:   make(chan struct{}),
+		resolving: make(chan struct{}, 16),
+	}
+	h.config.ContentionWait = contentionWait
 	var fired atomic.Bool
-	config.testStageHook = func(stage recoveryStage) error {
-		if stage == recoveryStageIntent && fired.CompareAndSwap(false, true) {
-			close(held)
-			<-release
+	h.config.testStageHook = func(stage recoveryStage) error {
+		switch {
+		case stage == recoveryStageTokenHeld:
+			h.resolving <- struct{}{}
+		case stage == recoveryStageIntent && fired.CompareAndSwap(false, true):
+			close(h.held)
+			if mode == failTheHolder {
+				// The publication returns indeterminate with its intent
+				// durable and unsettled, and nothing here will settle it.
+				return context.Canceled
+			}
+			<-h.release
 		}
 		return nil
 	}
-	runtime, err := Open(config)
+	runtime, err := Open(h.config)
 	if err != nil {
 		t.Fatal(err)
 	}
+	h.runtime = runtime
 	t.Cleanup(func() { _ = runtime.Close() })
-	return runtime, config, held, release
+	return h
+}
+
+func (h *tokenHolderHarness) intent(t *testing.T, publisher string) Intent {
+	t.Helper()
+	return testIntent(t, h.config.Domain, "transition", "one-token",
+		"published-by-"+publisher, guard.ModeAbsentOrIdentical, 0,
+		coordination.Digest{})
+}
+
+func (h *tokenHolderHarness) committed() bool {
+	head, _, err := h.runtime.ReadEntity(context.Background(),
+		guard.Entity{Kind: 'R', ID: coordination.EntityID("record/one")})
+	return err == nil && head != nil
 }
 
 type publishOutcome struct {
-	result Result
-	err    error
+	err error
 	// committed is whether the holder's write was readable at the moment
 	// this publication answered.
 	committed bool
+	elapsed   time.Duration
+}
+
+func (h *tokenHolderHarness) publish(
+	ctx context.Context, t *testing.T, publisher string,
+) <-chan publishOutcome {
+	intent := h.intent(t, publisher)
+	done := make(chan publishOutcome, 1)
+	go func() {
+		started := time.Now()
+		_, err := h.runtime.Publish(ctx, Request{Intent: intent})
+		done <- publishOutcome{
+			err: err, committed: h.committed(), elapsed: time.Since(started),
+		}
+	}()
+	return done
+}
+
+func await(t *testing.T, done <-chan publishOutcome, what string) publishOutcome {
+	t.Helper()
+	select {
+	case outcome := <-done:
+		return outcome
+	case <-time.After(20 * time.Second):
+		t.Fatalf("%s did not answer", what)
+		return publishOutcome{}
+	}
 }
 
 // TestALostTokenAnswersAfterItsHolderSettles: two publishers derive one
@@ -73,47 +141,24 @@ type publishOutcome struct {
 // re-reading then sees the state from before the winner's write, and reports a
 // conflict for a transition that is about to exist. That is how concurrent
 // approval re-requests and concurrent sweeps came home with a bare "fleet
-// registry conflict" under single-core scheduling.
+// registry conflict" under single-core scheduling (#729).
 func TestALostTokenAnswersAfterItsHolderSettles(t *testing.T) {
-	runtime, config, held, release := holdFirstIntent(t, time.Minute)
-	entity := guard.Entity{Kind: 'R', ID: coordination.EntityID("record/one")}
-	committed := func() bool {
-		head, _, err := runtime.ReadEntity(context.Background(), entity)
-		return err == nil && head != nil
-	}
-	holder := make(chan publishOutcome, 1)
-	go func() {
-		result, err := runtime.Publish(context.Background(), Request{
-			Intent: testIntent(t, config.Domain, "transition", "one-token",
-				"published-by-first", guard.ModeAbsentOrIdentical, 0,
-				coordination.Digest{}),
-		})
-		holder <- publishOutcome{result: result, err: err}
-	}()
-	<-held
+	h := newTokenHolderHarness(t, time.Minute, holdTheHolder)
+	holder := h.publish(context.Background(), t, "first")
+	<-h.held
 
-	loser := make(chan publishOutcome, 1)
-	go func() {
-		_, err := runtime.Publish(context.Background(), Request{
-			Intent: testIntent(t, config.Domain, "transition", "one-token",
-				"published-by-second", guard.ModeAbsentOrIdentical, 0,
-				coordination.Digest{}),
-		})
-		loser <- publishOutcome{err: err, committed: committed()}
-	}()
-
+	loser := h.publish(context.Background(), t, "second")
 	var lost publishOutcome
 	select {
 	case lost = <-loser:
 		// Answered while the holder was still held: only correct if the
 		// holder's write were already readable, which it cannot be.
-		close(release)
+		close(h.release)
 	case <-time.After(500 * time.Millisecond):
-		close(release)
-		lost = <-loser
+		close(h.release)
+		lost = await(t, loser, "the second publication")
 	}
-	won := <-holder
-	if won.err != nil {
+	if won := await(t, holder, "the holder"); won.err != nil {
 		t.Fatalf("the holder failed: %v", won.err)
 	}
 	if !errors.Is(lost.err, transaction.ErrConflict) {
@@ -125,54 +170,126 @@ func TestALostTokenAnswersAfterItsHolderSettles(t *testing.T) {
 	}
 }
 
-// TestALostTokenWaitIsBounded: a holder that never settles — a stalled or
-// crashed publisher — holds the loser no longer than the contention wait,
-// and the answer is still the conflict.
+// TestALostTokenWaitIsBounded: a holder still running here that does not
+// settle holds the loser no longer than the contention wait, and the answer
+// is still the conflict.
 func TestALostTokenWaitIsBounded(t *testing.T) {
-	runtime, config, held, release := holdFirstIntent(t, 50*time.Millisecond)
-	holder := make(chan error, 1)
-	go func() {
-		_, err := runtime.Publish(context.Background(), Request{
-			Intent: testIntent(t, config.Domain, "transition", "one-token",
-				"published-by-first", guard.ModeAbsentOrIdentical, 0,
-				coordination.Digest{}),
-		})
-		holder <- err
-	}()
-	<-held
+	h := newTokenHolderHarness(t, 50*time.Millisecond, holdTheHolder)
+	holder := h.publish(context.Background(), t, "first")
+	<-h.held
 	defer func() {
-		close(release)
-		if err := <-holder; err != nil {
-			t.Errorf("the holder failed: %v", err)
+		close(h.release)
+		if won := await(t, holder, "the holder"); won.err != nil {
+			t.Errorf("the holder failed: %v", won.err)
 		}
 	}()
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := runtime.Publish(context.Background(), Request{
-			Intent: testIntent(t, config.Domain, "transition", "one-token",
-				"published-by-second", guard.ModeAbsentOrIdentical, 0,
-				coordination.Digest{}),
-		})
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if !errors.Is(err, transaction.ErrConflict) {
-			t.Fatalf("the second publication = %v, want a conflict", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("the wait for an unsettled holder outlasted the contention wait")
+	lost := await(t, h.publish(context.Background(), t, "second"),
+		"a publication waiting out the contention wait")
+	if !errors.Is(lost.err, transaction.ErrConflict) {
+		t.Fatalf("the second publication = %v, want a conflict", lost.err)
 	}
+}
 
-	// And cancellation ends it sooner.
+// TestALostTokenWaitEndsWithItsContext: a context that ends while the loser
+// waits ends the wait, and the caller is told so — a deadline or a
+// cancellation, as the busy-guard wait answers — rather than a conflict.
+func TestALostTokenWaitEndsWithItsContext(t *testing.T) {
+	h := newTokenHolderHarness(t, time.Minute, holdTheHolder)
+	holder := h.publish(context.Background(), t, "first")
+	<-h.held
+	defer func() {
+		close(h.release)
+		if won := await(t, holder, "the holder"); won.err != nil {
+			t.Errorf("the holder failed: %v", won.err)
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loser := h.publish(ctx, t, "second")
+	// Canceled only once it has lost its token and is waiting, so the
+	// cancellation is the wait's to observe and not an earlier step's.
+	select {
+	case <-h.resolving:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the second publication never reached the holder wait")
+	}
 	cancel()
-	if _, err := runtime.Publish(ctx, Request{
-		Intent: testIntent(t, config.Domain, "transition", "one-token",
-			"published-by-third", guard.ModeAbsentOrIdentical, 0,
-			coordination.Digest{}),
-	}); err == nil {
-		t.Fatal("a canceled publication of a held token succeeded")
+	lost := await(t, loser, "a canceled waiting publication")
+	if !errors.Is(lost.err, context.Canceled) {
+		t.Fatalf("the canceled publication = %v, want context.Canceled", lost.err)
+	}
+}
+
+// TestALostTokenToAnIndeterminateHolderResolvesIt: the holder returned
+// indeterminate and left its intent unsettled, so nothing will settle it —
+// there is no periodic recovery — and waiting would always run the full
+// contention wait, for every loser and every one of a caller's retries. The
+// loser resolves the holder instead, as recovery would, and answers at once
+// with the holder's outcome readable; the next loser finds it settled.
+func TestALostTokenToAnIndeterminateHolderResolvesIt(t *testing.T) {
+	h := newTokenHolderHarness(t, time.Minute, failTheHolder)
+	won := await(t, h.publish(context.Background(), t, "first"), "the holder")
+	if !errors.Is(won.err, ErrIndeterminatePublication) {
+		t.Fatalf("the failed holder = %v, want an indeterminate publication",
+			won.err)
+	}
+	for _, publisher := range []string{"second", "third"} {
+		lost := await(t, h.publish(context.Background(), t, publisher),
+			"the "+publisher+" publication")
+		if !errors.Is(lost.err, transaction.ErrConflict) {
+			t.Fatalf("the %s publication = %v, want a conflict",
+				publisher, lost.err)
+		}
+		if lost.elapsed > 10*time.Second {
+			t.Fatalf("the %s publication took %v: it waited for a holder "+
+				"that nothing would settle", publisher, lost.elapsed)
+		}
+		if !lost.committed {
+			t.Fatalf("the %s publication answered with the indeterminate "+
+				"holder still unresolved", publisher)
+		}
+	}
+}
+
+// TestALostTokenWaiterDoesNotHoldUpClose: the wait runs outside the runtime
+// lock, so Close does not queue behind a waiter for its contention wait, and
+// the waiter ends once the runtime is closed.
+func TestALostTokenWaiterDoesNotHoldUpClose(t *testing.T) {
+	h := newTokenHolderHarness(t, time.Minute, failTheHolder)
+	if won := await(t, h.publish(context.Background(), t, "first"),
+		"the holder"); !errors.Is(won.err, ErrIndeterminatePublication) {
+		t.Fatalf("the failed holder = %v", won.err)
+	}
+	// Count the unsettled holder as running here, so the loser waits on it
+	// rather than resolving it; that is the waiter Close must not queue
+	// behind.
+	normalized, _, digest, err := canonicalIntent(h.intent(t, "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn, err := DeriveTXN(h.config.Domain, normalized.Operation, normalized.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.runtime.markInFlight(txn, digest)()
+
+	loser := h.publish(context.Background(), t, "second")
+	select {
+	case <-h.resolving:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the second publication never reached the holder wait")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- h.runtime.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close = %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close waited behind a publication waiting for a token holder")
+	}
+	if lost := await(t, loser, "a waiter on a closed runtime"); lost.err == nil {
+		t.Fatal("a publication that lost its token succeeded")
 	}
 }

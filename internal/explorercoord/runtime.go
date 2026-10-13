@@ -115,6 +115,12 @@ type Runtime struct {
 	recoveryBackoff     time.Duration
 	contentionWait      time.Duration
 	intentCursor        []byte
+	// inFlight counts this process's publications between persisting an
+	// intent and returning, keyed by TXN and logical digest, so a publication
+	// that lost its token to an unsettled intent can tell a holder still
+	// running here from one that has returned without settling.
+	inFlightMu sync.Mutex
+	inFlight   map[string]int
 }
 
 func Open(config Config) (*Runtime, error) {
@@ -290,6 +296,7 @@ func Open(config Config) (*Runtime, error) {
 		recoveryPages: config.RecoveryMaxPages, recoveryConcurrency: config.RecoveryConcurrency,
 		recoveryRounds: config.RecoveryRounds, recoveryBackoff: config.RecoveryBackoff,
 		contentionWait: config.ContentionWait,
+		inFlight:       make(map[string]int),
 	}
 	if err := runtime.compose(config, physicalWriter); err != nil {
 		return closeOnError(err)
@@ -339,10 +346,22 @@ func (r *Runtime) compose(config Config, physicalWriter transaction.PhysicalWrit
 // Publish persists the canonical intent before entering the existing
 // transaction protocol. Errors carrying ErrIndeterminatePublication must be
 // retried with the same intent/token or resolved through recovery.
+//
+// A publication whose token is held by a different, unsettled intent answers
+// its conflict only once that holder has been resolved (see
+// resolveTokenHolder), and does that outside r.mu so a waiter cannot hold up
+// Close.
 func (r *Runtime) Publish(ctx context.Context, request Request) (Result, error) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.publishLocked(ctx, request)
+	result, err := r.publishLocked(ctx, request)
+	r.mu.RUnlock()
+	var held *tokenHeldError
+	if errors.As(err, &held) {
+		if waitErr := r.resolveTokenHolder(ctx, held); waitErr != nil {
+			return Result{}, waitErr
+		}
+	}
+	return result, err
 }
 
 func (r *Runtime) publishLocked(
@@ -376,12 +395,17 @@ func (r *Runtime) publishLocked(
 	if err := r.validateIntentTables(request.Intent); err != nil {
 		return Result{}, err
 	}
+	// Registered before the intent is persisted, so there is no moment at
+	// which this publication's intent is durable and unsettled but it does
+	// not count as in flight. Errors here are Put's to report.
+	if normalized, _, digest, digestErr := canonicalIntent(request.Intent); digestErr == nil {
+		if txn, txnErr := DeriveTXN(
+			r.domain, normalized.Operation, normalized.Token); txnErr == nil {
+			defer r.markInFlight(txn, digest)()
+		}
+	}
 	record, err := r.persistIntent(ctx, request.Intent)
 	if err != nil {
-		var held *tokenHeldError
-		if errors.As(err, &held) {
-			r.waitForTokenHolder(ctx, held.txn, held.digest)
-		}
 		return Result{}, err
 	}
 	if hook := runtimeStageHook(r.protocolStore); hook != nil {
@@ -1143,46 +1167,131 @@ func (r *Runtime) recoverPending(
 	return transaction.ErrUnavailable
 }
 
-// waitForTokenHolder returns once the intent holding a transaction token has
-// settled, or the contention wait or the context ends first.
+// resolveTokenHolder returns once the intent holding a transaction token has
+// been resolved, so the caller's conflict is answered after the outcome that
+// decides it rather than before.
 //
 // A publication that finds its token held by a different, unsettled intent has
 // lost to it: the holder's transaction is the one that decides this
 // transition. Answering the conflict at once let the caller re-read before the
 // holder had written and report a conflict for a transition that was about to
-// exist. Concurrent re-requests of one approval and concurrent sweeps of one
-// expiry each derive one token from the transition and differ only in who
-// published it, and under scheduling pressure the holder routinely outlasted
-// the caller's short re-read. Waiting here, where the holder is known, lets
-// the caller's re-read observe the winner's outcome instead.
+// exist (#729). Concurrent re-requests of one approval and concurrent sweeps
+// of one expiry each derive one token from the transition and differ only in
+// who published it, and under scheduling pressure the holder routinely
+// outlasted the caller's short re-read.
 //
-// It never changes the answer: the caller still gets the conflict, and a wait
-// that ends by timeout, cancellation or a failed read only returns sooner. It
-// runs outside recoveryMu, so other publications and recovery are not held up.
-func (r *Runtime) waitForTokenHolder(
-	ctx context.Context, txn coordination.TXN, digest coordination.Digest,
-) {
-	if r.contentionWait == 0 {
-		return
+// Two kinds of holder:
+//
+//   - Still running in this process: wait for it to settle, bounded by the
+//     contention wait. Recovering it here would race the publication that
+//     owns it, so a holder that outlasts the wait is left to finish and the
+//     conflict is answered as before.
+//   - Not running here (it returned indeterminate without settling, or its
+//     process is gone): nothing will settle it until recovery runs, and
+//     there is no periodic recovery, so a wait would always run the full
+//     bound. Resolve it now, as recovery would, then answer.
+//
+// The answer is the caller's original conflict whichever way this ends,
+// except that a context ending during the wait is answered with ctx.Err(), as
+// waitForExpectedResolution does. Runs outside r.mu, taking it only per read,
+// so Close is never held up by a waiter for longer than one poll.
+func (r *Runtime) resolveTokenHolder(
+	ctx context.Context, held *tokenHeldError,
+) error {
+	if hook := runtimeStageHook(r.protocolStore); hook != nil {
+		_ = hook(recoveryStageTokenHeld)
 	}
-	holder := storedIntent{TXN: txn, LogicalDigest: digest}
 	timeout := time.NewTimer(r.contentionWait)
 	defer timeout.Stop()
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		unsettled, err := r.intents.hasPendingMarker(ctx, holder)
-		if err != nil || !unsettled {
-			return
+		unsettled, running, err := r.tokenHolderState(ctx, held)
+		if err != nil {
+			// A read the context ended is the context's answer.
+			return ctx.Err()
+		}
+		if !unsettled {
+			return nil
+		}
+		if !running {
+			r.recoverTokenHolder(ctx, held)
+			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-timeout.C:
-			return
+			return nil
 		case <-ticker.C:
 		}
 	}
+}
+
+// tokenHolderState reports whether the holder's pending marker is still
+// present, and whether its publication is still running in this process.
+func (r *Runtime) tokenHolderState(
+	ctx context.Context, held *tokenHeldError,
+) (unsettled, running bool, err error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return false, false, transaction.ErrUnavailable
+	}
+	unsettled, err = r.intents.hasPendingMarker(
+		ctx, storedIntent{TXN: held.txn, LogicalDigest: held.digest})
+	if err != nil || !unsettled {
+		return false, false, err
+	}
+	return true, r.isInFlight(held.txn, held.digest), nil
+}
+
+// recoverTokenHolder resolves a holder no publication here is running, the
+// way RecoverPage would: under recoveryMu, so it cannot interleave with an
+// intent being persisted or with a recovery pass. Its error is not the
+// caller's; the caller's re-read sees whatever it achieved.
+func (r *Runtime) recoverTokenHolder(ctx context.Context, held *tokenHeldError) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return
+	}
+	r.recoveryMu.Lock()
+	defer r.recoveryMu.Unlock()
+	// A retry of the holder's own intent may have started meanwhile; it
+	// owns the transaction again.
+	if r.isInFlight(held.txn, held.digest) {
+		return
+	}
+	_ = r.recoverIntent(ctx, held.txn)
+}
+
+func inFlightKey(txn coordination.TXN, digest coordination.Digest) string {
+	return string(txn) + string(digest[:])
+}
+
+// markInFlight records a publication of one intent as running here, and
+// returns the function that ends it.
+func (r *Runtime) markInFlight(
+	txn coordination.TXN, digest coordination.Digest,
+) func() {
+	key := inFlightKey(txn, digest)
+	r.inFlightMu.Lock()
+	r.inFlight[key]++
+	r.inFlightMu.Unlock()
+	return func() {
+		r.inFlightMu.Lock()
+		defer r.inFlightMu.Unlock()
+		if r.inFlight[key]--; r.inFlight[key] <= 0 {
+			delete(r.inFlight, key)
+		}
+	}
+}
+
+func (r *Runtime) isInFlight(txn coordination.TXN, digest coordination.Digest) bool {
+	r.inFlightMu.Lock()
+	defer r.inFlightMu.Unlock()
+	return r.inFlight[inFlightKey(txn, digest)] > 0
 }
 
 func (r *Runtime) waitForExpectedResolution(
@@ -1526,6 +1635,9 @@ const (
 	recoveryStageCommitted
 	recoveryStageCheckpoint
 	recoveryStageComplete
+	// recoveryStageTokenHeld is reported, not injected: a publication has
+	// lost its token to an unsettled intent and is about to resolve it.
+	recoveryStageTokenHeld
 )
 
 type stageStore struct {

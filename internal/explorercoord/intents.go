@@ -213,8 +213,10 @@ func Partition(
 // adds is that the conflict's outcome is not yet decided. The holder's
 // transaction decides it, so a caller that re-reads now can see the state from
 // before the holder's write and report a conflict for a transition that is
-// about to exist. publishLocked therefore waits for the holder to settle before
-// answering, the same contention wait a busy guard gets.
+// about to exist. Runtime.Publish therefore resolves the holder before
+// answering (resolveTokenHolder). PublishRecord and PruneCommitted still
+// answer it at once: record publications resolve a held attempt through
+// recordIntentToken, and prune tokens are not shared between writers.
 //
 // It names the holder by its transaction and logical digest alone, which is
 // what its pending marker is keyed and checked on.
