@@ -168,6 +168,54 @@ func TestATransitionReadStillAnswersNotFound(t *testing.T) {
 	}
 }
 
+// TestATransitionReadLagClearsOnReRead: the outbox drain depends on the
+// transition read (#729). Two drains of one action list the same pending
+// row; the first closes it, which moves the transition's head before the
+// closed cell is readable, and the second drain's CompleteActionTransition
+// read that window as absence and failed a concurrent approval re-request
+// with ErrActionCommitted. The read re-reads like the action and approval
+// reads; only a lag that outlasts the bound is still not-found, which
+// TestATransitionReadStillAnswersNotFound pins.
+func TestATransitionReadLagClearsOnReRead(t *testing.T) {
+	encodedRecord, err := encodeAction(testActionRecord())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := decodeAction(encodedRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, err := fleet.NewActionTransition(
+		[]byte("transition-token"), "action.enqueued", record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := encodeTransition(storedTransition{Transition: transition})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := maxCommittedReadAttempts - 1
+	store, err := NewDispatchStore(clearingRuntime{
+		laggingRuntime: laggingRuntime{epoch: 7},
+		remaining:      &remaining, value: encoded,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := store.readTransition(context.Background(),
+		transition.Record.ID, transition.Record.Version, transition.ID)
+	if err != nil {
+		t.Fatalf("transition read = %v, want the row: the window closed "+
+			"inside the bound", err)
+	}
+	if string(got.Transition.ID) != string(transition.ID) {
+		t.Fatalf("transition ID = %x, want %x", got.Transition.ID, transition.ID)
+	}
+	if remaining != 0 {
+		t.Fatalf("%d lagging reads were never consumed", remaining)
+	}
+}
+
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {
