@@ -172,7 +172,7 @@ func newLabelPlaneWith(t *testing.T, options planeOptions) labelPlane {
 	events, publisher, err := composeWithPublisher(
 		backend, authority.Resolver(), integrationGeneration{},
 		integrationAuditor{}, integrationLease{}, bytes.Repeat([]byte{7}, 32),
-		func() time.Time { return now }, visibility, nodes)
+		func() time.Time { return now }, visibility, nodes, composeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

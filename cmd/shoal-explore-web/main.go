@@ -297,6 +297,20 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"this on only once every replica runs this build; while it is off, "+
 			"nothing writes them and rolling back is safe",
 	)
+	movedPublicationGuard := flags.Bool(
+		"fleet-event-publication-guard", false,
+		"Write fleet-event publications under their own coordination guard "+
+			"letter instead of the one fleet approvals share (#681). While "+
+			"they share it, anyone who can read a committed action record "+
+			"can compute the guard entity of its not-yet-published "+
+			"lifecycle event and occupy it with an approval request, "+
+			"suppressing that event and wedging the action's outbox. Turn "+
+			"this on only once every replica runs this build: a replica "+
+			"from before it assumes the shared letter when sweeping expired "+
+			"publications and would fail every publication of its own once "+
+			"one written under the new letter expired. While it is off "+
+			"nothing writes the new letter and rolling back is safe",
+	)
 	approvalSweepInterval := flags.Duration(
 		"approval-sweep-interval", 0,
 		"How often the host's system observer sweeps held approval requests, "+
@@ -768,7 +782,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		binder:    authority.Binder(),
 		clock:     time.Now,
 		// #655: off until the operator says every replica can read them.
-		terminalStates: *approvalTerminalStates,
+		terminalStates:        *approvalTerminalStates,
+		movedPublicationGuard: *movedPublicationGuard,
 		// #664: off unless the operator requires a reason code.
 		requireDeclassificationReason: *requireDeclassificationReason,
 		maxNodeAdjacency:              uint32(*maxNodeAdjacency),
@@ -1295,6 +1310,10 @@ type serviceConfig struct {
 	// terminalStates is -approval-terminal-states (#655): whether anything
 	// may write the withdrawn and stranded states.
 	terminalStates bool
+	// movedPublicationGuard is -fleet-event-publication-guard (#681):
+	// whether new fleet-event publications take their own guard letter
+	// rather than the one fleet approvals share.
+	movedPublicationGuard bool
 	// requireDeclassificationReason is -require-declassification-reason
 	// (#664): authorized.Config.RequireDeclassificationReason.
 	requireDeclassificationReason bool
@@ -1553,14 +1572,17 @@ func openService(
 				// dispatch reads below and the client's own interaction
 				// and fold reads use, so no plane answers differently.
 				client.LabelVisibility(), client.NodeGate(),
-				explorerfleetevents.WithApprovalEvents(durableApprovals,
-					func(ctx context.Context, id []byte) (bool, error) {
-						approvals := approvalVisibility.Load()
-						if approvals == nil {
-							return false, nil
-						}
-						return approvals.VisibleTo(ctx, id)
-					}),
+				eventComposeOptions(
+					config.movedPublicationGuard,
+					explorerfleetevents.WithApprovalEvents(durableApprovals,
+						func(ctx context.Context, id []byte) (bool, error) {
+							approvals := approvalVisibility.Load()
+							if approvals == nil {
+								return false, nil
+							}
+							return approvals.VisibleTo(ctx, id)
+						}),
+				)...,
 			)
 		if err != nil {
 			store.Close()
@@ -1996,4 +2018,18 @@ func watchPolicyCatalogDivergence(
 			"catalog from disk.")
 		state.MarkDraining()
 	})
+}
+
+// eventComposeOptions appends -fleet-event-publication-guard (#681) to the
+// always-present event options when the operator has turned it on. Built as
+// a slice rather than passed as a possibly-nil option, so that nothing at
+// the far end has to interpret a nil ComposeOption.
+func eventComposeOptions(
+	movedPublicationGuard bool,
+	always ...explorerfleetevents.ComposeOption,
+) []explorerfleetevents.ComposeOption {
+	if !movedPublicationGuard {
+		return always
+	}
+	return append(always, explorerfleetevents.WithMovedPublicationGuard())
 }

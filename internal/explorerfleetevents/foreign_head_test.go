@@ -181,7 +181,8 @@ func TestAppendReportsAForeignHeadAsADefiniteRefusal(t *testing.T) {
 				Token: []byte("collide"), RetryUntil: now.Add(time.Hour),
 				Event: testEvent(1),
 			}
-			entity := publicationEntity(publicationEventID(request))
+			entity := publicationEntity(
+				publicationEventID(request), publicationKind)
 			if tc.late {
 				counted.before = func() { squat(t, runtime, config.Domain, entity) }
 			} else {

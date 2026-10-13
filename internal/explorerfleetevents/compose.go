@@ -91,7 +91,8 @@ func ComposeWithPublisher(
 		return nil, nil, err
 	}
 	return composeWithPublisher(
-		backend, resolver, generations, auditor, leases, cursorKey, clock, nil, nil)
+		backend, resolver, generations, auditor, leases, cursorKey, clock,
+		nil, nil, composeOptions{})
 }
 
 // ComposeWithPublisherAndReader constructs the production event service with
@@ -118,6 +119,18 @@ func ComposeWithPublisherAndReader(
 	if err != nil {
 		return nil, nil, err
 	}
+	// Parsed here rather than inside composeWithPublisher, because one of
+	// these options configures the backend rather than the service built on
+	// top of it, and parsing twice would build a second approval ledger.
+	var optional composeOptions
+	for _, option := range options {
+		if err := option(&optional); err != nil {
+			return nil, nil, err
+		}
+	}
+	if optional.movedPublicationGuard {
+		backend.MovePublicationGuard()
+	}
 	auditor, err := fleetevents.NewOperationInteractionAuditorWithReader(
 		interactionSinkFor, interactionReader, snapshots)
 	if err != nil {
@@ -125,15 +138,36 @@ func ComposeWithPublisherAndReader(
 	}
 	return composeWithPublisher(
 		backend, resolver, generations, auditor, leases, cursorKey, clock,
-		evidenceVisibility, evidenceNodes, options...)
+		evidenceVisibility, evidenceNodes, optional)
 }
 
 // ComposeOption adds optional wiring to the composed event service.
 type ComposeOption func(*composeOptions) error
 
 type composeOptions struct {
-	approvals          fleetevents.ApprovalLedger
-	approvalVisibility fleetevents.ApprovalVisibility
+	approvals             fleetevents.ApprovalLedger
+	approvalVisibility    fleetevents.ApprovalVisibility
+	movedPublicationGuard bool
+}
+
+// WithMovedPublicationGuard writes new fleet-event publications under their
+// own guard letter instead of the one fleet approvals share (#681).
+//
+// Sharing the letter lets a party who can read a committed record compute
+// the guard entity of its not-yet-published lifecycle event and occupy it
+// with an approval request, suppressing the event and wedging that action's
+// outbox. Separating the letters is what closes it.
+//
+// Enable it only once every replica runs a build containing this option. A
+// replica from before it assumes the shared letter when pruning and would
+// fail its sweep — and so its every publication — once a publication
+// written under the moved letter expired. While it is off nothing writes
+// the new letter and a rollback is safe.
+func WithMovedPublicationGuard() ComposeOption {
+	return func(options *composeOptions) error {
+		options.movedPublicationGuard = true
+		return nil
+	}
 }
 
 // WithApprovalEvents admits approval lifecycle events (#653). transitions is
@@ -169,14 +203,8 @@ func composeWithPublisher(
 	clock func() time.Time,
 	evidenceVisibility evidencelabels.Visibility,
 	evidenceNodes evidencelabels.NodeGate,
-	options ...ComposeOption,
+	optional composeOptions,
 ) (*fleetevents.Service, *ActionEventPublisher, error) {
-	var optional composeOptions
-	for _, option := range options {
-		if err := option(&optional); err != nil {
-			return nil, nil, err
-		}
-	}
 	capability := explorerfleetcap.New()
 	service, err := fleetevents.NewWithLifecycleCapability(fleetevents.Config{
 		Backend: backend, Resolver: resolver, GenerationReader: generations,

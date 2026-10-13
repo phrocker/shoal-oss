@@ -24,6 +24,7 @@ import (
 // root.
 var entityKinds = map[byte][]string{
 	'A': {"internal/explorerfleet/store.go"},
+	'B': {"internal/explorerfleetevents/adapter.go"},
 	'C': {"internal/explorerfleetevents/adapter.go"},
 	'D': {
 		"internal/explorerconformance/fixture.go",
@@ -55,6 +56,15 @@ var entityKinds = map[byte][]string{
 //     the event ID too. So while that event is unpublished, an approval
 //     request at its hex occupies it: the event is suppressed, and the
 //     action's outbox wedges (#681).
+//
+//     Publications now have their own letter, 'B', and the adapter writes
+//     them under it once MovePublicationGuard is on. The move is off by
+//     default because a replica from before it assumes 'P' when pruning,
+//     so every replica must be able to read the new letter before any
+//     writes it. 'P' therefore stays recorded here as shared, and this
+//     entry goes when the move is the default and not when the code landed
+//     — the collision is open for exactly as long as something still
+//     writes 'P'.
 //
 //   - 'D': fleet dispatch (raw, caller-chosen action ID), explorer documents
 //     (document ID), and the conformance fixture (its own domain). Dispatch
