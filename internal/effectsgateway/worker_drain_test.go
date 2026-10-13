@@ -552,6 +552,17 @@ func TestAStoppedWorkerSendsNothing(t *testing.T) {
 // what removes it.
 func TestAnAttemptedRunLeavesRunsOnlyOnceSettled(t *testing.T) {
 	h := newWorkerHarness(t, nil)
+	// Hold the drain until the run's goroutine has exited, so its select
+	// sees the runs done and the Kill's cancel both ready: the interleaving
+	// that once wrote the run, and removed it, after a Kill (#739).
+	worker := h.worker
+	hook := func(point string) {
+		if point == "drain:select" {
+			worker.work.Wait()
+		}
+	}
+	stopYieldHook.Store(&hook)
+	t.Cleanup(func() { stopYieldHook.Store(nil) })
 	gate := make(chan struct{})
 	h.target.mu.Lock()
 	h.target.gate = gate
@@ -588,6 +599,45 @@ func TestAnAttemptedRunLeavesRunsOnlyOnceSettled(t *testing.T) {
 	}
 	if n := h.worker.InFlight(); n != 0 || h.log.Len() != 1 {
 		t.Fatalf("after the write: %d held, %d entries", n, h.log.Len())
+	}
+}
+
+// TestADrainAfterAKillWritesNothing: a Kill is a crash, so a drain that runs
+// after it has begun writes nothing, even when every run has exited and one
+// attempted run is held unsettled. Here the Kill is caught between its two
+// steps — killed stored, nothing yet cancelled — while a SIGTERM's drain
+// finds the runs done (#739).
+func TestADrainAfterAKillWritesNothing(t *testing.T) {
+	h := newWorkerHarness(t, nil)
+	gate := make(chan struct{})
+	h.target.mu.Lock()
+	h.target.gate = gate
+	h.target.mu.Unlock()
+	h.explorer.enqueue("a1", "charge", chargeInput, workerEpoch.Add(time.Hour))
+	h.start()
+	select {
+	case <-h.target.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the target saw no request")
+	}
+	// Kill's first step, then let the request return: the run sees the
+	// worker stopped, reports nothing and exits, attempted and unsettled.
+	h.worker.killed.Store(true)
+	close(gate)
+	eventually(t, "the run's goroutine to exit", func() bool {
+		done := make(chan struct{})
+		go func() { h.worker.work.Wait(); close(done) }()
+		select {
+		case <-done:
+			return true
+		case <-time.After(10 * time.Millisecond):
+			return false
+		}
+	})
+	// The drain finds every run done and nothing cancelled.
+	_ = h.stop()
+	if n, entries := h.worker.InFlight(), h.log.Len(); n != 1 || entries != 0 {
+		t.Fatalf("a drain after a Kill wrote: %d held, %d entries", n, entries)
 	}
 }
 

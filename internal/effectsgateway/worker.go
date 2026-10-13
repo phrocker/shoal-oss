@@ -528,8 +528,16 @@ func (w *Worker) drain() int {
 		close(done)
 	}()
 	abandoned := 0
+	stopYield("drain:select")
 	select {
 	case <-done:
+		// A Kill or HardStop has begun: it is the hard.Done case, whichever
+		// the select saw first. Once the runs have exited, both are ready, and
+		// a Kill — a crash — writes nothing (#739); a HardStop does its own
+		// write.
+		if w.killed.Load() {
+			break
+		}
 		// Every run has finished, but one whose report could not be written
 		// is still held (the invariant on runs): retry its entry now, once,
 		// rather than return as if nothing were left only in memory.
