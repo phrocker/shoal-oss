@@ -111,9 +111,20 @@ func acquireLock(directory, name string, create, createFile bool) (*Lock, error)
 	if err := tryLockFile(file); err != nil {
 		_ = file.Close()
 		releaseIdentity(identity)
-		return nil, errors.Join(ErrLocked, err)
+		return nil, lockError(err)
 	}
 	return &Lock{file: file, identity: identity}, nil
+}
+
+// lockError classifies a failed nonblocking lock. Only contention, another
+// holder, is ErrLocked; anything else (no lock support on the filesystem,
+// a bad descriptor, a refused access) is returned as itself, so a caller does
+// not tell the operator to stop a holder that does not exist.
+func lockError(err error) error {
+	if isContention(err) {
+		return errors.Join(ErrLocked, err)
+	}
+	return fmt.Errorf("directory lock: lock file: %w", err)
 }
 
 func (l *Lock) Close() error {

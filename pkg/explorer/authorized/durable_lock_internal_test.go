@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,8 +44,18 @@ import (
 // created or removed entry moves its directory's.
 func catalogSnapshot(t *testing.T, dir string) []string {
 	t.Helper()
+	entries, err := snapshotDirectory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return entries
+}
+
+// snapshotDirectory is catalogSnapshot for a goroutine that may not call
+// t.Fatal.
+func snapshotDirectory(dir string) ([]string, error) {
 	var entries []string
-	if err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+	err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -63,10 +74,8 @@ func catalogSnapshot(t *testing.T, dir string) []string {
 		}
 		entries = append(entries, line)
 		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	return entries
+	})
+	return entries, err
 }
 
 func requireUnchanged(t *testing.T, dir string, before []string) {
@@ -502,5 +511,103 @@ func TestCrashedHolderDoesNotWedgeTheCatalog(t *testing.T) {
 	requireMigration(t, listing, 5)
 	if err := listing.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// opened is what the racing opener of TestPolicyCatalogLockOutlivesTheFlush
+// saw.
+type opened struct {
+	store    *DurablePolicyStore
+	snapshot []string
+	err      error
+}
+
+// TestPolicyCatalogLockOutlivesTheFlush pins Close's order: the lock is
+// released only after the engine has flushed and closed. An opener spinning
+// on the lock while the owner closes over a full WAL must find the directory
+// exactly as the finished Close leaves it; were the lock released first, it
+// would open (replaying the WAL) in the middle of the flush.
+func TestPolicyCatalogLockOutlivesTheFlush(t *testing.T) {
+	for attempt := range 5 {
+		dir := closedCatalog(t, 1)
+		owner, err := OpenDurablePolicyStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for version := range uint32(100) {
+			if err := owner.PutLabelMigration(context.Background(),
+				LabelMigrationRecord{Version: version + 2}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		spinning := make(chan struct{})
+		result := make(chan opened, 1)
+		go func() {
+			for first := true; ; first = false {
+				store, err := OpenDurablePolicyStore(dir)
+				if first {
+					close(spinning)
+				}
+				if err == nil {
+					snapshot, err := snapshotDirectory(dir)
+					result <- opened{store: store, snapshot: snapshot, err: err}
+					return
+				}
+				if !strings.Contains(err.Error(), "is already open") {
+					result <- opened{err: err}
+					return
+				}
+			}
+		}()
+		<-spinning
+		if err := owner.Close(); err != nil {
+			t.Fatal(err)
+		}
+		second := <-result
+		if second.err != nil {
+			if second.store != nil {
+				_ = second.store.Close()
+			}
+			t.Fatalf("attempt %d: the racing opener = %v", attempt, second.err)
+		}
+		closed := catalogSnapshot(t, dir)
+		requireMigration(t, second.store, 101)
+		if err := second.store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(second.snapshot, closed) {
+			t.Fatalf("attempt %d: the racing opener saw the directory mid-close:\n%q\nclosed:\n%q",
+				attempt, second.snapshot, closed)
+		}
+	}
+}
+
+// TestPolicyCatalogLockFailureNamesItsCause pins that a lock file this user
+// may not open is reported with its cause, and not as a running workspace to
+// stop.
+func TestPolicyCatalogLockFailureNamesItsCause(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs POSIX permissions that bind the caller")
+	}
+	dir := closedCatalog(t, 1)
+	lockFile := filepath.Join(dir, policyLockFile)
+	if err := os.Chmod(lockFile, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(lockFile, 0o600) })
+	for name, open := range map[string]func(string) (*DurablePolicyStore, error){
+		"workspace": OpenDurablePolicyStore,
+		"listing":   OpenExistingDurablePolicyStore,
+	} {
+		store, err := open(dir)
+		if err == nil {
+			_ = store.Close()
+			t.Fatalf("%s opened over an unopenable lock file", name)
+		}
+		if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) ||
+			strings.Contains(err.Error(), "already open") ||
+			!strings.Contains(err.Error(), "permission denied") {
+			t.Fatalf("%s = %v, want the permission error itself", name, err)
+		}
 	}
 }

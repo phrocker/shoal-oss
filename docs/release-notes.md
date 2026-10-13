@@ -51,6 +51,15 @@ workspace was still appending to.
   before running a listing.**
 - The kernel releases the lock when its process exits, however it exits. A
   lock file left behind by a crash does not block the next start.
+- The lock file is created mode `0600` by the workspace's user. A listing run
+  as a different (non-root) user gets a permission error, not "already open".
+  Run the listings as the workspace's user. Any lock failure other than
+  another holder, such as a filesystem without lock support, is reported as
+  itself.
+- **Rolling back reopens #686.** A workspace older than this release ignores
+  the lock. If you roll back after a newer release has created the lock file,
+  a current listing will take the lock and open the catalog under the running
+  old workspace. Stop the workspace before running a listing.
 
 ### Declassification reason codes and an offline listing (#664)
 

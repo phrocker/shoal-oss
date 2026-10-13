@@ -270,6 +270,9 @@ func OpenDurablePolicyStore(dir string) (*DurablePolicyStore, error) {
 const policyLockFile = ".shoal-policy-catalog.lock"
 
 // policyCatalogLockError words a failure to take dir's lock for the operator.
+// Only contention says another process has the catalog; any other failure
+// (a lock file this user may not open, a filesystem without locks) carries
+// its cause in the message, which shoal.Error does not print otherwise.
 func policyCatalogLockError(dir string, err error) error {
 	if errors.Is(err, dirlock.ErrLocked) {
 		return shoal.WrapError(shoal.ErrorUnavailable,
@@ -277,7 +280,7 @@ func policyCatalogLockError(dir string, err error) error {
 				"or another tool: stop it and try again", err)
 	}
 	return shoal.WrapError(shoal.ErrorUnavailable,
-		"acquire policy catalog "+dir, err)
+		"acquire policy catalog "+dir+": "+err.Error(), err)
 }
 
 // openLockedDurablePolicyStore opens the catalog in dir under lock, which the
