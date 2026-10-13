@@ -880,3 +880,42 @@ func extractedByNode(document, revision shoal.ID, rule AccessRule, node graph.No
 	registration.Node = node
 	return registration
 }
+
+// TestRelationOwnersAreKeptPerDocument is the relation counterpart: a
+// document's newer revision moves its owner entry, and takes that revision's
+// rule with it. Keeping the older rule would widen a relation whose document
+// was relabelled and extracted again.
+func TestRelationOwnersAreKeptPerDocument(t *testing.T) {
+	withTightenStores(t, func(t *testing.T, store PolicyStore, reopen func() PolicyStore) {
+		w := newTightenWorld(t)
+		ctx := context.Background()
+		for _, registration := range []EdgeRegistration{
+			assertedBy("doc-1", "rev-1", w.bare),
+			assertedBy("doc-2", "rev-2", w.bare),
+			assertedBy("doc-2", "rev-2b", w.secret),
+			assertedBy("doc-1", "rev-1b", w.secret),
+		} {
+			if err := store.PutEdge(ctx, registration); err != nil {
+				t.Fatalf("put %s@%s: %v", registration.DocumentID, registration.RevisionID, err)
+			}
+		}
+		check := func(store PolicyStore, when string) {
+			t.Helper()
+			registration, ok, err := store.Edge(ctx, sharedRelation().ID)
+			if err != nil || !ok {
+				t.Fatalf("%s: %v %v", when, ok, err)
+			}
+			if registration.DocumentID != "doc-1" || registration.RevisionID != "rev-1b" ||
+				!registration.Rule.equal(w.secret) {
+				t.Fatalf("%s: first owner = %s@%s under %s", when,
+					registration.DocumentID, registration.RevisionID, registration.Rule)
+			}
+			if got := strings.Join(ownerKeys(registration.CoOwners), ","); got != "doc-2@rev-2b" ||
+				!registration.CoOwners[0].Rule.equal(w.secret) {
+				t.Fatalf("%s: co-owners = %s", when, got)
+			}
+		}
+		check(store, "before reopen")
+		check(reopen(), "after reopen")
+	})
+}

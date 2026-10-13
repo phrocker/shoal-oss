@@ -136,7 +136,8 @@ func (e *Explorer) validateEvidenceSnapshotLocked(
 		}
 	}
 	for _, reference := range references {
-		if err := e.validateEvidenceReferenceLocked(reference); err != nil {
+		// Recording: only the current, canonical rendering is authoritative.
+		if err := e.validateEvidenceReferenceLocked(reference, false); err != nil {
 			return err
 		}
 		for _, assertion := range reference.Assertions {
@@ -155,8 +156,17 @@ func (e *Explorer) validateEvidenceSnapshotLocked(
 	return nil
 }
 
+// validateEvidenceReferenceLocked checks one evidence reference against the
+// current corpus. stored marks the re-validation of evidence a record already
+// holds: its graph anchor may then also match the rendering extracted nodes
+// and relations had before shared content was canonical (#700), reproduced
+// from the stored extraction records, so history recorded before the
+// upgrade stays readable. A new recording (stored false) must match the
+// canonical rendering alone; accepting a legacy one there would let a
+// recorder probe another document's surface text.
 func (e *Explorer) validateEvidenceReferenceLocked(
 	reference interaction.EvidenceReference,
+	stored bool,
 ) error {
 	canonical, err := reference.Canonical()
 	if err != nil {
@@ -275,6 +285,13 @@ func (e *Explorer) validateEvidenceReferenceLocked(
 		}
 		anchor, err := inference.NewGraphAnchorWithAssertions(
 			path, canonical.Assertions)
+		if (err != nil || anchor.ID() != canonical.AnchorID) && stored {
+			// Load-bearing: TestStoredLegacyEvidenceStaysReadable pins it.
+			if legacy, ok := e.legacyRenderings.path(path); ok {
+				anchor, err = inference.NewGraphAnchorWithAssertions(
+					legacy, canonical.Assertions)
+			}
+		}
 		if err != nil || anchor.ID() != canonical.AnchorID {
 			return shoal.NewError(
 				shoal.ErrorConflict,

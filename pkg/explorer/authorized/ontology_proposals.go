@@ -542,7 +542,11 @@ func (c *Client) ontologyEvidenceAllows(
 		return false, err
 	}
 	for _, node := range path.Nodes {
-		if !graphNodesEqual(canonicalNodes[node.ID], node) {
+		// A proposal stored before shared extraction content was
+		// canonical (#700) names an extracted node in its old rendering;
+		// it is compared as the catalog stores it, canonical.
+		evidenceNode, _ := explorer.CanonicalExtractedNode(node)
+		if !graphNodesEqual(canonicalNodes[node.ID], evidenceNode) {
 			return false, nil
 		}
 	}
@@ -551,7 +555,8 @@ func (c *Client) ontologyEvidenceAllows(
 		if err != nil {
 			return false, policyCatalogReadError(ctx, err)
 		}
-		if !ok || !graphEdgesEqual(edgeRegistration.Edge, edge) {
+		evidenceEdge, _ := explorer.CanonicalExtractedRelation(edge)
+		if !ok || !graphEdgesEqual(edgeRegistration.Edge, evidenceEdge) {
 			return false, nil
 		}
 		allowed, err := c.edgeAllows(

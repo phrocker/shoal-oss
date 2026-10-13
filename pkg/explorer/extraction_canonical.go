@@ -45,6 +45,10 @@ import (
 // catalog stores, CanonicalExtractedNode and CanonicalExtractedRelation.
 // The extractor's confidence stays on the relation's assertion.
 
+// canonicalSharedContent is always true outside tests; a test turns it off
+// to build the graph a binary from before this rule built.
+var canonicalSharedContent = true
+
 const (
 	extractedEntityIDNamespace   = "inferred-entity"
 	extractedRelationIDNamespace = "inferred-edge"
@@ -105,4 +109,91 @@ func entityKeyDisplay(key string) string {
 		return key
 	}
 	return strings.Join(words, " ")
+}
+
+// legacyExtractionRenderings is, for each extracted node and relation of the
+// current graph whose stored extraction records present it otherwise, the
+// content the graph gave it before shared content was canonical: the first
+// contributing record's, in extraction-ID order, exactly as the graph was
+// built then. Only the re-validation of stored evidence uses it.
+type legacyExtractionRenderings struct {
+	nodes map[shoal.ID]graph.Node
+	edges map[shoal.ID]graph.Edge
+}
+
+func (e *Explorer) legacyExtractionRenderingsLocked(
+	nodes map[shoal.ID]graph.Node, edges map[shoal.ID]graph.Edge,
+) legacyExtractionRenderings {
+	legacy := legacyExtractionRenderings{
+		nodes: make(map[shoal.ID]graph.Node),
+		edges: make(map[shoal.ID]graph.Edge),
+	}
+	extractionIDs := make([]shoal.ID, 0, len(e.extractions))
+	for id := range e.extractions {
+		extractionIDs = append(extractionIDs, id)
+	}
+	sort.Slice(extractionIDs, func(i, j int) bool {
+		return shoal.CompareID(extractionIDs[i], extractionIDs[j]) < 0
+	})
+	seenNodes := make(map[shoal.ID]struct{})
+	seenEdges := make(map[shoal.ID]struct{})
+	for _, id := range extractionIDs {
+		record := e.extractions[id]
+		if record == nil {
+			continue
+		}
+		if _, ok := nodes[record.DocumentID]; !ok {
+			continue
+		}
+		for _, raw := range record.Nodes {
+			if _, done := seenNodes[raw.ID]; done {
+				continue
+			}
+			seenNodes[raw.ID] = struct{}{}
+			canonical, ok := CanonicalExtractedNode(raw)
+			current, present := nodes[raw.ID]
+			if ok && present && nodesEqual(current, canonical) && !nodesEqual(raw, canonical) {
+				legacy.nodes[raw.ID] = cloneNode(raw)
+			}
+		}
+		for _, raw := range record.Edges {
+			if _, done := seenEdges[raw.ID]; done {
+				continue
+			}
+			seenEdges[raw.ID] = struct{}{}
+			canonical, ok := CanonicalExtractedRelation(raw)
+			current, present := edges[raw.ID]
+			if ok && present && edgesEqual(current, canonical) && !edgesEqual(raw, canonical) {
+				legacy.edges[raw.ID] = cloneEdge(raw)
+			}
+		}
+	}
+	return legacy
+}
+
+// path returns path with every node and edge that has a legacy rendering in
+// it, and false when it has none.
+func (l legacyExtractionRenderings) path(path graph.Path) (graph.Path, bool) {
+	changed := false
+	legacy := graph.Path{
+		Nodes: make([]graph.Node, len(path.Nodes)),
+		Edges: make([]graph.Edge, len(path.Edges)),
+	}
+	for index, node := range path.Nodes {
+		if raw, ok := l.nodes[node.ID]; ok {
+			legacy.Nodes[index] = cloneNode(raw)
+			changed = true
+			continue
+		}
+		legacy.Nodes[index] = node
+	}
+	for index, edge := range path.Edges {
+		if raw, ok := l.edges[edge.ID]; ok {
+			legacy.Edges[index] = cloneEdge(raw)
+			changed = true
+			continue
+		}
+		legacy.Edges[index] = edge
+	}
+	return legacy, changed
 }
