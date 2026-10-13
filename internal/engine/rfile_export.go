@@ -308,7 +308,10 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
 
-	files := tbl.rfiles()
+	files, err := tbl.exportRFiles()
+	if err != nil {
+		return nil, err
+	}
 	compatibility := exportCompatibility(files)
 	manifest := &RFileExportManifest{
 		Version:             RFileExportManifestVersion,
@@ -1059,7 +1062,7 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 			return fmt.Errorf("engine: publish imported tablet %d manifest: %w", i, publishErr)
 		}
 	}
-	tbl, err := openTable(tableDir, manifest.SourceTable, e.logger, e.cache, e.walSyncMode, e.walSyncInterval, e.backend, e.publishRFile)
+	tbl, err := openTable(tableDir, manifest.SourceTable, e.logger, e.cache, e.walSyncMode, e.walSyncInterval, e.backend, e.tombstoneRetention, e.publishRFile)
 	if err != nil {
 		return err
 	}
@@ -1406,10 +1409,33 @@ func (t *table) rfiles() []tableRFile {
 			out = append(out, tableRFile{TabletIndex: i, Path: f.Path, Instance: f.Instance})
 		}
 	}
-	// Within a tablet, keep the tablet's recency order (oldest first), not
-	// name order: an export manifest lists files in this order and an
-	// import registers them in it, so the importing engine resolves keys
-	// rewritten with the same timestamp to the same (newest) value (#692).
+	return sortTableRFiles(out)
+}
+
+// exportRFiles is rfiles for an export: each tablet records, durably and
+// before its files are listed, that they are being exported, so its
+// compactions keep the tombstones the export's consumers need from then on
+// (#708; see tablet.ExportLineage).
+func (t *table) exportRFiles() ([]tableRFile, error) {
+	var out []tableRFile
+	for i, tab := range t.tablets {
+		lineage, err := tab.ExportLineage()
+		if err != nil {
+			return nil, fmt.Errorf("engine: tablet %d: %w", i, err)
+		}
+		for _, f := range lineage {
+			out = append(out, tableRFile{TabletIndex: i, Path: f.Path, Instance: f.Instance})
+		}
+	}
+	return sortTableRFiles(out), nil
+}
+
+// sortTableRFiles groups files by tablet. Within a tablet it keeps the
+// tablet's recency order (oldest first), not name order: an export manifest
+// lists files in this order and an import registers them in it, so the
+// importing engine resolves keys rewritten with the same timestamp to the
+// same (newest) value (#692).
+func sortTableRFiles(out []tableRFile) []tableRFile {
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].TabletIndex < out[j].TabletIndex
 	})

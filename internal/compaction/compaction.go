@@ -108,6 +108,14 @@ type Spec struct {
 	// "do not propagate deletes" is a full major compaction.
 	FullMajorCompaction bool
 
+	// TombstonesOnly writes only the tombstones of the merged inputs: the
+	// deletes are propagated whatever FullMajorCompaction says, every live
+	// cell is left out, and of a coordinate's tombstones only the newest is
+	// kept (it covers the others). Stack must be empty. A tablet uses it to
+	// keep, beside a full compaction's output, the tombstones consumers of
+	// an exported tablet still need (#708).
+	TombstonesOnly bool
+
 	// Codec is the output RFile's block compression codec ("none", "gz",
 	// "snappy"). Empty defaults to "snappy" for good throughput/size balance.
 	Codec string
@@ -177,6 +185,8 @@ type Spec struct {
 type Result struct {
 	// Output is the written immutable file image.
 	Output []byte
+	// TombstonesWritten is how many of those cells are tombstones.
+	TombstonesWritten int64
 	// EntriesWritten is the cell count drained into the output — the
 	// number of cells the iterator stack surfaced, which may be less
 	// than the sum of input entries (versioning/filtering drops cells).
@@ -365,12 +375,15 @@ func drain(
 	attempt *convergeAttempt,
 ) (*Result, error) {
 	outputEmbedding := attempt.label
+	tombstones := &tombstoneCounter{source: top}
+	top = tombstones
 	finish := func(output []byte, written int64) *Result {
 		result := &Result{
-			Output:         output,
-			EntriesWritten: written,
-			EmbeddingSpace: outputEmbedding,
-			Converged:      attempt.active(),
+			Output:            output,
+			EntriesWritten:    written,
+			TombstonesWritten: tombstones.n,
+			EmbeddingSpace:    outputEmbedding,
+			Converged:         attempt.active(),
 		}
 		if result.Converged {
 			result.EmbeddingEpoch = attempt.epoch
@@ -576,16 +589,30 @@ func buildSource(spec Spec) (iterrt.SortedKeyValueIterator, io.Closer, error) {
 	// sole file (FullMajorCompaction at ScopeMajc). Everything else
 	// preserves them so a later compaction can apply suppression
 	// against RFiles this stack didn't see.
+	var delOptions map[string]string
+	if spec.TombstonesOnly {
+		if len(spec.Stack) > 0 {
+			closeAll()
+			return nil, nil, errors.New("compaction: TombstonesOnly takes no iterator stack")
+		}
+		delOptions = map[string]string{iterrt.DeletingOptionPropagate: "true"}
+	}
 	delIter := iterrt.NewDeletingIterator()
-	if err := delIter.Init(merge, nil, env); err != nil {
+	if err := delIter.Init(merge, delOptions, env); err != nil {
 		closeAll()
 		return nil, nil, fmt.Errorf("compaction: deleting iter init: %w", err)
 	}
 
-	top, err := iterrt.BuildStack(delIter, spec.Stack, env)
-	if err != nil {
-		closeAll()
-		return nil, nil, fmt.Errorf("compaction: build stack: %w", err)
+	var top iterrt.SortedKeyValueIterator
+	if spec.TombstonesOnly {
+		top = &tombstonesOnly{source: delIter}
+	} else {
+		var err error
+		top, err = iterrt.BuildStack(delIter, spec.Stack, env)
+		if err != nil {
+			closeAll()
+			return nil, nil, fmt.Errorf("compaction: build stack: %w", err)
+		}
 	}
 	if err := top.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
 		closeAll()
@@ -593,6 +620,84 @@ func buildSource(spec Spec) (iterrt.SortedKeyValueIterator, io.Closer, error) {
 	}
 
 	return top, closerFunc(closeAll), nil
+}
+
+// tombstoneCounter counts the tombstones drained through it. Both writers
+// advance past every cell they write, so counting on Next is exact for a
+// drain that completes.
+type tombstoneCounter struct {
+	source iterrt.SortedKeyValueIterator
+	n      int64
+}
+
+func (c *tombstoneCounter) Init(source iterrt.SortedKeyValueIterator, _ map[string]string, _ iterrt.IteratorEnvironment) error {
+	c.source = source
+	return nil
+}
+
+func (c *tombstoneCounter) Seek(r iterrt.Range, columnFamilies [][]byte, inclusive bool) error {
+	return c.source.Seek(r, columnFamilies, inclusive)
+}
+
+func (c *tombstoneCounter) Next() error {
+	if c.source.HasTop() && c.source.GetTopKey().Deleted {
+		c.n++
+	}
+	return c.source.Next()
+}
+
+func (c *tombstoneCounter) HasTop() bool { return c.source.HasTop() }
+
+func (c *tombstoneCounter) GetTopKey() *iterrt.Key { return c.source.GetTopKey() }
+
+func (c *tombstoneCounter) GetTopValue() []byte { return c.source.GetTopValue() }
+
+func (c *tombstoneCounter) DeepCopy(env iterrt.IteratorEnvironment) iterrt.SortedKeyValueIterator {
+	return &tombstoneCounter{source: c.source.DeepCopy(env)}
+}
+
+// tombstonesOnly surfaces only the tombstones of its source (see
+// Spec.TombstonesOnly).
+type tombstonesOnly struct {
+	source iterrt.SortedKeyValueIterator
+}
+
+func (f *tombstonesOnly) Init(source iterrt.SortedKeyValueIterator, _ map[string]string, _ iterrt.IteratorEnvironment) error {
+	f.source = source
+	return nil
+}
+
+func (f *tombstonesOnly) Seek(r iterrt.Range, columnFamilies [][]byte, inclusive bool) error {
+	if err := f.source.Seek(r, columnFamilies, inclusive); err != nil {
+		return err
+	}
+	return f.skipLive()
+}
+
+func (f *tombstonesOnly) Next() error {
+	if err := f.source.Next(); err != nil {
+		return err
+	}
+	return f.skipLive()
+}
+
+func (f *tombstonesOnly) skipLive() error {
+	for f.source.HasTop() && !f.source.GetTopKey().Deleted {
+		if err := f.source.Next(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *tombstonesOnly) HasTop() bool { return f.source.HasTop() }
+
+func (f *tombstonesOnly) GetTopKey() *iterrt.Key { return f.source.GetTopKey() }
+
+func (f *tombstonesOnly) GetTopValue() []byte { return f.source.GetTopValue() }
+
+func (f *tombstonesOnly) DeepCopy(env iterrt.IteratorEnvironment) iterrt.SortedKeyValueIterator {
+	return &tombstonesOnly{source: f.source.DeepCopy(env)}
 }
 
 // closerFunc adapts a func() to io.Closer.

@@ -125,7 +125,10 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 		Shipped:     map[string]RFileExportFile{},
 		ShippedKeys: map[string]string{},
 	}
-	files := tbl.rfiles()
+	files, err := tbl.exportRFiles()
+	if err != nil {
+		return nil, err
+	}
 	manifest := &RFileExportManifest{
 		Version:             RFileExportManifestVersion,
 		CreatedAt:           time.Now().UTC(),
