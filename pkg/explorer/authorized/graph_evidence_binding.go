@@ -122,7 +122,22 @@ package authorized
 //     decoded, so every binding ever written still decodes the same.
 //
 // At read, coverage (graphMembers) takes a derived edge's endpoints as
-// members, not the edge; its endpoints must be covered as any node is.
+// members, not the edge; its endpoints must be covered as any node is. An
+// edge entry for an ID that now resolves only as derived denies (rules).
+//
+// Two consequences, both accepted:
+//
+//   - A derived edge's ID changes whenever its latent cell is rescored (the
+//     derivation's score is part of the assertion's content). Fleet evidence
+//     over the old edge then resolves nothing and goes dark for good, for
+//     every reader, the holder included. That fails closed, exactly as #743
+//     sessions over such an edge do.
+//   - Fleet and event reads now depend on the base graph, through the
+//     trusted derived assertion reader, for every batch naming an edge. A
+//     sticky graph build error fails each such batch until the next
+//     mutation, and the first fleet read after a latent write rebuilds the
+//     graph under its write lock. Before #744 fleet reads read only the
+//     policy catalog.
 //
 // A binding that does not decode is denied, never an error, exactly as an
 // unknown member is: every denial is the same false verdict a never-recorded
@@ -138,6 +153,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -681,6 +697,16 @@ func (r *graphEvidenceRevisions) rules(
 		for _, entry := range r.bindings[index].entries {
 			member := graphMember{entry.Object, entry.ID}
 			covered[member] = append(covered[member], entry.Kind)
+			// An edge recorded over a registration that now resolves only
+			// as a derived edge denies: the derived resolution carries no
+			// rule, so the recorded registration's rule could no longer be
+			// enforced. Not reachable while derived IDs and registered IDs
+			// are disjoint (graphMembers); load-bearing:
+			// TestFleetEdgeRecordedRegisteredThenDerivedDenies.
+			if _, derived := edges.derived[entry.ID]; derived &&
+				entry.Object == GraphBindingEdge {
+				return nil, false
+			}
 			switch {
 			case documentBound(entry.Kind):
 				rules, ok := r.cache.referenceRules(RevisionReference{
@@ -768,9 +794,17 @@ func (c *Client) graphEvidenceBindings(
 	// trusted reader is asked about every edge, registered or not, as
 	// resolveInteractionEdges asks it, and a derived edge's endpoints are
 	// read with the reference's nodes.
-	derived, err := c.trustedDerivedEdges(ctx, edgeIDs)
-	if err != nil {
-		return nil, err
+	derived := make(map[shoal.ID]graph.Edge)
+	for start := 0; start < len(edgeIDs); {
+		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
+		resolved, err := c.trustedDerivedEdges(ctx, edgeIDs[start:end])
+		if err != nil {
+			return nil, err
+		}
+		start = end
+		for id, edge := range resolved {
+			derived[id] = edge
+		}
 	}
 	for _, edge := range derived {
 		nodeIDs = append(nodeIDs, edge.From, edge.To)

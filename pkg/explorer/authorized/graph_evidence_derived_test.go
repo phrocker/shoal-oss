@@ -67,6 +67,82 @@ func requireDerivedBinding(
 	}
 }
 
+// registeredThenDerived serves, while serving is set, one extra edge
+// registration under an ID the corpus holds as a derived edge; clearing it
+// removes the registration, so the ID resolves only as derived.
+type registeredThenDerived struct {
+	authorized.PolicyStore
+	registration authorized.EdgeRegistration
+	serving      *bool
+}
+
+func (s registeredThenDerived) Edges(
+	ctx context.Context, edgeIDs []shoal.ID,
+) (map[shoal.ID]authorized.EdgeRegistration, error) {
+	resolved, err := s.PolicyStore.Edges(ctx, edgeIDs)
+	if err != nil || !*s.serving {
+		return resolved, err
+	}
+	for _, id := range edgeIDs {
+		if id == s.registration.Edge.ID {
+			resolved[id] = s.registration
+		}
+	}
+	return resolved, nil
+}
+
+// TestFleetEdgeRecordedRegisteredThenDerivedDenies: evidence recorded while
+// an edge ID resolved a registration carries that registration's edge
+// entry. Once the registration is gone and the ID resolves only as a derived
+// edge, the entry's rule could no longer be enforced, so the evidence is
+// denied, to the holder too. Unreachable while derived and registered IDs
+// are disjoint; the store is injected to reach it. Not vacuous: the same
+// evidence is visible while the registration is served, and evidence bound
+// after the removal is visible.
+func TestFleetEdgeRecordedRegisteredThenDerivedDenies(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		w := newDerivedWorld(t, store)
+		w.connect(w.client, "edge-derived-fleet-shadow",
+			w.source.Document.ID, w.open.Document.ID)
+		shadowID := w.edgeID(w.client, "edge-derived-fleet-shadow")
+		registered, err := store.Edges(context.Background(), []shoal.ID{shadowID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		registration, ok := registered[shadowID]
+		if !ok || registration.Kind != authorized.RegistrationApplication {
+			t.Fatalf("no application registration for the shadow edge: %+v", registered)
+		}
+		registration.Edge.ID = w.toOpen.ID
+		serving := true
+		client := w.newClient(registeredThenDerived{
+			PolicyStore: store, registration: registration, serving: &serving,
+		})
+		w.resnapshot()
+		holder := w.as(w.holder)
+		recorded := w.bindFleetEvidence(client, holder, w.evidence(t, w.toOpen))[0]
+		binding, err := authorized.DecodeGraphEvidenceBinding(recorded.binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hasEdgeEntry := false
+		for _, entry := range binding.Entries() {
+			hasEdgeEntry = hasEdgeEntry || (entry.Object == authorized.GraphBindingEdge &&
+				entry.ID == w.toOpen.ID && entry.Kind == authorized.RegistrationApplication)
+		}
+		if !hasEdgeEntry {
+			t.Fatalf("the binding has no application entry for the edge: %+v", binding.Entries())
+		}
+		requireVerdicts(t, "while registered", gateVerdicts(t, client, holder,
+			recorded.bound()), true)
+		serving = false
+		later := w.bindFleetEvidence(client, holder, w.evidence(t, w.toOpen))[0]
+		requireDerivedBinding(t, later, w.source, w.open)
+		requireVerdicts(t, "once only derived", gateVerdicts(t, client, holder,
+			recorded.bound(), later.bound()), false, true)
+	})
+}
+
 // pathBlindValidator is the trusted corpus as snapshot validator, except
 // that it accepts every evidence path.
 type pathBlindValidator struct{ *explorer.Explorer }
