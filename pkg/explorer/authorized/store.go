@@ -71,12 +71,17 @@ const (
 )
 
 // NodeRegistration identifies the current revision and rule owning a node.
+//
+// CoOwners lists, in canonical order, every further document revision that
+// extracted this same shared entity (#700); see shared_owner.go. The catalog
+// maintains it: a registration passed to PutNode must not carry one.
 type NodeRegistration struct {
 	DocumentID shoal.ID
 	RevisionID shoal.ID
 	Node       graph.Node
 	Rule       AccessRule
 	Kind       RegistrationKind
+	CoOwners   []ExtractionOwner
 }
 
 // EdgeRegistration owns an edge and only its edge-local rule. Endpoint rules
@@ -90,6 +95,9 @@ type NodeRegistration struct {
 // see revision_binding.go. SourceRevisionsBound distinguishes an edge
 // connected with that binding (possibly empty, when neither endpoint belongs
 // to a document) from one registered before it existed.
+//
+// CoOwners lists every further document revision that extracted this same
+// relation (#700), as NodeRegistration.CoOwners does for a shared entity.
 type EdgeRegistration struct {
 	Edge                 graph.Edge
 	DocumentID           shoal.ID
@@ -98,6 +106,7 @@ type EdgeRegistration struct {
 	Kind                 RegistrationKind
 	SourceRevisions      []RevisionReference
 	SourceRevisionsBound bool
+	CoOwners             []ExtractionOwner
 }
 
 // MutationLease serializes base mutations shared by clients using one store.
@@ -716,39 +725,89 @@ func (s *MemoryPolicyStore) PutRevision(
 // PutNode registers an extracted graph node under the source revision rule
 // that authorized its publication. The node registration is idempotent for the
 // same owner and rule, but it never widens or rewrites a previously registered
-// node.
+// node. Another document revision extracting the very same entity becomes a
+// co-owner (#700); see shared_owner.go.
 func (s *MemoryPolicyStore) PutNode(
 	ctx context.Context,
 	nodeID shoal.ID,
 	registration NodeRegistration,
 ) error {
+	_, err := s.putNode(ctx, nodeID, registration)
+	return err
+}
+
+// putNode is PutNode, reporting the co-owner it added, if any, so the durable
+// store persists exactly that.
+func (s *MemoryPolicyStore) putNode(
+	ctx context.Context,
+	nodeID shoal.ID,
+	registration NodeRegistration,
+) (*ExtractionOwner, error) {
 	if err := contextFailure(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	normalized, err := normalizeNodeRegistration(nodeID, registration)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if s == nil {
-		return catalogUnavailable()
+		return nil, catalogUnavailable()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initialize()
-	if existing, ok := s.nodes[nodeID]; ok {
-		if nodeRegistrationsEqual(existing, normalized) {
-			return nil
-		}
-		// This same-rule merge is load-bearing; TestAuthorizedExtractDocumentSameTenantSharedEntityCollapses pins that shared derived entities collapse across a tenant's skill files without widening access.
-		if existing.Kind == normalized.Kind &&
-			existing.Rule.equal(normalized.Rule) &&
-			derivedEntityNodesEqual(existing.Node, normalized.Node) {
-			return nil
-		}
-		return catalogConflict()
+	existing, ok := s.nodes[nodeID]
+	if !ok {
+		s.nodes[nodeID] = normalized
+		return nil, nil
 	}
-	s.nodes[nodeID] = normalized
-	return nil
+	if nodeRegistrationsEqual(existing, normalized) {
+		return nil, nil
+	}
+	if existing.Kind != normalized.Kind {
+		return nil, catalogConflict()
+	}
+	switch existing.Kind {
+	case RegistrationMaterialized:
+		// A materialization keeps the same-rule merge: it has no document
+		// to co-own with.
+		if existing.Rule.equal(normalized.Rule) &&
+			derivedEntityNodesEqual(existing.Node, normalized.Node) {
+			return nil, nil
+		}
+		return nil, catalogConflict()
+	case RegistrationExtracted:
+	default:
+		return nil, catalogConflict()
+	}
+	// A shared entity must be exactly the stored node; only then is there
+	// nothing per-owner to show (#700). This merge is load-bearing;
+	// TestAuthorizedExtractDocumentSameTenantSharedEntityCollapses pins that
+	// shared derived entities collapse without widening access.
+	if !derivedEntityNodesEqual(existing.Node, normalized.Node) {
+		return nil, catalogConflict()
+	}
+	incoming := ExtractionOwner{
+		DocumentID: normalized.DocumentID,
+		RevisionID: normalized.RevisionID,
+		Rule:       normalized.Rule,
+	}
+	switch mergeOwner(existing.DocumentID, existing.RevisionID, existing.Rule,
+		existing.CoOwners, incoming) {
+	case ownerMergeKeep:
+		return nil, nil
+	case ownerMergeAdd:
+		// Load-bearing: TestSharedEntityVisibleThroughAnyOwner pins that a
+		// later extractor owns the entity too, so the first owner's rule
+		// cannot hide it from that extractor's readers.
+		existing.CoOwners = insertOwner(existing.CoOwners, incoming)
+		s.nodes[nodeID] = existing
+		added := incoming
+		added.Rule = mustCloneRule(incoming.Rule)
+		return &added, nil
+	default:
+		return nil, catalogConflict()
+	}
 }
 
 func derivedEntityNodesEqual(left, right graph.Node) bool {
@@ -1043,36 +1102,46 @@ func (s *MemoryPolicyStore) RollbackEdgeReservation(
 
 // PutEdge atomically registers an application edge and its edge-local rule.
 // Identical content and canonical rule are idempotent; identity or policy
-// reuse conflicts.
+// reuse conflicts. Another document revision extracting the very same
+// relation becomes a co-owner (#700).
 func (s *MemoryPolicyStore) PutEdge(
 	ctx context.Context,
 	registration EdgeRegistration,
 ) error {
+	_, err := s.putEdge(ctx, registration)
+	return err
+}
+
+// putEdge is PutEdge, reporting the co-owner it added, if any.
+func (s *MemoryPolicyStore) putEdge(
+	ctx context.Context,
+	registration EdgeRegistration,
+) (*ExtractionOwner, error) {
 	if err := contextFailure(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	normalized, err := normalizeApplicationEdgeRegistration(registration)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if s == nil {
-		return catalogUnavailable()
+		return nil, catalogUnavailable()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.initialize()
 	if _, intrinsic := s.intrinsicEdges[normalized.Edge.ID]; intrinsic {
-		return catalogConflict()
+		return nil, catalogConflict()
 	}
 	if claim, ok := s.edgeClaims[normalized.Edge.ID]; ok &&
 		!edgeRegistrationsEqual(claim, normalized) {
-		return catalogConflict()
+		return nil, catalogConflict()
 	}
 	if existing, ok := s.edges[normalized.Edge.ID]; ok {
 		switch extractedEdgeMerge(existing, normalized) {
 		case edgeMergeKeep:
 			delete(s.edgeClaims, normalized.Edge.ID)
-			return nil
+			return nil, nil
 		case edgeMergeReplace:
 			// The replaced application edge's revision binding (#695)
 			// is kept: replacing may only narrow who reads the edge.
@@ -1081,13 +1150,26 @@ func (s *MemoryPolicyStore) PutEdge(
 			normalized.SourceRevisionsBound = existing.SourceRevisionsBound
 			s.edges[normalized.Edge.ID] = cloneEdgeRegistration(normalized)
 			delete(s.edgeClaims, normalized.Edge.ID)
-			return nil
+			return nil, nil
+		case edgeMergeAddOwner:
+			// Load-bearing: TestSharedRelationVisibleThroughAnyOwner pins
+			// that a later asserter owns the relation too (#700).
+			added := ExtractionOwner{
+				DocumentID: normalized.DocumentID,
+				RevisionID: normalized.RevisionID,
+				Rule:       normalized.Rule,
+			}
+			existing.CoOwners = insertOwner(existing.CoOwners, added)
+			s.edges[normalized.Edge.ID] = existing
+			delete(s.edgeClaims, normalized.Edge.ID)
+			added.Rule = mustCloneRule(added.Rule)
+			return &added, nil
 		}
-		return catalogConflict()
+		return nil, catalogConflict()
 	}
 	s.edges[normalized.Edge.ID] = cloneEdgeRegistration(normalized)
 	delete(s.edgeClaims, normalized.Edge.ID)
-	return nil
+	return nil, nil
 }
 
 // Edge returns a current intrinsic edge or a registered application edge.
@@ -1554,6 +1636,10 @@ func normalizeNodeRegistration(
 			shoal.ErrorInvalidArgument,
 			"node registration kind must be extracted or materialized")
 	}
+	if len(registration.CoOwners) > 0 {
+		return NodeRegistration{}, shoal.NewError(shoal.ErrorInvalidArgument,
+			"node co-owners are recorded by the catalog, not registered")
+	}
 	rule, err := registration.Rule.clone()
 	if err != nil {
 		return NodeRegistration{}, err
@@ -1586,6 +1672,10 @@ func normalizeApplicationEdgeRegistration(
 	rule, err := registration.Rule.clone()
 	if err != nil {
 		return EdgeRegistration{}, err
+	}
+	if len(registration.CoOwners) > 0 {
+		return EdgeRegistration{}, shoal.NewError(shoal.ErrorInvalidArgument,
+			"edge co-owners are recorded by the catalog, not registered")
 	}
 	normalized := EdgeRegistration{
 		Edge: cloneGraphEdge(registration.Edge), Rule: rule,
@@ -1670,38 +1760,55 @@ const (
 	edgeMergeConflict edgeMerge = iota
 	edgeMergeKeep
 	edgeMergeReplace
+	edgeMergeAddOwner
 )
 
 // extractedEdgeMerge decides a PutEdge over an existing registration of the
 // same edge ID. Identical registrations are idempotent. Relation edge IDs do
-// not depend on the asserting document, so two documents under the same rule
-// can extract the same edge: the registration stays with the FIRST asserter,
-// like a shared extracted node. If that first asserter is later labelled, the
-// edge closes for readers without the label even though another, public
-// document also asserts it. That fails closed and is accepted (#570). A
-// matching edge that was registered without a document (an application edge,
-// or an extracted edge persisted before RegistrationKind existed) is replaced
-// by the extracted registration, which only adds the asserting document's
+// not depend on the asserting document, so two documents can extract the
+// same edge: every asserting revision owns it (#700), the first as the
+// registration's DocumentID/RevisionID/Rule and every later one as a
+// co-owner, and a reader sees it through any owner it can read. A matching
+// edge that was registered without a document (an application edge, or an
+// extracted edge persisted before RegistrationKind existed) is replaced by
+// the extracted registration, which only adds the asserting document's
 // current rule and so can only narrow who reads it.
 func extractedEdgeMerge(existing, incoming EdgeRegistration) edgeMerge {
 	if edgeRegistrationsEqual(existing, incoming) {
 		return edgeMergeKeep
 	}
 	if incoming.Kind != RegistrationExtracted ||
-		!graphEdgesEqual(existing.Edge, incoming.Edge) ||
-		!existing.Rule.equal(incoming.Rule) {
+		!graphEdgesEqual(existing.Edge, incoming.Edge) {
 		return edgeMergeConflict
 	}
 	switch existing.Kind {
 	case RegistrationExtracted:
-		return edgeMergeKeep
+		switch mergeOwner(existing.DocumentID, existing.RevisionID,
+			existing.Rule, existing.CoOwners, ExtractionOwner{
+				DocumentID: incoming.DocumentID,
+				RevisionID: incoming.RevisionID,
+				Rule:       incoming.Rule,
+			}) {
+		case ownerMergeKeep:
+			return edgeMergeKeep
+		case ownerMergeAdd:
+			return edgeMergeAddOwner
+		default:
+			return edgeMergeConflict
+		}
 	case RegistrationApplication:
+		if !existing.Rule.equal(incoming.Rule) {
+			return edgeMergeConflict
+		}
 		return edgeMergeReplace
 	default:
 		return edgeMergeConflict
 	}
 }
 
+// edgeRegistrationsEqual and nodeRegistrationsEqual compare a registration's
+// first owner and content. Co-owners (#700) are not compared: they are
+// recorded by the catalog, never registered.
 func edgeRegistrationsEqual(left, right EdgeRegistration) bool {
 	return left.Kind == right.Kind &&
 		graphEdgesEqual(left.Edge, right.Edge) &&
@@ -1742,6 +1849,11 @@ func cloneNodeRegistration(
 	}
 	registration.Rule = rule
 	registration.Node = cloneGraphNode(registration.Node)
+	owners, err := cloneOwners(registration.CoOwners)
+	if err != nil {
+		return NodeRegistration{}, err
+	}
+	registration.CoOwners = owners
 	return registration, nil
 }
 
@@ -1763,6 +1875,11 @@ func cloneEdgeRegistrationChecked(
 	registration.Rule = rule
 	registration.SourceRevisions = append(
 		[]RevisionReference(nil), registration.SourceRevisions...)
+	owners, err := cloneOwners(registration.CoOwners)
+	if err != nil {
+		return EdgeRegistration{}, err
+	}
+	registration.CoOwners = owners
 	return registration, nil
 }
 

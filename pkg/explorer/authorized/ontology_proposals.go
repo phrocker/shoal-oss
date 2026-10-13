@@ -519,7 +519,7 @@ func (c *Client) ontologyEvidenceAllows(
 	for index, node := range path.Nodes {
 		nodeIDs[index] = node.ID
 	}
-	nodes, err := c.resolveNodes(ctx, nodeIDs)
+	nodes, err := c.resolveNodes(ctx, nodeIDs, readerFor(decision, operation, now))
 	if err != nil {
 		return false, err
 	}

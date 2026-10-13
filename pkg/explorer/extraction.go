@@ -48,6 +48,14 @@ type ExtractionRequest struct {
 	EntityNamespace string
 	Limits          extraction.Limits
 	Generator       model.TextGenerator
+	// ContextNodes, when set, selects which existing entity nodes (given in
+	// ascending ID order) the extraction may see as graph context and ground
+	// entities on. It returns the visible subset. An authorizing caller sets
+	// it to what its principal may read, so neither the generator's prompt
+	// nor which entities the result reports as reused depends on a document
+	// that principal cannot read (#700). It runs without the explorer's lock
+	// held.
+	ContextNodes func(context.Context, []shoal.ID) ([]shoal.ID, error)
 }
 
 // ExtractionResult describes the graph publication performed by an explicit
@@ -218,14 +226,36 @@ func (e *Explorer) PlanExtractDocument(
 		e.mu.Unlock()
 		return ExtractionResult{}, err
 	}
-	pack, err := e.extractionContextLocked(
-		record, request.Version, request.EntityNamespace)
-	if err != nil {
-		e.mu.Unlock()
-		return ExtractionResult{}, err
-	}
+	contextNodes := e.extractionContextNodesLocked(request.EntityNamespace)
 	snapshot := e.snapshot
 	e.mu.Unlock()
+
+	if request.ContextNodes != nil && len(contextNodes) > 0 {
+		ids := make([]shoal.ID, len(contextNodes))
+		for index, node := range contextNodes {
+			ids[index] = node.ID
+		}
+		visible, err := request.ContextNodes(ctx, ids)
+		if err != nil {
+			return ExtractionResult{}, err
+		}
+		allowed := make(map[shoal.ID]struct{}, len(visible))
+		for _, id := range visible {
+			allowed[id] = struct{}{}
+		}
+		kept := contextNodes[:0]
+		for _, node := range contextNodes {
+			if _, ok := allowed[node.ID]; ok {
+				kept = append(kept, node)
+			}
+		}
+		contextNodes = kept
+	}
+	pack, err := extractionContext(
+		record, request.Version, contextNodes, snapshot)
+	if err != nil {
+		return ExtractionResult{}, err
+	}
 
 	instructions := strings.TrimSpace(request.Instructions)
 	if instructions == "" {
@@ -319,10 +349,40 @@ func (e *Explorer) documentRecordLocked(
 	return nil, shoal.NewError(shoal.ErrorNotFound, "document revision not found")
 }
 
-func (e *Explorer) extractionContextLocked(
+// extractionContextNodesLocked returns copies of the existing entity nodes of
+// entityNamespace, in ascending ID order: the graph context an extraction may
+// ground its entities on.
+func (e *Explorer) extractionContextNodesLocked(entityNamespace string) []graph.Node {
+	nodeIDs := make([]shoal.ID, 0, len(e.graphNodes))
+	for id, node := range e.graphNodes {
+		if node.Properties[extraction.GraphPropertyEntityKey] == "" ||
+			node.Properties[extraction.GraphPropertyOntologyConceptID] == "" {
+			continue
+		}
+		if entityNamespace != "" &&
+			node.Properties[extraction.GraphPropertyEntityNamespace] != entityNamespace {
+			continue
+		}
+		// This existing entity context is load-bearing; TestExtractDocumentRerunReusesSkillEntities pins rerun reuse instead of duplicate creation.
+		nodeIDs = append(nodeIDs, id)
+	}
+	sort.Slice(nodeIDs, func(i, j int) bool {
+		return shoal.CompareID(nodeIDs[i], nodeIDs[j]) < 0
+	})
+	nodes := make([]graph.Node, len(nodeIDs))
+	for index, id := range nodeIDs {
+		nodes[index] = cloneNode(e.graphNodes[id])
+	}
+	return nodes
+}
+
+// extractionContext builds an extraction's context pack from the document
+// and the existing entity nodes it may ground on. It reads no explorer state.
+func extractionContext(
 	record *persistedDocument,
 	version ontology.OntologyVersion,
-	entityNamespace string,
+	contextNodes []graph.Node,
+	snapshot Snapshot,
 ) (inference.ContextPack, error) {
 	identity, err := inference.NewOntologyIdentity(version)
 	if err != nil {
@@ -342,32 +402,15 @@ func (e *Explorer) extractionContextLocked(
 		return inference.ContextPack{}, err
 	}
 	anchors := []inference.EvidenceAnchor{anchor}
-	nodeIDs := make([]shoal.ID, 0, len(e.graphNodes))
-	for id, node := range e.graphNodes {
-		if node.Properties[extraction.GraphPropertyEntityKey] == "" ||
-			node.Properties[extraction.GraphPropertyOntologyConceptID] == "" {
-			continue
-		}
-		if entityNamespace != "" &&
-			node.Properties[extraction.GraphPropertyEntityNamespace] != entityNamespace {
-			continue
-		}
-		// This existing entity context is load-bearing; TestExtractDocumentRerunReusesSkillEntities pins rerun reuse instead of duplicate creation.
-		nodeIDs = append(nodeIDs, id)
-	}
-	sort.Slice(nodeIDs, func(i, j int) bool {
-		return shoal.CompareID(nodeIDs[i], nodeIDs[j]) < 0
-	})
-	for _, id := range nodeIDs {
+	for _, node := range contextNodes {
 		anchor, err := inference.NewGraphAnchor(graph.Path{
-			Nodes: []graph.Node{cloneNode(e.graphNodes[id])},
+			Nodes: []graph.Node{cloneNode(node)},
 		})
 		if err != nil {
 			return inference.ContextPack{}, err
 		}
 		anchors = append(anchors, anchor)
 	}
-	snapshot := e.snapshot
 	snapshotPin, err := inference.NewSnapshotPin(shoal.ID(snapshot.ID), snapshot.AsOf)
 	if err != nil {
 		return inference.ContextPack{}, err
@@ -654,4 +697,71 @@ func (e *Explorer) ExtractionRecords(ctx context.Context) ([]ExtractionRecord, e
 		return shoal.CompareID(records[left].ID, records[right].ID) < 0
 	})
 	return records, nil
+}
+
+// ExtractionAssertions returns, for each requested edge of the current graph,
+// every relationship assertion an extraction contributing to the current
+// graph makes of it, in extraction-ID order and without repeats. Several
+// documents can assert the very same relation edge, but the graph keeps one
+// assertion per edge (the last such extraction's), and its evidence cites
+// that extraction's document. An authorizing caller uses this trusted read
+// to show each reader an assertion whose evidence that reader may read
+// (#700). Edges with no extraction assertion are omitted.
+func (e *Explorer) ExtractionAssertions(
+	ctx context.Context, edgeIDs []shoal.ID,
+) (map[shoal.ID][]ontology.Assertion, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	wanted := make(map[shoal.ID]struct{}, len(edgeIDs))
+	for _, id := range edgeIDs {
+		if err := shoal.ValidateRequiredID("extraction edge ID", id); err != nil {
+			return nil, err
+		}
+		wanted[id] = struct{}{}
+	}
+	if err := e.acquireReadWithGraph(); err != nil {
+		return nil, err
+	}
+	defer e.mu.RUnlock()
+	extractionIDs := make([]shoal.ID, 0, len(e.extractions))
+	for id := range e.extractions {
+		extractionIDs = append(extractionIDs, id)
+	}
+	sort.Slice(extractionIDs, func(i, j int) bool {
+		return shoal.CompareID(extractionIDs[i], extractionIDs[j]) < 0
+	})
+	result := make(map[shoal.ID][]ontology.Assertion)
+	seen := make(map[shoal.ID]map[shoal.ID]struct{})
+	for _, id := range extractionIDs {
+		record := e.extractions[id]
+		if record == nil {
+			continue
+		}
+		// The same contribution rule computeCurrentGraph applies.
+		if _, ok := e.graphNodes[record.DocumentID]; !ok {
+			continue
+		}
+		for _, persisted := range record.Assertions {
+			if _, ok := wanted[persisted.EdgeID]; !ok {
+				continue
+			}
+			if _, ok := e.graphEdges[persisted.EdgeID]; !ok {
+				continue
+			}
+			assertion, err := restoreAssertion(persisted)
+			if err != nil {
+				return nil, err
+			}
+			if seen[persisted.EdgeID] == nil {
+				seen[persisted.EdgeID] = make(map[shoal.ID]struct{})
+			}
+			if _, duplicate := seen[persisted.EdgeID][assertion.ID()]; duplicate {
+				continue
+			}
+			seen[persisted.EdgeID][assertion.ID()] = struct{}{}
+			result[persisted.EdgeID] = append(result[persisted.EdgeID], assertion)
+		}
+	}
+	return result, nil
 }

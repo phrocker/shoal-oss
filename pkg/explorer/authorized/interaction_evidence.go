@@ -175,7 +175,8 @@ func (c *Client) verifyInteractionGraphEvidence(
 	decision auth.Decision,
 	now time.Time,
 ) error {
-	nodes, err := c.resolveNodes(ctx, reference.NodeIDs)
+	reader := readerFor(decision, auth.OperationRetrieve, now)
+	nodes, err := c.resolveNodes(ctx, reference.NodeIDs, reader)
 	if err != nil {
 		return err
 	}
@@ -186,7 +187,7 @@ func (c *Client) verifyInteractionGraphEvidence(
 	if err != nil {
 		return err
 	}
-	edges, err := c.resolveEdges(ctx, reference.EdgeIDs)
+	edges, err := c.resolveEdges(ctx, reference.EdgeIDs, reader)
 	if err != nil {
 		return err
 	}
