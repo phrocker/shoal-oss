@@ -309,6 +309,33 @@ type Action struct {
 	// it (capabilitiesSubset). Registering it is a new generation; see
 	// docs/executor-attestation.md, "Policy flip".
 	RequiresAttestation bool `json:"requires_attestation,omitempty"`
+	// ErrorCodes is the closed vocabulary of failure codes this action's
+	// executor may report (#740). A code outside it is not refused — it is
+	// adjudicated to invalid_executor_error under service origin, so the
+	// record says the service chose it.
+	//
+	// Closed rather than shaped. A grammar constrains the form of a code and
+	// not its content: "patient_4471_hiv_positive" is a perfectly good
+	// lowercase token, so a shape rule narrows the channel from a kilobyte
+	// to a line of readable text rather than closing it. Only a vocabulary
+	// fixed before the work runs cannot carry anything derived from what the
+	// work read.
+	//
+	// Empty declares nothing, so every code the executor reports is
+	// adjudicated. That is the fail-closed default and it is lossy: an
+	// action's failures all read invalid_executor_error until its descriptor
+	// names its codes. Lossy and not breaking is the point of adjudicating
+	// rather than refusing.
+	//
+	// The tag below is dead, as every tag on this struct is: Action defines
+	// MarshalJSON and UnmarshalJSON, and their hand-written field lists are
+	// the HTTP contract. The durable form is a third encoding again, the
+	// versioned binary codec in internal/explorerfleet's registry store. A
+	// field added here and nowhere else reaches neither, and reads as an
+	// action that declares nothing — which under a closed vocabulary has
+	// every reported code replaced. This field was missing from both on the
+	// first attempt.
+	ErrorCodes []string `json:"error_codes,omitempty"`
 }
 
 // legacyEffect projects a set onto the superseded scalar spelling.
@@ -361,6 +388,15 @@ func (a Action) MarshalJSON() ([]byte, error) {
 		// Omitted when false for the same reason, so every descriptor
 		// without the requirement keeps its bytes and digest.
 		RequiresAttestation bool `json:"requires_attestation,omitempty"`
+		// Omitted when empty for the same reason again. This is the
+		// durable form as well as the HTTP one, so a field missing here
+		// is a field the stored descriptor does not have, whatever the
+		// struct's own tag says — the tag is dead while this method
+		// exists, and leaving ErrorCodes out of it made every action
+		// read as declaring nothing. An action that declares nothing
+		// adjudicates every code, so the omission looked like the rule
+		// working.
+		ErrorCodes []string `json:"error_codes,omitempty"`
 	}
 	return json.Marshal(actionFields{
 		Name: a.Name, InputSchema: a.InputSchema,
@@ -368,6 +404,7 @@ func (a Action) MarshalJSON() ([]byte, error) {
 		LegacyEffect:        a.Effects.legacyEffect(),
 		RequiresApproval:    a.RequiresApproval,
 		RequiresAttestation: a.RequiresAttestation,
+		ErrorCodes:          a.ErrorCodes,
 	})
 }
 
@@ -397,6 +434,7 @@ func (a *Action) UnmarshalJSON(data []byte) error {
 		LegacyEffect        *Effect         `json:"effect"`
 		RequiresApproval    bool            `json:"requires_approval"`
 		RequiresAttestation bool            `json:"requires_attestation"`
+		ErrorCodes          []string        `json:"error_codes"`
 	}
 	var fields actionFields
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -426,6 +464,7 @@ func (a *Action) UnmarshalJSON(data []byte) error {
 		OutputSchema: fields.OutputSchema, Effects: fields.Effects,
 		RequiresApproval:    fields.RequiresApproval,
 		RequiresAttestation: fields.RequiresAttestation,
+		ErrorCodes:          fields.ErrorCodes,
 	}
 	return nil
 }
@@ -753,11 +792,16 @@ func canonicalCapabilities(input []Capability) ([]Capability, error) {
 					"action requires attestation but does not declare the "+
 						"external effect; attestation applies only to external work")
 			}
+			errorCodes, err := canonicalErrorCodes(action.ErrorCodes)
+			if err != nil {
+				return nil, err
+			}
 			result[i].Actions[j] = Action{
 				Name: action.Name, InputSchema: inputSchema,
 				OutputSchema: outputSchema, Effects: effects,
 				RequiresApproval:    action.RequiresApproval,
 				RequiresAttestation: action.RequiresAttestation,
+				ErrorCodes:          errorCodes,
 			}
 		}
 		sort.Slice(result[i].Actions, func(a, b int) bool {
@@ -878,4 +922,64 @@ func descriptorDigest(descriptor Descriptor) [sha256.Size]byte {
 // refuseUnconfinedRetrieval.
 type RetrievalConfiner interface {
 	ConfinesRetrievalToScope() bool
+}
+
+// MaxActionErrorCodes bounds a declared failure vocabulary. A taxonomy an
+// operator reconciles by hand does not have hundreds of entries, and the set
+// is carried on every descriptor read.
+const MaxActionErrorCodes = 64
+
+// canonicalErrorCodes validates and orders a declared failure vocabulary.
+//
+// Sorted and deduplicated because the registry digest covers it: two
+// descriptors declaring the same codes in a different order are the same
+// descriptor, and must not re-register as a new generation.
+//
+// A declared code must be a token and must not be one the service assigns.
+// Refusing here is safe in a way refusing at completion is not: registration
+// happens before any work runs, so nothing has been performed that a refusal
+// would strand.
+func canonicalErrorCodes(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	if len(values) > MaxActionErrorCodes {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"declared action error codes exceed their bound")
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value == "" || len(value) > MaxReportedActionErrorCodeBytes ||
+			!reportedActionErrorCode.MatchString(value) {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"a declared action error code must be a lowercase token of "+
+					"at most 64 characters")
+		}
+		if _, reserved := reservedActionErrorCodes[value]; reserved {
+			return nil, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"action error code "+value+" is assigned by the service and "+
+					"may not be declared")
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+// declaresErrorCode reports whether this action declared the code.
+func (a Action) declaresErrorCode(value string) bool {
+	for _, declared := range a.ErrorCodes {
+		if declared == value {
+			return true
+		}
+	}
+	return false
 }

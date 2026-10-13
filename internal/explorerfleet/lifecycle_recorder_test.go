@@ -5,6 +5,7 @@ package explorerfleet
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"reflect"
 	"testing"
@@ -106,11 +107,17 @@ func TestLifecycleRecorderRetryIsByteStable(t *testing.T) {
 		t.Fatalf("record attempts = %d", len(store.requests))
 	}
 	expectedID := interaction.DerivedID(
-		"session", "fleet.lifecycle.v4", string(lifecycle.Operation),
+		"session", "fleet.lifecycle.v5", string(lifecycle.Operation),
 		string(lifecycle.RequestID), string(lifecycle.AgentID),
 	)
 	// The earlier identities are still derived exactly, because retries
 	// reconcile against receipts written under them.
+	if v4LifecycleSessionID(lifecycle) != interaction.DerivedID(
+		"session", "fleet.lifecycle.v4", string(lifecycle.Operation),
+		string(lifecycle.RequestID), string(lifecycle.AgentID),
+	) {
+		t.Fatal("v4 lifecycle receipt identity drifted")
+	}
 	if v3LifecycleSessionID(lifecycle) != interaction.DerivedID(
 		"session", "fleet.lifecycle.v3", string(lifecycle.Operation),
 		string(lifecycle.RequestID), string(lifecycle.AgentID),
@@ -162,14 +169,19 @@ func TestLifecycleRecorderReconcilesLegacyReceiptBeforeWritingV2(t *testing.T) {
 	if store.stored.ID != accepted.ID {
 		t.Fatal("reconciliation rewrote the legacy receipt")
 	}
-	requireV4Receipt(t, store, lifecycle)
+	requireCurrentReceipt(t, store, lifecycle)
 }
 
-// requireV4Receipt checks that a retry reconciled with a legacy receipt also
-// wrote exactly one v4 receipt, carrying the current registry digest, beside
-// it (#521): the v1 digest the legacy receipt holds can be shared by two
-// different mutations, so the one actually applied is recorded under v2.
-func requireV4Receipt(
+// requireCurrentReceipt checks that a retry reconciled with a receipt from
+// an earlier era also wrote exactly one receipt under the identity this
+// build writes, carrying the current registry digest, beside it.
+//
+// For a v1-era receipt that is #521's requirement: the v1 digest it holds
+// can be shared by two different mutations, so the one actually applied has
+// to be recorded under an injective encoding. For a v4 receipt the digest
+// is already injective, and the reason is the plainer one — the retry still
+// has to be findable under the identity this build looks for first.
+func requireCurrentReceipt(
 	t *testing.T, store *reconcilingLifecycleStore, lifecycle fleet.Lifecycle,
 ) {
 	t.Helper()
@@ -177,7 +189,7 @@ func requireV4Receipt(
 		lifecycle.Operation, lifecycle.RequestID, lifecycle.AgentID)
 	written, ok := store.written[id]
 	if !ok || len(store.requests) != 1 || store.requests[0].ID != id {
-		t.Fatalf("legacy reconciliation did not write the v4 receipt: %d "+
+		t.Fatalf("reconciliation did not write the current receipt: %d "+
 			"requests", len(store.requests))
 	}
 	asserted, err := fleet.CallerAssertedRegistryReason(
@@ -186,7 +198,172 @@ func requireV4Receipt(
 		t.Fatal(err)
 	}
 	if written.QueryDigest != lifecycleQueryDigest(lifecycle, asserted) {
-		t.Fatal("v4 receipt does not carry the current registry digest")
+		t.Fatal("the new receipt does not carry the current registry digest")
+	}
+}
+
+// TestLifecycleRecorderReconcilesAV4Receipt is the half of #740's digest
+// version that the migration exists for.
+//
+// A v4 receipt carries the v2 registry mutation digest. This build computes
+// v3, so a retry of a request whose receipt a previous build wrote would
+// hash differently — and without this path it would reconcile with nothing,
+// write a second receipt for the same request, and answer a caller that was
+// merely retrying as though it had sent a new mutation.
+//
+// The retry is therefore compared under the receipt's own version, taken
+// from its identity. Nothing in the 32 stored bytes could have told us which
+// encoding produced them.
+func TestLifecycleRecorderReconcilesAV4Receipt(t *testing.T) {
+	lifecycle := testLifecycle()
+	lifecycle.MutationDigest = [sha256.Size]byte{3}
+	lifecycle.SupersededMutationDigest = [sha256.Size]byte{2}
+	lifecycle.LegacyMutationDigest = [sha256.Size]byte{1}
+
+	// Written as a build between #521 and #740 would have written it: under
+	// the v4 identity, with the v2 digest.
+	asV4 := lifecycleWithV2RegistryDigest(lifecycle)
+	asserted, err := fleet.CallerAssertedRegistryReason(
+		lifecycle.ReasonCode, lifecycle.ReasonDetail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := lifecycleSession(asV4, asserted)
+	accepted.ID = v4LifecycleSessionID(asV4)
+	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
+	accepted.Actor = interaction.ActorContext{
+		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,
+		ClientID:   lifecycle.ClientID,
+		OnBehalfOf: append([]shoal.ID(nil), lifecycle.OnBehalfOf...),
+	}
+	accepted.Reason, _ = interaction.NewReason(
+		"audit_purpose", lifecycle.AuditPurpose,
+	)
+	store := &reconcilingLifecycleStore{
+		trustedLifecycleRecorder: trustedLifecycleRecorder{
+			lifecycle: lifecycle,
+		},
+		stored: accepted,
+	}
+	recorder, err := NewLifecycleRecorderWithReader(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.RecordLifecycle(
+		context.Background(), lifecycle,
+	); err != nil {
+		t.Fatalf("a retry of a request a previous build recorded was "+
+			"answered as a new mutation: %v", err)
+	}
+	if store.stored.ID != accepted.ID {
+		t.Fatal("reconciliation rewrote the v4 receipt")
+	}
+	requireCurrentReceipt(t, store, lifecycle)
+}
+
+// TestADivergentV4ReceiptConflicts is the probe with teeth, and the reason
+// the test above is not enough on its own.
+//
+// A matching v4 receipt reconciles to the same outcome as never having
+// looked: either way the call succeeds and writes the current receipt. So
+// that test passes with the v4 alternate deleted — it was written first and
+// a mutation run caught it.
+//
+// What only the alternate can do is refuse. A v4 receipt recording a
+// *different* mutation under the same request ID means the caller is not
+// retrying, it is sending something new under an identity that is already
+// spoken for. Without the alternate the recorder never reads that receipt,
+// writes a second one under the v5 identity, and both stand: one request ID
+// with two receipts describing two different mutations, and nothing to say
+// which was applied.
+func TestADivergentV4ReceiptConflicts(t *testing.T) {
+	lifecycle := testLifecycle()
+	lifecycle.MutationDigest = [sha256.Size]byte{3}
+	lifecycle.SupersededMutationDigest = [sha256.Size]byte{2}
+	lifecycle.LegacyMutationDigest = [sha256.Size]byte{1}
+
+	// The receipt a previous build wrote, for a different descriptor under
+	// the same request: same identity inputs, different v2 digest.
+	divergent := lifecycle
+	divergent.SupersededMutationDigest = [sha256.Size]byte{9}
+	asV4 := lifecycleWithV2RegistryDigest(divergent)
+	asserted, err := fleet.CallerAssertedRegistryReason(
+		lifecycle.ReasonCode, lifecycle.ReasonDetail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := lifecycleSession(asV4, asserted)
+	accepted.ID = v4LifecycleSessionID(asV4)
+	accepted.RecordedAt = lifecycle.SnapshotAsOf.Add(time.Second)
+	accepted.Actor = interaction.ActorContext{
+		SubjectID: lifecycle.Subject, ActorID: lifecycle.Actor,
+		ClientID:   lifecycle.ClientID,
+		OnBehalfOf: append([]shoal.ID(nil), lifecycle.OnBehalfOf...),
+	}
+	accepted.Reason, _ = interaction.NewReason(
+		"audit_purpose", lifecycle.AuditPurpose,
+	)
+	// The identity is the same whichever mutation it describes, or this
+	// test is not about a collision at all.
+	if accepted.ID != v4LifecycleSessionID(
+		lifecycleWithV2RegistryDigest(lifecycle)) {
+		t.Fatal("the two mutations do not share a v4 identity, so nothing " +
+			"here is a conflict")
+	}
+	store := &reconcilingLifecycleStore{
+		trustedLifecycleRecorder: trustedLifecycleRecorder{
+			lifecycle: lifecycle,
+		},
+		stored: accepted,
+	}
+	recorder, err := NewLifecycleRecorderWithReader(store, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recorder.RecordLifecycle(
+		context.Background(), lifecycle,
+	); err == nil {
+		t.Fatal("a different mutation was accepted under a request ID a " +
+			"previous build had already recorded, leaving two receipts " +
+			"for one request and nothing to say which was applied")
+	}
+	if len(store.written) != 0 {
+		t.Fatalf("the refused mutation still wrote %d receipts",
+			len(store.written))
+	}
+}
+
+// TestAV4ReceiptIsNotComparedAsAV1Digest pins why the alternates carry a
+// lifecycle each rather than sharing one rebuilt with the v1 digest.
+//
+// Before the v4 entry existed the loop rebuilt the lifecycle once, with the
+// v1 digest, and compared every alternate against that. Adding v4 to such a
+// loop would read the right receipt and then compare it against the wrong
+// digest, so it would reconcile nothing and silently write a second receipt
+// — which is the failure the whole alternates list exists to prevent, and it
+// would look exactly like a first write.
+func TestAV4ReceiptIsNotComparedAsAV1Digest(t *testing.T) {
+	lifecycle := testLifecycle()
+	lifecycle.MutationDigest = [sha256.Size]byte{3}
+	lifecycle.SupersededMutationDigest = [sha256.Size]byte{2}
+	lifecycle.LegacyMutationDigest = [sha256.Size]byte{1}
+
+	asV1 := lifecycleWithV1RegistryDigest(lifecycle)
+	asV2 := lifecycleWithV2RegistryDigest(lifecycle)
+	if asV1.MutationDigest == asV2.MutationDigest {
+		t.Fatal("the fixture gives both eras the same digest, so this test " +
+			"cannot tell them apart")
+	}
+	asserted, err := fleet.CallerAssertedRegistryReason(
+		lifecycle.ReasonCode, lifecycle.ReasonDetail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lifecycleQueryDigest(asV1, asserted) ==
+		lifecycleQueryDigest(asV2, asserted) {
+		t.Fatal("a v4 receipt and a v1-era receipt of the same mutation " +
+			"have the same query digest, so comparing one as the other " +
+			"would go unnoticed")
 	}
 }
 

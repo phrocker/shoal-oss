@@ -63,13 +63,19 @@ type Lifecycle struct {
 	OnBehalfOf    []shoal.ID
 	AgentID       shoal.ID
 	// MutationDigest is the registry mutation digest the receipt is written
-	// with: the v2 encoding (see registryMutationDigest), or zero for a read.
+	// with: the v3 encoding (see registryMutationDigest), or zero for a read.
 	MutationDigest [sha256.Size]byte
-	// LegacyMutationDigest is the same mutation under the v1 encoding, which
-	// receipts written before v2 carry. It is read, never written: a recorder
-	// uses it only to reconcile a retry with such a receipt, and only for a
-	// receipt whose identity says it holds a v1 digest.
+	// LegacyMutationDigest is the same mutation under the v1 encoding, and
+	// SupersededMutationDigest under the v2 encoding. Receipts written
+	// before each upgrade carry them: fleet.lifecycle.v1 through v3 hold v1
+	// digests and fleet.lifecycle.v4 holds v2.
+	//
+	// Both are read, never written. A recorder uses them only to reconcile
+	// a retry with such a receipt, and only for a receipt whose identity
+	// says which version it holds — a 32-byte digest cannot say that
+	// itself, so the identity is the only thing that can.
 	LegacyMutationDigest     [sha256.Size]byte
+	SupersededMutationDigest [sha256.Size]byte
 	ReasonCode               string
 	ReasonDetail             string
 	Deadline                 int64

@@ -199,7 +199,7 @@ func TestRegistryDigestUpgradeReconcilesV1Receipt(t *testing.T) {
 		}
 		// Reconciled, and the mutation actually applied is now recorded
 		// under v4 with its v2 digest.
-		requireV4Receipt(t, store, upgraded)
+		requireCurrentReceipt(t, store, upgraded)
 		// A changed descriptor under the same request conflicts: with the
 		// v3 receipt directly, and with the v4 receipt where the v1 one is
 		// keyed by a digest it does not share.
@@ -272,7 +272,7 @@ func TestRegistryDigestLegacyReconcileRecordsTheAppliedMutation(t *testing.T) {
 		t.Fatalf("B retry against A's v3 receipt = %v", err)
 	}
 	// ...and is recorded under v4 by its own v2 digest.
-	requireV4Receipt(t, store, lifecycleB)
+	requireCurrentReceipt(t, store, lifecycleB)
 	// B again reconciles with its own v4 receipt.
 	if err := recorder.RecordLifecycle(context.Background(), lifecycleB); err != nil {
 		t.Fatalf("repeated B retry = %v", err)
@@ -324,5 +324,30 @@ func TestRegistryDigestUpgradeWritesV2(t *testing.T) {
 	err = recorder.RecordLifecycle(context.Background(), changed)
 	if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		t.Fatalf("changed descriptor against a v4 receipt = %v", err)
+	}
+}
+
+// TestRegistryDigestUpgradeCarriesTheV2Digest is #740's half of the upgrade,
+// asserted through the real service rather than the recorder alone.
+//
+// The recorder can reconcile a fleet.lifecycle.v4 receipt only if it is
+// handed the v2 digest to compare against, and nothing in the recorder's own
+// tests can tell whether the service fills that field — a mutation that
+// stopped populating it left every recorder test green. This is the join.
+func TestRegistryDigestUpgradeCarriesTheV2Digest(t *testing.T) {
+	upgraded := upgradeLifecycle(t, false)
+	var zero [32]byte
+	if upgraded.SupersededMutationDigest == zero {
+		t.Fatal("the service handed the recorder no v2 digest, so a retry " +
+			"of a request a previous build recorded can never reconcile " +
+			"and writes a second receipt instead")
+	}
+	// Distinct from both neighbours, or it is one of them under another
+	// name and reconciliation would compare the wrong version.
+	if upgraded.SupersededMutationDigest == upgraded.MutationDigest {
+		t.Fatal("the v2 digest equals the written one")
+	}
+	if upgraded.SupersededMutationDigest == upgraded.LegacyMutationDigest {
+		t.Fatal("the v2 digest equals the v1 one")
 	}
 }

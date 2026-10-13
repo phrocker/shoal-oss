@@ -104,42 +104,57 @@ func (r *LifecycleRecorder) RecordLifecycle(
 	}
 	requested := lifecycleSession(lifecycle, asserted)
 	if r.read != nil {
-		// Receipts written before this version live under the v1, v2 and v3
-		// identities. Reconcile a retry against one of those before writing a
-		// v4 receipt.
+		// Receipts written before this version live under the v1 through v4
+		// identities. Reconcile a retry against one of those before writing
+		// a v5 receipt.
 		//
-		// Every one of them carries the v1 registry mutation digest, so the
-		// retry is compared as that version: the version is read from the
-		// receipt's identity, never guessed from the stored digest. v1 and v2
-		// receipts also never carry a caller-asserted reason; v3 receipts do.
+		// Each carries the registry mutation digest of its own era, so the
+		// retry is compared as that version — and the version comes from the
+		// receipt's identity, never from the stored digest, which is 32
+		// bytes that cannot say what produced them. v1 through v3 hold the
+		// v1 digest; v4 holds v2. v1 and v2 receipts also never carry a
+		// caller-asserted reason; v3 and v4 do.
 		//
-		// A match is not the end of it. The v1 digest is not injective (#521):
-		// two different descriptors can share one, so a retry that matches a
-		// v1-era receipt may be a different mutation from the one that receipt
-		// admitted. If that receipt's own store write never landed, the retry
-		// is what gets applied. So a reconciled retry also writes the v4
-		// receipt, with the v2 digest of the mutation actually being applied,
-		// and falls through to the ordinary path below: the applied mutation
-		// is then recorded unambiguously, a repeat of the same retry
-		// reconciles with that v4 receipt, and any other mutation under the
-		// same request conflicts with it.
-		legacy := lifecycleWithV1RegistryDigest(lifecycle)
+		// A match is not the end of it, for the v1-era receipts. The v1
+		// digest is not injective (#521): two different descriptors can
+		// share one, so a retry that matches a v1-era receipt may be a
+		// different mutation from the one that receipt admitted. If that
+		// receipt's own store write never landed, the retry is what gets
+		// applied. So a reconciled retry also writes the v5 receipt, with
+		// the v3 digest of the mutation actually being applied, and falls
+		// through to the ordinary path below: the applied mutation is then
+		// recorded unambiguously, a repeat of the same retry reconciles with
+		// that v5 receipt, and any other mutation under the same request
+		// conflicts with it.
+		//
+		// A v4 receipt does not have that problem — v2 is injective — but it
+		// takes the same path, because the retry still has to be recorded
+		// under the identity this build writes.
+		legacyV1 := lifecycleWithV1RegistryDigest(lifecycle)
+		legacyV2 := lifecycleWithV2RegistryDigest(lifecycle)
 		for _, prior := range []struct {
-			id                shoal.ID
+			id shoal.ID
+			// as is the lifecycle rebuilt with the digest that receipt's
+			// era wrote. Carried per entry rather than taken from one
+			// variant, because v4 is the first alternate that is not a v1
+			// digest, and comparing it as one would reconcile nothing and
+			// silently write a second receipt for the same request.
+			as                fleet.Lifecycle
 			withoutAssertions bool
 		}{
-			{v1LifecycleSessionID(legacy), true},
-			{v2LifecycleSessionID(legacy), true},
-			{v3LifecycleSessionID(legacy), false},
+			{v1LifecycleSessionID(legacyV1), legacyV1, true},
+			{v2LifecycleSessionID(legacyV1), legacyV1, true},
+			{v3LifecycleSessionID(legacyV1), legacyV1, false},
+			{v4LifecycleSessionID(legacyV2), legacyV2, false},
 		} {
-			priorRequested := lifecycleSession(legacy, asserted)
+			priorRequested := lifecycleSession(prior.as, asserted)
 			priorRequested.ID = prior.id
 			record, readErr := r.read(
 				context.WithoutCancel(ctx), priorRequested.ID,
 			)
 			if readErr == nil {
 				if err := validateLifecycleReplay(
-					record.Session, priorRequested, legacy,
+					record.Session, priorRequested, prior.as,
 					prior.withoutAssertions,
 				); err != nil {
 					return err
@@ -375,23 +390,45 @@ func lifecycleWithV1RegistryDigest(lifecycle fleet.Lifecycle) fleet.Lifecycle {
 	return lifecycle
 }
 
+// lifecycleWithV2RegistryDigest returns the lifecycle as a build between #521
+// and #740 would have recorded it: with the v2 registry mutation digest.
+// Only receipts under a v4 identity are compared against it.
+func lifecycleWithV2RegistryDigest(lifecycle fleet.Lifecycle) fleet.Lifecycle {
+	lifecycle.MutationDigest = lifecycle.SupersededMutationDigest
+	return lifecycle
+}
+
+// v4LifecycleSessionID is the identity receipts had before the declared
+// error-code vocabulary joined the registry mutation digest (#740). A
+// receipt under it carries a v2 registry mutation digest. It is read, never
+// written.
+func v4LifecycleSessionID(lifecycle fleet.Lifecycle) shoal.ID {
+	return interaction.DerivedID(
+		"session",
+		"fleet.lifecycle.v4",
+		string(lifecycle.Operation),
+		string(lifecycle.RequestID),
+		string(lifecycle.AgentID),
+	)
+}
+
 // LifecycleReceiptID is the durable interaction session ID of the lifecycle
 // receipt for one registry operation, by request and agent. Reading it with
 // the corpus's InteractionRecord returns the receipt, including its
 // CallerAssertedReason (for an "atpl-apply" registration, the policy digest as
 // Source) and the trusted Actor who asserted it.
 //
-// Receipts under this identity, fleet.lifecycle.v4, carry the v2 registry
-// mutation digest. Receipts written before it have v1, v2 or v3 identities
-// and carry the v1 digest; v1 and v2 receipts also predate caller-asserted
-// reasons. The identity, not the stored digest, says which version a receipt
-// holds.
+// Receipts under this identity, fleet.lifecycle.v5, carry the v3 registry
+// mutation digest. Receipts written before it have v1 through v4 identities:
+// v1, v2 and v3 carry the v1 digest and v4 carries v2, and v1 and v2 also
+// predate caller-asserted reasons. The identity, not the stored digest, says
+// which version a receipt holds.
 func LifecycleReceiptID(
 	operation auth.Operation, requestID, agentID shoal.ID,
 ) shoal.ID {
 	return interaction.DerivedID(
 		"session",
-		"fleet.lifecycle.v4",
+		"fleet.lifecycle.v5",
 		string(operation),
 		string(requestID),
 		string(agentID),
