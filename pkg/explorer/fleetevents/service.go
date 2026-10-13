@@ -816,10 +816,21 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 		for _, group := range []struct {
 			references []interaction.EvidenceReference
 			visibility [][]string
+			binding    [][]byte
 		}{
-			{event.ConsumedEvidence, event.ConsumedEvidenceVisibility},
-			{event.CitedEvidence, event.CitedEvidenceVisibility},
+			{event.ConsumedEvidence, event.ConsumedEvidenceVisibility,
+				event.ConsumedEvidenceBinding},
+			{event.CitedEvidence, event.CitedEvidenceVisibility,
+				event.CitedEvidenceBinding},
 		} {
+			if len(group.binding) != 0 &&
+				len(group.binding) != len(group.references) {
+				// Same reason as the visibility check below: a misaligned
+				// binding would hold a reference to another's registrations.
+				return nil, shoal.NewError(
+					shoal.ErrorInternal,
+					"stored event evidence binding does not align with its references")
+			}
 			if len(group.visibility) != 0 && len(group.visibility) != len(group.references) {
 				// normalizeEvent refuses this at publish; a stored event
 				// that carries it is corrupt, and guessing an alignment
@@ -832,6 +843,9 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 				value := labelledReference{reference: group.references[i]}
 				if len(group.visibility) != 0 {
 					value.visibility = group.visibility[i]
+				}
+				if len(group.binding) != 0 {
+					value.binding = group.binding[i]
 				}
 				labelled = append(labelled, value)
 			}
@@ -846,6 +860,7 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 			// them; a document reference also names its cited revision.
 			graph := evidencelabels.Graph{
 				NodeIDs: value.reference.NodeIDs, EdgeIDs: value.reference.EdgeIDs,
+				Binding: value.binding,
 			}
 			if value.reference.Kind == interaction.EvidenceDocument {
 				graph.DocumentID = value.reference.Citation.DocumentID
@@ -908,6 +923,7 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 type labelledReference struct {
 	reference  interaction.EvidenceReference
 	visibility []string
+	binding    []byte
 }
 
 // readableEvidenceGroup applies one group's verdicts. Verdicts that do not

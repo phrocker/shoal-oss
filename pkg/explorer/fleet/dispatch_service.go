@@ -1403,7 +1403,7 @@ func (s *DispatchService) applyExecutionResult(
 			result.ErrorCode = "invalid_executor_evidence"
 			next.ErrorCodeOrigin = ErrorCodeOriginService
 		}
-	} else if joined, err := s.evidencePathsJoin(ctx, result); err != nil {
+	} else if bindings, joined, err := s.evidencePathsJoin(ctx, result); err != nil {
 		return ActionRecord{}, false, err
 	} else if !joined {
 		next.Evidence = nil
@@ -1420,6 +1420,7 @@ func (s *DispatchService) applyExecutionResult(
 		if err != nil {
 			return ActionRecord{}, false, err
 		}
+		applyEvidenceBindings(evidence, bindings)
 		next.Evidence = evidence
 		next.EvidenceSnapshotID = result.EvidenceSnapshotID
 		next.EvidenceSnapshotAsOf = result.EvidenceSnapshotAsOf.UTC()
@@ -3790,16 +3791,62 @@ func withinScope(permitted [][]byte, scope []byte) bool {
 // reference naming a graph member.
 func (s *DispatchService) evidencePathsJoin(
 	ctx context.Context, result ExecutionResult,
-) (bool, error) {
+) ([][]byte, bool, error) {
 	if s.evidenceNodes == nil {
-		return true, nil
+		return nil, true, nil
 	}
 	references := make([]interaction.EvidenceReference, 0, len(result.Evidence))
 	for _, reference := range result.Evidence {
 		references = append(references, reference.interactionReference())
 	}
-	return s.evidenceNodes.GraphEvidenceValid(
+	// The binding is what keeps a later relabel from opening this evidence
+	// (#705), and it is asked for at the same moment the reference is
+	// validated because both read the registrations the recorder sees.
+	if binder, ok := s.evidenceNodes.(graphEvidenceBinder); ok {
+		return binder.BindGraphEvidence(
+			ctx, result.EvidenceSnapshotID, result.EvidenceSnapshotAsOf,
+			references)
+	}
+	// A gate that cannot bind still validates. Its references are stored
+	// unbound, which the read gate holds to every registered revision of the
+	// documents their members belong to — over-closing rather than opening,
+	// and the same answer every reference recorded before bindings existed
+	// gets. NodeGate carries no BindGraphEvidence, so this is the path a
+	// gate outside pkg/explorer/authorized takes.
+	valid, err := s.evidenceNodes.GraphEvidenceValid(
 		ctx, result.EvidenceSnapshotID, result.EvidenceSnapshotAsOf, references)
+	return nil, valid, err
+}
+
+// applyEvidenceBindings gives each reference the binding the gate returned
+// for it, index for index — the order result.Evidence was in, which
+// structuredEvidence preserves.
+//
+// Assigned unconditionally, including to nil. result.Evidence is
+// executor-supplied, so leaving a short or absent binding set alone would let
+// an executor present its own: a binding it chose would name whatever
+// registration set it liked, and the read gate trusts the binding to decide
+// what the evidence is held to. The only binding that may reach the record is
+// the one the gate returned. Absent is safe — an unbound reference is held to
+// every registered revision.
+func applyEvidenceBindings(evidence []EvidenceRef, bindings [][]byte) {
+	for index := range evidence {
+		var binding []byte
+		if index < len(bindings) {
+			binding = bindings[index]
+		}
+		evidence[index].Binding = binding
+	}
+}
+
+// graphEvidenceBinder is the record-time binding, asked of the node gate
+// without widening evidencelabels.NodeGate — which every gate implements and
+// only the authorized client can answer this for.
+type graphEvidenceBinder interface {
+	BindGraphEvidence(
+		ctx context.Context, snapshotID shoal.ID, snapshotAsOf time.Time,
+		references []interaction.EvidenceReference,
+	) ([][]byte, bool, error)
 }
 
 // structuredEvidence is the record-time half of the label rule: each
@@ -3933,7 +3980,12 @@ func (s *DispatchService) readableRecords(
 // It is content-derived (it hashes the document ID, titles and quoted text),
 // so a reader who can guess the content could use it to confirm the guess.
 func evidenceGraph(reference EvidenceRef) evidencelabels.Graph {
-	graph := evidencelabels.Graph{NodeIDs: reference.NodeIDs, EdgeIDs: reference.EdgeIDs}
+	graph := evidencelabels.Graph{
+		NodeIDs: reference.NodeIDs, EdgeIDs: reference.EdgeIDs,
+		// Taken from the stored reference, before any redaction touches the
+		// record it came from.
+		Binding: reference.Binding,
+	}
 	if reference.Kind == interaction.EvidenceDocument {
 		graph.DocumentID = reference.Citation.DocumentID
 		graph.RevisionID = reference.Citation.RevisionID
