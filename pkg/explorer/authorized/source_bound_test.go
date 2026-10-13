@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -436,5 +437,105 @@ func TestUnboundedRetrieversRefuseABound(t *testing.T) {
 	})
 	if !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
 		t.Fatalf("base engine with a bound = %v, want unavailable", err)
+	}
+}
+
+// TestBoundedNeighborhoodDropsAnEdgeRegisteredOutsideTheBound pins the edge's
+// own registration check: an edge between two in-bound nodes whose own rule
+// names another source is outside the bound, though both endpoints are in.
+func TestBoundedNeighborhoodDropsAnEdgeRegisteredOutsideTheBound(t *testing.T) {
+	f := newFixture(t)
+	admin := f.admin(t)
+	edgesOnB, err := authorized.NewStaticPolicySelector(f.sourceB, f.policyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crossClient := f.newClient(t, f.base, f.store, f.sourceA, f.policyA, edgesOnB)
+	first, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///a-first.txt", MediaType: explorer.MediaTypeText,
+		Content: "the first harbour",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///a-second.txt", MediaType: explorer.MediaTypeText,
+		Content: "the second harbour",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgeID, err := crossClient.ApplicationEdgeID(admin, "edge_on_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := crossClient.Connect(admin, graph.Edge{
+		ID: edgeID, From: first.Document.ID, To: second.Document.ID,
+		Type: "references", Weight: 1,
+	}); err != nil {
+		t.Fatalf("connect A to A under a source-B edge rule: %v", err)
+	}
+	request := explorer.BoundedNeighborhoodRequest{
+		NodeIDs: []shoal.ID{first.Document.ID}, Depth: 1, Fanout: 64,
+		MaxNodes: 64, MaxScannedEdges: 4096,
+		Direction: explorer.GraphDirectionOutgoing,
+		EdgeTypes: []string{"references"},
+	}
+	hasEdge := func(neighborhood explorer.Neighborhood) bool {
+		for _, edge := range neighborhood.Edges {
+			if edge.ID == edgeID {
+				return true
+			}
+		}
+		return false
+	}
+	control, err := f.clientA.BoundedNeighborhood(admin, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasEdge(control.Neighborhood) {
+		t.Fatal("control: the unbounded expansion must return the source-B edge")
+	}
+	bound := &retrieval.SourceBound{Scopes: []retrieval.BoundScope{
+		{SourceID: f.sourceA, PolicyID: f.policyA},
+	}}
+	bounded, err := f.clientA.BoundedNeighborhoodWithin(admin, bound, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasEdge(bounded.Neighborhood) {
+		t.Fatal("an edge whose own rule is outside the bound must be dropped")
+	}
+	if hasNode(bounded.Neighborhood, second.Document.ID) {
+		t.Fatal("a node reached only through the dropped edge must not be returned")
+	}
+}
+
+// TestDocumentWithinHoldsAnOlderRevisionToTheCurrentRule pins that an older
+// revision is within a bound only while its document's current rule is too,
+// as revisionAllows holds it to the current rule (#570).
+func TestDocumentWithinHoldsAnOlderRevisionToTheCurrentRule(t *testing.T) {
+	f := newFixture(t)
+	admin := f.admin(t)
+	older, err := f.clientA.Ingest(admin, explorer.Source{
+		URI: "file:///moving.txt", MediaType: explorer.MediaTypeText,
+		Content: "the first draft",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.clientB.Ingest(admin, explorer.Source{
+		URI: "file:///moving.txt", MediaType: explorer.MediaTypeText,
+		Content: "the second draft",
+	}); err != nil {
+		t.Fatalf("move the document to source B: %v", err)
+	}
+	bound := &retrieval.SourceBound{Scopes: []retrieval.BoundScope{
+		{SourceID: f.sourceA, PolicyID: f.policyA},
+	}}
+	_, err = f.clientA.DocumentWithin(
+		admin, bound, older.Document.ID, older.Revision.ID)
+	if !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		t.Fatalf("older in-bound revision of a document now on another source = %v", err)
 	}
 }

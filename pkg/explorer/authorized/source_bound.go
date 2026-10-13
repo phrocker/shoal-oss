@@ -410,6 +410,18 @@ func (c *Client) confineNeighborhood(
 // under a bound: it is not derived, and every piece of its evidence — the
 // cited revision, and each node and edge of a cited path — is authorized and
 // within the bound. Evidence resting on a derivation is never within one.
+//
+// The citation and path-node checks are defence in depth, and no test makes
+// either the deciding one. An extraction assertion's evidence cites, and its
+// path runs through, the document revision that asserted it, and its edge is
+// kept only when that edge's own registration — owned by an asserting
+// revision, and conjoined with that document's current rule — is within the
+// bound. They can differ only for a relation shared across rule namespaces,
+// and the entity namespace is a digest of the whole access rule, so such a
+// relation arises only after a relabel or TightenRule; in every scenario
+// built so far an earlier layer (the edge's projection or an endpoint)
+// already drops it. They stay because the bound must hold for what the
+// assertion carries, not only for the edge it is attached to.
 func (c *Client) assertionWithinBound(
 	ctx context.Context,
 	assertion ontology.Assertion,

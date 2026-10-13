@@ -21,6 +21,7 @@ package webapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/internal/disclosureconformance"
@@ -158,7 +159,10 @@ func TestBoundedAskAuthorizesItsScope(t *testing.T) {
 	}
 	outcome = boundedAsk(t, service, uncleared, disclosureconformance.OpenTerm,
 		&retrieval.SourceBound{})
-	if outcome.ErrorCode != shoal.ErrorInvalidArgument {
+	// Refused before anything is read, not after an empty retrieval, which
+	// would share the error class.
+	if outcome.ErrorCode != shoal.ErrorInvalidArgument ||
+		!strings.Contains(outcome.ErrorText, "must name at least one scope") {
 		t.Fatalf("bounded ask naming no scope = %q (%s), want invalid argument",
 			outcome.ErrorCode, outcome.ErrorText)
 	}
