@@ -244,6 +244,14 @@ func (c *Client) LabelVisibility() *LabelVisibility {
 // makes, and for a trusted service is additionally bounded by its ceiling. A
 // node or edge the catalog does not know is not visible. It implements
 // evidencelabels.NodeGate for the dispatch and event planes.
+//
+// Current rules alone are not enough for stored evidence (#705): document
+// node IDs do not depend on the revision, so a relabel would open evidence
+// recorded over the labelled revision. Each graph is therefore also held to
+// the revisions it was recorded over: its recorded binding
+// (BindGraphEvidence, evidencelabels.Graph.Binding) or, for evidence recorded
+// before bindings existed, the legacy bound at Graph.EvidenceAsOf. See
+// graph_evidence_binding.go.
 type NodeGate struct {
 	client *Client
 }
@@ -370,6 +378,13 @@ func (g *NodeGate) GraphsVisibleToReader(
 		start = end
 	}
 
+	// The revisions each graph was recorded over (#705): the recorded binding,
+	// or for a graph recorded before bindings existed, the legacy bound.
+	recorded, err := c.loadGraphEvidenceRevisions(ctx, graphs, nodes, edges)
+	if err != nil {
+		return nil, err
+	}
+
 	verdicts := make([]bool, len(graphs))
 	for index, graph := range graphs {
 		var terms []string
@@ -416,6 +431,16 @@ func (g *NodeGate) GraphsVisibleToReader(
 					known = false
 				}
 			}
+		}
+		if known {
+			rules, ok := recorded.rules(index, graph, nodes, edges)
+			for _, rule := range rules {
+				if !ok {
+					break
+				}
+				ok = add(rule)
+			}
+			known = ok
 		}
 		if !known || len(terms) == 0 {
 			continue
