@@ -1648,6 +1648,34 @@ func validateReportedActionErrorCode(value string) error {
 	return nil
 }
 
+// validateAdmittedActionErrorCode is validateReportedActionErrorCode plus
+// the token shape, refused rather than adjudicated (#748).
+//
+// The completion path adjudicates a misshapen code because by then the
+// executor has performed the work and refusing would strand it. An
+// admission report is the opposite case and the comment at its call site
+// already says why: nothing about the underlying call is known from a
+// malformed report, and letting it through spends a live one-shot token on
+// a failure the caller was never told about, leaving it unable to report
+// the outcome it actually has. Refusing before anything is written is what
+// keeps that token usable.
+//
+// The code is not echoed. It is the caller-controlled bytes this refusal
+// exists to keep out of the record, and an error carrying it would put them
+// in a log and a response body instead.
+func validateAdmittedActionErrorCode(value string) error {
+	if err := validateReportedActionErrorCode(value); err != nil {
+		return err
+	}
+	if reportedErrorCodeIsAdjudicated(value) {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"an admitted action error code must be a lowercase token of at "+
+				"most 64 characters")
+	}
+	return nil
+}
+
 func validateOpaque(name string, value []byte, optional bool) error {
 	if optional && len(value) == 0 {
 		return nil
