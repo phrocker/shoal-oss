@@ -3966,11 +3966,17 @@ func (s *DispatchService) readableRecords(
 			continue
 		}
 		if len(record.Output) > 0 {
-			// A reader this service cannot identify is not the action's own
-			// principal as far as anything here can tell, so it is answered
-			// as an outsider rather than guessed at.
+			// A failure to identify the reader is the question failing, not
+			// an answer about this record: a cancelled context or a resolver
+			// outage says nothing about who is asking. Returned rather than
+			// folded into not-found, so an infrastructure fault does not
+			// read to every caller — including the action's own principal —
+			// as though its action had ceased to exist.
 			decision, decisionErr := resolveReader()
-			if decisionErr != nil || !outputReadableBy(decision, record) {
+			if decisionErr != nil {
+				return nil, nil, decisionErr
+			}
+			if !outputReadableBy(decision, record) {
 				unreadable[index] = true
 				continue
 			}

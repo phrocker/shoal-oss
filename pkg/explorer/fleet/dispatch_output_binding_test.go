@@ -60,6 +60,7 @@ func TestOutputIsNotServedPastItsEvidence(t *testing.T) {
 		name         string
 		enqueuer     bool
 		noResolver   bool
+		wantError    bool
 		subject      string
 		actor        string
 		wantAbsent   bool
@@ -84,12 +85,13 @@ func TestOutputIsNotServedPastItsEvidence(t *testing.T) {
 			actor: "stranger-actor", wantAbsent: true,
 		},
 		{
-			// A service that cannot identify its reader cannot tell whether
-			// this is the action's own principal, so it answers as it would
-			// an outsider. Failing open here would serve the Output to
-			// everyone the moment a resolver broke.
+			// A service that cannot identify its reader is a question
+			// failing, not an answer about this record: the error surfaces
+			// rather than becoming not-found, which would tell the action's
+			// own principal its action had vanished because a resolver
+			// broke. What it must never do is serve the Output.
 			name:       "a reader the service cannot identify",
-			noResolver: true, wantAbsent: true,
+			noResolver: true, wantError: true,
 		},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
@@ -110,6 +112,18 @@ func TestOutputIsNotServedPastItsEvidence(t *testing.T) {
 			}
 			readable, err := fixture.service.readableRecord(reader, stored)
 
+			if probe.wantError {
+				if err == nil {
+					t.Fatalf("an unidentifiable reader was served %q",
+						readable.Output)
+				}
+				if shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+					t.Fatalf("err = %v, want the failure surfaced: "+
+						"not-found says the action does not exist, which a "+
+						"broken resolver is no evidence of", err)
+				}
+				return
+			}
 			if probe.wantAbsent {
 				if err == nil {
 					t.Fatalf("the record was served with Output %q to a "+
@@ -228,5 +242,16 @@ func TestTheWithheldMarkerCannotClaimAnUnredactedOutput(t *testing.T) {
 	redacted.OutputWithheld = true
 	if err := redacted.Validate(); err != nil {
 		t.Fatalf("the redacted shape is not producible: %v", err)
+	}
+
+	// The rule the marker is an exception to: a succeeded record with no
+	// Output and no marker is still incomplete. Without this, relaxing the
+	// check to admit the marker could have admitted everything.
+	neither := cloneActionRecord(base)
+	neither.Output = nil
+	if err := neither.Validate(); err == nil {
+		t.Fatal("a succeeded record with no Output and no marker was " +
+			"accepted; the marker is an exception to that rule, not its " +
+			"removal")
 	}
 }

@@ -645,3 +645,26 @@ func TestClaimPossiblyCommittedIsARepullSignal(t *testing.T) {
 		}
 	}
 }
+
+// TestActionFromCarriesTheWithheldMarker pins #696's marker across the
+// gateway's own projection. Without it a worker sees a succeeded action with
+// no output and no reason given — the state the marker exists to replace,
+// reconstructed one layer further out.
+func TestActionFromCarriesTheWithheldMarker(t *testing.T) {
+	withheld := actionFrom(dispatchapi.Record{
+		ID: []byte("action"), State: "succeeded", OutputWithheld: true,
+	})
+	if !withheld.OutputWithheld {
+		t.Fatal("the gateway dropped the withheld marker")
+	}
+	if len(withheld.Output) != 0 {
+		t.Fatalf("Output = %q alongside the marker", withheld.Output)
+	}
+	served := actionFrom(dispatchapi.Record{
+		ID: []byte("action"), State: "succeeded",
+		Output: []byte(`{"ok":true}`),
+	})
+	if served.OutputWithheld {
+		t.Fatal("an ordinary action gained a withheld marker")
+	}
+}

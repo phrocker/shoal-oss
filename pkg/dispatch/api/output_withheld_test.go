@@ -3,7 +3,10 @@
 // work for additional information regarding copyright ownership.
 package api
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 // TestDecodeRecordKeepsTheWithheldMarker pins the SDK's half of #696.
 //
@@ -55,4 +58,49 @@ func TestDecodeRecordKeepsTheWithheldMarker(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTheWithheldMarkerSurvivesJSON pins the wire tag, which the decoder test
+// above does not: DecodeRecord builds recordWire in Go, so renaming
+// `json:"output_withheld"` leaves it passing while every client reading a
+// real response silently loses the marker. recordWire is unmarshalled
+// directly on the client paths (client.go:368 and :447), so the tag is what
+// carries it.
+func TestTheWithheldMarkerSurvivesJSON(t *testing.T) {
+	const body = `{"id":"YQ","state":"succeeded","output_withheld":true}`
+	var wire recordWire
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if !wire.OutputWithheld {
+		t.Fatalf("the wire did not decode output_withheld from %s; the tag "+
+			"is what every client reads", body)
+	}
+	record, err := decodeRecord(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.OutputWithheld {
+		t.Fatal("the marker was decoded from JSON and then dropped on the " +
+			"way to the record")
+	}
+
+	// And it is omitted when false, so an ordinary record's wire is
+	// unchanged by the field existing.
+	encoded, err := json.Marshal(recordWire{ID: "YQ", State: "succeeded"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != "" && contains(string(encoded), "output_withheld") {
+		t.Fatalf("an unredacted record carries the marker: %s", encoded)
+	}
+}
+
+func contains(haystack, needle string) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
 }
