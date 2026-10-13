@@ -481,9 +481,22 @@ func newWorld(t testing.TB, store authorized.PolicyStore, hidden bool) *world {
 	return w
 }
 
+// modelV2Raw is router v2's model (router.pair/v2 features).
+var modelV2Raw = func() []byte {
+	b, err := os.ReadFile(filepath.Join("..", "..", "pkg", "router", "testdata", "eval", "v2", "model", "router-pair-v2.json"))
+	if err != nil {
+		panic(err)
+	}
+	return b
+}()
+
+// servedModel is the model new worlds serve: v1's unless a test swaps in
+// v2's. No test here runs in parallel.
+var servedModel = modelRaw
+
 func newProvider() (*decisionlinear.Provider, error) {
-	sum := sha256.Sum256(modelRaw)
-	return decisionlinear.New(decisionlinear.Config{ModelBytes: modelRaw, ExpectedSHA256: hex.EncodeToString(sum[:]), ReleaseID: "router-pair-v1:test"})
+	sum := sha256.Sum256(servedModel)
+	return decisionlinear.New(decisionlinear.Config{ModelBytes: servedModel, ExpectedSHA256: hex.EncodeToString(sum[:]), ReleaseID: "router-pair-v1:test"})
 }
 
 func withPolicyStores(t *testing.T, run func(*testing.T, func() authorized.PolicyStore)) {

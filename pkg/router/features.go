@@ -187,20 +187,44 @@ type FeatureArtifact struct {
 	Ranges   []lexicon.Span
 }
 
-// FeatureArtifact encodes the analysis's features as the strict numeric JSON
-// internal/decisionlinear reads. Encoding is deterministic.
+// FeatureWidth is the vector width of a known feature schema.
+func FeatureWidth(schema string) (int, bool) {
+	switch schema {
+	case FeatureSchemaID:
+		return NumFeatures, true
+	case FeatureSchemaV2ID:
+		return NumFeaturesV2, true
+	}
+	return 0, false
+}
+
+// FeatureArtifact encodes the analysis's router.pair/v1 features as the
+// strict numeric JSON internal/decisionlinear reads. Encoding is
+// deterministic.
 func (a *Analysis) FeatureArtifact() FeatureArtifact {
+	out, _ := a.FeatureArtifactFor(FeatureSchemaID)
+	return out
+}
+
+// FeatureArtifactFor encodes the analysis's features of one schema. Every
+// schema's features are computed by Analyze, so the choice of schema (the
+// served model's) changes no other part of the analysis.
+func (a *Analysis) FeatureArtifactFor(schema string) (FeatureArtifact, error) {
+	vectors, err := a.FeaturesFor(schema)
+	if err != nil {
+		return FeatureArtifact{}, err
+	}
 	var b bytes.Buffer
-	b.WriteString(`{"schema":1,"feature_schema_id":"` + FeatureSchemaID + `","subjects":[`)
+	b.WriteString(`{"schema":1,"feature_schema_id":"` + schema + `","subjects":[`)
 	out := FeatureArtifact{}
-	for i, c := range a.cands {
+	for i, vector := range vectors {
 		if i > 0 {
 			b.WriteByte(',')
 		}
 		start := b.Len()
 		id := SubjectID(i)
 		b.WriteString(`{"id":"` + string(id) + `","features":[`)
-		for k, x := range c.features {
+		for k, x := range vector {
 			if k > 0 {
 				b.WriteByte(',')
 			}
@@ -212,10 +236,28 @@ func (a *Analysis) FeatureArtifact() FeatureArtifact {
 	}
 	b.WriteString(`]}`)
 	out.Bytes = b.Bytes()
-	return out
+	return out, nil
 }
 
-// Features returns each candidate's feature vector, in catalog order.
+// FeaturesFor returns each candidate's feature vector of one schema, in
+// catalog order.
+func (a *Analysis) FeaturesFor(schema string) ([][]float64, error) {
+	out := make([][]float64, len(a.cands))
+	for i, c := range a.cands {
+		switch schema {
+		case FeatureSchemaID:
+			out[i] = append([]float64(nil), c.features[:]...)
+		case FeatureSchemaV2ID:
+			out[i] = append([]float64(nil), c.featuresV2[:]...)
+		default:
+			return nil, invalid("router feature schema is unknown")
+		}
+	}
+	return out, nil
+}
+
+// Features returns each candidate's router.pair/v1 feature vector, in
+// catalog order.
 func (a *Analysis) Features() [][NumFeatures]float64 {
 	out := make([][NumFeatures]float64, len(a.cands))
 	for i, c := range a.cands {

@@ -1,0 +1,25 @@
+{
+  "schema": "shoal.router.grammar/v1",
+  "target": {
+    "kind": "lookup",
+    "template": "lookup:owned_by:in"
+  },
+  "cues": [
+    "own",
+    "owned",
+    "responsible",
+    "maintain"
+  ],
+  "patterns": [
+    "what does [the] {subject} own",
+    "which services does [the] {subject} own",
+    "what is owned by [the] {subject}",
+    "list services owned by [the] {subject}",
+    "what is [the] {subject} responsible for"
+  ],
+  "slots": [
+    {
+      "name": "subject"
+    }
+  ]
+}

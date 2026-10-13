@@ -32,8 +32,9 @@ type Input struct {
 }
 
 type candAnalysis struct {
-	best     *match
-	features [NumFeatures]float64
+	best       *match
+	features   [NumFeatures]float64
+	featuresV2 [NumFeaturesV2]float64
 }
 
 // Analysis is one text matched against one catalog: every candidate's best
@@ -76,6 +77,7 @@ func Analyze(in Input) (*Analysis, error) {
 		best := c.grammar.bestMatch(a.text)
 		a.cands[i] = candAnalysis{best: best, features: c.features(a.text, best)}
 	}
+	a.featurizeV2()
 	return a, nil
 }
 

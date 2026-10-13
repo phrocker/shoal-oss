@@ -33,6 +33,7 @@ func (a *Analysis) fill(index int, receipt Receipt) (Proposal, error) {
 	settled := make([]bool, len(g.slots))
 	usedMention := map[int]bool{}
 	usedToken := make([]bool, len(t.tokens))
+	patternMention := map[int]int{}
 	mark := func(span lexicon.Span) {
 		for p := span.Start; p < span.End && p < len(usedToken); p++ {
 			usedToken[p] = true
@@ -48,6 +49,7 @@ func (a *Analysis) fill(index int, receipt Receipt) (Proposal, error) {
 				continue
 			}
 			usedMention[fl.mention] = true
+			patternMention[fl.slot] = fl.mention
 			m := t.mentions[fl.mention]
 			switch {
 			case m.Ambiguous:
@@ -110,6 +112,22 @@ func (a *Analysis) fill(index int, receipt Receipt) (Proposal, error) {
 	for _, v := range values {
 		if v != nil {
 			slots = append(slots, *v)
+		}
+	}
+	// A node slot the pattern tier filled is still ambiguous when another
+	// mention that no slot used could have filled it with a node of the same
+	// kind: "restart ledger and inventory in staging" names two services for
+	// one service slot.
+	for si, s := range g.slots {
+		filled, ok := patternMention[si]
+		if !ok || values[si] == nil {
+			continue
+		}
+		for mi, m := range t.mentions {
+			if !usedMention[mi] && s.kindFits(m) && shareKind(m, t.mentions[filled]) {
+				ambiguous = append(ambiguous, s.name)
+				break
+			}
 		}
 	}
 	slotAbstain := func(reason Reason, missing []string) Proposal {
@@ -175,6 +193,17 @@ func (a *Analysis) fill(index int, receipt Receipt) (Proposal, error) {
 		return slotAbstain(ReasonInvalidInput, nil), nil
 	}
 	return seal(Proposal{Kind: c.kind, Target: &ref, Slots: slots, Input: canonical, Receipt: receipt}), nil
+}
+
+func shareKind(a, b lexicon.Mention) bool {
+	for _, x := range a.Kinds {
+		for _, y := range b.Kinds {
+			if x == y {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func phraseAt(t text, phrase []string, p int, used []bool) bool {

@@ -58,12 +58,19 @@ func (d *Decider) Decide(ctx context.Context, in DecideInput) (Decided, error) {
 		p, err := a.Propose(make([]bool, a.Candidates()), receipt)
 		return Decided{Proposal: p}, err
 	}
-	task, err := router.TaskSpec()
+	// The served model pins its feature schema (the predictor's
+	// preprocessing contract); the task and the evidence follow it. A model
+	// of an unknown schema is refused.
+	schema := string(d.Predictor.RouterPredictorIdentity().Config().PreprocessingID)
+	task, err := router.TaskSpecFor(schema)
 	if err != nil {
 		return Decided{}, err
 	}
 	now := d.Clock().UTC()
-	artifact := a.FeatureArtifact()
+	artifact, err := a.FeatureArtifactFor(schema)
+	if err != nil {
+		return Decided{}, err
+	}
 	digest := sha256Hex(artifact.Bytes)
 	artifactID := shoal.ID("router.features:" + digest)
 	revisionID := shoal.ID("sha256:" + digest)
@@ -101,7 +108,7 @@ func (d *Decider) Decide(ctx context.Context, in DecideInput) (Decided, error) {
 		TaskID: task.ID(), ObservationID: shoal.ID("router.observation:" + digest),
 		EnumerationID: shoal.ID("router.catalog:" + receipt.CatalogDigest),
 		ScopeID:       shoal.ID("router.scope:" + in.AuthFingerprint),
-		BuilderID:     router.FeatureSchemaID, OntologyProjectionID: "router.no-ontology/v1",
+		BuilderID:     shoal.ID(schema), OntologyProjectionID: "router.no-ontology/v1",
 		InputDigest: digest, TokenizerID: "lexicon.normalization/v2",
 		InputTokens: uint64(a.TokenCount()), TokenBudget: router.MaxTokens, Cutoff: now,
 		Sources: []decision.Source{{
@@ -156,7 +163,7 @@ func (d *Decider) Decide(ctx context.Context, in DecideInput) (Decided, error) {
 			matched[index[answer.SubjectID]] = true
 		}
 	}
-	receipt.FeatureSchemaID = router.FeatureSchemaID
+	receipt.FeatureSchemaID = schema
 	receipt.TaskID = task.ID()
 	receipt.PictureID = picture.ID()
 	receipt.RequestID = request.ID()

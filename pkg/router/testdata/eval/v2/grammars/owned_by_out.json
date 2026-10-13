@@ -1,0 +1,28 @@
+{
+  "schema": "shoal.router.grammar/v1",
+  "target": {
+    "kind": "lookup",
+    "template": "lookup:owned_by:out"
+  },
+  "cues": [
+    "owns",
+    "owner",
+    "owning",
+    "whose",
+    "responsible"
+  ],
+  "patterns": [
+    "who owns {subject}",
+    "which team owns {subject}",
+    "owner of {subject}",
+    "who is responsible for {subject}",
+    "whose service is {subject}",
+    "whose is {subject}",
+    "owning team for {subject}"
+  ],
+  "slots": [
+    {
+      "name": "subject"
+    }
+  ]
+}

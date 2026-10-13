@@ -59,6 +59,7 @@ type candidate struct {
 	executors []Target
 	grammar   *Grammar
 	vocab     map[string]bool
+	v2        candidateV2
 }
 
 // Catalog is the caller's visible targets with their bound grammars.
@@ -67,6 +68,9 @@ type Catalog struct {
 	digest     string
 	grammars   *GrammarSet
 	validator  InputValidator
+	// stemDF counts, per word stem, the visible candidates whose vocabulary
+	// has it (router.pair/v2). It is derived from what the digest covers.
+	stemDF map[string]int
 }
 
 // ErrTooManyTargets is returned when the visible targets exceed MaxTargets.
@@ -126,11 +130,13 @@ func NewCatalog(targets []Target, set *GrammarSet, validator InputValidator) (*C
 			c.grammar = defaultGrammar(c)
 		}
 		c.vocab = vocabulary(c)
+		c.v2 = prepareV2(c)
 		catalog.candidates = append(catalog.candidates, *c)
 	}
 	sort.Slice(catalog.candidates, func(i, j int) bool {
 		return catalog.candidates[i].key < catalog.candidates[j].key
 	})
+	catalog.stemDF = stemFrequencies(catalog.candidates)
 	digest, err := catalogDigest(catalog.candidates)
 	if err != nil {
 		return nil, err

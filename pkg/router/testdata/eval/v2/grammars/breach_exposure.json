@@ -1,0 +1,29 @@
+{
+  "schema": "shoal.router.grammar/v1",
+  "target": {
+    "kind": "decision",
+    "profile": "breach-exposure"
+  },
+  "cues": [
+    "breach",
+    "exposure",
+    "exposed",
+    "compromised"
+  ],
+  "patterns": [
+    "what is the breach exposure of {service}",
+    "how exposed is {service} to a breach",
+    "breach exposure for {service}"
+  ],
+  "slots": [
+    {
+      "name": "service",
+      "node_kinds": [
+        "service"
+      ]
+    }
+  ],
+  "input": {
+    "service": "$service"
+  }
+}
