@@ -151,9 +151,11 @@ func numbered(prefix string, n int) []string {
 // phrase and template checks only: an independent train or dev author
 // writing natural paraphrases would trip the word and bigram checks by
 // chance. Files under external/ are general-purpose resources not written
-// for this evaluation and get the phrase and template checks only too.
-// Everything else (grammars, lexicon files, the model, recipes) gets every
-// check. A file of any other kind is refused, so a new cue format cannot slip
+// for this evaluation and get the phrase and template checks only too, as do
+// trained models under model/ (amendment A2: their strings are the model
+// format's fixed keys and labels, and their cue content derives from the
+// audited grammars and train texts). Everything else (grammars, lexicon
+// files, recipes) gets every check. A file of any other kind is refused, so a new cue format cannot slip
 // past the audit.
 func v2CueSources(fsys fs.FS) ([]LeakSource, error) {
 	var out []LeakSource
@@ -169,7 +171,7 @@ func v2CueSources(fsys fs.FS) ([]LeakSource, error) {
 		if err != nil {
 			return err
 		}
-		src := LeakSource{Name: v2FixturePrefix + p, PhraseOnly: strings.HasPrefix(p, "external/")}
+		src := LeakSource{Name: v2FixturePrefix + p, PhraseOnly: phraseOnlyFixture(p)}
 		ext := path.Ext(p)
 		switch {
 		case ext == ".md":
@@ -462,7 +464,10 @@ func TestLeakGuardCatchesLeaks(t *testing.T) {
 		{"test template as a pattern", fstest.MapFS{"grammars/g.json": {Data: grammar(nil, []string{"[please] " + pattern + " [now]"})}}, "template"},
 		{"test-only cue word", fstest.MapFS{"grammars/g.json": {Data: grammar([]string{testWords[0]}, nil)}}, "word"},
 		{"test-only cue word as a synonym key", fstest.MapFS{"lexicon/syn.json": {Data: []byte(`{` + strconv.Quote(testWords[len(testWords)-1]) + `:"restart"}`)}}, "word"},
-		{"test-only word in the model", fstest.MapFS{"model/router-pair-v2.json": {Data: []byte(`{"features":[` + strconv.Quote(testWords[0]) + `]}`)}}, "word"},
+		{"verbatim text in the model", fstest.MapFS{"model/router-pair-v2.json": {Data: []byte(`{"features":[` + strconv.Quote(phraseText) + `]}`)}}, "phrase"},
+		{"test template in the model", fstest.MapFS{"model/router-pair-v2.json": {Data: []byte(`{"labels":[` +
+			strconv.Quote(strings.ReplaceAll(strings.Join(template.abstract, " "), slotToken, "billing")) + `]}`)}}, "template"},
+		{"test-only word pair in a lexicon file", fstest.MapFS{"lexicon/syn.json": {Data: []byte(`{"phrases":[` + strconv.Quote(pair[0]+" "+pair[1]) + `]}`)}}, "bigram"},
 		{"test-only word pair", fstest.MapFS{"grammars/g.json": {Data: grammar(nil, []string{pair[0] + " " + pair[1]})}}, "bigram"},
 	} {
 		sources, err := v2CueSources(tc.files)
@@ -482,11 +487,19 @@ func TestLeakGuardCatchesLeaks(t *testing.T) {
 			t.Errorf("%s: the audit found no %s leak", tc.name, tc.check)
 		}
 	}
-	// Train and dev case texts and external resources are exempt from the
-	// word and bigram checks.
+	// Train and dev case texts, external resources and trained models
+	// (amendment A2) are exempt from the word and bigram checks.
+	modelStrings := func(ss []string) []byte {
+		var q []string
+		for _, s := range ss {
+			q = append(q, strconv.Quote(s))
+		}
+		return []byte(`{"labels":[` + strings.Join(q, ",") + `],` + strconv.Quote(testWords[0]) + `:1}`)
+	}
 	for name, files := range map[string]fstest.MapFS{
 		"train case":         {"cases.jsonl": {Data: trainCase(testWords[0] + " " + pair[0] + " " + pair[1])}},
 		"external resources": {"external/words.txt": {Data: []byte(strings.Join(testWords, "\n"))}},
+		"model":              {"model/router-pair-v2.json": {Data: modelStrings(append(append([]string{}, testWords...), pair[0]+" "+pair[1]))}},
 	} {
 		sources, err := v2CueSources(files)
 		if err != nil {
@@ -498,6 +511,7 @@ func TestLeakGuardCatchesLeaks(t *testing.T) {
 			}
 		}
 	}
+	plantedWordScope(t, a, testWords[0])
 	// Unreadable kinds fail closed.
 	if _, err := v2CueSources(fstest.MapFS{"lexicon/vectors.bin": {Data: []byte{0}}}); err == nil {
 		t.Error("an unreadable cue file was accepted")
@@ -537,6 +551,76 @@ func TestLeakGuardCatchesLeaks(t *testing.T) {
 			if f.Check == "word" || f.Check == "bigram" {
 				t.Errorf("a Go literal got a %s finding", f.Check)
 			}
+		}
+	}
+}
+
+// TestV2PhraseOnlyScope pins which v2 fixture files get only the phrase and
+// template checks (amendment A2): trained models under model/, external
+// resources and case texts do; grammars, lexicon files and recipes still get
+// the word and bigram checks, through the same collector the guard uses.
+// TestLeakGuardCatchesLeaks checks the findings that follow from these flags
+// (plantedWordScope), since only it may read the sealed split.
+func TestV2PhraseOnlyScope(t *testing.T) {
+	want := map[string]bool{
+		"model/router-pair-v2.json":   true,
+		"model/other.json":            true,
+		"external/thesaurus.txt":      true,
+		"cases.jsonl":                 true,
+		"grammars/restart.json":       false,
+		"lexicon/synonyms.json":       false,
+		"recipes/router-pair-v2.json": false,
+		"recipe.json":                 false,
+		"notes.txt":                   false,
+	}
+	files := fstest.MapFS{}
+	for p := range want {
+		data := []byte(`{"x":"y"}`)
+		if p == "cases.jsonl" {
+			data = []byte(`{"id":"x","caller":"alice","split":"train","tags":[],"expected":{"kind":"abstain","reason":"no_target"},"text":"y"}` + "\n")
+		} else if path.Ext(p) == ".txt" {
+			data = []byte("y\n")
+		}
+		files[p] = &fstest.MapFile{Data: data}
+	}
+	sources, err := v2CueSources(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != len(want) {
+		t.Fatalf("collected %d sources, want %d", len(sources), len(want))
+	}
+	for _, src := range sources {
+		p := strings.TrimPrefix(src.Name, v2FixturePrefix)
+		if src.PhraseOnly != want[p] {
+			t.Errorf("%s: PhraseOnly = %v, want %v", p, src.PhraseOnly, want[p])
+		}
+	}
+}
+
+// plantedWordScope is TestLeakGuardCatchesLeaks's half of
+// TestV2PhraseOnlyScope: the same test-only word, planted through the real
+// collector, is a word finding in a grammar, a lexicon file and a recipe, and
+// none in a model (amendment A2).
+func plantedWordScope(t *testing.T, a *LeakAuditor, word string) {
+	t.Helper()
+	doc := []byte(`{"cues":[` + strconv.Quote(word) + `]}`)
+	for p, wantWord := range map[string]bool{
+		"grammars/g.json":           true,
+		"lexicon/syn.json":          true,
+		"recipes/r.json":            true,
+		"model/router-pair-v2.json": false,
+	} {
+		sources, err := v2CueSources(fstest.MapFS{p: {Data: doc}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := false
+		for _, f := range a.Audit(sources) {
+			got = got || f.Check == "word"
+		}
+		if got != wantWord {
+			t.Errorf("%s: word finding = %v, want %v", p, got, wantWord)
 		}
 	}
 }

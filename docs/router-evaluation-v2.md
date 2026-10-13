@@ -642,6 +642,85 @@ doing to get past a finding. Resolving it, for example by auditing the
 format's fixed keys and labels with the phrase and template checks only, is
 for the protocol's owner to decide in its own amendment.
 
+### A2 (2026-10-13): model files are audited with the phrase and template checks only
+
+**Reason.** This resolves the open item of A1. Rule 4 of "Leak prevention"
+says the guard's rules change only by amendment, and this is that
+amendment. Nothing above
+"## Amendments" changes. The split, the world, the baseline corpus, the
+metrics, the comparators, the success criteria, the judge, the run harness,
+the grammars, the cases and the model are unchanged. So are the router and
+the grandfathered set. **The author of this amendment never opened,
+decompressed or read the sealed split, and never saw the two flagged units.**
+The author knows of them only through the guard's output (source, string
+index, check, hash), as A1 reports it.
+
+**What changed.**
+
+- Files under `pkg/router/testdata/eval/v2/model/` now get **only the phrase
+  and template checks**, as `external/` resources and Go literals already
+  do. Before, they got every check, as "Which checks apply where" in rule 3
+  says ("the model").
+- Grammars, lexicon files, recipes and every other data cue source under the
+  v2 fixture tree still get every check. Case texts and `external/` are
+  unchanged.
+- The code: `phraseOnlyFixture` in `pkg/router/eval/leakaudit.go`, which the
+  collector `v2CueSources` in `leak_test.go` uses.
+- The mutation check changes to match. A test-only word "as a model feature"
+  no longer fails the guard. These now do fail it:
+  - planting a test text in a model file;
+  - planting a test template in a model file;
+  - planting a test-only word in a recipe;
+  - planting a test-only pair in a lexicon file.
+
+  A model file holding every test-only word and a test-only pair gets no
+  word or bigram finding.
+- `TestV2PhraseOnlyScope` pins which paths the collector marks phrase-only:
+  model files, `external/` files and case files are; grammar, lexicon and
+  recipe files are not. `TestLeakGuardCatchesLeaks` plants one test-only
+  word, through the real collector, in a grammar, a lexicon file, a recipe
+  and a model. Only the model gets no word finding. Making grammars
+  phrase-only fails both tests; this was checked before this commit.
+
+**Why.**
+
+1. **The two findings are at fixed strings of the model format.** The model
+   is `internal/decisionlinear`'s format. String 10 is a label name and
+   string 14 is the `recipe_sha256` key, both fixed by that format. Neither
+   was written for this evaluation, and neither can be changed for one.
+2. **Rule 4's remedy is not available.** The harness fixes the model's path
+   and the provider's strict format fixes those strings. Removing the unit
+   would make a model the harness cannot load. Changing the format would
+   change the provider that serves v1's frozen model too, which is outside
+   what this evaluation tests.
+3. **A model's cue content comes from sources that are already audited.** The
+   model is generated: `TestV2ModelIsReproducible` retrains it byte for byte
+   from the train split, with features computed over the grammars (A1). Its
+   weights are numbers. Every
+   grammar string gets the word and bigram checks, and every train text gets
+   the phrase and template checks. A test word can therefore reach the model
+   only through one of these sources, and the guard audits those sources.
+   Word checks on the model add nothing for its cue content. They catch only
+   the format's own keys and labels, which are the same for every model and
+   which no author chose.
+
+**Residual.** A model could in principle encode a test word only through a
+string of its own: a feature name, a label or a key. In this format none of
+those strings is learned from text. Feature names, labels and keys are fixed
+by the format and the feature schema (`router.pair/v2`'s features are
+positional, scope-free numbers, A1). A future model format that learned
+strings from text, such as a vocabulary or a hashed-feature table written
+out as words, would fall under the phrase and template checks alone. Such a
+format needs its own amendment to restore the word and bigram checks on it,
+or to audit its learned strings as a separate source. The phrase and template
+checks still catch a test text or template copied into any model file.
+
+**Effect.** `TestNoTestPhrasingInCueSources` now passes on the v2 artefacts
+of A1, unchanged. Because of this amendment, the two word findings of A1 do
+not occur. They never reached a commit on the main branch. They are
+recorded here by source, location and check (`model/router-pair-v2.json`,
+strings 10 and 14, word), and their hashes are not repeated.
+
 ## Results
 
 Not run.
