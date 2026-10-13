@@ -332,6 +332,15 @@ func TestApplicationEdgeNamespaceIsTheWritersIdentity(t *testing.T) {
 			c.ServiceRole, c.ServiceCeilingIdentity = auth.ServiceRoleDataWrite, "ceiling"
 			c.AllowedOperations = []auth.Operation{auth.OperationConnect}
 		},
+		// The same strings, on either side of the delegation chain's end.
+		"service in the delegation chain": func(c *auth.DecisionConfig) {
+			c.OnBehalfOf = []shoal.ID{"principal", "derivation", "ceiling"}
+		},
+		"delegation then service": func(c *auth.DecisionConfig) {
+			c.OnBehalfOf = []shoal.ID{"principal"}
+			c.ServiceRole, c.ServiceCeilingIdentity = auth.ServiceRoleDerivation, "ceiling"
+			c.AllowedOperations = []auth.Operation{auth.OperationConnect}
+		},
 		"service role": func(c *auth.DecisionConfig) {
 			c.ServiceRole, c.ServiceCeilingIdentity = auth.ServiceRoleDerivation, "ceiling"
 			c.AllowedOperations = []auth.Operation{auth.OperationConnect}

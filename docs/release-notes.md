@@ -22,14 +22,24 @@ namespace`, before an endpoint or the policy catalog is read. So:
 - no server-derived ID (document, section, span, intrinsic edge, extraction,
   derivation, interaction, materialized) can be in the namespace;
 - another identity's namespace differs by a 128-bit digest, so an accepted ID
-  can only collide with an edge the same writer connected. A writer's
-  identical retry still succeeds, and a different edge under its own ID still
-  conflicts.
+  can only collide with an edge connected under the same identity. A
+  writer's identical retry still succeeds, and a different edge under its
+  own ID still conflicts.
 
 The identity is the authorization domain, subject, actor, client ID,
 on-behalf-of chain and service role and ceiling. It leaves out the request,
 the grants and the policy generation, so a retry under new grants lands in
 the same namespace.
+
+**Caveat.** The namespace binds the identity, not its current authority. A
+narrowed session of the same identity (workspace narrowing, a down-scoped
+token, a revoked label) shares the namespace of that identity's broader
+sessions, so it can still tell whether one of their local edge IDs exists:
+Conflict for a different edge under that ID. This is library-only today
+(`Connect` has no HTTP or MCP route).
+
+`Connect` no longer discloses a hidden document by URI, but Ingest still
+does, over HTTP upload and MCP (#712).
 
 Migrating callers:
 
@@ -123,8 +133,9 @@ Found while checking this and filed:
 - #698, #699, #700: existence and count oracles. A bounded neighborhood's
   scan limit reveals the exact count of hidden edges and interactions on a
   visible node. A `Connect` ID colliding with a hidden edge reveals that
-  edge, and through intrinsic edge IDs, a hidden document by URI (#699,
-  fixed in this release, above). A shared
+  edge, and through intrinsic edge IDs, a hidden document by URI. `Connect`
+  no longer discloses either (#699, above); Ingest is still a URI existence
+  oracle over HTTP upload and MCP (#712). A shared
   extracted entity first owned by a later-labelled document reveals the
   entity key.
 - #694: heuristic detection of copy-down that names no input (session

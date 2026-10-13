@@ -45,9 +45,16 @@ import (
 // applicationEdgeIDPrefix, a digest of the caller's identity, then "/" and
 // the caller's local ID. No server derivation produces that prefix, and
 // another identity's namespace differs by a 128-bit digest, so the only
-// registrations an accepted ID can collide with are the writer's own. Any
-// other ID is refused with the same InvalidArgument whatever the catalog
-// holds: the refusal depends on the caller's identity and the ID only.
+// registrations an accepted ID can collide with were connected under the
+// same identity. Any other ID is refused with the same InvalidArgument
+// whatever the catalog holds: the refusal depends on the caller's identity
+// and the ID only.
+//
+// The namespace binds the identity, not its current authority: a narrowed
+// session of the same identity (workspace narrowing, a down-scoped token, a
+// revoked label) shares it, and can still tell whether a local ID that
+// identity's broader sessions connected exists. Connect has no HTTP or MCP
+// route, so this is reachable by library callers only.
 const applicationEdgeIDPrefix = "app-edge_"
 
 // applicationEdgeNamespaceVersion separates the digest from any other use
@@ -75,6 +82,9 @@ func applicationEdgeNamespace(decision auth.Decision) string {
 	write([]byte(decision.Actor()))
 	write([]byte(decision.ClientID()))
 	onBehalfOf := decision.OnBehalfOf()
+	// Explicit framing. Every component is length-delimited and all but the
+	// chain have a fixed count, so the chain's length is already implied;
+	// the count keeps the encoding self-describing if that ever changes.
 	binary.BigEndian.PutUint64(length[:], uint64(len(onBehalfOf)))
 	_, _ = digest.Write(length[:])
 	for _, principal := range onBehalfOf {
@@ -126,8 +136,9 @@ func ApplicationEdgeLocalID(decision auth.Decision, edgeID shoal.ID) (shoal.ID, 
 // connects an application edge it calls localID. Connect accepts no other
 // edge IDs (#699). The result depends only on the caller's identity and
 // localID, is the same on every call and across restarts, and is the ID
-// reads report for the edge. Two different callers never share an ID, so
-// one caller's edges never collide with another's.
+// reads report for the edge. Two different identities never share an ID, so
+// one identity's edges never collide with another's; sessions of the same
+// identity share its namespace whatever their grants.
 func (c *Client) ApplicationEdgeID(
 	ctx context.Context,
 	localID shoal.ID,
