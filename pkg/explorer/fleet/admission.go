@@ -1116,7 +1116,16 @@ func (s *AdmissionService) Report(
 	// Nothing about the underlying call is known from a malformed report, so
 	// refusing it before anything is written is the only answer that keeps the
 	// token usable.
-	if err := validateActionErrorCode(report.ErrorCode); err != nil {
+	//
+	// That argument covers the token shape as much as the cases this line
+	// already refused, which is #748. #740 made a misshapen code adjudicated
+	// rather than refused on the completion routes, and this route funnels
+	// into the same completeClaim — so before this, a report carrying prose
+	// spent its token and came back recorded as invalid_executor_error, with
+	// the caller's own code gone and no second chance to send it. The
+	// adjudication is right where the effect has happened and wrong here,
+	// where nothing has.
+	if err := validateAdmittedActionErrorCode(report.ErrorCode); err != nil {
 		return ActionRecord{}, err
 	}
 	// An admission that does not exist and an admission belonging to someone
