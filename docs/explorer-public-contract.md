@@ -38,8 +38,8 @@ key on the edge ID can recover the caller's local ID with
 Both identity digests (this one and the upload namespace's below) are
 HMAC-SHA256 under a random key held by the policy catalog (#721), so they
 cannot be recomputed from a guessed identity. The key is never disclosed or
-rotated. A durable catalog writes it at its first read-write open, and the
-offline listings never write it. An identity's unkeyed namespace from before
+rotated. A durable catalog opened read-write writes it the first time it
+needs a namespace, and the offline listings never write it. An identity's unkeyed namespace from before
 #721 is an alias of its own and of nobody else's. `Connect` accepts an ID
 there only when an edge is registered under it, which is a retry, and an
 upload routes to that namespace or is accepted there only when something is

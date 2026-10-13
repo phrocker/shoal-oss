@@ -54,11 +54,17 @@ import (
 //
 //   - MemoryPolicyStore draws a key on first use; it lives as long as the
 //     store, as its registrations do.
-//   - DurablePolicyStore draws one the first time the catalog is opened
-//     read-write (OpenDurablePolicyStore) and persists it in
-//     policyRowNamespaceKey, beside the format floor, before the open
-//     returns. The key is never rotated in place: rotating it would move
-//     every identity to a new namespace and strand what it wrote.
+//   - DurablePolicyStore, opened read-write (OpenDurablePolicyStore), draws
+//     one the first time a namespace is needed, under its write lock, and
+//     persists it in policyRowNamespaceKey, beside the format floor (which
+//     it writes first), before any MAC is returned. It is not written at
+//     open: a host that opens an empty or unmounted catalog directory and
+//     then refuses to serve (HasRegistrations) leaves no key there that a
+//     backup copied in later would contradict. A failed write makes the
+//     store fail closed (diverged) until it is reopened, so a key that may
+//     have reached the disk is never replaced by another one. The key is
+//     never rotated in place: rotating it would move every identity to a
+//     new namespace and strand what it wrote.
 //     OpenExistingDurablePolicyStore (the offline listings) never writes
 //     one; a store opened that way over a catalog without a key reports
 //     IdentityNamespaceMAC unavailable, and so refuses the routes that need
@@ -69,11 +75,13 @@ import (
 // durable binary before this change decodes such a row strictly as a source
 // claim (binaries since #695 match only the floor's exact row before that)
 // and refuses to open the catalog ("stored policy source claim record is
-// corrupt"). So a binary that would compute only unkeyed digests never runs
-// over a catalog whose identities already have keyed namespaces, and no
-// identity ends up with two namespaces that its binaries disagree on.
-// Rolling back past this change needs the catalog restored from a backup
-// taken before it; rolling forward again needs nothing.
+// corrupt"). The row exists from the first keyed namespace on, so a binary
+// that would compute only unkeyed digests never runs over a catalog whose
+// identities already have keyed namespaces, and no identity ends up with
+// two namespaces that its binaries disagree on. Rolling back past this
+// change needs the catalog restored from a backup taken before the key was
+// written; rolling forward again draws a new key, so keyed IDs and URIs
+// handed out before the restore are no longer the caller's.
 //
 // Migration. What was written before this change keeps its unkeyed digest:
 // nothing is rewritten, since a document's ID is derived from its source URI
@@ -139,8 +147,9 @@ func (s *MemoryPolicyStore) IdentityNamespaceMAC(
 }
 
 // IdentityNamespaceMAC returns HMAC-SHA256 of message under the catalog's
-// persisted identity namespace key. A catalog opened by
-// OpenExistingDurablePolicyStore that holds no key reports it unavailable.
+// persisted identity namespace key. A store opened read-write draws and
+// persists the key first if the catalog has none; one opened by
+// OpenExistingDurablePolicyStore reports it unavailable instead.
 func (s *DurablePolicyStore) IdentityNamespaceMAC(
 	ctx context.Context,
 	message []byte,
@@ -151,12 +160,14 @@ func (s *DurablePolicyStore) IdentityNamespaceMAC(
 	if s.memoryStore() == nil {
 		return nil, catalogUnavailable()
 	}
-	if s.namespaceKey == nil {
-		return nil, shoal.NewError(shoal.ErrorUnavailable,
-			"the policy catalog has no identity namespace key yet: it is "+
-				"written the first time the catalog is opened read-write")
+	key := s.namespaceKey.Load()
+	if key == nil {
+		var err error
+		if key, err = s.ensureNamespaceKey(); err != nil {
+			return nil, err
+		}
 	}
-	return namespaceMAC(s.namespaceKey, message), nil
+	return namespaceMAC(key, message), nil
 }
 
 // loadNamespaceKey records one decoded key cell. Every cell of the row is
@@ -170,8 +181,8 @@ func (s *DurablePolicyStore) loadNamespaceKey(value []byte) (uint64, error) {
 	if err := validateNamespaceKey(record); err != nil {
 		return 0, corruptPolicyRecord("identity namespace key", err)
 	}
-	if s.namespaceKey != nil {
-		if subtle.ConstantTimeCompare(s.namespaceKey[:], record.Key) != 1 {
+	if loaded := s.namespaceKey.Load(); loaded != nil {
+		if subtle.ConstantTimeCompare(loaded[:], record.Key) != 1 {
 			return 0, corruptPolicyRecord("identity namespace key",
 				fmt.Errorf("the catalog holds two different identity namespace keys"))
 		}
@@ -179,42 +190,59 @@ func (s *DurablePolicyStore) loadNamespaceKey(value []byte) (uint64, error) {
 	}
 	var key [namespaceKeyBytes]byte
 	copy(key[:], record.Key)
-	s.namespaceKey = &key
+	s.namespaceKey.Store(&key)
 	return record.Seq, nil
 }
 
 // checkNamespaceKeyAtLoad refuses a key in a catalog with no format floor:
-// a read-write open writes the floor before the key, so this binary never
-// leaves one without the other.
+// this binary writes the floor before the key, so it never leaves one
+// without the other.
 func (s *DurablePolicyStore) checkNamespaceKeyAtLoad(haveFloor bool) error {
-	if s.namespaceKey != nil && !haveFloor {
+	if s.namespaceKey.Load() != nil && !haveFloor {
 		return corruptPolicyRecord("identity namespace key",
 			fmt.Errorf("the identity namespace key was written without the format floor"))
 	}
 	return nil
 }
 
-// writeNamespaceKeyAtOpen draws and persists the catalog's key when a
-// read-write open finds none. It runs after the format floor is written and
-// before the store is returned, so nothing can use the store keyless.
-func (s *DurablePolicyStore) writeNamespaceKeyAtOpen(dir string) error {
-	if s.namespaceKey != nil {
-		return nil
+// ensureNamespaceKey draws and persists the catalog's key, the first time a
+// store opened read-write needs it. It runs under s.mu, writes the format
+// floor first (a read-write open already did), and publishes the key only
+// once it is durable. A failed write makes the store fail closed: the key
+// may have reached the disk anyway, and drawing another one would leave the
+// catalog with two.
+func (s *DurablePolicyStore) ensureNamespaceKey() (*[namespaceKeyBytes]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.diverged.Load() {
+		return nil, catalogUnavailable()
+	}
+	if key := s.namespaceKey.Load(); key != nil {
+		return key, nil
+	}
+	if s.namespaceKeyDir == "" {
+		return nil, shoal.NewError(shoal.ErrorUnavailable,
+			"the policy catalog has no identity namespace key yet, and a "+
+				"catalog opened for offline listing never writes one")
+	}
+	if err := s.ensureFormatFloor(); err != nil {
+		return nil, err
 	}
 	key := newNamespaceKey()
 	if err := s.writeRowBeforeApply(
 		[]byte(policyRowNamespaceKey), policyKindNamespaceKey,
 		persistedNamespaceKey{Seq: s.nextSeq(), Key: key[:]},
 	); err != nil {
-		return shoal.WrapError(shoal.ErrorUnavailable,
-			"write the policy catalog identity namespace key", err)
+		s.markDiverged()
+		return nil, catalogUnavailable()
 	}
-	s.namespaceKey = key
+	s.namespaceKey.Store(key)
 	// The key itself is never logged.
 	slog.Info("policy catalog identity namespace key written: binaries "+
 		"from before #721 now refuse this catalog (\"stored policy source "+
 		"claim record is corrupt\"); it is not corrupt, and rollback means "+
-		"restoring a backup taken before this upgrade",
-		"dir", dir)
-	return nil
+		"restoring a backup taken before this point, after which keyed edge "+
+		"IDs and upload URIs handed out since are no longer accepted",
+		"dir", s.namespaceKeyDir)
+	return key, nil
 }

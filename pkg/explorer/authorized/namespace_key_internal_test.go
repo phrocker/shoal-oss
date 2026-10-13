@@ -379,3 +379,100 @@ func TestApplicationEdgeLocalIDNeedsConnectsContext(t *testing.T) {
 		t.Fatal("another identity's context recognised the writer's ID")
 	}
 }
+
+// persistedSeqForTest decodes the sequence number of a raw floor or key row.
+func persistedSeqForTest(t *testing.T, dir string) (floor, key uint64) {
+	t.Helper()
+	floorValue, ok := rawPolicyCell(t, dir, []byte(policyRowFormatFloor))
+	if !ok {
+		t.Fatal("no format floor")
+	}
+	var floorRecord persistedFormatFloor
+	if err := decodePolicyRecord(floorValue, policyKindFormatFloor, &floorRecord); err != nil {
+		t.Fatal(err)
+	}
+	keyValue, ok := rawPolicyCell(t, dir, []byte(policyRowNamespaceKey))
+	if !ok {
+		t.Fatal("no identity namespace key")
+	}
+	var keyRecord persistedNamespaceKey
+	if err := decodePolicyRecord(keyValue, policyKindNamespaceKey, &keyRecord); err != nil {
+		t.Fatal(err)
+	}
+	return floorRecord.Seq, keyRecord.Seq
+}
+
+// TestNamespaceKeyIsWrittenOnFirstNeedNotAtOpen: a read-write open of an
+// empty directory (a host that then refuses to serve it) writes no key, so a
+// backup copied in later cannot contradict one; the first MAC writes it,
+// after the floor.
+func TestNamespaceKeyIsWrittenOnFirstNeedNotAtOpen(t *testing.T) {
+	dir := t.TempDir()
+	closeDurableForTest(t, openDurableForTest(t, dir))
+	if _, ok := rawPolicyCell(t, dir, []byte(policyRowNamespaceKey)); ok {
+		t.Fatal("a read-write open wrote the key before it was needed")
+	}
+	store := openDurableForTest(t, dir)
+	first := namespaceMACForTest(t, store)
+	if again := namespaceMACForTest(t, store); !bytes.Equal(again, first) {
+		t.Fatal("the key changed within one store")
+	}
+	closeDurableForTest(t, store)
+	if floor, key := persistedSeqForTest(t, dir); floor >= key {
+		t.Fatalf("floor seq %d, key seq %d: the key was not written after the floor", floor, key)
+	}
+	requireOldBinaryRefusesNamespaceKey(t, dir)
+}
+
+// TestNamespaceKeyWritesTheFloorFirst: a writable store over a catalog that
+// has no floor yet writes the floor before the key, so no crash between the
+// two can leave a key without a floor (which is refused at open).
+func TestNamespaceKeyWritesTheFloorFirst(t *testing.T) {
+	dir := preFloorCatalog(t)
+	store, err := OpenExistingDurablePolicyStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.formatFloor {
+		t.Fatal("the pre-floor catalog has a floor")
+	}
+	// As a read-write open that had not written its floor yet.
+	store.namespaceKeyDir = dir
+	namespaceMACForTest(t, store)
+	closeDurableForTest(t, store)
+	if floor, key := persistedSeqForTest(t, dir); floor >= key {
+		t.Fatalf("floor seq %d, key seq %d: the key was written before the floor", floor, key)
+	}
+	closeDurableForTest(t, openDurableForTest(t, dir))
+}
+
+// TestNamespaceKeyWriteFailureFailsClosed: a key whose write fails is never
+// used, and the store diverges, so it never draws a second key that could
+// contradict one that reached the disk anyway; a reopen draws one afresh.
+func TestNamespaceKeyWriteFailureFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	store := openDurableForTest(t, dir)
+	// Make every engine write fail.
+	if err := store.engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := store.IdentityNamespaceMAC(
+			context.Background(), namespaceKeyTestMessage); !shoal.IsErrorCode(
+			err, shoal.ErrorUnavailable) {
+			t.Fatalf("MAC with a failing write = %v, want unavailable", err)
+		}
+	}
+	if !store.Diverged() || store.namespaceKey.Load() != nil {
+		t.Fatal("a failed key write did not fail closed")
+	}
+	_ = store.lock.Close()
+	store.closed = true
+	if _, ok := rawPolicyCell(t, dir, []byte(policyRowNamespaceKey)); ok {
+		t.Fatal("the failed key reached the disk")
+	}
+	reopened := openDurableForTest(t, dir)
+	namespaceMACForTest(t, reopened)
+	closeDurableForTest(t, reopened)
+	closeDurableForTest(t, openDurableForTest(t, dir))
+}

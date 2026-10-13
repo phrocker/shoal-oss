@@ -511,6 +511,50 @@ func equalIDs(left, right []shoal.ID) bool {
 	return true
 }
 
+// shortMACStore is a catalog whose MAC is shorter than a digest, as no valid
+// one is.
+type shortMACStore struct {
+	authorized.PolicyStore
+}
+
+func (shortMACStore) IdentityNamespaceMAC(context.Context, []byte) ([]byte, error) {
+	return make([]byte, 15), nil
+}
+
+// TestNamespaceRoutesRefuseAShortMAC: a MAC too short for a digest is
+// refused as the catalog being unavailable, never sliced past its end.
+func TestNamespaceRoutesRefuseAShortMAC(t *testing.T) {
+	f := newFixture(t)
+	selector := f.staticSelector(t, f.sourceA, f.policyA)
+	client := f.labelClient(t, f.base, shortMACStore{authorized.NewMemoryPolicyStore()},
+		selector, selector)
+	ctx := f.context(t, f.bindingDecision(t, "short-mac-prober"))
+	for name, call := range map[string]func() error{
+		"ApplicationEdgeID": func() error {
+			_, err := client.ApplicationEdgeID(ctx, "x")
+			return err
+		},
+		"OwnUploadSourceURI": func() error {
+			_, err := client.OwnUploadSourceURI(ctx, "x.md")
+			return err
+		},
+		"Connect": func() error {
+			return client.Connect(ctx, graph.Edge{
+				ID:   "app-edge_" + shoal.ID(strings.Repeat("0", 32)) + "/x",
+				From: "a", To: "b", Type: "t", Weight: 1,
+			})
+		},
+		"Ingest by name": func() error {
+			_, err := client.Ingest(ctx, uploadSource("x.md", "x", ""))
+			return err
+		},
+	} {
+		if err := call(); !shoal.IsErrorCode(err, shoal.ErrorUnavailable) {
+			t.Fatalf("%s with a short MAC = %v, want unavailable", name, err)
+		}
+	}
+}
+
 // TestNamespaceRoutesFailClosedWithoutTheCatalog: with the catalog closed,
 // every route that needs a namespace is refused as the catalog being
 // unavailable, before anything is written, and no namespace is guessed.

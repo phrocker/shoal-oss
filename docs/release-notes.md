@@ -17,8 +17,12 @@ can be compared for equality but not recomputed from an identity, and two
 catalogs give one identity unrelated namespaces.
 
 - **Key.** A memory catalog draws its key on first use and keeps it for its
-  life. A durable catalog draws one the first time it is opened read-write and
-  stores it in a reserved catalog row next to the format floor. The key is
+  life. A durable catalog opened read-write draws one the first time it
+  needs a namespace, not at open, and stores it in a reserved catalog row
+  next to the format floor before it uses it. So a host that opens an empty
+  or unmounted catalog directory and then refuses to serve it leaves no key
+  that a backup copied in later would contradict. A failed write makes the
+  store fail closed until it is reopened. The key is
   never rotated, and it never appears in an error, log, listing or metric.
   `OpenExistingDurablePolicyStore` (the offline listings) never writes it.
   Over a catalog with no key, such a store reports the namespace routes
@@ -58,10 +62,18 @@ that holds the key with `stored policy source claim record is corrupt`. That
 error does not mean the catalog is corrupt. Because of this refusal, an older
 binary never computes unkeyed namespaces over a catalog whose identities
 already have keyed ones, and no identity ends up with two namespaces. To roll
-back, restore the catalog from a backup taken before the upgrade. Documents
-and edges written to the corpus after that backup are then unregistered, so
-reads deny them, as with any catalog restore. Rolling forward again needs
-nothing.
+back, restore the catalog from a backup taken before the key was written.
+Documents and edges written to the corpus after that backup are then
+unregistered, so reads deny them, as with any catalog restore.
+
+Rolling forward again draws a **new** key, so every identity gets new keyed
+namespaces. Keyed edge IDs and upload URIs held outside the catalog are then
+another identity's namespace to the server: application caches, stored
+`ApplicationEdgeID` or `OwnUploadSourceURI` results, a client's own
+bookkeeping. `Connect` refuses those IDs, and ingests at those URIs are
+refused unless eligible as another uploader's documents. Re-derive them with
+`ApplicationEdgeID` and `OwnUploadSourceURI`. The same applies to restoring
+any backup taken before the key was written.
 
 ### Uploads by name live in the uploader's namespace (#712)
 
