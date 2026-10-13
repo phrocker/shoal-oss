@@ -166,6 +166,9 @@ func (e *Explorer) CommitGraphMaterialization(
 				shoal.ErrorConflict, "graph edge ID already has different content")
 		}
 	}
+	if err := e.requireApplicationEdgeIDsFreeLocked(planned.Edges); err != nil {
+		return GraphMaterializationResult{}, err
+	}
 	planned.PublishedAt = time.Now().UTC()
 	accepted, err := e.conditionalInteractionRecord(
 		graphMaterializationRecordRow(planned.ID),

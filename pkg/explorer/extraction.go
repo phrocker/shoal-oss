@@ -318,6 +318,9 @@ func (e *Explorer) CommitExtraction(
 	); err != nil {
 		return ExtractionResult{}, err
 	}
+	if err := e.requireApplicationEdgeIDsFreeLocked(published.Edges); err != nil {
+		return ExtractionResult{}, err
+	}
 	// This stable row overwrite is load-bearing; TestExtractDocumentRerunReusesSkillEntities pins idempotent re-publication.
 	if err := e.writeRecord(
 		extractionRecordRow(published.ID), embeddedRecordExtraction, published,

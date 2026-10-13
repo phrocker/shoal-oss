@@ -120,6 +120,57 @@ A host that ingests caller-chosen URIs of its own must namespace them itself.
   the digest. The same holds for #699's application edge IDs. Keying both
   digests is tracked on #721.
 
+### `Connect` edges to extracted and materialized nodes stay in the graph (#724)
+
+`Connect` accepted an application edge whose endpoint was an extracted
+ontology entity or a materialized graph node, and the edge showed up right
+away. The next graph rebuild then dropped it: any ingest, extraction,
+interaction, fold, materialization or restart. The base graph rebuilt
+application edges before it placed the extracted and materialized nodes, so
+the edge's endpoint was "missing". The edge record stayed on disk and its
+policy-catalog registration stayed in the catalog, but no read served it.
+Edges between documents, sections and spans were not affected. The bug dates
+from the first extraction release (#311).
+
+Now:
+
+- The rebuild places every node before any application edge. Edges that were
+  hidden come back after the upgrade, with no migration step.
+- What a reappearing edge shows is still decided by its catalog registration
+  and, since #695, its endpoints' revisions. The label migration and an
+  authorized relabel narrow registrations from the catalog, not from the
+  graph, so they covered hidden edges too. An edge to an entity of a document
+  labelled in the meantime comes back closed to readers without the label.
+- An edge ID is written once. The unwrapped `Explorer.Connect` used to check
+  only the graph, so an edge the graph did not show could be overwritten with
+  different content. It now checks the stored record too and returns
+  Conflict. The authorized `Connect` was already refused by the catalog
+  reservation and never reached the base.
+- An application edge and an intrinsic, extracted or materialized edge never
+  silently replace each other under one ID. Different content under one ID
+  fails the rebuild with Conflict, the same as two extractions that disagree
+  about one edge. Before, an application edge silently replaced an intrinsic
+  edge with its ID. Ingest, extraction and materialization now refuse an edge
+  that reuses a stored application edge's ID with different content, even
+  when the application edge is not shown. Through the authorized client the
+  two can't collide at all, because application edge IDs live in the
+  writer's namespace (#699).
+
+**An edge overwritten while it was hidden.** A base edge rewritten by an
+unwrapped `Explorer.Connect` while the bug hid it no longer matches its
+catalog registration. The authorized client treats it like any base edge
+that disagrees with its registration: it fails closed and serves neither the
+base content nor the registered content. Neighborhood and bounded
+neighborhood reads leave the edge out and serve every other edge as usual.
+An interaction whose graph evidence uses the edge fails verification as not
+found.
+Remedy: the ID can't be reused, so connect the intended
+edge again under a new local ID (`ApplicationEdgeID(ctx, "<new local id>")`).
+The stale edge stays withheld. The unwrapped explorer serves the base content
+because it has no catalog. This only arises on a deployment that called the
+unwrapped `Explorer.Connect` directly on a corpus also served through
+`authorized.Client`.
+
 ### `Connect` edge IDs live in the writer's namespace (#699)
 
 `authorized.Client.Connect` returned Conflict for any edge ID already in the

@@ -539,6 +539,9 @@ func (e *Explorer) ingest(
 		}
 	}
 	if !attempted {
+		if err := e.requireApplicationEdgeIDsFreeLocked(record.Edges); err != nil {
+			return IngestResult{}, err
+		}
 		pending, err := e.publicationPending(ctx)
 		if err != nil {
 			return IngestResult{}, err
@@ -693,8 +696,15 @@ func (e *Explorer) Document(
 	}, nil
 }
 
-// Connect adds an application-defined edge between existing document,
-// section, or span nodes.
+// Connect adds an application-defined edge between two existing graph
+// nodes: document, section and span nodes, extracted ontology entities, and
+// materialized graph nodes. Interaction, fold and provenance nodes are
+// refused. The edge stays in the graph across every later rebuild for as
+// long as both endpoints do (#724).
+//
+// An edge ID is written once: retrying the identical edge is a no-op, and
+// different content under an ID already held, by a stored application edge
+// (shown or not) or by any edge in the graph, is a conflict.
 func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := contextError(ctx); err != nil {
 		return err
@@ -756,6 +766,16 @@ func (e *Explorer) Connect(ctx context.Context, edge graph.Edge) error {
 			shoal.ErrorInvalidArgument,
 			"applications cannot attach edges to provenance nodes",
 		)
+	}
+	// The durable application record is checked as well as the graph: an
+	// edge the graph does not show (its endpoint's revision was superseded,
+	// or a rebuild before #724 dropped it) still owns its ID, and must never
+	// be overwritten with different content.
+	if existing, ok := e.edges[edge.ID]; ok {
+		if edgesEqual(existing.Edge, edge) {
+			return nil
+		}
+		return shoal.NewError(shoal.ErrorConflict, "edge ID already has different content")
 	}
 	if existing, ok := e.graphEdges[edge.ID]; ok {
 		if edgesEqual(existing, edge) {
@@ -939,16 +959,6 @@ func (e *Explorer) computeCurrentGraph() (
 			edges[edge.ID] = edge
 		}
 	}
-	for id, record := range e.edges {
-		edge := record.Edge
-		if _, from := nodes[edge.From]; !from {
-			continue
-		}
-		if _, to := nodes[edge.To]; !to {
-			continue
-		}
-		edges[id] = edge
-	}
 	extractionIDs := make([]shoal.ID, 0, len(e.extractions))
 	for id := range e.extractions {
 		extractionIDs = append(extractionIDs, id)
@@ -1050,6 +1060,15 @@ func (e *Explorer) computeCurrentGraph() (
 			edges[edge.ID] = cloneEdge(edge)
 		}
 	}
+	// Application edges (Connect) join only after every node an application
+	// may attach one to is in place: document, section and span nodes,
+	// extracted entities and materialized nodes. Filtering them any earlier
+	// dropped every edge touching an extracted or materialized node at the
+	// first rebuild after Connect (#724). Interaction, fold and provenance
+	// nodes come later, but Connect refuses those endpoints.
+	if err := placeApplicationEdges(nodes, edges, e.edges); err != nil {
+		return nil, nil, nil, err
+	}
 	// Interaction nodes share the corpus graph but are excluded from
 	// retrieval and from expansion that did not explicitly seed them. An
 	// interaction edge whose source endpoint disappeared (a superseded
@@ -1141,6 +1160,54 @@ func (e *Explorer) computeCurrentGraph() (
 		}
 	}
 	return nodes, edges, assertions, nil
+}
+
+// placeApplicationEdges adds every stored application edge whose endpoints
+// are both in nodes. An application edge never displaces an intrinsic,
+// extracted or materialized edge with the same ID, and is never displaced by
+// one: different content under one ID is a conflict, exactly as two
+// extractions disagreeing about one edge are. Identical content is the same
+// edge. Ingest, extraction and materialization refuse to introduce such a
+// collision, so only state written before #724 can reach it.
+func placeApplicationEdges(
+	nodes map[shoal.ID]graph.Node,
+	edges map[shoal.ID]graph.Edge,
+	stored map[shoal.ID]persistedEdge,
+) error {
+	for id, record := range stored {
+		edge := record.Edge
+		if _, from := nodes[edge.From]; !from {
+			continue
+		}
+		if _, to := nodes[edge.To]; !to {
+			continue
+		}
+		if existing, exists := edges[id]; exists && !edgesEqual(existing, edge) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"application edge ID already has different content",
+			)
+		}
+		edges[id] = edge
+	}
+	return nil
+}
+
+// requireApplicationEdgeIDsFreeLocked refuses source or derived edges that
+// would reuse a stored application edge's ID with different content. The
+// application record is checked rather than the graph, because the graph
+// omits an application edge whose endpoint is not current, and that edge
+// still owns its ID (#724).
+func (e *Explorer) requireApplicationEdgeIDsFreeLocked(edges []graph.Edge) error {
+	for _, edge := range edges {
+		if record, ok := e.edges[edge.ID]; ok && !edgesEqual(record.Edge, edge) {
+			return shoal.NewError(
+				shoal.ErrorConflict,
+				"edge ID collides with an application edge",
+			)
+		}
+	}
+	return nil
 }
 
 func (e *Explorer) ensureGraphLocked() error {
