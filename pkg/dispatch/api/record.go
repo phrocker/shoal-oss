@@ -23,6 +23,7 @@ type Record struct {
 	Action          string
 	Input           json.RawMessage
 	Output          json.RawMessage
+	OutputWithheld  bool
 	ErrorCode       string
 	ErrorCodeOrigin string
 	Deadline        time.Time

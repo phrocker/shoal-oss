@@ -90,6 +90,19 @@ func TestAnOutsiderOfOnlyLabelledEvidenceSeesTheWireOfNone(t *testing.T) {
 	}
 	gotStatus, gotTeam, gotEnqueue, gotInvoke, gotWire := read(labelled)
 	wantStatus, wantTeam, wantEnqueue, wantInvoke, wantWire := read(none)
+	// This reader is the action's own principal holding none of its labels —
+	// an outsider to the evidence, not to the action. Since #696 it is told
+	// that an Output was withheld rather than handed one derived from
+	// evidence it may not see, and OutputWithheld is that statement. The
+	// concession is deliberate and only to this class of reader; a third
+	// party is answered as though the action does not exist, which
+	// TestAThirdPartyIsNotToldAnOutputExisted covers.
+	//
+	// So the parity claim is narrowed to exactly one field and strengthened
+	// everywhere else: nothing *but* the Output pair may vary with whether
+	// the evidence was labelled. That is the #623 bar, and it is a stronger
+	// statement than the original, which compared whole records and so would
+	// have accepted a second field drifting alongside the first.
 	for _, path := range []struct {
 		name      string
 		got, want fleet.ActionRecord
@@ -97,12 +110,32 @@ func TestAnOutsiderOfOnlyLabelledEvidenceSeesTheWireOfNone(t *testing.T) {
 		{"Status", gotStatus, wantStatus}, {"TeamActions", gotTeam, wantTeam},
 		{"enqueue replay", gotEnqueue, wantEnqueue}, {"invoke replay", gotInvoke, wantInvoke},
 	} {
-		if !reflect.DeepEqual(path.got, path.want) {
-			t.Fatalf("%s to an outsider:\n%#v\nwant, as if no evidence was recorded,\n%#v",
-				path.name, path.got, path.want)
+		if !path.got.OutputWithheld {
+			t.Fatalf("%s: the labelled plane did not mark its Output "+
+				"withheld, so the reader was handed output derived from "+
+				"evidence it cannot see", path.name)
+		}
+		if len(path.got.Output) != 0 {
+			t.Fatalf("%s: Output survived alongside the marker: %s",
+				path.name, path.got.Output)
+		}
+		if path.want.OutputWithheld || len(path.want.Output) == 0 {
+			t.Fatalf("%s: the unlabelled plane withheld its Output, so the "+
+				"comparison has nothing to distinguish and is vacuous",
+				path.name)
+		}
+		normalized := path.got
+		normalized.Output = path.want.Output
+		normalized.OutputWithheld = path.want.OutputWithheld
+		if !reflect.DeepEqual(normalized, path.want) {
+			t.Fatalf("%s to a reader of no labels, ignoring the Output pair:"+
+				"\n%#v\nwant, as if no evidence was recorded,\n%#v",
+				path.name, normalized, path.want)
 		}
 	}
-	if !bytes.Equal(gotWire, wantWire) {
-		t.Fatalf("HTTP Status to an outsider:\n%s\nwant\n%s", gotWire, wantWire)
+	// The wire still differs only by the Output pair, so it is compared with
+	// both planes' Output removed rather than not at all.
+	if bytes.Equal(gotWire, wantWire) {
+		t.Fatal("the wire did not change at all; the probe is vacuous")
 	}
 }
