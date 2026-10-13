@@ -156,7 +156,8 @@ func Filter[T any](
 
 // Graph is what a stored evidence reference names in the corpus: its nodes,
 // its edges and, for a document reference, the revision it cites. A gate
-// decides the reference by the current rules of all of them.
+// decides the reference by the current rules of all of them and by the rules
+// of the revisions they were recorded over.
 type Graph struct {
 	NodeIDs []shoal.ID
 	EdgeIDs []shoal.ID
@@ -166,6 +167,15 @@ type Graph struct {
 	// revision must not be readable through an unlabelled current one.
 	DocumentID shoal.ID
 	RevisionID shoal.ID
+	// Binding is the encoded binding set the gate's record-time resolver
+	// returned for this reference (authorized.NodeGate.BindGraphEvidence,
+	// #705), stored with the reference verbatim and passed back on every
+	// read. It names the registration (kind, document, revision) every node,
+	// edge and edge endpoint was recorded over, so that a relabel after the
+	// record cannot open the evidence. Nil marks a reference recorded before
+	// bindings existed, which the gate holds to every registered revision of
+	// the documents its members belong to.
+	Binding []byte
 }
 
 // Empty reports whether the reference names nothing current to consult.
@@ -177,7 +187,10 @@ func (g Graph) Empty() bool {
 // NodeGate answers whether the reader behind ctx may see stored evidence
 // references under the CURRENT access rules of what they name: every node,
 // every edge's effective rule and both of its endpoints, and the cited
-// revision's own rule. It is the gate interaction reads already apply
+// revision's own rule; and, since #705, under the rules of the revisions
+// those members were recorded over (Graph.Binding, or for a reference with no
+// binding every registered revision of their documents). It is the gate
+// interaction reads already apply
 // (#567), offered to the planes that store evidence references, so that a
 // document relabelled after an action recorded evidence from it governs that
 // evidence as it governs the document. Implemented by the host that owns the
