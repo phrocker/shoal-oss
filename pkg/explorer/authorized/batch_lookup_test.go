@@ -869,6 +869,9 @@ var (
 		"RecordDeclassification": {}, "Declassifications": {},
 		// The revision binding's write (#695), made while recording.
 		"PutInteractionRevisions": {},
+		// The identity namespace MAC (#721) reads no catalog records: it
+		// is a computation under the catalog's in-memory key.
+		"IdentityNamespaceMAC": {},
 	}
 )
 

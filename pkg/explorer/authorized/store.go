@@ -240,6 +240,13 @@ type PolicyStore interface {
 	InteractionRevisions(
 		context.Context, []shoal.ID,
 	) (map[shoal.ID][]RevisionReference, error)
+	// IdentityNamespaceMAC returns HMAC-SHA256 of the message under the
+	// catalog's identity namespace key (#721; see namespace_key.go). The
+	// key is random, belongs to the catalog, is the same for the catalog's
+	// whole life, and is never returned or disclosed: a holder of the store
+	// can compute MACs, never the key. Application edge and upload
+	// namespaces are derived from it.
+	IdentityNamespaceMAC(context.Context, []byte) ([]byte, error)
 }
 
 type revisionKey struct {
@@ -282,6 +289,9 @@ type MemoryPolicyStore struct {
 	// interactionRevisions is what PutInteractionRevisions recorded, in
 	// canonical order (#695).
 	interactionRevisions map[shoal.ID][]RevisionReference
+	// namespaceKey is the identity namespace key (#721), drawn on first use.
+	namespaceKeyOnce sync.Once
+	namespaceKey     *[namespaceKeyBytes]byte
 }
 
 // NewMemoryPolicyStore constructs an empty reference catalog.

@@ -25,6 +25,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -375,10 +376,21 @@ func (c *Client) ingest(
 	ownedSource := cloneSource(source)
 	// A namespaced upload URI outside the caller's namespace is refused here,
 	// before anything is read (#712).
-	uploadKind, uploadName, err := classifyUploadSourceURI(
-		decision, ownedSource.URI)
-	if err != nil {
-		return explorer.IngestResult{}, err
+	var (
+		uploadKind       uploadSourceKind
+		uploadName       string
+		uploadNamespaces identityNamespaces
+	)
+	if strings.HasPrefix(ownedSource.URI, UploadSourceURIPrefix) {
+		uploadNamespaces, err = c.uploadNamespaces(ctx, decision)
+		if err != nil {
+			return explorer.IngestResult{}, err
+		}
+		uploadKind, uploadName, err = classifyUploadSourceURI(
+			uploadNamespaces, ownedSource.URI)
+		if err != nil {
+			return explorer.IngestResult{}, err
+		}
 	}
 	// The selector sees the source as requested: an upload by its name.
 	rule, err := c.selectIngestRule(
@@ -401,11 +413,14 @@ func (c *Client) ingest(
 	var routed UploadRoute
 	switch {
 	case uploadKind == uploadSourceName && routeUploads:
-		routed, err = c.routeUploadSource(ctx, decision, now, uploadName)
+		routed, err = c.routeUploadSource(
+			ctx, decision, uploadNamespaces, now, uploadName)
 	case uploadKind == uploadSourceTarget:
 		routed, err = c.routeUploadTarget(ctx, decision, now, ownedSource.URI)
 	case uploadKind == uploadSourceOwn:
 		routed = UploadRoute{Kind: UploadRouteOwn, SourceURI: ownedSource.URI}
+	case uploadKind == uploadSourceLegacyOwn:
+		routed, err = c.routeLegacyOwnUpload(ctx, ownedSource.URI)
 	}
 	if err != nil {
 		return explorer.IngestResult{}, err

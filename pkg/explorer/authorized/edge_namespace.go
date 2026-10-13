@@ -50,6 +50,13 @@ import (
 // whatever the catalog holds: the refusal depends on the caller's identity
 // and the ID only.
 //
+// The digest is keyed by the catalog's identity namespace key (#721,
+// namespace_key.go), so it cannot be recomputed from a guessed identity.
+// The identity's unkeyed namespace from before #721 is accepted only to
+// retry an edge already registered under it: whether that holds depends on
+// what the caller's own identity connected, never on another identity's
+// edges.
+//
 // The namespace binds the identity, not its current authority: a narrowed
 // session of the same identity (workspace narrowing, a down-scoped token, a
 // revoked label) shares it, and can still tell whether a local ID that
@@ -58,32 +65,107 @@ import (
 const applicationEdgeIDPrefix = "app-edge_"
 
 // applicationEdgeNamespaceVersion separates the digest from any other use
-// of the same components.
-const applicationEdgeNamespaceVersion = "shoal/authorized/application-edge-namespace/v1"
+// of the same components. Version 1 is the unkeyed digest of #711, which
+// legacyApplicationEdgeNamespace still computes; version 2 is keyed (#721).
+const (
+	legacyApplicationEdgeNamespaceVersion = "shoal/authorized/application-edge-namespace/v1"
+	applicationEdgeNamespaceVersion       = "shoal/authorized/application-edge-namespace/v2"
+)
 
-// applicationEdgeNamespace returns the ID prefix of every application edge
-// the decision's identity may connect. It covers every component that
-// identifies who is writing: the authorization domain, the subject, the
-// acting application, the client, the delegation chain and the service
-// identity. It leaves out what changes per request (request and correlation
-// IDs) and what changes per grant (policies, generation), so a writer's
-// retry lands in the same namespace.
-func applicationEdgeNamespace(decision auth.Decision) string {
-	return applicationEdgeIDPrefix +
-		identityNamespaceDigest(applicationEdgeNamespaceVersion, decision) + "/"
+// identityNamespaces is one identity's namespace prefix for one namespace
+// kind: the keyed one it writes in (#721), and the unkeyed one (#711, #718)
+// that what it wrote before #721 is in. Both are the same identity's;
+// neither is ever another identity's.
+type identityNamespaces struct {
+	keyed  string
+	legacy string
 }
 
-// identityNamespaceDigest is the hex digest, under version, of every
-// component that identifies who is writing (see applicationEdgeNamespace).
-// Each caller-scoped namespace (application edges, uploads) uses its own
-// version, so the same identity's namespaces are unrelated.
-func identityNamespaceDigest(version string, decision auth.Decision) string {
-	digest := sha256.New()
+// in reports which of the two namespaces value is in, with its rest after
+// the prefix: (rest, legacy, true), or false for neither.
+func (n identityNamespaces) in(value string) (string, bool, bool) {
+	if len(value) > len(n.keyed) && strings.HasPrefix(value, n.keyed) {
+		return value[len(n.keyed):], false, true
+	}
+	if len(value) > len(n.legacy) && strings.HasPrefix(value, n.legacy) {
+		return value[len(n.legacy):], true, true
+	}
+	return "", false, false
+}
+
+// applicationEdgeNamespaces returns the ID prefixes of the application
+// edges the decision's identity connects: applicationEdgeIDPrefix, the
+// identity's digest, "/". The digest covers every component that identifies
+// who is writing: the authorization domain, the subject, the acting
+// application, the client, the delegation chain and the service identity. It
+// leaves out what changes per request (request and correlation IDs) and what
+// changes per grant (policies, generation), so a writer's retry lands in the
+// same namespace.
+func (c *Client) applicationEdgeNamespaces(
+	ctx context.Context,
+	decision auth.Decision,
+) (identityNamespaces, error) {
+	digest, err := c.identityNamespaceDigest(
+		ctx, applicationEdgeNamespaceVersion, decision)
+	if err != nil {
+		return identityNamespaces{}, err
+	}
+	return identityNamespaces{
+		keyed:  applicationEdgeIDPrefix + digest + "/",
+		legacy: legacyApplicationEdgeNamespace(decision),
+	}, nil
+}
+
+// legacyApplicationEdgeNamespace is the unkeyed namespace of #711.
+func legacyApplicationEdgeNamespace(decision auth.Decision) string {
+	return applicationEdgeIDPrefix + legacyIdentityNamespaceDigest(
+		legacyApplicationEdgeNamespaceVersion, decision) + "/"
+}
+
+// identityNamespaceDigestBytes is the digest's length: 128 bits, 32 hex
+// digits, as before #721.
+const identityNamespaceDigestBytes = 16
+
+// identityNamespaceDigest is the keyed hex digest, under version, of every
+// component that identifies who is writing (see applicationEdgeNamespaces):
+// the first 128 bits of the catalog's IdentityNamespaceMAC of
+// identityNamespaceMessage. Each caller-scoped namespace (application edges,
+// uploads) uses its own version, so the same identity's namespaces are
+// unrelated. A catalog failure is reported as the catalog being
+// unavailable, whatever its cause.
+func (c *Client) identityNamespaceDigest(
+	ctx context.Context,
+	version string,
+	decision auth.Decision,
+) (string, error) {
+	mac, err := c.policyStore.IdentityNamespaceMAC(
+		ctx, identityNamespaceMessage(version, decision))
+	if err != nil {
+		return "", policyCatalogReadError(ctx, err)
+	}
+	if len(mac) < identityNamespaceDigestBytes {
+		return "", catalogUnavailable()
+	}
+	return hex.EncodeToString(mac[:identityNamespaceDigestBytes]), nil
+}
+
+// legacyIdentityNamespaceDigest is the unkeyed digest of #711 and #718,
+// which anyone can recompute from a guessed identity (#721). It is computed
+// only to recognise what an identity wrote before #721, and only ever for
+// the caller's own identity.
+func legacyIdentityNamespaceDigest(version string, decision auth.Decision) string {
+	digest := sha256.Sum256(identityNamespaceMessage(version, decision))
+	return hex.EncodeToString(digest[:identityNamespaceDigestBytes])
+}
+
+// identityNamespaceMessage frames version and the identity's components.
+func identityNamespaceMessage(version string, decision auth.Decision) []byte {
+	var message []byte
 	var length [8]byte
 	write := func(value []byte) {
 		binary.BigEndian.PutUint64(length[:], uint64(len(value)))
-		_, _ = digest.Write(length[:])
-		_, _ = digest.Write(value)
+		message = append(message, length[:]...)
+		message = append(message, value...)
 	}
 	write([]byte(version))
 	write(decision.AuthorizationDomain())
@@ -95,21 +177,21 @@ func identityNamespaceDigest(version string, decision auth.Decision) string {
 	// chain have a fixed count, so the chain's length is already implied;
 	// the count keeps the encoding self-describing if that ever changes.
 	binary.BigEndian.PutUint64(length[:], uint64(len(onBehalfOf)))
-	_, _ = digest.Write(length[:])
+	message = append(message, length[:]...)
 	for _, principal := range onBehalfOf {
 		write([]byte(principal))
 	}
 	write([]byte(decision.ServiceRole()))
 	write([]byte(decision.ServiceCeilingIdentity()))
-	return hex.EncodeToString(digest.Sum(nil)[:16])
+	return message
 }
 
-// applicationEdgeID places localID in the decision's namespace.
-func applicationEdgeID(decision auth.Decision, localID shoal.ID) (shoal.ID, error) {
+// applicationEdgeID places localID in the identity's keyed namespace.
+func applicationEdgeID(namespaces identityNamespaces, localID shoal.ID) (shoal.ID, error) {
 	if err := shoal.ValidateRequiredID("local graph edge ID", localID); err != nil {
 		return "", err
 	}
-	id := shoal.ID(applicationEdgeNamespace(decision) + string(localID))
+	id := shoal.ID(namespaces.keyed + string(localID))
 	if err := shoal.ValidateRequiredID("graph edge ID", id); err != nil {
 		return "", err
 	}
@@ -117,36 +199,71 @@ func applicationEdgeID(decision auth.Decision, localID shoal.ID) (shoal.ID, erro
 }
 
 // requireApplicationEdgeNamespace refuses an edge ID outside the caller's
-// namespace. The refusal is the same whatever the catalog or corpus holds.
-func requireApplicationEdgeNamespace(decision auth.Decision, edgeID shoal.ID) error {
-	namespace := applicationEdgeNamespace(decision)
-	if len(edgeID) > len(namespace) &&
-		strings.HasPrefix(string(edgeID), namespace) {
-		return nil
+// namespaces, and reports whether it is in the caller's legacy one. The
+// refusal is the same whatever the catalog or corpus holds. Connect accepts
+// a legacy ID only to retry an edge already registered under it, and
+// refuses any other one with this same error.
+func requireApplicationEdgeNamespace(
+	namespaces identityNamespaces, edgeID shoal.ID,
+) (bool, error) {
+	if _, legacy, ok := namespaces.in(string(edgeID)); ok {
+		return legacy, nil
 	}
+	return false, applicationEdgeNamespaceRefused()
+}
+
+func applicationEdgeNamespaceRefused() error {
 	return shoal.NewError(shoal.ErrorInvalidArgument,
 		"graph edge ID is outside the caller's application edge namespace; "+
 			"derive it with ApplicationEdgeID")
 }
 
+// applicationEdgeNamespacesKey carries, into the trusted edge selector
+// Connect calls, the namespaces of the identity connecting.
+type applicationEdgeNamespacesKey struct{}
+
+func withApplicationEdgeNamespaces(
+	ctx context.Context, namespaces identityNamespaces,
+) context.Context {
+	return context.WithValue(ctx, applicationEdgeNamespacesKey{}, namespaces)
+}
+
 // ApplicationEdgeLocalID returns the local ID of an application edge ID in
 // the decision's namespace, and false for any other ID. A trusted
-// EdgePolicySelector that selects by edge ID can use it to key on the ID its
-// caller chose.
-func ApplicationEdgeLocalID(decision auth.Decision, edgeID shoal.ID) (shoal.ID, bool) {
-	if requireApplicationEdgeNamespace(decision, edgeID) != nil {
+// EdgePolicySelector that selects by edge ID can use it, with the context
+// Connect passed it, to key on the ID its caller chose. Since #721 the
+// namespace is keyed by the catalog, so it is recognised only in that
+// context: with any other context, it reports false. An ID in the identity's
+// namespace from before #721 (which Connect accepts only to retry an edge
+// registered under it) is recognised too.
+func ApplicationEdgeLocalID(
+	ctx context.Context, decision auth.Decision, edgeID shoal.ID,
+) (shoal.ID, bool) {
+	if ctx == nil {
 		return "", false
 	}
-	return edgeID[len(applicationEdgeNamespace(decision)):], true
+	namespaces, ok := ctx.Value(applicationEdgeNamespacesKey{}).(identityNamespaces)
+	// The legacy namespace is a function of the decision's identity alone,
+	// so this binds the context's namespaces to that identity.
+	if !ok || namespaces.legacy != legacyApplicationEdgeNamespace(decision) {
+		return "", false
+	}
+	local, _, ok := namespaces.in(string(edgeID))
+	if !ok {
+		return "", false
+	}
+	return shoal.ID(local), true
 }
 
 // ApplicationEdgeID returns the edge ID under which the authenticated caller
 // connects an application edge it calls localID. Connect accepts no other
-// edge IDs (#699). The result depends only on the caller's identity and
-// localID, is the same on every call and across restarts, and is the ID
-// reads report for the edge. Two different identities never share an ID, so
-// one identity's edges never collide with another's; sessions of the same
-// identity share its namespace whatever their grants.
+// new edge IDs (#699). The result depends only on the caller's identity,
+// localID and the catalog's identity namespace key (#721): it is the same on
+// every call and across restarts of one durable catalog, is the ID reads
+// report for the edge, and cannot be recomputed from the identity without
+// the key. Two different identities never share an ID, so one identity's
+// edges never collide with another's; sessions of the same identity share
+// its namespace whatever their grants.
 func (c *Client) ApplicationEdgeID(
 	ctx context.Context,
 	localID shoal.ID,
@@ -158,7 +275,11 @@ func (c *Client) ApplicationEdgeID(
 	if err != nil {
 		return "", err
 	}
-	id, err := applicationEdgeID(decision, localID)
+	namespaces, err := c.applicationEdgeNamespaces(ctx, decision)
+	if err != nil {
+		return "", err
+	}
+	id, err := applicationEdgeID(namespaces, localID)
 	if err != nil {
 		return "", err
 	}
