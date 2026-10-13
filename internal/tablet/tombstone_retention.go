@@ -86,6 +86,17 @@ import (
 // producer for its own consumers: its export marks its files, imported
 // ones included, and its compactions keep the tombstones as above.
 //
+// Upgrades: a files.json written before exports were recorded says nothing
+// about them. Its files are given an export time when first read (their
+// tombstones are kept one horizon), but the tablet is not marked exported,
+// so on a tablet that never exports, data written after the upgrade behaves
+// as before (see assumeExportedUntracked).
+//
+// Export times and their ages are wall-clock milliseconds. A clock stepped
+// back only delays expiry; a clock jumped forward by more than the horizon
+// expires kept tombstones early. Nothing local is monotonic across that
+// (file names come from the same clock), so it is documented, not clamped.
+//
 // Only full compactions drop tombstones; a multi-run compaction (mixed
 // embedding states) keeps all of them in its outputs, which start pending.
 
@@ -124,15 +135,17 @@ func (t *Tablet) retentionMillis() int64 {
 
 // assumeExportedUntracked handles a generation whose exports were not
 // recorded: no files.json, or one an older binary wrote. Any of its files
-// may have been exported, so each is treated as exported now. Its tombstones
-// are then kept for one horizon from the first time this binary reads it,
-// unless a write records that first.
+// may have been exported, so each is treated as exported now, and their
+// tombstones are kept for one horizon from the first time this binary reads
+// them. The tablet itself is NOT marked exported: almost no tablet is (stores,
+// settings, pure consumers), and marking every upgraded tablet would keep
+// all its later deletes pending forever. Data written after the upgrade is
+// covered once a real export marks the tablet.
 func assumeExportedUntracked(state *immutableState) {
 	if len(state.active) == 0 {
 		return
 	}
 	now := exportClock()
-	state.exportedLineage = true
 	for _, path := range state.active {
 		state.exported[filepath.Base(path)] = now
 	}
@@ -179,6 +192,48 @@ func (t *Tablet) ExportLineage() ([]MintedFile, error) {
 	return out, nil
 }
 
+// recompactionIsNoOpLocked reports whether a full compaction of inputs
+// (oldest first) would only rewrite what the tablet already holds: every file
+// is an output of one earlier full compaction (one main output, which holds
+// no tombstone, plus tombstone-only outputs), all in the configured format,
+// and each tombstone output would be kept as it is, alone in its group (none
+// expiring, none merging). It is what a single file in the configured format
+// is without kept tombstones: a compaction with nothing to do. Caller holds
+// t.mu.
+func (t *Tablet) recompactionIsNoOpLocked(inputs []compaction.Input, retained []tombstoneGroup) bool {
+	if len(inputs) < 2 {
+		return false
+	}
+	var base string
+	free := 0
+	for _, in := range inputs {
+		name := filepath.Base(in.Name)
+		if fileFormat(name) != t.opts.FileFormat || len(name) < 15 || name[0] != 'C' || name[14] != '-' {
+			return false
+		}
+		if _, ok := nameMillis(name); !ok {
+			return false
+		}
+		if base == "" {
+			base = name[:15]
+		} else if name[:15] != base {
+			return false
+		}
+		if _, ok := t.tombstoneFree[name]; ok {
+			free++
+		}
+	}
+	if free != 1 || len(retained) != len(inputs)-1 {
+		return false
+	}
+	for _, group := range retained {
+		if len(group.inputs) != 1 {
+			return false
+		}
+	}
+	return true
+}
+
 // tombstoneGroup is one tombstone-only output a full compaction writes:
 // the inputs whose tombstones it keeps (newest first) and the export time
 // it records (0: pending).
@@ -189,12 +244,14 @@ type tombstoneGroup struct {
 
 // planRetainedTombstones groups the inputs of a full compaction (oldest
 // first) by the tombstone output their tombstones go to. Inputs past the
-// horizon are left out: their tombstones are dropped. It returns nil when
-// the tablet keeps no tombstones (never exported, or retention disabled).
-// Caller holds t.mu.
+// horizon are left out: their tombstones are dropped. An input with no
+// export time is pending only on a tablet that has been exported; on any
+// other tablet it is dropped (an upgraded tablet's files have an assumed
+// export time, see assumeExportedUntracked, so they keep theirs for one
+// horizon). It returns nil when retention is disabled. Caller holds t.mu.
 func (t *Tablet) planRetainedTombstones(inputs []compaction.Input) []tombstoneGroup {
 	horizon := t.retentionMillis()
-	if !t.exportedLineage || horizon == 0 {
+	if horizon == 0 {
 		return nil
 	}
 	width := horizon / tombstoneBuckets
@@ -210,6 +267,9 @@ func (t *Tablet) planRetainedTombstones(inputs []compaction.Input) []tombstoneGr
 			continue // nothing to keep
 		}
 		at := t.exported[filepath.Base(in.Name)]
+		if at == 0 && !t.exportedLineage {
+			continue // never exported: nobody outside holds its data
+		}
 		bucket := pending
 		if at > 0 {
 			if now-at >= horizon {

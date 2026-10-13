@@ -369,26 +369,12 @@ func TestTombstoneRetentionIsBounded(t *testing.T) {
 	}
 }
 
-// TestUntrackedManifestAssumesExported: a files.json from an older binary
-// (or none) does not say what was exported, so every listed file is
-// treated as exported when it is read: its tombstones are kept for one
-// horizon, then dropped.
-func TestUntrackedManifestAssumesExported(t *testing.T) {
-	now := int64(1_000_000_000)
-	withExportClock(t, &now)
-	backend := memory.New()
-	dir := t.TempDir()
-	tb := openRetaining(t, dir, backend)
-	putRow(t, tb, "x", 1)
-	flushTablet(t, tb)
-	deleteRow(t, tb, "x", 2)
-	flushTablet(t, tb)
-	if err := tb.Close(); err != nil {
-		t.Fatal(err)
-	}
-	// Rewrite files.json as an older binary would: unknown fields dropped.
+// downgradeManifest rewrites dir's files.json as an older binary would:
+// the export record and the tombstone-free list are dropped.
+func downgradeManifest(t *testing.T, backend storage.Backend, dir string) {
+	t.Helper()
 	m := readManifest(t, backend, dir)
-	m.ExportTracked, m.Exported, m.ExportedLineage = false, nil, false
+	m.ExportTracked, m.Exported, m.ExportedLineage, m.TombstoneFree = false, nil, false, nil
 	data, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
@@ -396,19 +382,136 @@ func TestUntrackedManifestAssumesExported(t *testing.T) {
 	if err := storage.WriteAll(context.Background(), backend, filepath.Join(dir, "files.json"), data); err != nil {
 		t.Fatal(err)
 	}
-	tb = openRetaining(t, dir, backend)
-	defer func() { _ = tb.Close() }()
-	compactTablet(t, tb)
-	if rows, _ := tombstoneRows(t, tb); !rows["x"] {
-		t.Fatal("tombstone of an untracked (possibly exported) tablet dropped")
+}
+
+// liveRows returns the rows a delete-aware read sees.
+func liveRows(t *testing.T, tb *Tablet) map[string]bool {
+	t.Helper()
+	env := iterrt.IteratorEnvironment{Scope: iterrt.ScopeScan}
+	src, closeAll, err := tb.Source(env)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if m := readManifest(t, backend, dir); !m.ExportTracked || !m.ExportedLineage {
-		t.Fatal("the assumed export was not recorded")
+	defer closeAll()
+	del := iterrt.NewDeletingIterator()
+	if err := del.Init(src, map[string]string{iterrt.DeletingOptionPropagate: "false"}, env); err != nil {
+		t.Fatal(err)
 	}
-	now += testRetention.Milliseconds()
-	compactTablet(t, tb)
-	if rows, _ := tombstoneRows(t, tb); len(rows) != 0 {
-		t.Fatalf("tombstones %v kept past one horizon", rows)
+	if err := del.Seek(iterrt.InfiniteRange(), nil, false); err != nil {
+		t.Fatal(err)
+	}
+	rows := map[string]bool{}
+	for del.HasTop() {
+		rows[string(del.GetTopKey().Row)] = true
+		if err := del.Next(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rows
+}
+
+func writeLatest(t *testing.T, tb *Tablet, row string, del bool) {
+	t.Helper()
+	m, err := cclient.NewMutation([]byte(row))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if del {
+		m.DeleteLatest([]byte("cf"), []byte("cq"), nil)
+	} else {
+		m.PutLatest([]byte("cf"), []byte("cq"), nil, []byte("v"))
+	}
+	if err := tb.Write([]*cclient.Mutation{m}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestUpgradeFromUntrackedManifest: a files.json from an older binary (or
+// none) does not say what was exported. The files it lists are treated as
+// exported when first read, so their tombstones are kept for one horizon;
+// the tablet itself is NOT marked exported, so for a tablet that never
+// exports (a store, a pure consumer) data written after the upgrade behaves
+// exactly as before: its deletes are dropped at the next full compaction and
+// a re-put after a compacted DeleteLatest is visible. A real producer is
+// marked by its first export and keeps them as usual.
+func TestUpgradeFromUntrackedManifest(t *testing.T) {
+	for _, kind := range []string{"never exported", "pure consumer", "producer"} {
+		t.Run(kind, func(t *testing.T) {
+			now := int64(1_000_000_000)
+			withExportClock(t, &now)
+			backend := memory.New()
+			dir := t.TempDir()
+			tb := openRetaining(t, dir, backend)
+			if kind == "pure consumer" {
+				// The legacy tombstone arrived in an import.
+				src := openRetaining(t, t.TempDir(), backend)
+				putRow(t, src, "x", 1)
+				deleteRow(t, src, "x", 2)
+				flushTablet(t, src)
+				imported := filepath.Join(dir, importNamePrefix+"legacy.rf")
+				backend.Put(imported, mustReadAll(t, backend, src.RFiles()[0]))
+				_ = src.Close()
+				if _, err := tb.RegisterImmutableFiles([]ImportedFile{{Path: imported, Source: "p:x"}}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				putRow(t, tb, "x", 1)
+				flushTablet(t, tb)
+				deleteRow(t, tb, "x", 2)
+				flushTablet(t, tb)
+			}
+			if err := tb.Close(); err != nil {
+				t.Fatal(err)
+			}
+			downgradeManifest(t, backend, dir)
+
+			tb = openRetaining(t, dir, backend)
+			defer func() { _ = tb.Close() }()
+			if tb.exportedLineage {
+				t.Fatal("an untracked tablet was marked exported")
+			}
+			if kind == "producer" {
+				exportTablet(t, tb)
+			}
+			putRow(t, tb, "q1", 1)
+			flushTablet(t, tb)
+			deleteRow(t, tb, "q1", 2)
+			flushTablet(t, tb)
+			writeLatest(t, tb, "r", false)
+			writeLatest(t, tb, "r", true)
+			flushTablet(t, tb)
+			compactTablet(t, tb)
+			rows, _ := tombstoneRows(t, tb)
+			if !rows["x"] {
+				t.Fatal("the legacy tombstone (possibly exported) was dropped at once")
+			}
+			if exported := kind == "producer"; rows["q1"] != exported || rows["r"] != exported {
+				t.Fatalf("post-upgrade tombstones %v; kept = %v, want %v", rows, rows["q1"], exported)
+			}
+			// A re-put after the compacted DeleteLatest is visible unless the
+			// tablet really exported (then the kept tombstone shadows it).
+			writeLatest(t, tb, "r", false)
+			if visible := liveRows(t, tb)["r"]; visible == (kind == "producer") {
+				t.Fatalf("re-put visible = %v", visible)
+			}
+			// After one horizon nothing pending-forever remains on a tablet
+			// that never exports; a producer keeps only what it has not yet
+			// exported.
+			for i := 0; i < 5; i++ {
+				now += 30 * 24 * time.Hour.Milliseconds()
+				if kind == "producer" {
+					exportTablet(t, tb)
+				}
+				compactTablet(t, tb)
+			}
+			rows, _ = tombstoneRows(t, tb)
+			if kind != "producer" && len(rows) != 0 {
+				t.Fatalf("tombstones %v kept 150 days after the upgrade", rows)
+			}
+			if kind == "producer" && len(rows) != 0 {
+				t.Fatalf("producer kept %v past the horizon of their export", rows)
+			}
+		})
 	}
 }
 
@@ -506,16 +609,16 @@ func TestTombstoneFreeRecordsOnlyFilesWithoutTombstones(t *testing.T) {
 }
 
 // TestPublishKeepsExportedLineage: publishing an import generation over a
-// directory whose earlier generation was exported (or is untracked and so
-// may have been) keeps the directory's exported lineage; over a fresh one
-// it does not set it.
+// directory whose earlier generation was exported keeps the directory's
+// exported lineage; over a fresh, untracked or never-exported one it does
+// not set it.
 func TestPublishKeepsExportedLineage(t *testing.T) {
 	for _, tc := range []struct {
 		name, previous string
 		want           bool
 	}{
 		{"exported", `{"version":1,"ordered":true,"export_tracked":true,"exported_lineage":true,"active":[]}`, true},
-		{"untracked with files", `{"version":1,"ordered":true,"active":["F0000000004000.rf"]}`, true},
+		{"untracked with files", `{"version":1,"ordered":true,"active":["F0000000004000.rf"]}`, false},
 		{"tracked, never exported", `{"version":1,"ordered":true,"export_tracked":true,"active":["F0000000004000.rf"]}`, false},
 		{"none", "", false},
 	} {
@@ -551,4 +654,139 @@ func mustReadAll(t *testing.T, b storage.Backend, path string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+// TestRecompactionWithKeptTombstonesIsNoOp: a tablet holding only the main
+// output and kept-tombstone outputs of one full compaction has nothing to
+// compact while nothing is new and nothing expires; a new file or an
+// expiring tombstone output makes the compaction run again.
+func TestRecompactionWithKeptTombstonesIsNoOp(t *testing.T) {
+	now := int64(1_000_000_000)
+	withExportClock(t, &now)
+	tb := openRetaining(t, t.TempDir(), memory.New())
+	defer tb.Close()
+	putRow(t, tb, "x", 1)
+	putRow(t, tb, "y", 1)
+	flushTablet(t, tb)
+	exportTablet(t, tb)
+	deleteRow(t, tb, "x", 2)
+	flushTablet(t, tb)
+	compactTablet(t, tb)
+	after := fmt.Sprint(tb.RFiles())
+	if len(tb.RFiles()) != 2 {
+		t.Fatalf("premise: %v", after)
+	}
+	compactTablet(t, tb)
+	if got := fmt.Sprint(tb.RFiles()); got != after {
+		t.Fatalf("idle recompaction rewrote %s as %s", after, got)
+	}
+	exportTablet(t, tb) // the pending output gets an export time
+	compactTablet(t, tb)
+	if got := fmt.Sprint(tb.RFiles()); got != after {
+		t.Fatalf("recompaction after an export rewrote %s as %s", after, got)
+	}
+	putRow(t, tb, "z", 1)
+	flushTablet(t, tb)
+	compactTablet(t, tb)
+	if got := fmt.Sprint(tb.RFiles()); got == after || len(tb.RFiles()) != 2 {
+		t.Fatalf("a new file was not compacted: %s", got)
+	}
+	// A compaction output of another engine, shipped into this directory
+	// without a ProducerID and adopted by a refresh, is new too, although
+	// its name looks like one of ours.
+	other := openRetaining(t, t.TempDir(), memory.New())
+	putRow(t, other, "w", 1)
+	flushTablet(t, other)
+	putRow(t, other, "w2", 1)
+	flushTablet(t, other)
+	compactTablet(t, other)
+	stray := filepath.Join(tb.dir, "C0000000000001-000.rf")
+	tb.backend.(*memory.Backend).Put(stray, mustReadAll(t, other.backend, other.RFiles()[0]))
+	_ = other.Close()
+	if _, err := tb.RefreshFiles(); err != nil {
+		t.Fatal(err)
+	}
+	if tb.FileCount() != 3 {
+		t.Fatalf("premise: stray not adopted, %v", tb.RFiles())
+	}
+	compactTablet(t, tb)
+	if tb.FileCount() != 2 || !liveRows(t, tb)["w"] {
+		t.Fatalf("an adopted stray was not compacted: %v", tb.RFiles())
+	}
+	if rows, _ := tombstoneRows(t, tb); !rows["x"] {
+		t.Fatal("tombstone lost")
+	}
+	now += testRetention.Milliseconds()
+	compactTablet(t, tb)
+	if rows, _ := tombstoneRows(t, tb); len(rows) != 0 || tb.FileCount() != 1 {
+		t.Fatalf("expiring tombstone output not compacted: %v, %d files", rows, tb.FileCount())
+	}
+}
+
+// TestUpgradedMultiRunOutputsKeepAssumedExportTime: on an upgraded tablet
+// that never exports, a multi-run compaction's outputs carry their inputs'
+// assumed export time, so their tombstones still get one horizon instead of
+// being dropped as never exported.
+func TestUpgradedMultiRunOutputsKeepAssumedExportTime(t *testing.T) {
+	now := int64(1_000_000_000)
+	withExportClock(t, &now)
+	backend := memory.New()
+	dir := t.TempDir()
+	tb := openRetaining(t, dir, backend)
+	a, b := embeddingspace.Has("space-a"), embeddingspace.Has("space-b")
+	for _, state := range []embeddingspace.FileState{a, b} {
+		if err := tb.SetDefaultEmbedding(state); err != nil {
+			t.Fatal(err)
+		}
+		deleteRow(t, tb, "d"+state.String(), 2)
+		flushTablet(t, tb)
+	}
+	if err := tb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	downgradeManifest(t, backend, dir)
+	tb = openRetaining(t, dir, backend)
+	defer tb.Close()
+	assumed := now
+	now += 1000
+	compactTablet(t, tb)
+	if len(tb.exported) != 2 {
+		t.Fatalf("multi-run outputs carry %v; want the assumed export time", tb.exported)
+	}
+	for name, at := range tb.exported {
+		if at != assumed {
+			t.Fatalf("%s carries %d, want %d", name, at, assumed)
+		}
+	}
+}
+
+// TestRefreshLoadsAnotherWritersExportRecord: RefreshFiles reloads the export
+// record and tombstone-free list from files.json, so a tablet handle whose
+// directory another handle exported keeps the tombstones that export needs.
+func TestRefreshLoadsAnotherWritersExportRecord(t *testing.T) {
+	now := int64(1_000_000_000)
+	withExportClock(t, &now)
+	backend := memory.New()
+	dir := t.TempDir()
+	reader := openRetaining(t, dir, backend)
+	defer reader.Close()
+	writer := openRetaining(t, dir, backend)
+	putRow(t, writer, "x", 1)
+	flushTablet(t, writer)
+	exportTablet(t, writer)
+	deleteRow(t, writer, "x", 2)
+	flushTablet(t, writer)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.RefreshFiles(); err != nil {
+		t.Fatal(err)
+	}
+	if !reader.exportedLineage || len(reader.exported) != 1 || len(reader.tombstoneFree) != 1 {
+		t.Fatalf("refresh: lineage=%v exported=%v free=%v", reader.exportedLineage, reader.exported, reader.tombstoneFree)
+	}
+	compactTablet(t, reader)
+	if rows, _ := tombstoneRows(t, reader); !rows["x"] {
+		t.Fatal("a refreshed handle dropped the tombstone another handle's export needs")
+	}
 }

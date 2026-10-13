@@ -131,6 +131,19 @@ type Options struct {
 	// need (#708). Zero uses tablet.DefaultTombstoneRetention; negative
 	// (tablet.TombstoneRetentionDisabled) drops them at every full
 	// compaction. It applies to every table this engine opens or creates.
+	//
+	// On a table that has been exported, a kept tombstone keeps shadowing
+	// every write to its cell at or below its timestamp for this long. In
+	// particular DeleteLatest followed by PutLatest of the same cell (both
+	// at the maximum timestamp, and the delete sorts first) leaves the cell
+	// deleted until the tombstone expires, where before a full compaction
+	// on the producer let the re-put show (consumers holding the tombstone
+	// kept hiding it). Writers that delete and re-create a cell on an
+	// exported table should use explicit, increasing timestamps. Tables
+	// that are never exported are unaffected.
+	//
+	// Export times are wall-clock: a forward clock jump larger than the
+	// horizon expires kept tombstones early.
 	// A table's TabletOptions may set their own at creation; like the WAL
 	// settings it is not persisted, so a reopened table uses this one.
 	TombstoneRetention time.Duration

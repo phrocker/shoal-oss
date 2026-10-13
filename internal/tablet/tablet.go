@@ -918,6 +918,9 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	var retained []tombstoneGroup
 	if full {
 		retained = t.planRetainedTombstones(runs[0].inputs)
+		if t.recompactionIsNoOpLocked(runs[0].inputs, retained) {
+			return nil // nothing new and nothing expiring
+		}
 	}
 
 	type compactedOutput struct {
@@ -971,10 +974,22 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 			cleanupOutputs()
 			return fmt.Errorf("tablet: write compacted: %w", err)
 		}
-		outputs = append(outputs, compactedOutput{
+		output := compactedOutput{
 			name: outName, path: outPath, entries: result.EntriesWritten,
 			tombstoneFree: result.TombstonesWritten == 0,
-		})
+		}
+		// A multi-run output keeps its tombstones. On an exported tablet
+		// it starts pending; on any other it carries the latest export time
+		// of its inputs (an upgraded tablet's assumed one), since pending
+		// there would mean dropped.
+		if !full && !output.tombstoneFree && !t.exportedLineage {
+			for _, in := range run.inputs {
+				if at := t.exported[filepath.Base(in.Name)]; at > output.exportedAt {
+					output.exportedAt = at
+				}
+			}
+		}
+		outputs = append(outputs, output)
 	}
 	for index, group := range retained {
 		result, err := compaction.Compact(compaction.Spec{
@@ -1012,9 +1027,11 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	}
 	outputPaths := make([]string, len(outputs))
 	minted := make(map[string]string, len(outputs))
-	// A kept-tombstone output carries its tombstones' export time; every
-	// other output starts pending. (A multi-run output may hold tombstones
-	// that were exported in its inputs: pending only keeps them longer.)
+	// A kept-tombstone output carries its tombstones' export time, a
+	// multi-run output on a never-exported tablet its inputs' latest; every
+	// other output starts pending. (On an exported tablet a multi-run output
+	// may hold tombstones exported in its inputs: pending only keeps them
+	// longer.)
 	exported := make(map[string]int64)
 	tombstoneFree := make(map[string]struct{})
 	for index, output := range outputs {
@@ -1667,8 +1684,8 @@ type immutableManifest struct {
 	// ExportTracked marks a manifest whose Exported / ExportedLineage are
 	// authoritative (written by a binary that records exports). Without it
 	// (an older binary, or no manifest at all) nothing says which files were
-	// exported, so every listed file is treated as exported when it is read
-	// (see tombstone_retention.go).
+	// exported, so every listed file is treated as exported when it is read,
+	// but the tablet is not marked exported (see assumeExportedUntracked).
 	ExportTracked bool `json:"export_tracked,omitempty"`
 	// Exported is the millisecond each live file was first exported, for
 	// the files that have been.
@@ -2024,8 +2041,10 @@ func PublishImmutableFiles(b storage.Backend, dir string, files []ImportedFile) 
 			state.nameHighWater = previous.NameHighWater
 		}
 		// A directory whose earlier generation was exported keeps that
-		// fact (an untracked one with files may have been).
-		if previous.ExportedLineage || (!previous.ExportTracked && len(previous.Active) > 0) {
+		// fact. (Its retired files' data is gone from the new generation,
+		// and an untracked one is not assumed exported: see
+		// assumeExportedUntracked.)
+		if previous.ExportedLineage {
 			state.exportedLineage = true
 		}
 	}
