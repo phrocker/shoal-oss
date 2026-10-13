@@ -1142,6 +1142,40 @@ func matchesFilter(filter Filter, event Event) bool {
 	if len(filter.Kinds) > 0 && !containsString(filter.Kinds, event.Kind) {
 		return false
 	}
+	if len(filter.SourceIDs) == 0 && len(filter.PolicyIDs) == 0 {
+		return true
+	}
+	// A filter naming sources or policies is a promise to narrow to them, and
+	// an event carrying no evidence carries no source or policy at all — so
+	// it cannot be shown to be within the named scope.
+	//
+	// It used to match. Both scope checks live inside the loop below, so an
+	// evidence-free event skipped them and satisfied every SourceIDs and
+	// PolicyIDs filter vacuously. That does not widen past authorization —
+	// Filter only narrows, and the subscription's own scope is checked when
+	// it is created — but it is not what the filter says it does.
+	//
+	// Defence in depth, not a reachable publication. normalizeEvent has
+	// refused len(Evidence) == 0 since #343, and Publish, PublishLifecycle
+	// and publish all go through it, so no publisher can produce an
+	// evidence-free event. Both trusted publishers would anyway: the action
+	// publisher appends record.ObjectID unconditionally with the record's
+	// source and policy, and the approval publisher builds exactly one entry
+	// from the request.
+	//
+	// What this covers is a stored row with no evidence — a corrupt one, or
+	// a direct write to the backend. The adapter's Scan decodes without
+	// re-validating, so such a row reaches here. Worth keeping for the same
+	// reason the check exists at all: the filter is a promise, and a row
+	// that cannot be shown to be in scope is not in scope.
+	//
+	// It is not the whole answer for that row. authorize falls back to a
+	// domain-only check for one, so it would still reach subscribers whose
+	// filter names no source. Making Scan refuse what normalizeEvent would
+	// reject is the fix for that, and is not this change.
+	if len(event.Evidence) == 0 {
+		return false
+	}
 	for _, evidence := range event.Evidence {
 		if len(filter.SourceIDs) > 0 && !containsBytes(filter.SourceIDs, evidence.SourceID) {
 			return false
