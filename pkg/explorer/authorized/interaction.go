@@ -811,14 +811,11 @@ func (c *Client) authorizeInteractionBatch(
 		return nil
 	}
 	reader := readerFor(decision, auth.OperationRead, now)
-	edges, err := c.resolveEdges(ctx, batchEdgeIDs, reader)
+	edges, err := c.resolveInteractionEdges(ctx, batchEdgeIDs, reader)
 	if err != nil {
 		return err
 	}
-	for _, registration := range edges {
-		batchNodeIDs = append(
-			batchNodeIDs, registration.Edge.From, registration.Edge.To)
-	}
+	batchNodeIDs = append(batchNodeIDs, edges.endpoints()...)
 	registrations, err := c.resolveNodes(ctx, batchNodeIDs, reader)
 	if err != nil {
 		return err
@@ -1059,15 +1056,11 @@ func (c *Client) interactionEvidenceAllowsBounded(
 		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs/2)
 		chunk := edgeIDs[start:end]
 		start = end
-		edges, err := c.resolveEdges(ctx, chunk, reader)
+		edges, err := c.resolveInteractionEdges(ctx, chunk, reader)
 		if err != nil {
 			return false, err
 		}
-		endpoints := make([]shoal.ID, 0, 2*len(edges))
-		for _, registration := range edges {
-			endpoints = append(
-				endpoints, registration.Edge.From, registration.Edge.To)
-		}
+		endpoints := edges.endpoints()
 		registrations, err := c.resolveNodes(ctx, endpoints, reader)
 		if err != nil {
 			return false, err
@@ -1087,7 +1080,8 @@ func (c *Client) interactionEvidenceAllowsBounded(
 			return false, err
 		}
 		allowed, err := interactionEvidenceAllows(
-			registrations, nil, chunk, nil, decision, operation, now)
+			registrations, interactionEdges{}, chunk, nil,
+			decision, operation, now)
 		if err != nil || !allowed {
 			return false, err
 		}
@@ -1115,7 +1109,7 @@ func interactionAuthorizationCost(nodes, edges int) int {
 
 func interactionEvidenceAllows(
 	registrations registeredNodes,
-	edges registeredEdges,
+	edges interactionEdges,
 	nodeIDs []shoal.ID,
 	edgeIDs []shoal.ID,
 	decision auth.Decision,
@@ -1137,12 +1131,26 @@ func interactionEvidenceAllows(
 		}
 	}
 	for _, edgeID := range edgeIDs {
-		registration, ok := edges[edgeID]
-		if !ok || registration.Edge.ID != edgeID {
-			return false, nil
+		var allowed bool
+		var err error
+		if registration, ok := edges.registered[edgeID]; ok {
+			if registration.Edge.ID != edgeID {
+				return false, nil
+			}
+			allowed, err = edgeAllowsResolved(
+				registrations, registration, decision, operation, now)
+		} else if edge, ok := edges.derived[edgeID]; ok {
+			// A derived edge has no rule of its own; it is admitted by its
+			// endpoints, as filterNeighborhood admits it (#719). The bounded
+			// path also checks every endpoint as a node, so this check and
+			// that one each suffice there; the batch path has only this one.
+			// TestRecordingOverAHiddenDerivedEdgeIsNeverWritten ("misrouted")
+			// pins that a hidden endpoint the session's own nodes do not
+			// name still refuses it.
+			allowed, err = edgeEndpointsAllow(
+				registrations, EdgeRegistration{Edge: edge},
+				decision, operation, now)
 		}
-		allowed, err := edgeAllowsResolved(
-			registrations, registration, decision, operation, now)
 		if err != nil {
 			return false, err
 		}
