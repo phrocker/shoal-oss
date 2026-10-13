@@ -259,14 +259,28 @@ func (c *Client) Ingest(
 	returned explorer.IngestResult,
 	returnedErr error,
 ) {
-	// refused is set at a refusal that leaves nothing committed once the
-	// source claim is resolved. The returned error is marked so only if the
-	// claim's cleanup succeeded: a cleanup failure joins a catalog error to
-	// the refusal, and that outcome is not covered (#687). This defer is
-	// registered first, so it runs after the claim's. Every other error,
-	// including one passed on from the base, is concealed, so the guarantee
-	// can only ever be one this client gave.
-	refused, claimCleanupFailed := false, false
+	// This defer is registered first, so it runs after the claim's and sees
+	// how the claim was resolved. It decides the commit outcome of every
+	// error the call returns, in one place (#687):
+	//
+	//   - refused is set at a refusal that leaves nothing committed once the
+	//     claim is resolved. Its error is marked MarkRefusedWithoutEffect,
+	//     but only if the claim's cleanup succeeded.
+	//   - Every other error is concealed, so the no-effect guarantee can only
+	//     ever be one this client gave, never one passed on from the base.
+	//   - mayHaveWritten is set once something durable may have changed: the
+	//     base reported a write (any disposition but unchanged or
+	//     historical), or the registration was attempted. A failure from
+	//     then on (a read, an audit, the registration, the guard) may leave
+	//     the claim pending or a revision registered, so it is marked
+	//     indeterminate. (A failed rollback after nothing was written stays
+	//     definite, as TestIngestSurfacesOriginalAndCleanupFailures pins: the
+	//     document is unchanged. Pend and commit only follow a possible
+	//     write, so their failures are covered.) The marker only adds:
+	//     the error keeps its text, code and errors.Is identity. An error the
+	//     base itself returns is the base's to classify; this client trusts
+	//     an unmarked one as definite, as its claim rollback already does.
+	refused, claimCleanupFailed, mayHaveWritten := false, false, false
 	defer func() {
 		if returnedErr == nil {
 			return
@@ -276,6 +290,9 @@ func (c *Client) Ingest(
 			return
 		}
 		returnedErr = explorer.ConcealRefusedWithoutEffect(returnedErr)
+		if mayHaveWritten {
+			returnedErr = explorer.MarkIndeterminateCommit(returnedErr)
+		}
 	}()
 	decision, guard, now, err := c.begin(ctx, auth.OperationIngest)
 	if err != nil {
@@ -343,6 +360,11 @@ func (c *Client) Ingest(
 			claimOutcome = sourceClaimPend
 		}
 		return explorer.IngestResult{}, err
+	}
+	switch result.Disposition {
+	case explorer.IngestUnchanged, explorer.IngestHistorical:
+	default:
+		mayHaveWritten = true
 	}
 	// An applied base write is not yet a committed claim (#665). The claim
 	// commits only once the revision is registered current below. Until
@@ -447,6 +469,7 @@ func (c *Client) Ingest(
 			return explorer.IngestResult{}, err
 		}
 	}
+	mayHaveWritten = true
 	if err := c.policyStore.PutRevision(ctx, RevisionRegistration{
 		DocumentID:     result.Document.ID,
 		RevisionID:     result.Revision.ID,

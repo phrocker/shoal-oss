@@ -39,6 +39,12 @@ showed one refused file per attempt.
   `files`), a multi-file failure stays indeterminate, over MCP too.
 - The authorized client conceals the no-effect marker on any error it did not
   mark itself, including one from its base.
+- Every error an authorized ingest returns after its base may have written is
+  now indeterminate: a failed read, audit, registration or guard after an
+  applied write, a commit-time reason refusal, and a failed re-registration.
+  Before, some of these were returned as definite errors. With the batch rule
+  above, a batch stopped by one of them would otherwise have been reported as
+  definite.
 
 ### Re-ingesting an earlier revision says so (#674)
 

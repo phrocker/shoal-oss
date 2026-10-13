@@ -489,6 +489,18 @@ The authorized client returns the no-effect marker only on the refusals it
 gives itself. Any other error it returns, including one passed on from its
 base, has the marker concealed (`explorer.ConcealRefusedWithoutEffect`).
 
+Every error an authorized ingest returns once something durable may have
+changed is indeterminate (`explorer.IsIndeterminateCommit`). That is from the
+moment the base reports a write (any disposition but `unchanged` or
+`historical`), or the registration is attempted. A failed read after the
+write, a failed pre-commit audit, a commit-time reason refusal, a failed
+registration and a failed guard all qualify: each may leave the claim pending
+or a revision registered. The marker only adds, so codes and `errors.Is`
+identities are kept. An error before any write stays definite, and so does an
+error after an `unchanged` result that fails before the registration. The
+base's own errors are classified by the base, and the client trusts an
+unmarked one as definite, as its claim rollback does.
+
 `pkg/code` retains its existing typed stable-ID algorithms. `Source.Ref` is
 excluded from `Source.ID` and the ingestion key because multiple refs can
 resolve to one immutable revision. Retrying a committed identical ingestion

@@ -516,7 +516,9 @@ refusal (`409 conflict` naming the file, or the reason-required `400`). The
 batch is indeterminate (a `503` with `unavailable`, the
 `Shoal-Commit-Outcome: indeterminate` header and `"indeterminate": true`,
 keeping the message) only when a file's own outcome is unknown, which is when
-the failure that stopped the batch was itself indeterminate. A file that
+the failure that stopped the batch was itself indeterminate. The authorized
+client marks every failure after its base may have written as indeterminate,
+so a file that may have been applied is never reported as definite. A file that
 returned a result, `applied` or `unchanged` (even an authorized relabel), has
 a known outcome. A batch with such files beside refusals, or before a definite
 failure, keeps its definite status and is **partial**: the
