@@ -181,3 +181,109 @@ func TestStoredLegacyEvidenceStaysReadable(t *testing.T) {
 		t.Fatalf("a new recording over the canonical rendering: %v", err)
 	}
 }
+
+// TestStoredLegacyEvidenceFollowsTheOldBuild: with two pre-upgrade records
+// presenting the entity differently ("Zeta", "ZETA"), the old graph showed
+// the first record's, in extraction-ID order, and a session hashed over
+// that stays readable after the upgrade; so it does when a canonical record
+// written after the upgrade (from any document) sorts before both.
+func TestStoredLegacyEvidenceFollowsTheOldBuild(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	corpus, err := Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipts []IngestResult
+	for _, uri := range []string{"file:///a.md", "file:///b.md", "file:///c.md"} {
+		receipt, err := corpus.Ingest(ctx, Source{
+			URI: uri, MediaType: MediaTypeMarkdown, Content: "# Zeta Skill\n" + uri,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipts = append(receipts, receipt)
+	}
+	canonicalSharedContent = false
+	defer func() { canonicalSharedContent = true }()
+	hex := strings.Repeat("0", 63)
+	skill := shoal.ID("inferred-entity:" + hex + "1")
+	presented := func(display string) graph.Node {
+		return graph.Node{
+			ID: skill, Kind: "ontology:skill", Labels: []string{display, "skill"},
+			Properties: shoal.Metadata{
+				extraction.GraphPropertyOntologyConceptID:  "concept:skill",
+				extraction.GraphPropertyOntologyConceptKey: "skill",
+				extraction.GraphPropertyEntityKey:          "zeta",
+				"confidence":                               "0.500000",
+			},
+		}
+	}
+	inject := func(c *Explorer, id shoal.ID, receipt IngestResult, node graph.Node) {
+		t.Helper()
+		record := persistedExtraction{
+			ID: id, DocumentID: receipt.Document.ID, RevisionID: receipt.Revision.ID,
+			OntologySchemaID: "schema", OntologyVersionID: "version",
+			PublishedAt: time.Unix(1700000000, 0).UTC(), Nodes: []graph.Node{node},
+		}
+		c.mu.Lock()
+		err := c.writeRecord(extractionRecordRow(record.ID), embeddedRecordExtraction, record)
+		if err == nil {
+			c.extractions[record.ID] = &record
+			err = c.rebuildCurrentGraphLocked()
+		}
+		c.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	inject(corpus, "document-extraction:b", receipts[1], presented("ZETA"))
+	inject(corpus, "document-extraction:a", receipts[0], presented("Zeta"))
+	corpus.mu.RLock()
+	shown := cloneNode(corpus.graphNodes[skill])
+	corpus.mu.RUnlock()
+	if strings.Join(shown.Labels, ",") != "Zeta,skill" {
+		t.Fatalf("fixture: the old build showed %v, want the first record's", shown.Labels)
+	}
+	pin, err := corpus.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor, err := inference.NewGraphAnchor(graph.Path{Nodes: []graph.Node{shown}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := interaction.Session{
+		ID: interaction.DerivedID("session", "two-legacy"), RecordedAt: pin.AsOf.Add(time.Second),
+		Operation:  interaction.OperationRetrieval,
+		SnapshotID: shoal.ID(pin.ID), SnapshotAsOf: pin.AsOf,
+		AuthorizationFingerprint: "auth-sha256:legacy",
+		AuthorizationExpiresAt:   pin.AsOf.Add(time.Hour),
+		SeedNodeIDs:              []shoal.ID{skill},
+		SeedEvidence: []interaction.EvidenceReference{{
+			AnchorID: anchor.ID(), Kind: interaction.EvidenceGraph,
+			NodeIDs: []shoal.ID{skill},
+		}},
+	}
+	if err := corpus.RecordInteraction(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := corpus.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	canonicalSharedContent = true
+	corpus, err = Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = corpus.Close() })
+	if _, err := corpus.InteractionRecord(ctx, session.ID); err != nil {
+		t.Fatalf("the session over the old build's rendering is unreadable: %v", err)
+	}
+	canonical, _ := CanonicalExtractedNode(presented("zeta"))
+	inject(corpus, "document-extraction:0", receipts[2], canonical)
+	if _, err := corpus.InteractionRecord(ctx, session.ID); err != nil {
+		t.Fatalf("a later canonical record closed a pre-upgrade session: %v", err)
+	}
+}

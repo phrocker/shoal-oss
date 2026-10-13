@@ -145,25 +145,33 @@ func (e *Explorer) legacyExtractionRenderingsLocked(
 		if _, ok := nodes[record.DocumentID]; !ok {
 			continue
 		}
+		// A record whose content is already canonical was written after
+		// the rule, so the old graph never saw it: it cannot be the record
+		// that rendering came from, and must not evict that record. Among
+		// the others, the first in extraction-ID order wins, as it did.
 		for _, raw := range record.Nodes {
+			canonical, ok := CanonicalExtractedNode(raw)
+			if !ok || nodesEqual(raw, canonical) {
+				continue
+			}
 			if _, done := seenNodes[raw.ID]; done {
 				continue
 			}
 			seenNodes[raw.ID] = struct{}{}
-			canonical, ok := CanonicalExtractedNode(raw)
-			current, present := nodes[raw.ID]
-			if ok && present && nodesEqual(current, canonical) && !nodesEqual(raw, canonical) {
+			if current, present := nodes[raw.ID]; present && nodesEqual(current, canonical) {
 				legacy.nodes[raw.ID] = cloneNode(raw)
 			}
 		}
 		for _, raw := range record.Edges {
+			canonical, ok := CanonicalExtractedRelation(raw)
+			if !ok || edgesEqual(raw, canonical) {
+				continue
+			}
 			if _, done := seenEdges[raw.ID]; done {
 				continue
 			}
 			seenEdges[raw.ID] = struct{}{}
-			canonical, ok := CanonicalExtractedRelation(raw)
-			current, present := edges[raw.ID]
-			if ok && present && edgesEqual(current, canonical) && !edgesEqual(raw, canonical) {
+			if current, present := edges[raw.ID]; present && edgesEqual(current, canonical) {
 				legacy.edges[raw.ID] = cloneEdge(raw)
 			}
 		}
