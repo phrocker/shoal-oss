@@ -245,6 +245,13 @@ func (c *Client) LabelVisibility() *LabelVisibility {
 // node or edge the catalog does not know is not visible. It implements
 // evidencelabels.NodeGate for the dispatch and event planes.
 //
+// An edge with no registration is resolved, as the interaction plane resolves
+// it (#719, #744), as the derived (latent) edge its trusted derived assertion
+// builds (resolveInteractionEdges). It carries no rule of its own and is
+// visible exactly when both of its endpoints are; one the trusted reader does
+// not vouch for is not visible, the same false verdict as an edge that never
+// existed.
+//
 // Current rules alone are not enough for stored evidence (#705): document
 // node IDs do not depend on the revision, so a relabel would open evidence
 // recorded over the labelled revision. Each graph is therefore also held to
@@ -308,17 +315,12 @@ func (g *NodeGate) GraphsVisibleToReader(
 			revisions[revisionKey{graph.DocumentID, graph.RevisionID}] = nil
 		}
 	}
-	edges := registeredEdges{}
-	for start := 0; start < len(edgeIDs); {
-		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
-		resolved, err := c.resolveEdges(ctx, edgeIDs[start:end], reader)
-		if err != nil {
-			return nil, err
-		}
-		for id, registration := range resolved {
-			edges[id] = registration
-		}
-		start = end
+	// Each edge by its registration or, with none, as the derived (latent)
+	// edge its trusted derived assertion builds (#744), exactly as the
+	// interaction recorder and its reads resolve it (#719).
+	edges, err := c.resolveGateEdges(ctx, edgeIDs, reader)
+	if err != nil {
+		return nil, err
 	}
 	var nodeIDs []shoal.ID
 	seenNodes := map[shoal.ID]bool{}
@@ -333,9 +335,8 @@ func (g *NodeGate) GraphsVisibleToReader(
 			addNode(id)
 		}
 	}
-	for _, registration := range edges {
-		addNode(registration.Edge.From)
-		addNode(registration.Edge.To)
+	for _, endpoint := range edges.endpoints() {
+		addNode(endpoint)
 	}
 	nodes := registeredNodes{}
 	for start := 0; start < len(nodeIDs); {
@@ -404,12 +405,25 @@ func (g *NodeGate) GraphsVisibleToReader(
 		known := true
 		members := append([]shoal.ID(nil), graph.NodeIDs...)
 		for _, id := range graph.EdgeIDs {
-			registration, ok := edges[id]
-			if !ok || registration.Edge.ID != id || !add(registration.Rule) {
+			if registration, ok := edges.registered[id]; ok {
+				if registration.Edge.ID != id || !add(registration.Rule) {
+					known = false
+					break
+				}
+				members = append(members, registration.Edge.From, registration.Edge.To)
+				continue
+			}
+			// A derived edge has no rule of its own: it is visible exactly
+			// when both of its endpoints are, as filterNeighborhood and
+			// interactionEvidenceAllows admit it, so its endpoints' rules
+			// are its terms. Load-bearing:
+			// TestFleetEvidenceOverAHiddenDerivedEdgeLooksLikeAbsence.
+			edge, ok := edges.derived[id]
+			if !ok {
 				known = false
 				break
 			}
-			members = append(members, registration.Edge.From, registration.Edge.To)
+			members = append(members, edge.From, edge.To)
 		}
 		for _, id := range members {
 			if !known {
@@ -505,7 +519,10 @@ func (g *NodeGate) GraphEvidenceValid(
 	}
 }
 
-// pathJoins reports whether edgeIDs join nodeIDs in sequence in the catalog.
+// pathJoins reports whether edgeIDs join nodeIDs in sequence in the catalog:
+// each edge as its registration records it or, with none, as its trusted
+// derived assertion builds it (#744). The trusted reader is asked about every
+// edge, registered or not (resolveInteractionEdges).
 func (g *NodeGate) pathJoins(
 	ctx context.Context, nodeIDs, edgeIDs []shoal.ID,
 ) (bool, error) {
@@ -514,14 +531,13 @@ func (g *NodeGate) pathJoins(
 	}
 	for start := 0; start < len(edgeIDs); {
 		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
-		resolved, err := g.client.resolveEdges(ctx, edgeIDs[start:end], nil)
+		resolved, err := g.client.resolveInteractionEdges(ctx, edgeIDs[start:end], nil)
 		if err != nil {
 			return false, err
 		}
 		for index := start; index < end; index++ {
-			registration, ok := resolved[edgeIDs[index]]
-			if !ok || registration.Edge.From != nodeIDs[index] ||
-				registration.Edge.To != nodeIDs[index+1] {
+			edge, ok := resolved.edge(edgeIDs[index])
+			if !ok || edge.From != nodeIDs[index] || edge.To != nodeIDs[index+1] {
 				return false, nil
 			}
 		}

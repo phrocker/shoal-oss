@@ -101,6 +101,44 @@ package authorized
 // relabelled public again even if a labelled revision came between. R0's
 // content is public, so what is exposed is only that the action cited it.
 //
+// A derived (latent) edge (#744) has no registration: it is resolved through
+// its trusted derived assertion (resolveInteractionEdges), at record time
+// (pathJoins, BindGraphEvidence) and at read time alike, and a reader sees it
+// exactly when both of its endpoints are visible to them. It is bound by its
+// endpoints alone: the binding
+// records their node entries, with their (kind, document, revision), and no
+// entry for the edge. The wire format is unchanged (version 1), deliberately:
+//
+//   - The edge has no kind, rule or revision of its own, so an entry for it
+//     would record nothing a read could be held to. Everything it requires
+//     is its endpoints' rules and revisions, which node entries carry, and a
+//     relabel of either endpoint closes the evidence through them.
+//   - It cannot change endpoints: its ID is its assertion's content-derived
+//     ID, which names subject and object, and derivedInteractionEdge refuses
+//     an assertion held under any other ID.
+//   - A new entry kind would need version 2 (or a widened version 1 that a
+//     binary built before it refuses, closing every new record it reads),
+//     for no added check. Endpoint entries are what version 1 always
+//     decoded, so every binding ever written still decodes the same.
+//
+// At read, coverage (graphMembers) takes a derived edge's endpoints as
+// members, not the edge; its endpoints must be covered as any node is. An
+// edge entry for an ID that now resolves only as derived denies (rules).
+//
+// Two consequences, both accepted:
+//
+//   - A derived edge's ID changes whenever its latent cell is rescored (the
+//     derivation's score is part of the assertion's content). Fleet evidence
+//     over the old edge then resolves nothing and goes dark for good, for
+//     every reader, the holder included. That fails closed, exactly as #743
+//     sessions over such an edge do.
+//   - Fleet and event reads now depend on the base graph, through the
+//     trusted derived assertion reader, for every batch naming an edge. A
+//     sticky graph build error fails each such batch until the next
+//     mutation, and the first fleet read after a latent write rebuilds the
+//     graph under its write lock. Before #744 fleet reads read only the
+//     policy catalog.
+//
 // A binding that does not decode is denied, never an error, exactly as an
 // unknown member is: every denial is the same false verdict a never-recorded
 // reference gets (#398).
@@ -115,6 +153,7 @@ import (
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/evidencelabels"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -489,7 +528,7 @@ func (c *Client) loadGraphEvidenceRevisions(
 	ctx context.Context,
 	graphs []evidencelabels.Graph,
 	nodes registeredNodes,
-	edges registeredEdges,
+	edges interactionEdges,
 ) (*graphEvidenceRevisions, error) {
 	loaded := &graphEvidenceRevisions{
 		cache:    c.newRevisionRuleCache(),
@@ -537,19 +576,39 @@ type graphMember struct {
 }
 
 // graphMembers lists a graph's members under the current registrations. The
-// caller has already denied a graph naming an unregistered edge.
-func graphMembers(graph evidencelabels.Graph, edges registeredEdges) []graphMember {
+// caller has already denied a graph naming an edge that resolves neither a
+// registration nor a derived edge.
+//
+// A derived (latent) edge (#744) is not a member itself, only its endpoints
+// are: it has no registration, so it has no kind, rule or revision a binding
+// entry could record or a reader could be held to, and what it requires is
+// exactly its endpoints' rules and revisions. Its endpoints are therefore
+// members that must be covered by node entries, which BindGraphEvidence
+// records for it. A derived edge's ID is its assertion's content-derived ID,
+// never a registered edge's, so it cannot later resolve a registration
+// that this would leave uncovered; if one ever did, it would be a member
+// again, with no edge entry, and deny.
+func graphMembers(graph evidencelabels.Graph, edges interactionEdges) []graphMember {
 	members := make([]graphMember, 0, len(graph.NodeIDs)+3*len(graph.EdgeIDs))
 	for _, id := range graph.NodeIDs {
 		members = append(members, graphMember{GraphBindingNode, id})
 	}
 	for _, id := range graph.EdgeIDs {
-		members = append(members, graphMember{GraphBindingEdge, id})
-		if registration, ok := edges[id]; ok {
+		if registration, ok := edges.registered[id]; ok {
 			members = append(members,
+				graphMember{GraphBindingEdge, id},
 				graphMember{GraphBindingNode, registration.Edge.From},
 				graphMember{GraphBindingNode, registration.Edge.To})
+			continue
 		}
+		if edge, ok := edges.derived[id]; ok {
+			members = append(members,
+				graphMember{GraphBindingNode, edge.From},
+				graphMember{GraphBindingNode, edge.To})
+			continue
+		}
+		// Unresolved: a member with no registration, which denies.
+		members = append(members, graphMember{GraphBindingEdge, id})
 	}
 	return members
 }
@@ -558,7 +617,7 @@ func graphMembers(graph evidencelabels.Graph, edges registeredEdges) []graphMemb
 // registration belongs to, and its kind. ok is false for an unregistered
 // member.
 func memberRevision(
-	member graphMember, nodes registeredNodes, edges registeredEdges,
+	member graphMember, nodes registeredNodes, edges interactionEdges,
 ) (kind RegistrationKind, reference RevisionReference, bound, ok bool) {
 	switch member.object {
 	case GraphBindingNode:
@@ -569,7 +628,7 @@ func memberRevision(
 		reference, bound = nodeRevision(registration)
 		return registration.Kind, reference, bound, true
 	default:
-		registration, found := edges[member.id]
+		registration, found := edges.registered[member.id]
 		if !found {
 			return 0, RevisionReference{}, false, false
 		}
@@ -582,7 +641,7 @@ func memberRevision(
 // to, each shared extracted one through the owner the reader reads it by,
 // except the document a document reference cites (see citesDocument).
 func legacyGraphDocuments(
-	graph evidencelabels.Graph, nodes registeredNodes, edges registeredEdges,
+	graph evidencelabels.Graph, nodes registeredNodes, edges interactionEdges,
 ) []shoal.ID {
 	var documentIDs []shoal.ID
 	for _, member := range graphMembers(graph, edges) {
@@ -622,7 +681,7 @@ func citesDocument(graph evidencelabels.Graph, documentID shoal.ID) bool {
 //     revision of it.
 func (r *graphEvidenceRevisions) rules(
 	index int, graph evidencelabels.Graph,
-	nodes registeredNodes, edges registeredEdges,
+	nodes registeredNodes, edges interactionEdges,
 ) ([]AccessRule, bool) {
 	members := graphMembers(graph, edges)
 	for _, member := range members {
@@ -638,6 +697,16 @@ func (r *graphEvidenceRevisions) rules(
 		for _, entry := range r.bindings[index].entries {
 			member := graphMember{entry.Object, entry.ID}
 			covered[member] = append(covered[member], entry.Kind)
+			// An edge recorded over a registration that now resolves only
+			// as a derived edge denies: the derived resolution carries no
+			// rule, so the recorded registration's rule could no longer be
+			// enforced. Not reachable while derived IDs and registered IDs
+			// are disjoint (graphMembers); load-bearing:
+			// TestFleetEdgeRecordedRegisteredThenDerivedDenies.
+			if _, derived := edges.derived[entry.ID]; derived &&
+				entry.Object == GraphBindingEdge {
+				return nil, false
+			}
 			switch {
 			case documentBound(entry.Kind):
 				rules, ok := r.cache.referenceRules(RevisionReference{
@@ -721,6 +790,25 @@ func (c *Client) graphEvidenceBindings(
 		nodeIDs = append(nodeIDs, reference.NodeIDs...)
 		edgeIDs = append(edgeIDs, reference.EdgeIDs...)
 	}
+	// An edge with no registration may be a derived (latent) edge (#744). The
+	// trusted reader is asked about every edge, registered or not, as
+	// resolveInteractionEdges asks it, and a derived edge's endpoints are
+	// read with the reference's nodes.
+	derived := make(map[shoal.ID]graph.Edge)
+	for start := 0; start < len(edgeIDs); {
+		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
+		resolved, err := c.trustedDerivedEdges(ctx, edgeIDs[start:end])
+		if err != nil {
+			return nil, err
+		}
+		start = end
+		for id, edge := range resolved {
+			derived[id] = edge
+		}
+	}
+	for _, edge := range derived {
+		nodeIDs = append(nodeIDs, edge.From, edge.To)
+	}
 	nodes, edges, err := c.rawRegistrations(ctx, nodeIDs, edgeIDs)
 	if err != nil {
 		return nil, err
@@ -741,13 +829,20 @@ func (c *Client) graphEvidenceBindings(
 			addNode(id)
 		}
 		for _, id := range reference.EdgeIDs {
-			registration, ok := edges[id]
-			if !ok {
+			if registration, ok := edges[id]; ok {
+				entries = append(entries, edgeBindingEntry(id, registration))
+				addNode(registration.Edge.From)
+				addNode(registration.Edge.To)
 				continue
 			}
-			entries = append(entries, edgeBindingEntry(id, registration))
-			addNode(registration.Edge.From)
-			addNode(registration.Edge.To)
+			// A derived edge records no entry of its own (graphMembers):
+			// it is bound by its endpoints' entries, so a later relabel of
+			// either endpoint holds the evidence to the revision recorded
+			// here.
+			if edge, ok := derived[id]; ok {
+				addNode(edge.From)
+				addNode(edge.To)
+			}
 		}
 		binding, err := NewGraphEvidenceBinding(entries...)
 		if err != nil {
