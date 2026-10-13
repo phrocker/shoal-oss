@@ -659,7 +659,7 @@ func (s *conformancePolicySelector) SelectEdgePolicy(
 	}
 	// Connect accepts only IDs in the caller's namespace (#699); the
 	// fixtures name edges by the local ID the harness chose.
-	local, ok := authorized.ApplicationEdgeLocalID(decision, edge.ID)
+	local, ok := authorized.ApplicationEdgeLocalID(ctx, decision, edge.ID)
 	if !ok {
 		return auth.Policy{}, shoal.NewError(
 			shoal.ErrorUnauthorized, "authorization denied")

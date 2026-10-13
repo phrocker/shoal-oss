@@ -2,6 +2,79 @@
 
 ## Unreleased
 
+### Edge and upload namespaces are keyed by the catalog (#721)
+
+The application edge namespace (`app-edge_<digest>/<local>`, #699) and the
+upload namespace (`upload://workspace/u-<digest>/<name>`, #712) named an
+identity by an unkeyed SHA-256 of its components. Every component is known or
+guessable, so anyone who could read an edge ID or a document's `source_uri`
+could group edges and uploads by author, and confirm a guessed author by
+recomputing the digest.
+
+**Behaviour change.** The digest is now HMAC-SHA256 under a random 256-bit
+key that belongs to the policy catalog, still truncated to 32 hex digits. It
+can be compared for equality but not recomputed from an identity, and two
+catalogs give one identity unrelated namespaces.
+
+- **Key.** A memory catalog draws its key on first use and keeps it for its
+  life. A durable catalog opened read-write draws one the first time it
+  needs a namespace, not at open, and stores it in a reserved catalog row
+  next to the format floor before it uses it. So a host that opens an empty
+  or unmounted catalog directory and then refuses to serve it leaves no key
+  that a backup copied in later would contradict. A failed write makes the
+  store fail closed until it is reopened. The key is
+  never rotated, and it never appears in an error, log, listing or metric.
+  `OpenExistingDurablePolicyStore` (the offline listings) never writes it.
+  Over a catalog with no key, such a store reports the namespace routes
+  unavailable.
+- **`PolicyStore`.** The interface gains `IdentityNamespaceMAC(ctx, message)`,
+  which returns a MAC under the key, never the key itself. Wrappers that embed
+  a `PolicyStore` pick it up unchanged.
+- **API change.** `authorized.ApplicationEdgeLocalID` now takes the context
+  `Connect` passes the edge selector: `ApplicationEdgeLocalID(ctx, decision,
+  id)`. With any other context it reports false.
+
+**Migration.** Nothing is rewritten. A document's ID is derived from its
+source URI, and an edge's ID is what its writer chose. So what was written
+before this release keeps its unkeyed digest, which stays linkable as before.
+Each identity's own unkeyed namespace is an alias of its keyed one, and never
+of anyone else's:
+
+- **Uploads.** Step 1 of the upload route (#712) tries the caller's keyed URI
+  of the name first, then its unkeyed one, and goes to whichever has something
+  stored. An ingest at the caller's unkeyed URI is accepted as its own when
+  something is stored there. If nothing is, it is refused with the same
+  `InvalidArgument` as an ineligible target. New documents only go to the
+  keyed namespace.
+- **Edges.** `Connect` accepts an ID in the caller's unkeyed namespace only
+  when an edge is registered under it, which is a retry. It refuses any other
+  such ID with the same `InvalidArgument` as an ID outside the namespace. New
+  edges use `ApplicationEdgeID`, which returns the keyed ID.
+  `ApplicationEdgeLocalID` recognises both.
+
+Edge reservations left by a `Connect` from before this release whose base
+write was indeterminate can no longer be completed under their unkeyed ID.
+
+**Rollback.** The key row is under the source-claim prefix, like the format
+floor, with another record kind. Every durable binary from before this
+release, including those since the floor (#695), therefore refuses a catalog
+that holds the key with `stored policy source claim record is corrupt`. That
+error does not mean the catalog is corrupt. Because of this refusal, an older
+binary never computes unkeyed namespaces over a catalog whose identities
+already have keyed ones, and no identity ends up with two namespaces. To roll
+back, restore the catalog from a backup taken before the key was written.
+Documents and edges written to the corpus after that backup are then
+unregistered, so reads deny them, as with any catalog restore.
+
+Rolling forward again draws a **new** key, so every identity gets new keyed
+namespaces. Keyed edge IDs and upload URIs held outside the catalog are then
+another identity's namespace to the server: application caches, stored
+`ApplicationEdgeID` or `OwnUploadSourceURI` results, a client's own
+bookkeeping. `Connect` refuses those IDs, and ingests at those URIs are
+refused unless eligible as another uploader's documents. Re-derive them with
+`ApplicationEdgeID` and `OwnUploadSourceURI`. The same applies to restoring
+any backup taken before the key was written.
+
 ### Uploads by name live in the uploader's namespace (#712)
 
 The browser upload route and the MCP `shoal.ingest` tool store a file as
@@ -244,7 +317,8 @@ Migrating callers:
 - call `ApplicationEdgeID` and connect under the result. Reads (for example
   `Neighborhood`) report the namespaced ID;
 - a trusted `EdgePolicySelector` that selects by edge ID gets the namespaced
-  ID. `authorized.ApplicationEdgeLocalID(decision, id)` returns the local ID;
+  ID. `authorized.ApplicationEdgeLocalID(ctx, decision, id)`, with the context
+  `Connect` passed the selector, returns the local ID (#721);
 - application edges connected before this release keep their IDs and stay
   readable as before. A retry of one now gets `InvalidArgument` instead of
   succeeding;

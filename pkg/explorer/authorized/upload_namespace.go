@@ -43,8 +43,11 @@ import (
 // the mutation lock and before anything is written, to:
 //
 //  1. the caller's own namespaced URI (UploadSourceURIPrefix, "u-", a digest
-//     of the caller's identity, "/", the name) when anything is stored there:
-//     a claim, a registration or a base document;
+//     of the caller's identity keyed by the catalog (#721), "/", the name)
+//     when anything is stored there: a claim, a registration or a base
+//     document; or else the caller's own URI of the name in its unkeyed
+//     namespace from before #721 (see uploadNamespaces), when anything is
+//     stored there;
 //  2. otherwise the un-namespaced URI of the name, the URI every upload had
 //     before #712, when it is eligible: something is recorded for it and the
 //     caller is authorized to ingest under every rule recorded for it (its
@@ -92,7 +95,9 @@ import (
 // absent name and for a hidden one alike, is the namespace.
 //
 // A namespaced URI is accepted as an ingest's source URI in the caller's own
-// namespace, and in another identity's namespace only when it is eligible; a
+// namespace, in the caller's own unkeyed namespace from before #721 only when
+// something is stored there (and otherwise refused as an ineligible target
+// is), and in another identity's namespace only when it is eligible; a
 // hidden or absent one there is refused with one InvalidArgument, the same
 // either way. Any other URI under UploadSourceURIPrefix that is not a bare
 // name is refused with one InvalidArgument before anything is read. Source
@@ -121,14 +126,38 @@ const uploadNamespaceSegmentPrefix = "u-"
 const uploadNamespaceDigestLength = 32
 
 // uploadNamespaceVersion separates the upload namespace's digest from the
-// application edge namespace's digest of the same identity.
-const uploadNamespaceVersion = "shoal/authorized/upload-namespace/v1"
+// application edge namespace's digest of the same identity. Version 1 is the
+// unkeyed digest of #718; version 2 is keyed (#721).
+const (
+	legacyUploadNamespaceVersion = "shoal/authorized/upload-namespace/v1"
+	uploadNamespaceVersion       = "shoal/authorized/upload-namespace/v2"
+)
 
-// uploadNamespace returns the URI prefix of every upload the decision's
-// identity owns.
-func uploadNamespace(decision auth.Decision) string {
-	return UploadSourceURIPrefix + uploadNamespaceSegmentPrefix +
-		identityNamespaceDigest(uploadNamespaceVersion, decision) + "/"
+// uploadNamespaces returns the URI prefixes of the uploads the decision's
+// identity owns: the keyed namespace it uploads to (#721), and the unkeyed
+// one of #718 its uploads from before #721 are in.
+//
+// The unkeyed namespace is an alias of the identity's own, so its uploads
+// from before #721 keep routing to it: step 1 of the route (see
+// UploadSourceURIPrefix) takes the keyed URI of the name when anything is
+// stored there and otherwise the unkeyed one, and an ingest at the unkeyed
+// URI is accepted as the caller's own when anything is stored there. New
+// documents only ever go to the keyed namespace. Only the caller's own
+// identity is ever turned into an unkeyed namespace, so the alias tells the
+// caller nothing about anyone else.
+func (c *Client) uploadNamespaces(
+	ctx context.Context,
+	decision auth.Decision,
+) (identityNamespaces, error) {
+	digest, err := c.identityNamespaceDigest(ctx, uploadNamespaceVersion, decision)
+	if err != nil {
+		return identityNamespaces{}, err
+	}
+	return identityNamespaces{
+		keyed: UploadSourceURIPrefix + uploadNamespaceSegmentPrefix + digest + "/",
+		legacy: UploadSourceURIPrefix + uploadNamespaceSegmentPrefix +
+			legacyIdentityNamespaceDigest(legacyUploadNamespaceVersion, decision) + "/",
+	}, nil
 }
 
 // UploadRouteKind says which document an upload was written to.
@@ -167,17 +196,21 @@ const (
 	uploadSourceName
 	// uploadSourceOwn is a URI in the caller's own namespace, stored as is.
 	uploadSourceOwn
+	// uploadSourceLegacyOwn is a URI in the caller's own namespace from
+	// before #721, stored as is only when something is stored there.
+	uploadSourceLegacyOwn
 	// uploadSourceTarget is a well-formed URI in another identity's
 	// namespace, written only when eligible.
 	uploadSourceTarget
 )
 
-// classifyUploadSourceURI says how Ingest treats sourceURI. For a bare
-// upload name it returns the name (the URI's segment after
-// UploadSourceURIPrefix). It reads nothing: a refusal depends only on the
-// caller's identity and the URI it sent.
+// classifyUploadSourceURI says how Ingest treats sourceURI, given the
+// caller's upload namespaces. For a bare upload name it returns the name (the
+// URI's segment after UploadSourceURIPrefix). It reads nothing: a refusal
+// depends only on the caller's identity, the catalog's key and the URI it
+// sent.
 func classifyUploadSourceURI(
-	decision auth.Decision, sourceURI string,
+	namespaces identityNamespaces, sourceURI string,
 ) (uploadSourceKind, string, error) {
 	if !strings.HasPrefix(sourceURI, UploadSourceURIPrefix) {
 		return notUploadSource, "", nil
@@ -186,10 +219,11 @@ func classifyUploadSourceURI(
 	if rest != "" && !strings.Contains(rest, "/") {
 		return uploadSourceName, rest, nil
 	}
-	own := uploadNamespace(decision)
-	if len(sourceURI) > len(own) && strings.HasPrefix(sourceURI, own) &&
-		!strings.Contains(sourceURI[len(own):], "/") {
-		return uploadSourceOwn, "", nil
+	if name, legacy, ok := namespaces.in(sourceURI); ok && !strings.Contains(name, "/") {
+		if legacy {
+			return uploadSourceLegacyOwn, name, nil
+		}
+		return uploadSourceOwn, name, nil
 	}
 	if name, ok := namespacedUploadName(sourceURI); ok {
 		return uploadSourceTarget, name, nil
@@ -240,10 +274,11 @@ func namespacedUploadName(sourceURI string) (string, bool) {
 func (c *Client) routeUploadSource(
 	ctx context.Context,
 	decision auth.Decision,
+	namespaces identityNamespaces,
 	now time.Time,
 	name string,
 ) (UploadRoute, error) {
-	own := uploadNamespace(decision) + name
+	own := namespaces.keyed + name
 	summaries, err := c.base.Documents(ctx)
 	if err != nil {
 		return UploadRoute{}, err
@@ -251,6 +286,18 @@ func (c *Client) routeUploadSource(
 	stored, err := c.sourceURIStored(ctx, own, summaries)
 	if err != nil {
 		return UploadRoute{}, err
+	}
+	if !stored {
+		// The caller's own document of the name from before #721, in its
+		// unkeyed namespace, is its own document too (step 1).
+		legacyOwn := namespaces.legacy + name
+		stored, err = c.sourceURIStored(ctx, legacyOwn, summaries)
+		if err != nil {
+			return UploadRoute{}, err
+		}
+		if stored {
+			own = legacyOwn
+		}
 	}
 	legacy := UploadSourceURIPrefix + name
 	legacyEligible, err := c.uploadRouteEligible(ctx, decision, now, legacy)
@@ -293,6 +340,30 @@ func (c *Client) routeUploadSource(
 		OtherDocuments: eligible, Ambiguous: eligible > 1}, nil
 }
 
+// routeLegacyOwnUpload admits a URI in the caller's own namespace from
+// before #721 when something is stored there, so a retry of an upload made
+// before #721 lands on its document. New documents go to the keyed
+// namespace: an ingest at an unkeyed URI with nothing stored there is
+// refused as an ineligible target is. Only the caller's own identity ever
+// wrote there, so this depends on nothing anyone else stored.
+func (c *Client) routeLegacyOwnUpload(
+	ctx context.Context,
+	sourceURI string,
+) (UploadRoute, error) {
+	summaries, err := c.base.Documents(ctx)
+	if err != nil {
+		return UploadRoute{}, err
+	}
+	stored, err := c.sourceURIStored(ctx, sourceURI, summaries)
+	if err != nil {
+		return UploadRoute{}, err
+	}
+	if !stored {
+		return UploadRoute{}, uploadTargetRefused()
+	}
+	return UploadRoute{Kind: UploadRouteOwn, SourceURI: sourceURI}, nil
+}
+
 // routeUploadTarget admits a target URI in another identity's namespace only
 // when it is eligible, and otherwise refuses it the same way whether a
 // document the caller is outside is stored there or nothing is.
@@ -313,7 +384,7 @@ func (c *Client) routeUploadTarget(
 }
 
 // sourceURIStored reports whether a claim, a registration or a base document
-// exists for sourceURI. It is asked only of the caller's own namespace.
+// exists for sourceURI. It is asked only of the caller's own namespaces.
 func (c *Client) sourceURIStored(
 	ctx context.Context,
 	sourceURI string,
@@ -401,8 +472,9 @@ func (c *Client) IngestUpload(
 // stored under the name; an ingest of UploadSourceURIPrefix + name writes
 // there unless the caller has no document of the name and is authorized under
 // another one (see UploadSourceURIPrefix). The result depends only on the
-// caller's identity and the name, and is the same on every call and across
-// restarts.
+// caller's identity, the name and the catalog's identity namespace key
+// (#721): it is the same on every call and across restarts of one durable
+// catalog, and cannot be recomputed from the identity without the key.
 func (c *Client) OwnUploadSourceURI(
 	ctx context.Context,
 	name string,
@@ -415,8 +487,12 @@ func (c *Client) OwnUploadSourceURI(
 	if err != nil {
 		return "", err
 	}
+	namespaces, err := c.uploadNamespaces(ctx, decision)
+	if err != nil {
+		return "", err
+	}
 	if err := guard.Check(ctx); err != nil {
 		return "", err
 	}
-	return uploadNamespace(decision) + name, nil
+	return namespaces.keyed + name, nil
 }

@@ -61,7 +61,9 @@ func (c *Client) withCanonicalDocumentIndex(
 //
 // The edge ID must be in the caller's application edge namespace
 // (ApplicationEdgeID); any other ID is InvalidArgument, before anything is
-// read. An ID outside it could collide with an edge the caller cannot read,
+// read. An ID in the caller's namespace from before #721 is accepted only
+// when an edge is registered under it (a retry), and is otherwise refused
+// with the same InvalidArgument. An ID outside it could collide with an edge the caller cannot read,
 // and whether Connect then failed would disclose that edge, or through an
 // intrinsic edge ID a hidden document at a guessed URI (#699).
 func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
@@ -73,7 +75,12 @@ func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
 	if err != nil {
 		return err
 	}
-	if err := requireApplicationEdgeNamespace(decision, ownedEdge.ID); err != nil {
+	namespaces, err := c.applicationEdgeNamespaces(ctx, decision)
+	if err != nil {
+		return err
+	}
+	legacy, err := requireApplicationEdgeNamespace(namespaces, ownedEdge.ID)
+	if err != nil {
 		return err
 	}
 
@@ -87,6 +94,18 @@ func (c *Client) Connect(ctx context.Context, edge graph.Edge) error {
 	if err := guard.Check(ctx); err != nil {
 		return err
 	}
+	// An ID in the caller's namespace from before #721 is accepted only to
+	// retry an edge registered under it; new edges go in the keyed one.
+	// Only the caller's own identity ever connected in that namespace, so
+	// the refusal discloses nothing about anyone else.
+	if legacy {
+		if _, registered, err := c.policyStore.Edge(ctx, ownedEdge.ID); err != nil {
+			return policyCatalogReadError(ctx, err)
+		} else if !registered {
+			return applicationEdgeNamespaceRefused()
+		}
+	}
+	ctx = withApplicationEdgeNamespaces(ctx, namespaces)
 	from, err := c.authorizedNode(
 		ctx, ownedEdge.From, decision, auth.OperationConnect, now)
 	if err != nil {

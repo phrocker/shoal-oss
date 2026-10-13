@@ -360,23 +360,4 @@ func TestApplicationEdgeNamespaceIsTheWritersIdentity(t *testing.T) {
 		}
 		seen[got] = name
 	}
-	decision, err := auth.NewDecision(base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if local, ok := authorized.ApplicationEdgeLocalID(decision, original); !ok || local != "edge" {
-		t.Fatalf("ApplicationEdgeLocalID = %q, %v", local, ok)
-	}
-	other := base
-	other.Subject = "other"
-	otherDecision, err := auth.NewDecision(other)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if local, ok := authorized.ApplicationEdgeLocalID(otherDecision, original); ok {
-		t.Fatalf("another identity's ID parsed as its own: %q", local)
-	}
-	if _, ok := authorized.ApplicationEdgeLocalID(decision, "plain-edge"); ok {
-		t.Fatal("an ID outside every namespace parsed")
-	}
 }

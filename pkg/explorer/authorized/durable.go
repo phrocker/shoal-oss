@@ -73,6 +73,13 @@ type DurablePolicyStore struct {
 	// formatFloor reports that the catalog holds the format floor revision
 	// bindings require (revision_binding_durable.go).
 	formatFloor bool
+	// namespaceKey is the catalog's identity namespace key (#721,
+	// namespace_key.go), nil until one is loaded or written; it is written
+	// under mu and read without it. namespaceKeyDir is the catalog's
+	// directory for a store opened read-write, which may write the key, and
+	// empty for one opened for offline listing, which never does.
+	namespaceKey    atomic.Pointer[[namespaceKeyBytes]byte]
+	namespaceKeyDir string
 	// diverged is set once a write-through fails after the memory store was
 	// already mutated, so memory may hold state the engine does not. From
 	// then on the store fails closed: every read and write reports the
@@ -270,7 +277,10 @@ type persistedCoOccurrence struct {
 //
 // It writes the catalog's format floor (revision_binding_durable.go) if the
 // catalog has none, so from the first read-write open by this binary on, a
-// binary from before #695 refuses the catalog.
+// binary from before #695 refuses the catalog. The store writes the
+// catalog's identity namespace key (namespace_key.go) the first time it needs
+// one, and from then on a binary from before #721 refuses the catalog in the
+// same way.
 func OpenDurablePolicyStore(dir string) (*DurablePolicyStore, error) {
 	lock, err := dirlock.Acquire(dir, policyLockFile)
 	if err != nil {
@@ -342,6 +352,9 @@ func openLockedDurablePolicyStore(
 			_ = lock.Close()
 			return nil, err
 		}
+		// The identity namespace key is written on first need, not here
+		// (namespace_key.go).
+		store.namespaceKeyDir = dir
 	}
 	return store, nil
 }
@@ -436,6 +449,14 @@ func (s *DurablePolicyStore) load() error {
 				haveFloor = true
 			}
 			maxSeq = maxUint64(maxSeq, record.Seq)
+		case bytes.Equal(row, []byte(policyRowNamespaceKey)):
+			// Before the source-claim prefix it shares (see
+			// policyRowNamespaceKey).
+			seq, err := s.loadNamespaceKey(value)
+			if err != nil {
+				return err
+			}
+			maxSeq = maxUint64(maxSeq, seq)
 		case bytes.HasPrefix(row, []byte(policyRowNodeOwner)),
 			bytes.HasPrefix(row, []byte(policyRowEdgeOwner)):
 			prefix, kind, owners := policyRowNodeOwner, policyKindNodeOwner, nodeOwners
@@ -618,6 +639,9 @@ func (s *DurablePolicyStore) load() error {
 		return err
 	}
 	if err := s.reconstructOwners(haveFloor, nodeOwners, edgeOwners); err != nil {
+		return err
+	}
+	if err := s.checkNamespaceKeyAtLoad(haveFloor); err != nil {
 		return err
 	}
 	if haveMigration {
