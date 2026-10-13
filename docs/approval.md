@@ -1226,11 +1226,24 @@ tests remain the right tool for service-level properties below the transport.
   event once #653's 22h window passes, as any unretried row does.
 - **An Invoke whose `approval.enqueued` event did not publish (#655)** has
   committed the materialization and written the action, and answers the
-  unpublished event (`503`) without running it. The retry runs it, through
-  enqueue's replay branch — which is consulted before the approval service,
-  so it does not retry the approval row. That row is published by the
-  requester's next Request or Status of the approval, within #653's window,
-  as for any approval transition whose maker does not come back.
+  unpublished event (`503`) without running it. The retry runs the work, but
+  it never enters the approval service: enqueue's replay branch finds the
+  action and returns first. Nothing on the Invoke path publishes that row
+  again. Only the requester's own Request or Status of the approval, inside
+  #653's window, would; the sweep re-publishes only its own rows, and is off
+  by default. A requester that only ever invokes therefore never has
+  `approval.enqueued` published: once the window passes, the next drain to
+  visit the row closes it as lapsed. The loss is bounded to that one event,
+  and the row is closed rather than wedged.
+- **Concurrent Invokes with the same `ClaimID` can both execute (#762).**
+  The second call's enqueue replays the first call's live claim, Invoke's
+  same-ClaimID shortcut sends it to `ExecuteClaim`, and nothing written
+  between the claim and `Execute` stops a second execution. The mechanism
+  predates #655 and applies to every action, but before #655 an
+  approval-required action could not be invoked at all. The exposure is new
+  for this class, which is typically the class with external effects: one
+  approval can then produce a duplicated external effect. #762 tracks the
+  fix, an atomic execution admission per claim.
 - **A withdrawal reason is recorded, not served.** It is on the record and its
   audit, as the request's own reason is, and no route or event returns it.
 - **Audits record attempts.** Approval audits precede their write, and each

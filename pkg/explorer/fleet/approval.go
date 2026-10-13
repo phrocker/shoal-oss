@@ -1169,7 +1169,12 @@ type approvalAttempt struct {
 	// ready, when set, is asked immediately before anything is written that
 	// makes work: the approved → enqueued commit, and the action write of an
 	// enqueued approval. A refusal there leaves the approval as it was.
-	ready func() error
+	//
+	// It is asked at the attempt's own time, not the call's: a retry after a
+	// lost compare-and-set runs later, and a descriptor lease that lapsed in
+	// between must refuse here rather than at the claim, which would leave
+	// a queued record that never runs.
+	ready func(now time.Time) error
 }
 
 // reach is the body of Request, shared with Invoke's materialization: read
@@ -1300,7 +1305,7 @@ func (s *ApprovalService) advanceReady(
 	decision auth.Decision,
 	current ApprovalRecord,
 	now time.Time,
-	ready func() error,
+	ready func(now time.Time) error,
 ) (ApprovalReceipt, error) {
 	switch current.State {
 	case ApprovalPending:
@@ -1395,7 +1400,7 @@ func (s *ApprovalService) advanceReady(
 			return ApprovalReceipt{}, approverMappingMoved()
 		}
 		if ready != nil {
-			if err := ready(); err != nil {
+			if err := ready(now); err != nil {
 				return ApprovalReceipt{}, err
 			}
 		}
@@ -1435,7 +1440,7 @@ func (s *ApprovalService) advanceReady(
 		// request's generation). Past those the row stays enqueued with no
 		// action, and Status reports it as unresolvable.
 		if ready != nil {
-			if err := ready(); err != nil {
+			if err := ready(now); err != nil {
 				return ApprovalReceipt{}, err
 			}
 		}

@@ -64,7 +64,7 @@ func TestInvokesMaterializationNeverHolds(t *testing.T) {
 		generations: fixedGenerations{generation: 3}, terminal: true,
 	}
 	decision := approvalBranchDecision(t, pending.RequestedAt, auth.OperationDispatch)
-	ready := func() error {
+	ready := func(time.Time) error {
 		t.Fatal("ready was asked of a request that is not approved")
 		return nil
 	}
@@ -125,7 +125,7 @@ func TestInvokesMaterializationAsksReadyBeforeWriting(t *testing.T) {
 		context.Background(),
 		approvalBranchDecision(t, approved.RequestedAt, auth.OperationDispatch),
 		approved.Request, now,
-		approvalAttempt{invoke: true, ready: func() error {
+		approvalAttempt{invoke: true, ready: func(time.Time) error {
 			asked++
 			return refusal
 		}})
@@ -163,5 +163,69 @@ func TestTheApprovalMaterializerIsInstalledOnce(t *testing.T) {
 	if hook := dispatch.approvals.Load(); hook == nil ||
 		hook.approvalMaterializer != approvalMaterializer(first) {
 		t.Fatal("the second install replaced the first")
+	}
+}
+
+// conflictOnceApprovalStore loses the first compare-and-set, as a concurrent
+// writer would, and moves the clock forward as it does.
+type conflictOnceApprovalStore struct {
+	*memoryApprovalStore
+	lost    bool
+	advance func()
+}
+
+func (s *conflictOnceApprovalStore) ApplyApproval(
+	ctx context.Context, mutation ApprovalMutation,
+) (ApprovalRecord, error) {
+	if !s.lost {
+		s.lost = true
+		s.advance()
+		return ApprovalRecord{}, ErrApprovalConflict
+	}
+	return s.memoryApprovalStore.ApplyApproval(ctx, mutation)
+}
+
+// TestInvokesMaterializationAsksReadyAtEachAttemptsTime: the first attempt
+// passes ready and loses its compare-and-set; by the retry the clock has
+// moved past what the work can run at. ready is asked again at the retry's
+// own time, refuses, and the approval is left as it was.
+func TestInvokesMaterializationAsksReadyAtEachAttemptsTime(t *testing.T) {
+	approved := decided(validApprovalRecord(t), ApprovalApproved, ApprovalVerdictApprove)
+	now := approved.DecidedAt.Add(time.Minute)
+	clock := now
+	lapse := now.Add(10 * time.Minute)
+	store := &conflictOnceApprovalStore{
+		memoryApprovalStore: &memoryApprovalStore{records: map[string]ApprovalRecord{
+			string(approved.ID): CloneApprovalRecord(approved),
+		}},
+		advance: func() { clock = lapse },
+	}
+	service := &ApprovalService{
+		dispatch: &DispatchService{
+			store: newMemoryDispatchStore(), clock: func() time.Time { return clock },
+		},
+		store: store, recorder: unguardedApprovalRecorder{},
+		generations: fixedGenerations{generation: approved.PolicyGeneration},
+	}
+	var asked []time.Time
+	refusal := shoal.NewError(shoal.ErrorUnavailable, "lease lapsed")
+	_, err := service.reach(
+		context.Background(),
+		approvalBranchDecision(t, approved.RequestedAt, auth.OperationDispatch),
+		approved.Request, now,
+		approvalAttempt{invoke: true, ready: func(at time.Time) error {
+			asked = append(asked, at)
+			if !at.Before(lapse) {
+				return refusal
+			}
+			return nil
+		}})
+	if !errors.Is(err, refusal) || len(asked) != 2 ||
+		!asked[0].Equal(now) || !asked[1].Equal(lapse) {
+		t.Fatalf("reach = %v, ready asked at %v", err, asked)
+	}
+	if stored := store.records[string(approved.ID)]; stored.Version != approved.Version ||
+		stored.State != ApprovalApproved {
+		t.Fatalf("a refused retry wrote %q v%d", stored.State, stored.Version)
 	}
 }

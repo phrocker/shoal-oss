@@ -672,3 +672,79 @@ func TestInvokeOfWorkThatCannotRunHereMaterializesNothing(t *testing.T) {
 	}
 	h.mustRequest(requester, request, fleet.ApprovalEnqueued)
 }
+
+// loseFirstMaterialization loses the first approved → enqueued
+// compare-and-set, as a concurrent writer would, after running lost.
+type loseFirstMaterialization struct {
+	fleet.ApprovalStore
+	armed *atomic.Bool
+	lost  func()
+}
+
+func (s loseFirstMaterialization) ApplyApproval(
+	ctx context.Context, mutation fleet.ApprovalMutation,
+) (fleet.ApprovalRecord, error) {
+	if mutation.Record.State == fleet.ApprovalEnqueued &&
+		s.armed.CompareAndSwap(true, false) {
+		s.lost()
+		return fleet.ApprovalRecord{}, fleet.ErrApprovalConflict
+	}
+	return s.ApprovalStore.ApplyApproval(ctx, mutation)
+}
+
+// TestInvokeRechecksRunnabilityAtTheRetrysTime: the agent's lease lapses
+// between Invoke's first materialization attempt, which loses its
+// compare-and-set, and the retry. The retry asks whether the work can run at
+// its own time, is refused, and nothing is materialized: the approval stays
+// approved and no queued record is left behind for a claim to refuse.
+func TestInvokeRechecksRunnabilityAtTheRetrysTime(t *testing.T) {
+	t.Parallel()
+	armed := &atomic.Bool{}
+	var h *invokeHarness
+	h = newInvokeHarness(t, func(store fleet.ApprovalStore) fleet.ApprovalStore {
+		return loseFirstMaterialization{
+			ApprovalStore: store, armed: armed,
+			// Past the relay's lease, inside the approval window.
+			lost: func() { h.advance(31 * time.Minute) },
+		}
+	})
+	if _, err := h.opened.fleetRegistry.Register(h.as(registrant), fleet.RegisterRequest{
+		Context:         h.context(h.now().Add(time.Minute)),
+		RegistrationKey: "relay-registration",
+		Spec: fleet.Spec{
+			ID: "relay", AuthorizationDomain: workspaceAuthorizationDomain,
+			Scopes: []fleet.Scope{
+				{SourceID: workspaceSourceID, PolicyID: workspaceGrantPolicyID},
+			},
+			ExecutorRef:    "local",
+			Capabilities:   approvalActions(true),
+			LeaseExpiresAt: h.now().Add(30 * time.Minute),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := h.held("invoke-lease-lapse")
+	receipt := h.requestFor("relay", request)
+	if _, err := h.decide(approver, receipt, fleet.ApprovalVerdictApprove); err != nil {
+		t.Fatal(err)
+	}
+	enqueue := h.enqueue(request)
+	enqueue.AgentID, enqueue.AgentGeneration = "relay", h.generationOf("relay")
+
+	armed.Store(true)
+	if _, err := h.opened.fleetDispatch.Invoke(h.as(requester), fleet.InvokeRequest{
+		Enqueue: enqueue, ClaimID: []byte("claim"), Lease: time.Minute,
+	}); err == nil {
+		t.Fatal("invoke across a lapsed lease succeeded")
+	}
+	if armed.Load() {
+		t.Fatal("the first materialization attempt was not lost")
+	}
+	if stored := h.status(request.id).Approval; stored.State != fleet.ApprovalApproved ||
+		stored.Version != 2 {
+		t.Fatalf("invoke across a lapsed lease moved the approval to %q v%d",
+			stored.State, stored.Version)
+	}
+	h.actionAbsent(request)
+	h.assertRuns(0)
+}

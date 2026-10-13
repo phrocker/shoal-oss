@@ -5,6 +5,7 @@ package fleet
 
 import (
 	"context"
+	"time"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -134,11 +135,12 @@ func (s *ApprovalService) materializeForInvoke(
 	// reference would otherwise be materialized and then refused at the
 	// claim, leaving work behind (#455's ordering). Asked under invoke, of
 	// the same credential, because that is the operation the run takes.
-	ready := func() error {
+	// At the attempt's time, which reach advances on each retry.
+	ready := func(at time.Time) error {
 		_, _, _, err := dispatch.registry.resolveAction(
 			ctx, decision, base.AgentID, base.AgentGeneration,
 			base.Capability, base.Action, base.SourceID, base.PolicyID,
-			base.ObjectID, auth.OperationInvoke, now)
+			base.ObjectID, auth.OperationInvoke, at)
 		return err
 	}
 	receipt, err := s.reach(
