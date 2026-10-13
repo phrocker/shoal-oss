@@ -122,6 +122,11 @@ type Tablet struct {
 	// import is registered (see RegisterImmutableFiles).
 	sources  map[string]string
 	absorbed map[string]struct{}
+	// instance is this process lifetime's name instance (drawn on first
+	// mint, never persisted); minted is the instance each live file this
+	// tablet minted was minted under, by base name. See instance.go.
+	instance string
+	minted   map[string]string
 }
 
 // state returns the tablet's generation with the given active list and
@@ -133,6 +138,7 @@ func (t *Tablet) state(active []string, obsolete map[string]struct{}) immutableS
 		nameHighWater: t.nameHighWater,
 		sources:       t.sources,
 		absorbed:      t.absorbed,
+		minted:        t.minted,
 	}
 }
 
@@ -278,6 +284,7 @@ func Open(dir string, opts Options) (*Tablet, error) {
 	t.nameHighWater = found.nameHighWater
 	t.sources = found.sources
 	t.absorbed = found.absorbed
+	t.minted = found.minted
 
 	// Open WAL
 	walPath := filepath.Join(dir, "wal.log")
@@ -897,6 +904,10 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	if err != nil {
 		return err
 	}
+	instance, err := t.mintInstanceLocked()
+	if err != nil {
+		return err
+	}
 	t.nameHighWater = base
 	for index, run := range runs {
 		inputs := make([]compaction.Input, len(run.inputs))
@@ -934,8 +945,10 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		obsolete[filepath.Base(old)] = struct{}{}
 	}
 	outputPaths := make([]string, len(outputs))
+	minted := make(map[string]string, len(outputs))
 	for index, output := range outputs {
 		outputPaths[index] = output.path
+		minted[output.name] = instance
 	}
 	// Imported inputs stay held after their files are folded into the
 	// outputs, so re-importing them is still a no-op: by producer identity,
@@ -956,11 +969,13 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	}
 	next := t.state(outputPaths, obsolete)
 	next.sources, next.absorbed = sources, absorbed
+	next.minted = minted
 	commit := func() {
 		t.files = outputPaths
 		t.obsolete = obsolete
 		t.sources = sources
 		t.absorbed = absorbed
+		t.minted = minted
 	}
 	if err := persistImmutableManifest(t.backend, t.dir, next); err != nil {
 		if storage.IsCommittedWriteError(err) {
@@ -1175,6 +1190,8 @@ func (t *Tablet) RefreshFiles() (int, error) {
 	t.nameHighWater = found.nameHighWater
 	t.sources = found.sources
 	t.absorbed = found.absorbed
+	// The in-memory instance is kept: a refresh is not a new writer.
+	t.minted = found.minted
 	return len(t.files), nil
 }
 
@@ -1226,6 +1243,10 @@ func (t *Tablet) flushLocked() error {
 	if err != nil {
 		return fmt.Errorf("flush: %w", err)
 	}
+	instance, err := t.mintInstanceLocked()
+	if err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
 	t.nameHighWater = namesHighWater(t.nameHighWater, outName)
 	outPath := filepath.Join(t.dir, outName)
 	if err := storage.WriteAll(context.Background(), t.backend, outPath, data); err != nil {
@@ -1233,8 +1254,13 @@ func (t *Tablet) flushLocked() error {
 	}
 
 	files := append(append([]string(nil), t.files...), outPath)
-	if err := persistImmutableManifest(t.backend, t.dir, t.state(files, t.obsolete)); err != nil {
+	minted := cloneMinted(t.minted)
+	minted[outName] = instance
+	next := t.state(files, t.obsolete)
+	next.minted = minted
+	if err := persistImmutableManifest(t.backend, t.dir, next); err != nil {
 		if storage.IsCommittedWriteError(err) {
+			t.minted = minted
 			t.files = files
 			t.active = newSkiplistMemtable()
 			if truncateErr := t.wal.Truncate(); truncateErr != nil {
@@ -1248,6 +1274,7 @@ func (t *Tablet) flushLocked() error {
 		_ = removeObject(t.backend, outPath)
 		return fmt.Errorf("flush: publish generation: %w", err)
 	}
+	t.minted = minted
 	t.files = files
 	t.active = newSkiplistMemtable()
 
@@ -1541,6 +1568,10 @@ type immutableManifest struct {
 	// newest. The set only grows (about 70 bytes per compacted imported
 	// file, rewritten with every manifest update); pruning is a follow-up.
 	AbsorbedSources []string `json:"absorbed_sources,omitempty"`
+	// Minted is the instance each live file this tablet minted was minted
+	// under (see instance.go). An older binary drops it; the files it
+	// listed then have no instance and are re-shipped once by a sync.
+	Minted map[string]string `json:"minted,omitempty"`
 }
 
 // immutableState is a tablet's immutable generation as files.json records
@@ -1551,6 +1582,7 @@ type immutableState struct {
 	nameHighWater int64
 	sources       map[string]string   // imported file base name -> producer identity
 	absorbed      map[string]struct{} // producer identities compacted locally
+	minted        map[string]string   // minted file base name -> instance
 }
 
 const importNamePrefix = ".shoal-import-"
@@ -1600,7 +1632,7 @@ func namesHighWater(floor int64, names ...string) int64 {
 }
 
 func discoverImmutableFiles(b storage.Backend, dir string, adoptUnknown bool) (immutableState, error) {
-	active, obsolete, highWater, sources, absorbed, err := discoverImmutableFilesRaw(b, dir, adoptUnknown)
+	active, obsolete, highWater, sources, absorbed, minted, err := discoverImmutableFilesRaw(b, dir, adoptUnknown)
 	if err != nil {
 		return immutableState{}, err
 	}
@@ -1612,14 +1644,14 @@ func discoverImmutableFiles(b storage.Backend, dir string, adoptUnknown bool) (i
 	highWater = namesHighWater(highWater, obsoleteNames...)
 	return immutableState{
 		active: active, obsolete: obsolete, nameHighWater: highWater,
-		sources: sources, absorbed: absorbed,
+		sources: sources, absorbed: absorbed, minted: minted,
 	}, nil
 }
 
-func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool) ([]string, map[string]struct{}, int64, map[string]string, map[string]struct{}, error) {
+func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool) ([]string, map[string]struct{}, int64, map[string]string, map[string]struct{}, map[string]string, error) {
 	keys, err := listTabletObjects(b, dir)
 	if err != nil {
-		return nil, nil, 0, nil, nil, err
+		return nil, nil, 0, nil, nil, nil, err
 	}
 	available := make(map[string]string)
 	manifestPresent := false
@@ -1648,18 +1680,18 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 			active = append(active, key)
 		}
 		legacyRecencyOrder(active)
-		return active, obsolete, highWater, map[string]string{}, map[string]struct{}{}, nil
+		return active, obsolete, highWater, map[string]string{}, map[string]struct{}{}, map[string]string{}, nil
 	}
 	data, err := storage.ReadAll(context.Background(), b, filepath.Join(dir, "files.json"))
 	if err != nil {
-		return nil, nil, 0, nil, nil, fmt.Errorf("read immutable manifest: %w", err)
+		return nil, nil, 0, nil, nil, nil, fmt.Errorf("read immutable manifest: %w", err)
 	}
 	var manifest immutableManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, nil, 0, nil, nil, fmt.Errorf("decode immutable manifest: %w", err)
+		return nil, nil, 0, nil, nil, nil, fmt.Errorf("decode immutable manifest: %w", err)
 	}
 	if manifest.Version != immutableManifestVersion {
-		return nil, nil, 0, nil, nil, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
+		return nil, nil, 0, nil, nil, nil, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
 	}
 	if manifest.NameHighWater > highWater {
 		highWater = manifest.NameHighWater
@@ -1680,7 +1712,7 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 	for i, name := range manifest.Active {
 		path, ok := available[name]
 		if !ok {
-			return nil, nil, 0, nil, nil, fmt.Errorf("authoritative immutable file %q is missing", name)
+			return nil, nil, 0, nil, nil, nil, fmt.Errorf("authoritative immutable file %q is missing", name)
 		}
 		if lastIndex[name] != i {
 			continue
@@ -1717,7 +1749,15 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 	for _, source := range manifest.AbsorbedSources {
 		absorbed[source] = struct{}{}
 	}
-	return active, obsolete, highWater, sources, absorbed, nil
+	// Only live, listed files keep their minted instance: an adopted stray
+	// was not minted here.
+	minted := make(map[string]string, len(manifest.Minted))
+	for name, instance := range manifest.Minted {
+		if _, live := known[name]; live && instance != "" {
+			minted[name] = instance
+		}
+	}
+	return active, obsolete, highWater, sources, absorbed, minted, nil
 }
 
 func listTabletObjects(b storage.Backend, dir string) ([]string, error) {
@@ -1756,6 +1796,12 @@ func persistImmutableManifest(b storage.Backend, dir string, state immutableStat
 				manifest.Sources = make(map[string]string)
 			}
 			manifest.Sources[name] = source
+		}
+		if instance := state.minted[name]; instance != "" {
+			if manifest.Minted == nil {
+				manifest.Minted = make(map[string]string)
+			}
+			manifest.Minted[name] = instance
 		}
 	}
 	for name := range state.obsolete {

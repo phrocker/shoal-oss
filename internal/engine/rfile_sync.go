@@ -24,12 +24,21 @@ const SyncStateVersion = 1
 // already-uploaded RFile's slash-relative path to its manifest entry, so an
 // unchanged file can be re-listed in the next manifest without re-reading or
 // re-hashing it.
+//
+// A path is only a stable identity within one producer instance: a producer
+// directory recreated, restored or cloned can mint a name again for new
+// bytes, and a stamp change rewrites the bytes under the same name.
+// ShippedKeys records, per path, the shipKey (producer instance + export
+// transform) the copy was shipped under; a file is reused only under the same
+// key, and otherwise shipped again. A state without ShippedKeys (written by
+// an older binary) re-ships every file once.
 type SyncState struct {
-	Version   int                        `json:"version"`
-	Table     string                     `json:"table"`
-	Sequence  int64                      `json:"sequence"`
-	UpdatedAt time.Time                  `json:"updated_at"`
-	Shipped   map[string]RFileExportFile `json:"shipped"`
+	Version     int                        `json:"version"`
+	Table       string                     `json:"table"`
+	Sequence    int64                      `json:"sequence"`
+	UpdatedAt   time.Time                  `json:"updated_at"`
+	Shipped     map[string]RFileExportFile `json:"shipped"`
+	ShippedKeys map[string]string          `json:"shipped_keys,omitempty"`
 }
 
 // IncrementalExportResult reports what a single sync tick did.
@@ -97,19 +106,24 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 	}
 
 	priorShipped := map[string]RFileExportFile{}
+	priorKeys := map[string]string{}
 	var priorSeq int64
 	if prior != nil {
 		priorSeq = prior.Sequence
 		if prior.Shipped != nil {
 			priorShipped = prior.Shipped
 		}
+		if prior.ShippedKeys != nil {
+			priorKeys = prior.ShippedKeys
+		}
 	}
 
 	state := &SyncState{
-		Version:  SyncStateVersion,
-		Table:    tableName,
-		Sequence: priorSeq + 1,
-		Shipped:  map[string]RFileExportFile{},
+		Version:     SyncStateVersion,
+		Table:       tableName,
+		Sequence:    priorSeq + 1,
+		Shipped:     map[string]RFileExportFile{},
+		ShippedKeys: map[string]string{},
 	}
 	files := tbl.rfiles()
 	manifest := &RFileExportManifest{
@@ -132,15 +146,21 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 		dstPath := joinBackendPath(dst, opts.DestinationRoot, filepath.FromSlash(rel))
 		current[rel] = true
 
-		// Skipping by path is sound because a tablet never reuses a file
-		// name: local names stay above the persisted name high-water mark
-		// (even after deletion or a clock step back), and import names carry
-		// a random nonce. A path therefore always names the same bytes.
-		if prev, ok := priorShipped[rel]; ok && prev.DestinationPath == dstPath {
+		// Within one producer instance a tablet never reuses a file name:
+		// local names stay above the persisted name high-water mark (even
+		// after deletion or a clock step back), and import names carry a
+		// random nonce. A copy of the data directory (recreated, restored,
+		// cloned) is a different instance and may reissue a name, and a
+		// stamp change rewrites the bytes, so a shipped copy is reused only
+		// under the same shipKey; otherwise the file is shipped again.
+		key := shipKey(f.Instance, opts)
+		if prev, ok := priorShipped[rel]; ok && prev.DestinationPath == dstPath && priorKeys[rel] == key {
 			prev.Format = string(fileFormatForPath(f.Path))
 			prev.Role = ExportRoleAuthoritative
+			prev.ProducerEpoch = producerEpoch(f.Instance, opts)
 			manifest.RFiles = append(manifest.RFiles, prev)
 			state.Shipped[rel] = prev
+			state.ShippedKeys[rel] = key
 			skipped = append(skipped, rel)
 			continue
 		}
@@ -159,9 +179,11 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 			BCFileVersion:   bcVersion,
 			Format:          string(fileFormatForPath(f.Path)),
 			Role:            ExportRoleAuthoritative,
+			ProducerEpoch:   producerEpoch(f.Instance, opts),
 		}
 		manifest.RFiles = append(manifest.RFiles, entry)
 		state.Shipped[rel] = entry
+		state.ShippedKeys[rel] = key
 		uploaded = append(uploaded, rel)
 	}
 
