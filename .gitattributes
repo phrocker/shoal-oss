@@ -6,3 +6,6 @@ test/accumulo/conf/** text eol=lf
 testdata/explorer-eval/** text eol=lf
 # Byte-exact fixture: a lone carriage return the boundary check must see.
 internal/importboundary/testdata/cgo-probe-lonecr/cmd/shoal-capi/probe.c -text
+# Sealed v2 router test split (docs/router-evaluation-v2.md): kept out of
+# diffs, greps and code search so that v2 grammar authors do not see it.
+pkg/router/testdata/eval/v2/test.jsonl.gz binary linguist-generated=true

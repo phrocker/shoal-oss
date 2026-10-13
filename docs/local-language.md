@@ -175,7 +175,9 @@ How it works:
 The pre-registered evaluation is in
 [router-evaluation.md](router-evaluation.md). On held-out phrasings this
 first model is more conservative than the lexical baseline and less
-accurate. It proposed nothing wrong.
+accurate. It proposed nothing wrong. v2 is pre-registered in
+[router-evaluation-v2.md](router-evaluation-v2.md), with a fresh test split
+sealed before any v2 grammar or model work.
 
 **Disclosure.** Tests compose the real authorized client (memory and durable
 policy stores), fleet registry and auth decisions. They build two worlds:
