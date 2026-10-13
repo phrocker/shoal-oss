@@ -35,6 +35,10 @@ type DispatchService struct {
 	evidenceVisibility EvidenceVisibility
 	evidenceLabels     evidencelabels.Translator
 	evidenceNodes      evidencelabels.NodeGate
+	// closedErrorVocab adjudicates a reported failure code the action's
+	// descriptor does not declare (#740 phase 2). Off by default; see
+	// DispatchConfig.ClosedErrorVocabulary.
+	closedErrorVocab bool
 	// skippedPublications counts transition rows this process left pending
 	// because the caller was not entitled to publish them. See
 	// SkippedTransitionPublications.
@@ -79,6 +83,7 @@ func NewDispatchService(config DispatchConfig) (*DispatchService, error) {
 		evidenceVisibility: config.EvidenceVisibility,
 		evidenceLabels:     config.EvidenceLabels,
 		evidenceNodes:      config.EvidenceNodes,
+		closedErrorVocab:   config.ClosedErrorVocabulary,
 	}
 	return service, nil
 }
@@ -1431,7 +1436,7 @@ func (s *DispatchService) applyExecutionResult(
 	// those are more specific than this adjudication would be. The origin
 	// field is what tells the two apart, which is exactly the distinction
 	// #508 records as unavailable from the code alone.
-	if reportedErrorCodeIsAdjudicated(result.ErrorCode) &&
+	if s.reportedErrorCodeIsAdjudicated(action, result.ErrorCode) &&
 		next.ErrorCodeOrigin != ErrorCodeOriginService {
 		// Adjudicated, never refused. By here the executor has done whatever
 		// the action describes, and refusing a code after its effect would
@@ -4211,13 +4216,21 @@ func (s *DispatchService) readablePage(
 // withheld. It is reachable where Output is not: a failed action carries a
 // code and no Output, so #696's withholding never fires for it.
 //
-// This is phase 1 of #740 and it narrows the channel rather than closing it.
-// A shape rule constrains form, not content: "patient_4471_hiv_positive" is
-// a perfectly good lowercase token, so what this buys is MaxActionErrorBytes
-// reduced to MaxReportedActionErrorCodeBytes — a kilobyte down to sixty-four
-// — and not a channel that cannot carry what the work read. Closing it needs
-// a vocabulary each action declares before the work runs, which is phase 2
-// and is why #740 stays open.
+// There are two rules, and which one applies is an operator's choice.
+//
+// The shape rule is the default and it narrows the channel rather than
+// closing it. A shape rule constrains form, not content:
+// "patient_4471_hiv_positive" is a perfectly good lowercase token, so what
+// it buys is MaxActionErrorBytes reduced to MaxReportedActionErrorCodeBytes
+// — a kilobyte down to sixty-four — and not a channel that cannot carry
+// what the work read.
+//
+// The vocabulary rule closes it. A code the action's descriptor does not
+// declare is adjudicated, and a descriptor's vocabulary is fixed before the
+// work runs, so nothing the work read can appear in it. An action that
+// declares nothing has every code adjudicated, which is the fail-closed
+// direction and is lossy and visible: its failures all read
+// invalid_executor_error until its descriptor names its codes.
 //
 // Every route that records a reported code reaches here: Invoke through
 // applyExecutionResult directly, CompleteClaim and the admission surface
@@ -4229,7 +4242,9 @@ func (s *DispatchService) readablePage(
 //
 // Empty is how a report says there was no error. It is not a code and is
 // left alone.
-func reportedErrorCodeIsAdjudicated(value string) bool {
+func (s *DispatchService) reportedErrorCodeIsAdjudicated(
+	action Action, value string,
+) bool {
 	if value == "" {
 		return false
 	}
@@ -4240,6 +4255,35 @@ func reportedErrorCodeIsAdjudicated(value string) bool {
 	// sit in the same field.
 	if _, reserved := reservedActionErrorCodes[value]; reserved {
 		return true
+	}
+	if s.closedErrorVocab {
+		// The shape is not consulted as well, deliberately. A declared code
+		// has already been through canonicalErrorCodes, which refuses a
+		// non-token at registration, so a declared code is a token by
+		// construction and a second check here could only ever disagree
+		// with the descriptor.
+		return !action.declaresErrorCode(value)
+	}
+	return reportedErrorCodeFailsShape(value)
+}
+
+// reportedErrorCodeFailsShape is phase 1's rule on its own: whether a code
+// is outside the lowercase-token shape.
+//
+// Separate from the adjudication above because it is a property of the
+// value and not of the action, and one caller needs exactly that. The
+// admission surface refuses a misshapen code at its own boundary (#748),
+// before its one-shot token is spent, and it asks this question before the
+// action is resolved. The vocabulary is a property of the action and can
+// only be asked where the action is known.
+func reportedErrorCodeFailsShape(value string) bool {
+	// Empty is how a report says there was no error. It is the absence of a
+	// code rather than a misshapen one, and it does not match the token
+	// grammar, so it has to be excluded here and not left to the callers —
+	// the first version of this extraction left it to them and refused
+	// every successful admission report.
+	if value == "" {
+		return false
 	}
 	return len(value) > MaxReportedActionErrorCodeBytes ||
 		!reportedActionErrorCode.MatchString(value)
