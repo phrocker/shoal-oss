@@ -500,3 +500,115 @@ func TestSessionBindsItsCitedAssertionsEvidence(t *testing.T) {
 		}
 	})
 }
+
+// neighborhoodCountingBase counts the base neighborhoods read through it,
+// and the edges they returned.
+type neighborhoodCountingBase struct {
+	explorer.BoundedClient
+	calls, edges int
+}
+
+func (b *neighborhoodCountingBase) Neighborhood(
+	ctx context.Context, request explorer.NeighborhoodRequest,
+) (explorer.Neighborhood, error) {
+	result, err := b.BoundedClient.Neighborhood(ctx, request)
+	b.calls++
+	b.edges += len(result.Edges)
+	return result, err
+}
+
+// noEdgeAssertions is the corpus's validator without its edge-assertion
+// reader, so NewClient promotes none.
+type noEdgeAssertions struct {
+	authorized.EvidenceSnapshotValidator
+	authorized.ExtractionAssertionReader
+}
+
+// TestCitedAssertionLookupReadsOnlyTheCitedEdges: resolving a cited
+// assertion reads the edge's attached assertion from the trusted corpus by
+// edge ID, never the base neighborhood of its source, which for a hub is its
+// whole adjacency read under the base's exclusive lock. The control, a
+// client without the trusted reader, falls back to that scan and still
+// records.
+func TestCitedAssertionLookupReadsOnlyTheCitedEdges(t *testing.T) {
+	const hubEdges = 24
+	store := authorized.NewMemoryPolicyStore()
+	r := newCitedRelationWorld(t, store)
+	f := r.w.f
+	// The relation's source becomes a hub: each further document extracts a
+	// relation of the same type from it to a tool of its own, so even the
+	// type-filtered fallback reads every hub edge.
+	for index := 0; index < hubEdges; index++ {
+		hub, _ := relationOf(r.w.extract(r.w.ingest(
+			fmt.Sprintf("file:///citation/hub-%d/SKILL.md", index),
+			skillBody("zeta", fmt.Sprintf("zeta-tool-%d", index)), nil)))
+		if hub == "" || hub == r.edge.ID {
+			t.Fatalf("hub document %d asserts no new relation", index)
+		}
+	}
+	around, err := f.base.Neighborhood(context.Background(), explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{r.edge.From}, Depth: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(around.Edges) < hubEdges {
+		t.Fatalf("the relation's source has %d edges; not a hub", len(around.Edges))
+	}
+	selector := f.staticSelector(t, f.sourceA, f.policyA)
+	newClient := func(base explorer.Client, validator authorized.SnapshotValidator) *authorized.Client {
+		client, err := authorized.NewClient(authorized.Config{
+			Base:                   base,
+			VectorScorer:           trustedVectorScorer(f.base),
+			InteractionWriter:      trustedInteractionWriter(f.base),
+			InteractionReader:      trustedInteractionReader(f.base),
+			SnapshotValidator:      validator,
+			DerivedAssertionReader: trustedDerivedAssertionReader(f.base),
+			FoldStore:              trustedFoldStore(f.base),
+			Resolver:               f.authority.Resolver(),
+			PolicySelector:         selector,
+			EdgePolicySelector:     selector,
+			PolicyStore:            store,
+			GenerationReader:       f.reader,
+			Clock:                  f.clock.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client
+	}
+	validator := trustedSnapshotValidator(f.base)
+	evidenceValidator, ok := validator.(authorized.EvidenceSnapshotValidator)
+	extractions, extractionsOK := validator.(authorized.ExtractionAssertionReader)
+	if !ok || !extractionsOK {
+		t.Fatal("the corpus is not a trusted evidence validator")
+	}
+	world := r.w.client
+	defer func() { r.w.client = world }()
+	path := recordingPaths[0]
+
+	trusted := &neighborhoodCountingBase{BoundedClient: f.base}
+	r.w.client = newClient(trusted, validator)
+	if err := r.record(t, path, "interaction.session_hub_trusted", r.own, "attacker"); err != nil {
+		t.Fatalf("recording through the trusted reader: %v", err)
+	}
+	if trusted.calls != 0 {
+		t.Fatalf("recording read %d base neighborhoods (%d edges) to resolve one cited assertion",
+			trusted.calls, trusted.edges)
+	}
+
+	// The control: the fallback does scan the hub, so the count above would
+	// see a scan.
+	fallback := &neighborhoodCountingBase{BoundedClient: f.base}
+	r.w.client = newClient(fallback, noEdgeAssertions{
+		EvidenceSnapshotValidator: evidenceValidator,
+		ExtractionAssertionReader: extractions,
+	})
+	if err := r.record(t, path, "interaction.session_hub_fallback", r.own, "attacker"); err != nil {
+		t.Fatalf("recording through the fallback: %v", err)
+	}
+	if fallback.calls == 0 || fallback.edges < hubEdges {
+		t.Fatalf("the fallback read %d neighborhoods with %d edges; the control is vacuous",
+			fallback.calls, fallback.edges)
+	}
+}

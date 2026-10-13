@@ -51,9 +51,10 @@ type citedEvidence struct {
 //   - every cited non-derived assertion, under the evidence gate reads use
 //     (#700): each revision its evidence cites and each node of its evidence
 //     paths, with path edges limited to the session's own authorized edges.
-//     A derived assertion carries derivation evidence only, and a reader may
-//     read it when it may read its endpoints, which the touched-node check
-//     already requires.
+//     A derived assertion is skipped. Assertion.Validate requires it to carry
+//     exactly one derivation evidence and no citation, so there is nothing
+//     to check, and a derived (latent) edge has no policy edge registration,
+//     so the touched-edge check already refuses any session touching one.
 //
 // Every refusal is auth.ObjectNotFound, whether the revision or assertion is
 // hidden, unregistered, or never existed, so the outcome does not depend on
@@ -78,6 +79,10 @@ func (c *Client) verifyInteractionCitations(
 				RevisionID: reference.Citation.RevisionID,
 			})
 		case interaction.EvidenceGraph:
+			// Keyed by assertion ID alone: the ID hashes the assertion's
+			// content, evidence included, so one ID is one evidence set to
+			// check whichever edge a reference names. The trusted validator
+			// still checks each reference against its own edge.
 			for _, assertion := range reference.Assertions {
 				if assertion.Origin != ontology.AssertionDerived {
 					cited[assertion.AssertionID] = assertion
@@ -184,31 +189,8 @@ func (c *Client) citedInteractionAssertions(
 		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
 		chunk := edgeIDs[start:end]
 		start = end
-		registrations, err := c.policyStore.Edges(ctx, chunk)
-		if err != nil {
-			return nil, policyCatalogReadError(ctx, err)
-		}
-		sources := make([]shoal.ID, 0, len(chunk))
-		types := make([]string, 0, len(chunk))
-		for _, edgeID := range chunk {
-			registration, ok := registrations[edgeID]
-			if !ok {
-				return nil, auth.ObjectNotFound()
-			}
-			sources = append(sources, registration.Edge.From)
-			types = append(types, registration.Edge.Type)
-		}
-		raw, err := c.base.Neighborhood(ctx, explorer.NeighborhoodRequest{
-			NodeIDs: sources, Depth: 1, EdgeTypes: types,
-		})
-		if err != nil {
-			return nil, directBaseError(err)
-		}
-		for _, assertion := range raw.Assertions {
-			edgeID := shoal.ID(assertion.Metadata()[graphAssertionEdgeIDMetadata])
-			if err := match(edgeID, assertion); err != nil {
-				return nil, err
-			}
+		if err := c.graphAttachedAssertions(ctx, chunk, match); err != nil {
+			return nil, err
 		}
 		if isNilDependency(c.relationAssertions) {
 			continue
@@ -234,4 +216,66 @@ func (c *Client) citedInteractionAssertions(
 		assertions = append(assertions, assertion)
 	}
 	return assertions, nil
+}
+
+// EdgeAssertionReader is the explicitly trusted source of the assertion the
+// base graph attaches to each edge, read by edge ID (#714). NewClient
+// promotes it from SnapshotValidator, never from Base.
+type EdgeAssertionReader interface {
+	EdgeAssertions(
+		context.Context, []shoal.ID,
+	) (map[shoal.ID]ontology.Assertion, error)
+}
+
+// graphAttachedAssertions passes match the assertion the base graph attaches
+// to each edge. The trusted EdgeAssertionReader reads exactly those edges
+// under the corpus's shared lock. Without one, it falls back to the base's
+// depth-1 neighborhood of each edge's source, filtered to the edges' types,
+// which reads the source's whole adjacency.
+func (c *Client) graphAttachedAssertions(
+	ctx context.Context,
+	edgeIDs []shoal.ID,
+	match func(shoal.ID, ontology.Assertion) error,
+) error {
+	if !isNilDependency(c.edgeAssertions) {
+		attached, err := c.edgeAssertions.EdgeAssertions(ctx, edgeIDs)
+		if err != nil {
+			return directBaseError(err)
+		}
+		for _, edgeID := range edgeIDs {
+			if assertion, ok := attached[edgeID]; ok {
+				if err := match(edgeID, assertion); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	registrations, err := c.policyStore.Edges(ctx, edgeIDs)
+	if err != nil {
+		return policyCatalogReadError(ctx, err)
+	}
+	sources := make([]shoal.ID, 0, len(edgeIDs))
+	types := make([]string, 0, len(edgeIDs))
+	for _, edgeID := range edgeIDs {
+		registration, ok := registrations[edgeID]
+		if !ok {
+			return auth.ObjectNotFound()
+		}
+		sources = append(sources, registration.Edge.From)
+		types = append(types, registration.Edge.Type)
+	}
+	raw, err := c.base.Neighborhood(ctx, explorer.NeighborhoodRequest{
+		NodeIDs: sources, Depth: 1, EdgeTypes: types,
+	})
+	if err != nil {
+		return directBaseError(err)
+	}
+	for _, assertion := range raw.Assertions {
+		edgeID := shoal.ID(assertion.Metadata()[graphAssertionEdgeIDMetadata])
+		if err := match(edgeID, assertion); err != nil {
+			return err
+		}
+	}
+	return nil
 }
