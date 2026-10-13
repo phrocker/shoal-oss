@@ -721,8 +721,11 @@ func (s *MemoryPolicyStore) PutRevision(
 			// ApplicationEdgeCollisions reports it). Only a pre-#699 Connect
 			// could have taken such an ID, and refusing here kept the
 			// squatted document unregistered, and so withheld from every
-			// reader, on every ingest. One of the same content was dropped
-			// above. Only an exact document contains edge wins: anything
+			// reader, on every ingest. An exact document contains edge wins
+			// the same way when the application registration has its very
+			// content; any other edge of the same content was dropped above
+			// and stays an application edge. Only an exact document contains
+			// edge wins: anything
 			// else the client read as intrinsic may be the application edge
 			// itself, as the base shows it, under content of its own (a base
 			// edge that diverged from its registration), and must never be
@@ -1226,13 +1229,33 @@ func (s *MemoryPolicyStore) putEdge(
 		}
 		// An extracted or materialized edge wins its ID over an application
 		// registration of other content or rule (#732), as it does in the
-		// base graph (#724), where the application edge stays stored but
-		// withheld. The derived registration replaces the application one
-		// whole, its binding included, so nothing of the application edge's
-		// policy governs the derived edge, and the application edge's base
-		// content never matches it, so every authorized read withholds that
-		// edge even if the base shows it again. Only a pre-#699 Connect
-		// could take a derived edge's ID; Connect refuses it from now on.
+		// base graph (#724). This is a deliberate precedence: before #732
+		// every such case was refused here, an extracted edge of the same
+		// content under another rule and any materialized edge included,
+		// which refused that extraction or materialization for good. The
+		// derived registration replaces the
+		// application one whole, its binding included, so nothing of the
+		// application edge's policy governs the derived edge.
+		//
+		// Of other content, the application edge stays stored but withheld
+		// in the base, and its content never matches this registration, so
+		// every authorized read withholds it even if the base shows it
+		// again. Of the same content, the base shows one edge, the derived
+		// one, which is the extractor's or materializer's own canonical
+		// assertion and is served under its own registration.
+		//
+		// Only edgeMergeReplace (an extracted edge of the same content and
+		// rule) keeps the application binding: that is the same assertion
+		// under the same policy, typically an extracted edge persisted
+		// before RegistrationKind and decoded as an application edge
+		// (legacyEdgeKind), whose binding #695 keeps because it can only
+		// narrow. A registration of another rule is another policy's
+		// assertion, which must not govern the derived edge, and a
+		// materialized edge carries no binding at all
+		// (normalizeApplicationEdgeRegistration).
+		//
+		// Only a pre-#699 Connect could take a derived edge's ID, and
+		// Connect refuses it from now on.
 	}
 	s.edges[normalized.Edge.ID] = cloneEdgeRegistration(normalized)
 	delete(s.edgeClaims, normalized.Edge.ID)
@@ -1327,18 +1350,26 @@ func (s *MemoryPolicyStore) Edges(
 	return resolved, nil
 }
 
-// withoutApplicationEdgesLocked returns intrinsic without every edge an
-// application registration holds with the same content. The client reads a
-// revision's intrinsic edges from the base graph (its "contains" edges among
-// the revision's nodes), and the base shows a stored application edge there
-// whenever no derived edge holds its ID with other content (#724). An edge
-// that matches an application registration exactly may therefore be that
-// application edge, and registering it as intrinsic would put it under the
-// document's rule alone, dropping the application edge's own rule and
-// binding: a widening. It stays governed by the application registration,
-// which also requires both endpoints' rules, so it is never served more
-// widely than either reading allows. Before #732 such a revision was refused
-// outright. The caller holds s.mu.
+// withoutApplicationEdgesLocked returns intrinsic without every edge that is
+// not an exact document contains edge (explorer.IsDocumentContainsEdge) and
+// that an application registration holds with the same content. The client
+// reads a revision's intrinsic edges from the base graph (its "contains"
+// edges among the revision's nodes), and the base shows a stored application
+// edge there whenever no derived edge holds its ID with other content
+// (#724). Such an edge is the application edge, and registering it as
+// intrinsic would put it under the document's rule alone, dropping the
+// application edge's own rule and binding: a widening. It stays governed by
+// the application registration, which also requires both endpoints' rules.
+// Before #732 such a revision was refused outright.
+//
+// An exact document contains edge is kept even when an application
+// registration holds identical content: it is the parse's own edge, which
+// every document of the revision has and retrieval validation requires
+// (buildCanonicalRetrievalDocument counts one per parent and child), so
+// dropping it would leave the revision one intrinsic edge short and fail
+// every retrieval that hydrates the document. The intrinsic registration
+// wins it, and the application registration is withheld and reported, as
+// for other content. The caller holds s.mu.
 func (s *MemoryPolicyStore) withoutApplicationEdgesLocked(
 	intrinsic []graph.Edge,
 ) []graph.Edge {
@@ -1346,7 +1377,8 @@ func (s *MemoryPolicyStore) withoutApplicationEdgesLocked(
 	for _, edge := range intrinsic {
 		if custom, ok := s.edges[edge.ID]; ok &&
 			custom.Kind == RegistrationApplication &&
-			graphEdgesEqual(custom.Edge, edge) {
+			graphEdgesEqual(custom.Edge, edge) &&
+			!explorer.IsDocumentContainsEdge(edge) {
 			continue
 		}
 		kept = append(kept, edge)
@@ -1373,7 +1405,10 @@ func (s *MemoryPolicyStore) edgeRegistrationLocked(
 // registrations the catalog withholds because a current intrinsic edge holds
 // the same ID (#732). It is the catalog's counterpart of
 // explorer.Explorer.ApplicationEdgeCollisions: an operator diagnostic that
-// no Client method exposes. A withheld registration stays stored and governs
+// no Client method exposes. Unlike the base's, it also lists an application
+// registration identical to the intrinsic edge (see
+// withoutApplicationEdgesLocked), which the base graph does not count as a
+// collision. A withheld registration stays stored and governs
 // nothing; it governs its edge again only if the intrinsic edge stops being
 // current. An application registration an extracted or materialized edge
 // displaced is not listed: that registration was replaced (see putEdge), and

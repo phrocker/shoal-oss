@@ -18,32 +18,45 @@ IDs.
 **Behaviour change.** The catalog now follows the base graph:
 
 - **Intrinsic edges.** A revision whose intrinsic edge ID an application
-  registration holds with other content is registered. The intrinsic edge
+  registration holds is registered, whether that registration has other
+  content or the intrinsic edge's very content. The intrinsic edge
   wins its ID: `Edge` and `Edges` resolve it, so it is served under the
   document's rule alone. The application registration stays stored but
   governs nothing, so the application edge is withheld from every reader,
   even if the base showed it. It is reported by the new operator diagnostic
   `ApplicationEdgeCollisions(ctx)` on `MemoryPolicyStore` and
   `DurablePolicyStore`, which matches `Explorer.ApplicationEdgeCollisions`
-  for intrinsic edges. Like the base's, it is not on `PolicyStore` and no
+  for intrinsic edges, except that it also lists an application registration
+  identical to the intrinsic edge, which the base graph does not count as a
+  collision. Like the base's, it is not on `PolicyStore` and no
   `authorized.Client` method exposes it. Only an exact document `contains`
   edge (`explorer.IsDocumentContainsEdge`) wins: the client reads a
   revision's intrinsic edges from the base graph, so anything else could be
   the application edge itself, and that revision is still refused.
 - **An application `contains` edge between a document's own nodes**, which
   the base graph shows and the client therefore reads as intrinsic, is no
-  longer a reason to refuse the document's next revision. It is left out of
+  longer a reason to refuse the document's next revision, unless it is an
+  exact document `contains` edge (which wins, as above). It is left out of
   the revision's intrinsic edges and stays governed by its application
   registration (its rule and both endpoints' rules), never by the document's
   rule alone.
-- **Extracted and materialized edges.** An extracted or materialized
-  registration replaces an application registration of other content or
-  rule under its ID, binding included, and consumes a leftover reservation
-  there, instead of refusing the extraction or materialization. The base
-  still holds and reports the application edge, which never matches the
-  derived registration, so it stays withheld even if the base shows it
-  again. An extracted edge matching an application registration exactly,
-  under the same rule, still takes it over and keeps its binding, as before.
+- **Extracted and materialized edges.** This is a deliberate precedence
+  change. An extracted or materialized registration replaces an application
+  registration of other content or rule under its ID, and consumes a
+  leftover reservation there, instead of refusing the extraction or
+  materialization. That includes an extracted edge of the same content under
+  another rule, and any materialized edge, which were refused before.
+  The application registration's binding (#695) is dropped with it: another
+  rule's binding must not govern the derived edge, and a materialized edge
+  carries none. With other content, the base still holds and reports the
+  application edge. It never matches the derived registration, so it stays
+  withheld even if the base shows it again. With the same content, the base
+  shows one edge, which is the extractor's or materializer's own canonical
+  assertion and is served under its registration. Only an extracted edge
+  matching an application registration exactly, under the same rule, keeps
+  the binding, as before: that is the same assertion under the same policy
+  (usually an extracted edge persisted before registration kinds existed),
+  and keeping it can only narrow.
 - Whichever way the derived edge won, `Connect` can never take the ID back:
   the reservation is refused while the derived registration holds it.
 
@@ -74,9 +87,10 @@ row to every binary.
   withheld edge keeps its ID, and an application edge whose ID an intrinsic
   edge holds becomes visible again, under its own registration, if a later
   revision of that document no longer has that intrinsic edge.
-- An application edge identical to a document's intrinsic edge is not a
-  collision in the base graph. The catalog keeps it under its application
-  registration, so that edge is served only to readers of both rules.
+- An application `contains` edge that is not an exact document `contains`
+  edge but is read as intrinsic, and has no catalog registration (written
+  through the unwrapped `Explorer.Connect`), is still registered as
+  intrinsic, as before this release.
 
 ### Edge and upload namespaces are keyed by the catalog (#721)
 
