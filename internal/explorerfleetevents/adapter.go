@@ -116,7 +116,23 @@ type Adapter struct {
 	now           func() time.Time
 	retained      uint64
 	publicationGC []byte
+	// movedPublicationGuard writes new publications under
+	// movedPublicationKind instead of the letter approvals share (#681).
+	// Off by default: every replica must be able to *read* the moved letter
+	// before any replica writes it, which is what prunePublicationEntity
+	// does unconditionally.
+	movedPublicationGuard bool
 }
+
+// MovePublicationGuard writes new publications under their own guard letter
+// instead of the one fleet approvals share (#681).
+//
+// Turn it on only once every replica runs a build that contains this change.
+// A replica from before it assumes the shared letter when pruning, and would
+// fail its prune — and so its Append — once a publication written under the
+// moved letter expired. While it is off nothing writes the new letter and a
+// rollback is safe.
+func (a *Adapter) MovePublicationGuard() { a.movedPublicationGuard = true }
 
 type mutationAuditContextKey struct{}
 
@@ -156,6 +172,16 @@ type eventRecord struct {
 	PublicationID []byte                       `json:"publication_id"`
 	RetryUntil    time.Time                    `json:"retry_until"`
 	Audit         fleetevents.LifecycleReceipt `json:"audit"`
+	// GuardKind names the guard letter this publication was written under,
+	// so the prune path can build the entity the publication's own intent
+	// guarded rather than assuming one (#681). Empty means publicationKind,
+	// which is every record written before the move and every record
+	// written by a replica with it off.
+	//
+	// What is actually stored is eventRecordWire, not these tags: this type
+	// defines MarshalJSON, so the tags above are dead and a field added
+	// here alone is dropped on the way to storage.
+	GuardKind string `json:"guard_kind,omitempty"`
 }
 
 type lifecycleReceiptWire struct {
@@ -494,28 +520,39 @@ func (r *subscriptionRecord) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The stored form of an event record. It is written out field by field
+// rather than from eventRecord's own tags, so a field added to that struct
+// is not stored until it is added here too — GuardKind was added to both,
+// and a field present in one and not the other is silently dropped.
+//
+// GuardKind is omitempty so that a record written with the publication
+// guard still shared is byte for byte what a build before #681 wrote. The
+// replay branch recognizes a repeated publication by comparing these bytes,
+// so a record that gained a field unconditionally would read as a conflict
+// to any replica that had not yet gained it.
+type eventRecordWire struct {
+	Event         eventWire
+	PublicationID []byte
+	RetryUntil    time.Time
+	Audit         lifecycleReceiptWire
+	GuardKind     string `json:",omitempty"`
+}
+
 func (r eventRecord) MarshalJSON() ([]byte, error) {
-	return json.Marshal(struct {
-		Event         eventWire
-		PublicationID []byte
-		RetryUntil    time.Time
-		Audit         lifecycleReceiptWire
-	}{eventToWire(r.Event), r.PublicationID, r.RetryUntil, receiptToWire(r.Audit)})
+	return json.Marshal(eventRecordWire{
+		eventToWire(r.Event), r.PublicationID, r.RetryUntil,
+		receiptToWire(r.Audit), r.GuardKind,
+	})
 }
 
 func (r *eventRecord) UnmarshalJSON(value []byte) error {
-	var wire struct {
-		Event         eventWire
-		PublicationID []byte
-		RetryUntil    time.Time
-		Audit         lifecycleReceiptWire
-	}
+	var wire eventRecordWire
 	if err := json.Unmarshal(value, &wire); err != nil {
 		return err
 	}
 	r.Event, r.PublicationID, r.RetryUntil =
 		wire.Event.domain(), wire.PublicationID, wire.RetryUntil
-	r.Audit = wire.Audit.domain()
+	r.Audit, r.GuardKind = wire.Audit.domain(), wire.GuardKind
 	return nil
 }
 
@@ -1022,6 +1059,7 @@ func (a *Adapter) Append(
 		value, marshalErr := json.Marshal(eventRecord{
 			Event: event, PublicationID: publicationID,
 			RetryUntil: request.RetryUntil, Audit: request.Audit,
+			GuardKind: a.publicationGuardKindLabel(),
 		})
 		if marshalErr != nil {
 			return fleetevents.PublishResult{}, marshalErr
@@ -1128,6 +1166,12 @@ func (a *Adapter) repeatedPublication(
 	expected, err := json.Marshal(eventRecord{
 		Event: requested, PublicationID: publicationID,
 		RetryUntil: request.RetryUntil, Audit: existing.Audit,
+		// From the stored record, not this replica's setting, for the same
+		// reason Audit is: it belongs to whoever wrote the publication. A
+		// replay by a replica configured differently is still the same
+		// publication, and taking the local value here would turn the
+		// rollout itself into a conflict (#681).
+		GuardKind: existing.GuardKind,
 	})
 	if err != nil {
 		return fleetevents.PublishResult{}, false, err
@@ -1187,9 +1231,8 @@ func (a *Adapter) publishEvent(
 	if err != nil {
 		return explorercoord.Result{}, err
 	}
-	publicationEntity := publicationEntity(eventID)
 	publicationGuard, err := a.mutationGuard(
-		ctx, publicationEntity, eventID, lpart)
+		ctx, a.publicationEntity(eventID), eventID, lpart)
 	if err != nil {
 		return explorercoord.Result{}, err
 	}
@@ -1274,9 +1317,12 @@ func (a *Adapter) pruneExpiredPublications(
 		if now.Before(record.RetryUntil) {
 			continue
 		}
+		entity, entityErr := prunePublicationEntity(record)
+		if entityErr != nil {
+			return entityErr
+		}
 		targets = append(targets, explorercoord.PruneTarget{
-			Table: Table, Cell: cell,
-			Entity: publicationEntity(record.Event.EventID),
+			Table: Table, Cell: cell, Entity: entity,
 		})
 		tokenParts = append(tokenParts, record.Event.EventID)
 	}
@@ -1643,10 +1689,101 @@ func (a *Adapter) eventRow(sequence uint64) []byte {
 	return eventRow((sequence-1)%a.retained + 1)
 }
 
-func publicationEntity(publicationID []byte) guard.Entity {
+// publicationKind is the guard letter a publication was written under
+// before #681, shared with fleet approvals, and movedPublicationKind is the
+// one it moves to.
+//
+// Sharing a letter is not itself the defect: ownedBy (#670/#677) already
+// stops either store adopting the other's head. The defect is occupation. A
+// publication's entity ID is hex(eventID), and for a lifecycle event the
+// event ID is H(token, RetryUntil) over fields that are all on the committed
+// record — so any party who can read that record can compute the entity.
+// While the event is still unpublished, that party can request an approval
+// whose ID is the same hex string, and the publication is then refused for
+// good: the event is suppressed, and because reconcileActionTransitions
+// returns on the first error, every later transition of that action fails to
+// publish too. That action's outbox wedges.
+//
+// Publications move rather than approvals, though approvals are the side
+// whose IDs the attacker chooses. Approval IDs are client-named and live as
+// long as the approval; publication entity IDs are derived, short-lived and
+// collected. Reserving the 64-lowercase-hex shape in the approval namespace
+// would tax a durable, client-named namespace to accommodate an ephemeral
+// internal identifier, refuse a plausible client scheme (sha256 hex is what
+// an idempotency key usually looks like), and be reopened by the next store
+// to pick 'P'. Separating the two is what does not come back.
+//
+// Making the token unpredictable instead — the way a public publication's
+// already is, scoped by publisher subject and fingerprint — cannot work.
+// actionEventIdentities derives the token without a publisher in it, and
+// that is load-bearing: reconcileActionTransitions lets one principal drain
+// another's pending row, so two principals publishing the same transition
+// must compute the same token or the event publishes twice. Unpredictability
+// and cross-principal idempotency are in direct conflict here, and
+// idempotency wins (#480).
+const (
+	publicationKind      byte = 'P'
+	movedPublicationKind byte = 'B'
+)
+
+// movedPublicationKindLabel is how the moved letter is recorded on the event
+// record. A record carrying no label was written under publicationKind,
+// which is what makes a record written before this change readable by a
+// build after it, and a record written by a replica with the move off byte
+// for byte what a build before this change would have written.
+const movedPublicationKindLabel = "B"
+
+func publicationEntity(publicationID []byte, kind byte) guard.Entity {
 	return guard.Entity{
-		Kind: 'P',
+		Kind: kind,
 		ID:   coordination.EntityID(hex.EncodeToString(publicationID)),
+	}
+}
+
+// publicationEntity is the entity this adapter guards a new publication
+// under, which is the only place the configured letter is chosen.
+func (a *Adapter) publicationEntity(publicationID []byte) guard.Entity {
+	if a.movedPublicationGuard {
+		return publicationEntity(publicationID, movedPublicationKind)
+	}
+	return publicationEntity(publicationID, publicationKind)
+}
+
+// publicationGuardKindLabel is what a new record records about its own
+// guard. Empty while the move is off, so the serialized record is identical
+// to what a build before #681 produces — which matters because the replay
+// branch recognizes a repeated publication by comparing marshalled bytes,
+// and a record that gained a field would read as a conflict to a replica
+// that had not.
+func (a *Adapter) publicationGuardKindLabel() string {
+	if a.movedPublicationGuard {
+		return movedPublicationKindLabel
+	}
+	return ""
+}
+
+// prunePublicationEntity is the entity a *stored* publication is guarded
+// under, taken from the record rather than from this replica's setting.
+//
+// This is the half that has to ship before anything writes the new letter.
+// buildPruneTargetLocked looks for a live owning guard on the publication's
+// own intent at the entity the prune names; a replica that assumed 'P' for a
+// record written under the moved letter would find none and fail the whole
+// prune with ErrInternal, which is not a conflict, so its Append would fail
+// every time such a publication expired.
+func prunePublicationEntity(record eventRecord) (guard.Entity, error) {
+	switch record.GuardKind {
+	case "":
+		return publicationEntity(record.Event.EventID, publicationKind), nil
+	case movedPublicationKindLabel:
+		return publicationEntity(
+			record.Event.EventID, movedPublicationKind), nil
+	default:
+		// Refused rather than defaulted. A label this build does not know
+		// came from a later one, and guessing 'P' for it would retire the
+		// wrong guard.
+		return guard.Entity{}, errors.New(
+			"fleet events: publication receipt names an unknown guard kind")
 	}
 }
 
