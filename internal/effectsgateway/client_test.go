@@ -667,4 +667,23 @@ func TestActionFromCarriesTheWithheldMarker(t *testing.T) {
 	if served.OutputWithheld {
 		t.Fatal("an ordinary action gained a withheld marker")
 	}
+
+	// And #746's, across the same projection. A worker that loses this one
+	// sees a failed action with no ambiguity report, which is an ordinary
+	// state rather than an impossible one — so unlike the Output's marker,
+	// nothing downstream would notice it had gone.
+	reportsWithheld := actionFrom(dispatchapi.Record{
+		ID: []byte("action"), State: "failed",
+		AmbiguityReportsWithheld: true,
+	})
+	if !reportsWithheld.AmbiguityReportsWithheld {
+		t.Fatal("the gateway dropped the withheld-reports marker")
+	}
+	if len(reportsWithheld.AmbiguityReports) != 0 {
+		t.Fatalf("reports = %+v alongside the marker",
+			reportsWithheld.AmbiguityReports)
+	}
+	if served.AmbiguityReportsWithheld {
+		t.Fatal("an ordinary action gained a withheld-reports marker")
+	}
 }

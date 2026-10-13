@@ -344,16 +344,23 @@ type Action struct {
 	// not see a succeeded action with no output and no reason, which is a
 	// state the service cannot produce and would otherwise have to be
 	// guessed at.
-	OutputWithheld  bool
-	ErrorCode       string
-	Deadline        time.Time
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	ExecutorKey     ExecutorKey
-	ClaimID         []byte
-	ClaimFence      uint64
-	ClaimLeaseUntil time.Time
-	EffectPossible  bool
+	OutputWithheld bool
+	// AmbiguityReportsWithheld says the reports were removed because the
+	// reader may not see the evidence the action cited (#746). Target and
+	// Reference are target-controlled worker text, so they are withheld
+	// alongside the Output. Unlike an absent Output, an absent report set
+	// is ordinary, so this flag is what tells a principal entitled to a
+	// reference that there is one it is not being shown.
+	AmbiguityReportsWithheld bool
+	ErrorCode                string
+	Deadline                 time.Time
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	ExecutorKey              ExecutorKey
+	ClaimID                  []byte
+	ClaimFence               uint64
+	ClaimLeaseUntil          time.Time
+	EffectPossible           bool
 	// Effected is the volume a failed record says escaped before the failure
 	// (#427), zero when none was reported. Read back on a resend, never
 	// re-derived: the field is write-once and compared on replay.
@@ -394,8 +401,10 @@ func actionFrom(record dispatchapi.Record) Action {
 		AgentID: record.AgentID, AgentGeneration: record.AgentGeneration,
 		Capability: record.Capability, Action: record.Action,
 		Input: record.Input, Output: record.Output,
-		OutputWithheld: record.OutputWithheld, ErrorCode: record.ErrorCode,
-		Deadline: record.Deadline, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
+		OutputWithheld:           record.OutputWithheld,
+		AmbiguityReportsWithheld: record.AmbiguityReportsWithheld,
+		ErrorCode:                record.ErrorCode,
+		Deadline:                 record.Deadline, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 		ClaimID: record.ClaimID, ClaimFence: record.ClaimFence,
 		ClaimLeaseUntil: record.ClaimLeaseUntil, EffectPossible: record.EffectPossible,
 		Effected: record.Effected, CorrelationID: record.CorrelationID,

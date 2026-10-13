@@ -1013,3 +1013,39 @@ func TestFleetDispatchErrorMarksEveryIndeterminateJoin(t *testing.T) {
 		})
 	}
 }
+
+// TestTheWithheldReportsMarkerReachesTheWire pins #746's marker across the
+// explorer's own encoder, which is a join the service-level test cannot see:
+// readableRecords sets the field on the record, and if encodeFleetAction
+// does not copy it, every HTTP client reads a failed action with no
+// ambiguity report and no indication one was removed.
+//
+// Asserted on the marshalled bytes rather than the struct, because the tag
+// is what a client reads and building fleetActionWire in Go would pass with
+// it renamed.
+func TestTheWithheldReportsMarkerReachesTheWire(t *testing.T) {
+	withheld, err := json.Marshal(encodeFleetAction(fleet.ActionRecord{
+		ID: []byte("action"), State: fleet.DispatchFailed,
+		ErrorCode:                "upstream_unreachable",
+		AmbiguityReportsWithheld: true,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(withheld, []byte(`"ambiguity_reports_withheld":true`)) {
+		t.Fatalf("the marker did not reach the wire: %s", withheld)
+	}
+
+	// Omitted otherwise, so an ordinary record's bytes are unchanged by the
+	// field existing.
+	ordinary, err := json.Marshal(encodeFleetAction(fleet.ActionRecord{
+		ID: []byte("action"), State: fleet.DispatchSucceeded,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(ordinary, []byte("ambiguity_reports_withheld")) {
+		t.Fatalf("a record with nothing withheld names the field: %s",
+			ordinary)
+	}
+}

@@ -36,4 +36,17 @@ func TestAWithheldMarkerIsNeverStored(t *testing.T) {
 	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
 		t.Fatalf("err = %v, want invalid-argument", err)
 	}
+
+	// And #746's marker, which is the same read-path value for the same
+	// reason: a stored one would withhold a reference from the operator who
+	// needs it to reconcile with the other system, permanently.
+	record.OutputWithheld = false
+	record.AmbiguityReportsWithheld = true
+	_, err = encodeAction(record)
+	if err == nil {
+		t.Fatal("a record with a durable withheld-reports marker was stored")
+	}
+	if !shoal.IsErrorCode(err, shoal.ErrorInvalidArgument) {
+		t.Fatalf("err = %v, want invalid-argument", err)
+	}
 }

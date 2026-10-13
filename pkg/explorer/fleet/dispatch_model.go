@@ -556,14 +556,38 @@ type ActionRecord struct {
 	// report under the same fence is appended rather than replacing the first:
 	// two reports from one attempt mean the worker retried, and that is
 	// information an operator wants rather than noise to collapse.
-	AmbiguityReports   []AmbiguityReport
-	ClaimantSubject    shoal.ID
-	ClaimantActor      shoal.ID
-	ClaimantClientID   shoal.ID
-	ClaimantOnBehalfOf []shoal.ID
-	ClaimFence         uint64
-	ClaimLease         time.Duration
-	ClaimLeaseUntil    time.Time
+	AmbiguityReports []AmbiguityReport
+	// AmbiguityReportsWithheld marks a read whose AmbiguityReports were
+	// removed because the reader may not see the evidence the action cited
+	// (#746).
+	//
+	// Target and Reference are worker-written text describing an exchange
+	// with a system Shoal does not control, so the bytes are
+	// target-controlled — the field's own bound says so — and nothing binds
+	// them to the evidence the action read. That is the channel #696 closed
+	// for Output and #740 narrowed for ErrorCode, and these are the last of
+	// it.
+	//
+	// A read-path value, like OutputWithheld: no writer sets it, and the
+	// stored record never carries it.
+	//
+	// It exists for a different reason from OutputWithheld's, which is
+	// worth saying plainly rather than inheriting. A succeeded record with
+	// no Output is a state Validate refuses, so the absence itself would
+	// have said "withheld"; a record with no ambiguity reports is ordinary
+	// — most records have none — so dropping them discloses nothing and
+	// needs no marker to stay legal. The marker is for the principal
+	// entitled to them: a Reference is the handle an operator takes to the
+	// other system, and silently showing none would have them conclude
+	// there is nothing to reconcile.
+	AmbiguityReportsWithheld bool
+	ClaimantSubject          shoal.ID
+	ClaimantActor            shoal.ID
+	ClaimantClientID         shoal.ID
+	ClaimantOnBehalfOf       []shoal.ID
+	ClaimFence               uint64
+	ClaimLease               time.Duration
+	ClaimLeaseUntil          time.Time
 	// ClaimAttestationID is the verified executor attestation the current
 	// claim (or its latest extension) was granted under, when the action
 	// requires attestation (#446). Empty otherwise.
@@ -1477,6 +1501,14 @@ func (r ActionRecord) Validate() error {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"action output cannot be both present and withheld")
+	}
+	// The same rule for the ambiguity reports, for the same reason: a record
+	// claiming a redaction while carrying what it claims to have removed
+	// would make the marker say nothing.
+	if r.AmbiguityReportsWithheld && len(r.AmbiguityReports) > 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action ambiguity reports cannot be both present and withheld")
 	}
 	if r.State == DispatchFailed && r.ErrorCode == "" {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "failed action outcome is incomplete")

@@ -314,21 +314,28 @@ type Action struct {
 	// action would arrive with no output at all, which is a state the
 	// service cannot produce and a client would have to decode as a
 	// redaction; this states it instead.
-	OutputWithheld   bool              `json:"output_withheld,omitempty"`
-	ErrorCode        string            `json:"error_code,omitempty"`
-	ErrorCodeOrigin  string            `json:"error_code_origin,omitempty"`
-	Effected         *Effected         `json:"effected,omitempty"`
-	RequestID        string            `json:"request_id"`
-	CorrelationID    string            `json:"correlation_id,omitempty"`
-	Deadline         time.Time         `json:"deadline"`
-	CreatedAt        time.Time         `json:"created_at"`
-	UpdatedAt        time.Time         `json:"updated_at"`
-	ExecutorKey      string            `json:"executor_key,omitempty"`
-	ClaimID          string            `json:"claim_id,omitempty"`
-	ClaimFence       uint64            `json:"claim_fence,omitempty"`
-	ClaimLeaseUntil  time.Time         `json:"claim_lease_until,omitempty"`
-	EffectPossible   bool              `json:"effect_possible"`
-	AmbiguityReports []AmbiguityReport `json:"ambiguity_reports,omitempty"`
+	OutputWithheld bool `json:"output_withheld,omitempty"`
+	// AmbiguityReportsWithheld says the reports were removed because the
+	// reader may not see the evidence the action cited (#746). Target and
+	// Reference are target-controlled worker text, so they are withheld
+	// alongside the Output. Unlike an absent Output, an absent report set
+	// is ordinary, so this flag is what tells a principal entitled to a
+	// reference that there is one it is not being shown.
+	AmbiguityReportsWithheld bool              `json:"ambiguity_reports_withheld,omitempty"`
+	ErrorCode                string            `json:"error_code,omitempty"`
+	ErrorCodeOrigin          string            `json:"error_code_origin,omitempty"`
+	Effected                 *Effected         `json:"effected,omitempty"`
+	RequestID                string            `json:"request_id"`
+	CorrelationID            string            `json:"correlation_id,omitempty"`
+	Deadline                 time.Time         `json:"deadline"`
+	CreatedAt                time.Time         `json:"created_at"`
+	UpdatedAt                time.Time         `json:"updated_at"`
+	ExecutorKey              string            `json:"executor_key,omitempty"`
+	ClaimID                  string            `json:"claim_id,omitempty"`
+	ClaimFence               uint64            `json:"claim_fence,omitempty"`
+	ClaimLeaseUntil          time.Time         `json:"claim_lease_until,omitempty"`
+	EffectPossible           bool              `json:"effect_possible"`
+	AmbiguityReports         []AmbiguityReport `json:"ambiguity_reports,omitempty"`
 	// The evidence fields are what an in-plane executor reported; the
 	// explorer returns them on every record.
 	EvidenceSnapshotID   string     `json:"evidence_snapshot_id,omitempty"`

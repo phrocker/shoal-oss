@@ -3936,8 +3936,14 @@ func (s *DispatchService) readableRecord(
 	return readable[0], nil
 }
 
-// outputReadableBy reports whether this reader may be told that an Output
-// existed at all, which decides what a withheld record looks like to it.
+// outputReadableBy reports whether this reader may be told that an Output,
+// or an ambiguity report, existed at all — which decides what a withheld
+// record looks like to it.
+//
+// One predicate for both because the question is the same one: may this
+// reader be shown worker-written bytes from an action whose evidence it may
+// not see. Splitting it would let the two answers drift, and there is no
+// reader that should get one and not the other.
 //
 // Output is executor-supplied, checked only against the descriptor's
 // OutputSchema, and carries no labels and no binding to the evidence it was
@@ -4031,7 +4037,13 @@ func (s *DispatchService) readableRecords(
 			result[index] = record
 			continue
 		}
-		if len(record.Output) > 0 {
+		// Both carry what the worker wrote past the evidence it read:
+		// Output because it is derived from it (#696), the ambiguity
+		// reports because Target and Reference are unbounded worker text
+		// describing an exchange with a third party (#746). Either one
+		// present asks the same question of the same reader, so they are
+		// decided together rather than by two gates that could drift.
+		if len(record.Output) > 0 || len(record.AmbiguityReports) > 0 {
 			// A failure to identify the reader is the question failing, not
 			// an answer about this record: a cancelled context or a resolver
 			// outage says nothing about who is asking. Returned rather than
@@ -4051,6 +4063,10 @@ func (s *DispatchService) readableRecords(
 		if len(record.Output) > 0 {
 			redacted.Output = nil
 			redacted.OutputWithheld = true
+		}
+		if len(record.AmbiguityReports) > 0 {
+			redacted.AmbiguityReports = nil
+			redacted.AmbiguityReportsWithheld = true
 		}
 		if len(readable) == 0 {
 			// Exactly a record that never had evidence: Validate refuses a
