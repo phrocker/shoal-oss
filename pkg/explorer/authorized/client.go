@@ -566,7 +566,7 @@ func (c *Client) ingest(
 	}
 	var intrinsicEdges []graph.Edge
 	if current {
-		intrinsicEdges, err = c.intrinsicEdges(ctx, nodeIDs)
+		intrinsicEdges, err = c.intrinsicEdges(ctx, view, nodeIDs)
 		if err != nil {
 			return explorer.IngestResult{}, err
 		}
@@ -1094,6 +1094,7 @@ func selectedPolicyRule(
 
 func (c *Client) intrinsicEdges(
 	ctx context.Context,
+	view explorer.DocumentView,
 	nodeIDs []shoal.ID,
 ) ([]graph.Edge, error) {
 	neighborhood, err := c.base.Neighborhood(ctx, explorer.NeighborhoodRequest{
@@ -1126,7 +1127,74 @@ func (c *Client) intrinsicEdges(
 	sort.Slice(edges, func(left, right int) bool {
 		return shoal.CompareID(edges[left].ID, edges[right].ID) < 0
 	})
+	if err := c.refuseApplicationEdgesOutsideParse(ctx, view, edges); err != nil {
+		return nil, err
+	}
 	return edges, nil
+}
+
+// refuseApplicationEdgesOutsideParse refuses a revision whose intrinsic
+// edges, as read from the base graph, include an application-held edge of
+// the exact document contains shape that is not one of the parse's own
+// parent and child pairs (#732). The policy catalog lets an exact document
+// contains edge win an ID an application registration holds, but the
+// catalog cannot see the document's structure. An application edge given the
+// deterministic contains ID of two of the document's nodes that are not
+// parent and child would then be registered as intrinsic, and
+// buildCanonicalRetrievalDocument, which expects exactly the parse's pairs,
+// would reject the document in every retrieval that hydrates it: an unscoped
+// retrieval of every reader of it. Refusing the revision instead keeps that
+// state contained to the one document, failing closed, as before #732.
+func (c *Client) refuseApplicationEdgesOutsideParse(
+	ctx context.Context, view explorer.DocumentView, edges []graph.Edge,
+) error {
+	pairs := documentContainsPairs(view)
+	var outside []shoal.ID
+	for _, edge := range edges {
+		if _, expected := pairs[canonicalEdgePair{from: edge.From, to: edge.To}]; !expected &&
+			explorer.IsDocumentContainsEdge(edge) {
+			outside = append(outside, edge.ID)
+		}
+	}
+	for start := 0; start < len(outside); {
+		end := chunkEnd(start, len(outside), maxInteractionAuthorizationIDs)
+		registrations, err := c.policyStore.Edges(ctx, outside[start:end])
+		start = end
+		if err != nil {
+			return policyCatalogReadError(ctx, err)
+		}
+		for _, registration := range registrations {
+			if registration.Kind == RegistrationApplication {
+				return catalogConflict()
+			}
+		}
+	}
+	return nil
+}
+
+// documentContainsPairs returns the parent and child pairs of a revision's
+// parse: the document and its root sections, each section and its child
+// sections, and each section and its spans. It is the set
+// buildCanonicalRetrievalDocument expects a revision's intrinsic edges to
+// cover exactly.
+func documentContainsPairs(view explorer.DocumentView) map[canonicalEdgePair]struct{} {
+	pairs := make(map[canonicalEdgePair]struct{})
+	var visit func(explorer.SectionView)
+	visit = func(section explorer.SectionView) {
+		parent := section.Section.ParentID
+		if parent == "" {
+			parent = view.Document.ID
+		}
+		pairs[canonicalEdgePair{from: parent, to: section.Section.ID}] = struct{}{}
+		for _, span := range section.Spans {
+			pairs[canonicalEdgePair{from: section.Section.ID, to: span.ID}] = struct{}{}
+		}
+		for _, child := range section.Children {
+			visit(child)
+		}
+	}
+	visit(view.Root)
+	return pairs
 }
 
 func exactRevisionIsCurrent(

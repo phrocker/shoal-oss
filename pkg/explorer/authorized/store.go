@@ -729,7 +729,10 @@ func (s *MemoryPolicyStore) PutRevision(
 			// else the client read as intrinsic may be the application edge
 			// itself, as the base shows it, under content of its own (a base
 			// edge that diverged from its registration), and must never be
-			// registered under the document's rule. Any other registration
+			// registered under the document's rule. The catalog cannot see
+			// the parse, so the client refuses beforehand an exact one that
+			// is not a parent and child pair of it
+			// (refuseApplicationEdgesOutsideParse). Any other registration
 			// (extracted, materialized) under the ID still conflicts.
 			if custom, ok := s.edges[edge.ID]; ok &&
 				(custom.Kind != RegistrationApplication ||

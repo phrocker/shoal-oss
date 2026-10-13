@@ -32,7 +32,13 @@ IDs.
   `authorized.Client` method exposes it. Only an exact document `contains`
   edge (`explorer.IsDocumentContainsEdge`) wins: the client reads a
   revision's intrinsic edges from the base graph, so anything else could be
-  the application edge itself, and that revision is still refused.
+  the application edge itself, and that revision is still refused. So is a
+  revision, through `Ingest` or the development backfill, where an
+  application registration holds an edge of that exact shape between two of
+  the document's nodes that are not a parent and its child in the parse.
+  Registering such an edge as intrinsic would make retrieval reject the
+  document, and with it every unscoped retrieval by any of its readers.
+  Refusing it keeps the damage to that one document, as before.
 - **An application `contains` edge between a document's own nodes**, which
   the base graph shows and the client therefore reads as intrinsic, is no
   longer a reason to refuse the document's next revision, unless it is an

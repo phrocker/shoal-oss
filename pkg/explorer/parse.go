@@ -547,9 +547,17 @@ func canonicalVisibility(expression string) string {
 // so a stored application edge the base graph shows can never pass as an
 // intrinsic edge with content of its own.
 func IsDocumentContainsEdge(edge graph.Edge) bool {
-	want := containsEdge(edge.From, edge.To)
+	want := DocumentContainsEdge(edge.From, edge.To)
 	return edge.ID == want.ID && edge.Type == want.Type &&
 		edge.Weight == want.Weight && len(edge.Properties) == 0
+}
+
+// DocumentContainsEdge returns the "contains" edge of the document contains
+// shape (IsDocumentContainsEdge) from one node to another. A document parse
+// derives it only between a parent and its child; for any other pair it is
+// just the shape.
+func DocumentContainsEdge(from, to shoal.ID) graph.Edge {
+	return containsEdge(from, to)
 }
 
 func containsEdge(from, to shoal.ID) graph.Edge {
