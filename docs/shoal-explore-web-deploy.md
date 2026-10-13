@@ -596,15 +596,20 @@ format floor written". From then on an older `shoal-explore-web` or
 `internal: stored policy source claim record is corrupt`. The catalog is not
 corrupt; the older binary would otherwise ignore the new bindings. To roll
 back, restore the backup taken before the upgrade. Do not delete the row.
+The corpus volume need not be restored with it: a document ingested after
+the backup has no registration in the restored catalog and is withheld from
+every reader (fail closed) until it is ingested again. Restore the corpus
+from the same point if you want the two to agree.
 
 Known gaps:
 
 - Interactions and edges recorded before #695 carry no record of the
-  revision they were derived from. They are held to every revision of their
-  documents that was published by the time they were made (and the current
-  one), so they stay closed over a labelled revision they could have seen,
-  and may also close over one published just before them that they did not
-  use.
+  revision they were derived from. A session is held to every revision of
+  its documents up to the one current at its snapshot (by publication
+  sequence) and the current one, so it may close over an earlier labelled
+  revision it did not use. An edge is held to every revision its endpoints'
+  documents ever had, so an old edge to a once-labelled document stays
+  closed to readers without that label.
 - A fleet action's `Output` is shown to readers whose view of the action's
   evidence is withheld (#696).
 - Existence and count oracles. A bounded neighborhood's scan limit reveals

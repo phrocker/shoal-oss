@@ -26,15 +26,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
 // relabelAfterValidation runs after once, just after the first snapshot
-// validation it serves succeeds: a relabel landing between a recording's
-// validation and its write.
+// validation it serves succeeds. It also serves as a snapshot validator that
+// is not a PublicationReader.
 type relabelAfterValidation struct {
 	inner authorized.EvidenceSnapshotValidator
 	after func()
@@ -61,65 +60,6 @@ func (v *relabelAfterValidation) ValidateEvidenceSnapshot(
 ) error {
 	return v.fire(v.inner.ValidateEvidenceSnapshot(
 		ctx, id, asOf, nodeIDs, edgeIDs, references))
-}
-
-// TestRelabelRacingARecordingNeverOpensTheSession: the session's sources
-// are read, authorized and validated over the labelled revision, and the
-// relabel lands before the session is written. Either the write is refused
-// (the corpus re-checks the snapshot when it writes) or the session is bound
-// to the labelled revision; either way the reader cannot read it.
-func TestRelabelRacingARecordingNeverOpensTheSession(t *testing.T) {
-	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
-		w := newBindingWorld(t, newFixture(t), store)
-		inner, ok := trustedSnapshotValidator(w.f.base).(authorized.EvidenceSnapshotValidator)
-		if !ok {
-			t.Fatal("the corpus does not validate evidence snapshots")
-		}
-		var relabelled explorer.IngestResult
-		validator := &relabelAfterValidation{inner: inner, after: func() {
-			relabelled = w.relabel(w.client)
-		}}
-		selector := w.f.staticSelector(t, w.f.sourceA, w.f.policyA)
-		recorder, err := authorized.NewClient(authorized.Config{
-			Base:              w.f.base,
-			InteractionWriter: trustedInteractionWriter(w.f.base),
-			InteractionReader: trustedInteractionReader(w.f.base),
-			SnapshotValidator: validator,
-			FoldStore:         trustedFoldStore(w.f.base),
-			Resolver:          w.f.authority.Resolver(),
-			PolicySelector:    selector,
-			PolicyStore:       store,
-			GenerationReader:  w.f.reader,
-			Clock:             w.f.clock.Now,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		recordErr := w.tryRecord(recorder, bindingSession, w.closed.Document.ID)
-		if relabelled.Revision.ID == "" {
-			t.Fatal("the relabel did not race the recording")
-		}
-		_, err = w.client.InteractionRecord(w.as(w.reader), bindingSession)
-		assertSameRefusal(t, "raced session", err, w.neverRecord(w.client))
-		if recordErr != nil {
-			return
-		}
-		recorded, err := store.InteractionRevisions(
-			context.Background(), []shoal.ID{bindingSession})
-		if err != nil {
-			t.Fatal(err)
-		}
-		labelled := authorized.RevisionReference{
-			DocumentID: w.closed.Document.ID, RevisionID: w.closed.Revision.ID,
-		}
-		for _, reference := range recorded[bindingSession] {
-			if reference == labelled {
-				return
-			}
-		}
-		t.Fatalf("recorded %+v, which omits the labelled revision",
-			recorded[bindingSession])
-	})
 }
 
 // movingCatalog moves one document node to another revision once moved is

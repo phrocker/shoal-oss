@@ -15,12 +15,16 @@ but everything derived from it opened. Now:
   rule). Folds follow their members.
 - An application edge records the revision each endpoint belonged to when it
   was connected, and its effective rule includes those revisions' rules.
-- Outputs recorded before this release carry no such record. They are held
-  to every revision of their documents published by the time they were made
-  (a session's snapshot, an edge's first publication) plus the current one.
-  A pre-release output can therefore close for a reader without a label on a
-  revision that was published before it. Edges extracted or materialized
-  before registration kinds existed are not affected.
+- Outputs recorded before this release carry no such record:
+  - A session is held to every revision of its documents up to the one that
+    was current at the session's snapshot (by the corpus's publication
+    sequence, which a wall-clock step cannot reorder), plus the current one.
+  - An application edge is held to every revision its endpoints' documents
+    ever had, plus the current one. So an edge connected before this release
+    to a document that was ever labelled stays closed to a reader without
+    that label.
+  - Edges extracted or materialized before registration kinds existed are
+    not affected.
 
 **Policy catalog format: back up before upgrading.** The first time this
 release opens a policy catalog read-write (`shoal-explore-web`,
@@ -33,7 +37,10 @@ an older binary would otherwise ignore the new bindings and reopen what they
 close. Back up the policy directory (`-policy-dir`, or the policy catalog
 under `-state-dir`) before upgrading. To roll back, restore that backup; do
 not delete the row. The offline listings of this release do not write the
-row.
+row. The corpus volume does not need to be restored with it: a document
+ingested after the backup has no registration in the restored catalog, so it
+is withheld from every reader (fail closed) until it is ingested again.
+Restore the corpus volume from the same point if you want the two to agree.
 
 ### Copy-down through edges, interactions and extraction is not a declassification (#663)
 

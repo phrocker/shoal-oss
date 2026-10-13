@@ -65,17 +65,18 @@ func TestPublicationsReportRevisionsAndConnectedEdges(t *testing.T) {
 		if len(published) != 1 || len(revisions) != 2 {
 			t.Fatalf("RevisionPublications = %v", published)
 		}
-		if !revisions[first.Revision.ID].Before(revisions[second.Revision.ID]) {
-			t.Fatalf("revisions are not ordered by publication: %v", revisions)
+		early, late := revisions[first.Revision.ID], revisions[second.Revision.ID]
+		if early.Sequence == 0 || early.Sequence >= late.Sequence ||
+			early.PublishedAt.IsZero() || late.PublishedAt.IsZero() {
+			t.Fatalf("revisions are not ordered by publication: %+v", revisions)
 		}
-		at, connected, err := corpus.ConnectedEdgePublications(ctx,
+		connected, err := corpus.ConnectedEdges(ctx,
 			[]shoal.ID{"connected", "never-connected"})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !connected["connected"] || connected["never-connected"] ||
-			at["connected"].Before(revisions[second.Revision.ID]) {
-			t.Fatalf("ConnectedEdgePublications = %v, %v", at, connected)
+		if !connected["connected"] || connected["never-connected"] {
+			t.Fatalf("ConnectedEdges = %v", connected)
 		}
 	}
 	check(corpus)

@@ -53,22 +53,29 @@ import (
 //     revision, drops the edge (denied).
 //
 // Outputs recorded before this binding existed carry no recorded revisions.
-// They are held to the rule of every registered revision of each document
-// their inputs now belong to that could have been what they were derived
-// from: every revision except those the trusted corpus (PublicationReader)
-// says it published after the output was made, plus the current one. A
-// session was made at its SnapshotAsOf, which the corpus validated against a
-// snapshot it took when the session was written, and that snapshot's AsOf is
-// no earlier than the publication of every revision then current. An edge was
-// made when the corpus first published it (its Connect record). An unbound
-// application edge the corpus holds no Connect record for was never
-// connected: it is an extracted or materialized edge persisted before
-// RegistrationKind existed (legacyEdgeKind), and is left as registered.
-// Without a PublicationReader every revision counts. This is never less than
-// before the binding existed. Both bounds are wall-clock times: a clock that
-// stepped backwards between an ingest and a later output can leave out the
-// revision that output was made over, a residual that outputs bound at write
-// do not have.
+// They are held to the rule of the revisions of each document their inputs
+// now belong to that they could have been derived from, and never less than
+// before the binding existed:
+//
+//   - A legacy session is held to every revision the trusted corpus
+//     (PublicationReader) published up to the one that was current at its
+//     snapshot, plus the current revision. The session's SnapshotAsOf was
+//     validated against a snapshot the corpus took when the session was
+//     written, and that AsOf is no earlier than the publication time of
+//     every revision then current. The wall clock only picks the newest
+//     revision published at or before AsOf; its publication sequence, which
+//     the corpus assigns monotonically, bounds the rest (sequenceBound), so a
+//     clock step between two publications cannot drop the revision the
+//     session saw or any before it. A revision with no sequence counts, as
+//     does every revision when nothing bounds them.
+//   - A legacy application edge is held to every registered revision of each
+//     endpoint's document. Its Connect time and a revision's publication time
+//     are unrelated wall-clock readings, so no time bound is safe. An unbound
+//     application edge the corpus holds no Connect record for was never
+//     connected: it is an extracted or materialized edge persisted before
+//     RegistrationKind existed (legacyEdgeKind), and is left as registered.
+//   - Without a PublicationReader both count every revision, and every
+//     unbound application edge counts as connected.
 //
 // The legacy rule reads a document's whole revision history (once per
 // document per read), so its cost grows with that history; only outputs

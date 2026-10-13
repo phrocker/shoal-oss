@@ -475,14 +475,13 @@ func TestLegacyDerivedOutputsAreHeldToEveryRevision(t *testing.T) {
 	})
 }
 
-// TestRevisionBindingSurvivesReopen: the bindings are durable. A catalog
-// reopened over the same corpus keeps every derived output closed.
-// TestLegacyOutputsAreHeldOnlyToWhatExistedWhenMade: an output recorded
-// before the binding is held to the revisions published by the time it was
-// made (the session's snapshot, the edge's first publication) and the current
-// one, so a label added and removed after it was made does not close it. One
-// made while the label stood stays closed. Without a trusted publication
-// reader, every revision counts.
+// TestLegacyOutputsAreHeldOnlyToWhatExistedWhenMade: a session recorded
+// before the binding is held to the revisions published by its snapshot (by
+// publication sequence) and the current one, so a label added and removed
+// after it was made does not close it. One made while the label stood stays
+// closed. A legacy edge has no such bound and counts every revision, and
+// without a trusted publication reader every revision counts for a session
+// too.
 func TestLegacyOutputsAreHeldOnlyToWhatExistedWhenMade(t *testing.T) {
 	const laterURI = "file:///binding/later.txt"
 	const (
@@ -520,8 +519,14 @@ func TestLegacyOutputsAreHeldOnlyToWhatExistedWhenMade(t *testing.T) {
 		if _, err := w.client.InteractionRecord(reader, earlySession); err != nil {
 			t.Fatalf("a legacy session made before the label is denied: %v", err)
 		}
-		if !w.edgeVisible(w.client, w.reader, earlyEdge) {
-			t.Fatal("a legacy edge connected before the label is denied")
+		// An edge's Connect time is not compared with revision
+		// publication times (a stepped clock could drop the revision it was
+		// connected over), so it is held to every revision.
+		if w.edgeVisible(w.client, w.reader, earlyEdge) {
+			t.Fatal("a legacy edge to a once-labelled document is visible")
+		}
+		if !w.edgeVisible(w.client, w.holder, earlyEdge) {
+			t.Fatal("the holder does not see the legacy edge")
 		}
 		_, err = w.client.InteractionRecord(reader, labelSession)
 		assertSameRefusal(t, "legacy session made under the label", err,
@@ -556,6 +561,8 @@ func TestLegacyOutputsAreHeldOnlyToWhatExistedWhenMade(t *testing.T) {
 	})
 }
 
+// TestRevisionBindingSurvivesReopen: the bindings are durable. A catalog
+// reopened over the same corpus keeps every derived output closed.
 func TestRevisionBindingSurvivesReopen(t *testing.T) {
 	f := newFixture(t)
 	dir := t.TempDir()

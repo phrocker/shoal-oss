@@ -26,14 +26,22 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
-// RevisionPublications reports when each stored revision of the requested
-// documents was published (its PublishedAt, the same clock a snapshot's AsOf
-// is taken from). A revision with no recorded publication time is omitted, as
-// is a document with no stored revision. The authorized layer uses it to bound
-// which revisions an output recorded before #695 could have been derived from.
+// RevisionPublication is when the corpus published one stored revision: its
+// wall-clock PublishedAt (the clock a snapshot's AsOf is taken from) and its
+// PublicationSequence, which is monotonic where the wall clock is not. Either
+// is zero when the record carries none.
+type RevisionPublication struct {
+	PublishedAt time.Time
+	Sequence    uint64
+}
+
+// RevisionPublications reports the publication of each stored revision of the
+// requested documents. A document with no stored revision is omitted. The
+// authorized layer uses it to bound which revisions a session recorded before
+// #695 could have been derived from.
 func (e *Explorer) RevisionPublications(
 	ctx context.Context, documentIDs []shoal.ID,
-) (map[shoal.ID]map[shoal.ID]time.Time, error) {
+) (map[shoal.ID]map[shoal.ID]RevisionPublication, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
@@ -47,17 +55,20 @@ func (e *Explorer) RevisionPublications(
 	if err := e.requireOpen(); err != nil {
 		return nil, err
 	}
-	published := make(map[shoal.ID]map[shoal.ID]time.Time, len(documentIDs))
+	published := make(map[shoal.ID]map[shoal.ID]RevisionPublication, len(documentIDs))
 	for _, documentID := range documentIDs {
 		if _, done := published[documentID]; done {
 			continue
 		}
-		revisions := make(map[shoal.ID]time.Time, len(e.documents[documentID]))
+		revisions := make(map[shoal.ID]RevisionPublication, len(e.documents[documentID]))
 		for revisionID, record := range e.documents[documentID] {
-			if record == nil || record.PublishedAt.IsZero() {
+			if record == nil {
 				continue
 			}
-			revisions[revisionID] = record.PublishedAt.UTC()
+			revisions[revisionID] = RevisionPublication{
+				PublishedAt: record.PublishedAt.UTC(),
+				Sequence:    record.PublicationSequence,
+			}
 		}
 		if len(revisions) > 0 {
 			published[documentID] = revisions
@@ -66,38 +77,30 @@ func (e *Explorer) RevisionPublications(
 	return published, nil
 }
 
-// ConnectedEdgePublications reports, for each requested edge that an
-// application connected (Connect), when it was first published. An edge that
-// was never connected (an intrinsic, extracted or materialized edge), or whose
-// record carries no publication time, is omitted from the result; connected
-// reports which of the requested edges are connected edges at all.
-func (e *Explorer) ConnectedEdgePublications(
+// ConnectedEdges reports which of the requested edges an application
+// connected (Connect). An intrinsic, extracted or materialized edge is never
+// a connected edge.
+func (e *Explorer) ConnectedEdges(
 	ctx context.Context, edgeIDs []shoal.ID,
-) (published map[shoal.ID]time.Time, connected map[shoal.ID]bool, err error) {
+) (map[shoal.ID]bool, error) {
 	if err := contextError(ctx); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	for _, edgeID := range edgeIDs {
 		if err := shoal.ValidateRequiredID("graph edge ID", edgeID); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if err := e.requireOpen(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	published = make(map[shoal.ID]time.Time, len(edgeIDs))
-	connected = make(map[shoal.ID]bool, len(edgeIDs))
+	connected := make(map[shoal.ID]bool, len(edgeIDs))
 	for _, edgeID := range edgeIDs {
-		record, ok := e.edges[edgeID]
-		if !ok {
-			continue
-		}
-		connected[edgeID] = true
-		if !record.PublishedAt.IsZero() {
-			published[edgeID] = record.PublishedAt.UTC()
+		if _, ok := e.edges[edgeID]; ok {
+			connected[edgeID] = true
 		}
 	}
-	return published, connected, nil
+	return connected, nil
 }

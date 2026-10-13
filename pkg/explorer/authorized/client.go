@@ -41,15 +41,14 @@ type SnapshotValidator interface {
 	ValidateSnapshot(context.Context, shoal.ID, time.Time, []shoal.ID) error
 }
 
-// PublicationReader reports when the corpus published each stored revision
-// and connected each application edge (*explorer.Explorer implements it).
+// PublicationReader reports how the corpus published each stored revision
+// and which application edges it connected (*explorer.Explorer implements
+// it).
 type PublicationReader interface {
 	RevisionPublications(
 		context.Context, []shoal.ID,
-	) (map[shoal.ID]map[shoal.ID]time.Time, error)
-	ConnectedEdgePublications(
-		context.Context, []shoal.ID,
-	) (map[shoal.ID]time.Time, map[shoal.ID]bool, error)
+	) (map[shoal.ID]map[shoal.ID]explorer.RevisionPublication, error)
+	ConnectedEdges(context.Context, []shoal.ID) (map[shoal.ID]bool, error)
 }
 
 // EvidenceSnapshotValidator additionally binds exact source evidence to the
@@ -107,8 +106,9 @@ type Config struct {
 	// trusted dependency also implements DerivedAssertionReader. Base is never
 	// promoted implicitly.
 	DerivedAssertionReader DerivedAssertionReader
-	// PublicationReader is the optional explicitly trusted source of when the
-	// corpus published each revision and connected each application edge.
+	// PublicationReader is the optional explicitly trusted source of how the
+	// corpus published each revision and which application edges it
+	// connected.
 	// It narrows what an output recorded before #695 is held to (see
 	// revision_binding.go). When omitted, NewClient may use
 	// SnapshotValidator if that dependency also implements it; without one,

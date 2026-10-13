@@ -34,6 +34,8 @@ import (
 
 	"github.com/phrocker/shoal-oss/internal/engine"
 	"github.com/phrocker/shoal-oss/internal/iterrt"
+	"github.com/phrocker/shoal-oss/pkg/explorer"
+	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -566,15 +568,14 @@ func revisionIDsOf(rules map[shoal.ID][]RevisionRule) map[shoal.ID][]string {
 
 // fakePublications is a PublicationReader with fixed answers.
 type fakePublications struct {
-	revisions map[shoal.ID]map[shoal.ID]time.Time
-	edges     map[shoal.ID]time.Time
+	revisions map[shoal.ID]map[shoal.ID]explorer.RevisionPublication
 	connected map[shoal.ID]bool
 }
 
 func (f fakePublications) RevisionPublications(
 	_ context.Context, documentIDs []shoal.ID,
-) (map[shoal.ID]map[shoal.ID]time.Time, error) {
-	out := make(map[shoal.ID]map[shoal.ID]time.Time)
+) (map[shoal.ID]map[shoal.ID]explorer.RevisionPublication, error) {
+	out := make(map[shoal.ID]map[shoal.ID]explorer.RevisionPublication)
 	for _, id := range documentIDs {
 		if revisions, ok := f.revisions[id]; ok {
 			out[id] = revisions
@@ -583,29 +584,24 @@ func (f fakePublications) RevisionPublications(
 	return out, nil
 }
 
-func (f fakePublications) ConnectedEdgePublications(
+func (f fakePublications) ConnectedEdges(
 	_ context.Context, edgeIDs []shoal.ID,
-) (map[shoal.ID]time.Time, map[shoal.ID]bool, error) {
-	published := make(map[shoal.ID]time.Time)
+) (map[shoal.ID]bool, error) {
 	connected := make(map[shoal.ID]bool)
 	for _, id := range edgeIDs {
-		if at, ok := f.edges[id]; ok {
-			published[id] = at
-		}
 		if f.connected[id] {
 			connected[id] = true
 		}
 	}
-	return published, connected, nil
+	return connected, nil
 }
 
-// TestLegacyEdgesAreBoundByTheirPublication: an unbound application edge is
-// held to its endpoint document's revisions published by the time it was
-// connected, plus the current one; one the corpus never connected (an
-// extracted or materialized edge persisted before RegistrationKind) is left
-// as registered; with no publication time, or no reader, every revision
-// counts.
-func TestLegacyEdgesAreBoundByTheirPublication(t *testing.T) {
+// legacyHistory registers r1 (open), r2 (labelled) and r3 (current, under
+// its own rule) of one document, with the given publications.
+func legacyHistory(
+	t *testing.T, publications map[shoal.ID]explorer.RevisionPublication,
+) (*MemoryPolicyStore, fakePublications, AccessRule, AccessRule) {
+	t.Helper()
 	ctx := context.Background()
 	store := NewMemoryPolicyStore()
 	labelled := batchTestRule(t, "source", "labelled")
@@ -613,7 +609,7 @@ func TestLegacyEdgesAreBoundByTheirPublication(t *testing.T) {
 	for index, revision := range []struct {
 		id   shoal.ID
 		rule AccessRule
-	}{{"r1", labelled}, {"r2", open}} {
+	}{{"r1", open}, {"r2", labelled}, {"r3", legacyCurrentRule(t)}} {
 		if err := store.PutRevision(ctx, RevisionRegistration{
 			DocumentID: "document", RevisionID: revision.id,
 			NodeIDs:       []shoal.ID{"document", "node"},
@@ -623,49 +619,60 @@ func TestLegacyEdgesAreBoundByTheirPublication(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	return store, fakePublications{
+		revisions: map[shoal.ID]map[shoal.ID]explorer.RevisionPublication{
+			"document": publications,
+		},
+	}, open, labelled
+}
+
+func legacyCurrentRule(t *testing.T) AccessRule {
+	return batchTestRule(t, "source", "current")
+}
+
+// TestLegacyEdgesAreHeldToEveryRevision: an unbound application edge the
+// corpus connected is held to every revision of its endpoint's document,
+// whatever the publication clocks say (#695 review: an edge connected at
+// 90 minutes over a labelled revision published at 2 hours by a stepped
+// clock must stay closed). One the corpus never connected (an extracted or
+// materialized edge persisted before RegistrationKind) is left as
+// registered, unless there is no reader to say so.
+func TestLegacyEdgesAreHeldToEveryRevision(t *testing.T) {
+	ctx := context.Background()
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store, reader, open, labelled := legacyHistory(t,
+		map[shoal.ID]explorer.RevisionPublication{
+			"r1": {PublishedAt: base.Add(time.Hour), Sequence: 1},
+			"r2": {PublishedAt: base.Add(2 * time.Hour), Sequence: 2},
+			"r3": {PublishedAt: base.Add(3 * time.Hour), Sequence: 3},
+		})
+	reader.connected = map[shoal.ID]bool{"connected": true}
 	edgeRule := batchTestRule(t, "source", "edge")
 	edges := map[shoal.ID]EdgeRegistration{}
-	for _, id := range []shoal.ID{"before", "after", "unconnected", "untimed"} {
+	for _, id := range []shoal.ID{"connected", "unconnected"} {
 		edges[id] = EdgeRegistration{
 			Edge: graph.Edge{ID: id, From: "document", To: "node", Type: "links", Weight: 1},
 			Rule: edgeRule, Kind: RegistrationApplication,
 		}
 	}
-	reader := fakePublications{
-		revisions: map[shoal.ID]map[shoal.ID]time.Time{"document": {
-			"r1": base.Add(time.Hour), "r2": base.Add(2 * time.Hour),
-		}},
-		edges: map[shoal.ID]time.Time{
-			"before": base, "after": base.Add(3 * time.Hour),
-		},
-		connected: map[shoal.ID]bool{"before": true, "after": true, "untimed": true},
+	everything, err := conjoinRules(edgeRule, open)
+	if err != nil {
+		t.Fatal(err)
 	}
-	conjoin := func(rules ...AccessRule) AccessRule {
-		rule := edgeRule
-		for _, component := range rules {
-			var err error
-			if rule, err = conjoinRules(rule, component); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return rule
+	if everything, err = conjoinRules(everything, labelled); err != nil {
+		t.Fatal(err)
 	}
-	everything := conjoin(labelled, open)
+	if everything, err = conjoinRules(everything, legacyCurrentRule(t)); err != nil {
+		t.Fatal(err)
+	}
 	for name, test := range map[string]struct {
 		client *Client
 		want   map[shoal.ID]AccessRule
 	}{
 		"with a reader": {&Client{policyStore: store, publications: reader},
-			map[shoal.ID]AccessRule{
-				"before": conjoin(open), "after": everything,
-				"unconnected": edgeRule, "untimed": everything,
-			}},
+			map[shoal.ID]AccessRule{"connected": everything, "unconnected": edgeRule}},
 		"without a reader": {&Client{policyStore: store},
-			map[shoal.ID]AccessRule{
-				"before": everything, "after": everything,
-				"unconnected": everything, "untimed": everything,
-			}},
+			map[shoal.ID]AccessRule{"connected": everything, "unconnected": everything}},
 	} {
 		got, err := test.client.bindEdgeSourceRevisions(ctx, edges)
 		if err != nil {
@@ -675,6 +682,121 @@ func TestLegacyEdgesAreBoundByTheirPublication(t *testing.T) {
 			if !got[id].Rule.equal(want) {
 				t.Fatalf("%s: %s rule = %v, want %v", name, id, got[id].Rule, want)
 			}
+		}
+	}
+}
+
+// TestLegacySessionBoundIsByPublicationSequence: a session's wall-clock
+// snapshot time only picks the newest revision published by then; the
+// publication sequence decides the rest, so a stepped clock cannot drop a
+// revision published before the one the session saw.
+func TestLegacySessionBoundIsByPublicationSequence(t *testing.T) {
+	ctx := context.Background()
+	at := func(seconds int) time.Time {
+		return time.Date(2026, 1, 1, 0, 0, seconds, 0, time.UTC)
+	}
+	type publication = explorer.RevisionPublication
+	pub := func(seconds int, sequence uint64) publication {
+		return publication{PublishedAt: at(seconds), Sequence: sequence}
+	}
+	for _, test := range []struct {
+		name         string
+		publications map[shoal.ID]publication
+		asOf         time.Time
+		labelled     bool // whether r2's labelled rule is required
+	}{
+		{"labelled revision published after the snapshot", map[shoal.ID]publication{
+			"r1": pub(100, 1), "r2": pub(200, 2), "r3": pub(300, 3),
+		}, at(150), false},
+		{"bound is inclusive", map[shoal.ID]publication{
+			"r1": pub(100, 1), "r2": pub(200, 2), "r3": pub(300, 3),
+		}, at(200), true},
+		{"clock stepped back after the labelled revision", map[shoal.ID]publication{
+			"r1": pub(100, 1), "r2": pub(200, 2), "r3": pub(150, 3),
+		}, at(150), true},
+		{"a revision with no sequence counts", map[shoal.ID]publication{
+			"r1": pub(100, 1), "r2": pub(200, 0), "r3": pub(300, 3),
+		}, at(150), true},
+		{"a revision with no time does not set the bound", map[shoal.ID]publication{
+			"r1": pub(100, 1), "r2": publication{Sequence: 2}, "r3": pub(300, 3),
+		}, at(150), false},
+		{"nothing published by the snapshot: every revision", map[shoal.ID]publication{
+			"r1": pub(100, 1), "r2": pub(200, 2), "r3": pub(300, 3),
+		}, at(50), true},
+		{"no snapshot time: every revision", map[shoal.ID]publication{
+			"r1": pub(100, 1), "r2": pub(200, 2), "r3": pub(300, 3),
+		}, time.Time{}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, reader, _, labelled := legacyHistory(t, test.publications)
+			client := &Client{policyStore: store, publications: reader}
+			cache := client.newRevisionRuleCache()
+			if err := cache.loadDocuments(ctx, []shoal.ID{"document"}); err != nil {
+				t.Fatal(err)
+			}
+			rules, ok := cache.documentRules(
+				"document", cache.sequenceBound("document", test.asOf))
+			if !ok {
+				t.Fatal("no current revision")
+			}
+			required, current := false, false
+			for _, rule := range rules {
+				required = required || rule.equal(labelled)
+				current = current || rule.equal(legacyCurrentRule(t))
+			}
+			if required != test.labelled {
+				t.Fatalf("labelled revision required = %v, want %v", required, test.labelled)
+			}
+			if !current {
+				t.Fatal("the current revision is not required")
+			}
+		})
+	}
+}
+
+// TestRevisionGateKeysTheLegacyBoundBySequence: one read deciding two
+// sessions with different bounds over one document decides each by its own
+// bound, the zero and epoch times included.
+func TestRevisionGateKeysTheLegacyBoundBySequence(t *testing.T) {
+	ctx := context.Background()
+	at := func(seconds int) time.Time {
+		return time.Date(2026, 1, 1, 0, 0, seconds, 0, time.UTC)
+	}
+	store, reader, _, _ := legacyHistory(t, map[shoal.ID]explorer.RevisionPublication{
+		"r1": {PublishedAt: at(100), Sequence: 1},
+		"r2": {PublishedAt: at(200), Sequence: 2},
+		"r3": {PublishedAt: at(300), Sequence: 3},
+	})
+	client := &Client{policyStore: store, publications: reader}
+	decision, err := auth.NewDecision(auth.DecisionConfig{
+		Subject: "subject", Actor: "actor",
+		AuthorizationDomain: []byte("domain"),
+		AllowedOperations:   []auth.Operation{auth.OperationNeighborhood},
+		PermittedSourceIDs:  [][]byte{[]byte("source")},
+		PermittedPolicyIDs:  [][]byte{[]byte("policy"), []byte("current")},
+		PolicyGeneration:    1, AuthenticationExpires: at(400).Add(time.Hour),
+		RequestID: "request",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := client.newRevisionGate(decision, auth.OperationNeighborhood, at(400))
+	if err := gate.cache.loadDocuments(ctx, []shoal.ID{"document"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		asOf time.Time
+		want bool
+	}{
+		{at(150), true}, {time.Time{}, false}, {time.Unix(0, 0).UTC(), false},
+		{at(150), true}, {at(250), false},
+	} {
+		got, err := gate.documentAllows("document", step.asOf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != step.want {
+			t.Fatalf("asOf %v: allowed = %v, want %v", step.asOf, got, step.want)
 		}
 	}
 }
