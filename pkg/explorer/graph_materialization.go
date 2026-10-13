@@ -161,6 +161,12 @@ func (e *Explorer) CommitGraphMaterialization(
 		}
 	}
 	for _, edge := range planned.Edges {
+		// A shown application edge does not refuse the materialization: the
+		// derived edge wins its ID and the application edge is withheld and
+		// reported (#724), as for an ingest or an extraction.
+		if record, ok := e.edges[edge.ID]; ok && edgesEqual(record.Edge, e.graphEdges[edge.ID]) {
+			continue
+		}
 		if existing, ok := e.graphEdges[edge.ID]; ok && !edgesEqual(existing, edge) {
 			return GraphMaterializationResult{}, shoal.NewError(
 				shoal.ErrorConflict, "graph edge ID already has different content")
