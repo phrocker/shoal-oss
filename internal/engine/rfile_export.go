@@ -219,6 +219,11 @@ type RFileExportFile struct {
 	// Empty values are the legacy encoding of rfile/authoritative.
 	Format string `json:"format,omitempty"`
 	Role   string `json:"role,omitempty"`
+	// ProducerEpoch is the producer instance (and export transform) the
+	// file's name was minted under (see producerEpoch): a producer that
+	// reissues a name does so under a different epoch. Empty when unknown.
+	// Importers do not use it yet (#701); older ones ignore it.
+	ProducerEpoch string `json:"producer_epoch,omitempty"`
 }
 
 const (
@@ -337,6 +342,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 			BCFileVersion:   bcVersion,
 			Format:          string(fileFormatForPath(f.Path)),
 			Role:            ExportRoleAuthoritative,
+			ProducerEpoch:   producerEpoch(f.Instance, opts),
 		})
 	}
 	// Group by tablet but keep each tablet's recency order (from rfiles):
@@ -1388,14 +1394,16 @@ func hashObject(ctx context.Context, b storage.Backend, path string) (int64, str
 type tableRFile struct {
 	TabletIndex int
 	Path        string
+	// Instance is the producer instance the tablet minted the file under
+	// (empty for a file it did not mint); see shipKey.
+	Instance string
 }
 
 func (t *table) rfiles() []tableRFile {
 	var out []tableRFile
 	for i, tab := range t.tablets {
-		tabFiles := tab.RFiles()
-		for _, p := range tabFiles {
-			out = append(out, tableRFile{TabletIndex: i, Path: p})
+		for _, f := range tab.RFileLineage() {
+			out = append(out, tableRFile{TabletIndex: i, Path: f.Path, Instance: f.Instance})
 		}
 	}
 	// Within a tablet, keep the tablet's recency order (oldest first), not
