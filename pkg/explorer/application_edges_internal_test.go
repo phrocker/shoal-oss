@@ -20,9 +20,13 @@
 package explorer
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -302,4 +306,140 @@ func TestLegacyIntrinsicSquatStaysReadableAcrossReopen(t *testing.T) {
 // freshApplicationEdge returns a fresh application edge between two documents.
 func freshApplicationEdge(from, to shoal.ID) graph.Edge {
 	return graph.Edge{ID: "fresh", From: from, To: to, Type: "x", Weight: 1}
+}
+
+// lockedBuffer is a log sink safe for concurrent writers.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestApplicationEdgeCollisionReportIsDeterministic pins that several
+// simultaneous collisions are reported in ascending ID order on every
+// rebuild, and logged once: an unchanged set is never logged again, whatever
+// order the stored edges are visited in.
+func TestApplicationEdgeCollisionReportIsDeterministic(t *testing.T) {
+	logs := &lockedBuffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	const warning = "application edges withheld"
+
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = corpus.Close() })
+	var squatters []graph.Edge
+	for i := 0; i < 8; i++ {
+		document, err := corpus.Ingest(ctx, Source{
+			URI:       fmt.Sprintf("file:///collision-%d.md", i),
+			MediaType: MediaTypeMarkdown, Content: fmt.Sprintf("# doc %d\n\nbody %d\n", i, i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		squatter := corpus.documents[document.Document.ID][document.Revision.ID].Edges[0]
+		squatter.Type = "squatter"
+		squatters = append(squatters, squatter)
+	}
+	want := make([]shoal.ID, len(squatters))
+	corpus.mu.Lock()
+	for i, squatter := range squatters {
+		corpus.edges[squatter.ID] = persistedEdge{Edge: squatter, PublishedAt: time.Now().UTC()}
+		want[i] = squatter.ID
+	}
+	corpus.mu.Unlock()
+	slices.SortFunc(want, shoal.CompareID)
+
+	for round := 0; round < 12; round++ {
+		corpus.mu.Lock()
+		err := corpus.rebuildCurrentGraphLocked()
+		corpus.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reported, err := corpus.ApplicationEdgeCollisions(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(reported, want) {
+			t.Fatalf("round %d: reported collisions = %v, want %v", round, reported, want)
+		}
+	}
+	// A write that rebuilds without changing the set logs nothing either.
+	if _, err := corpus.Ingest(ctx, Source{
+		URI: "file:///unrelated.md", MediaType: MediaTypeMarkdown, Content: "# unrelated\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(logs.String(), warning); got != 1 {
+		t.Fatalf("collision warnings = %d, want 1:\n%s", got, logs.String())
+	}
+}
+
+// TestApplicationEdgeNeverAttachesToProvenanceNodes pins the endpoint guard
+// in placeApplicationEdges: provenance nodes (here a derived assertion's
+// producer and assertion nodes) are already placed when application edges
+// are, so a stored application edge naming one is skipped, neither served
+// nor reported as a collision.
+func TestApplicationEdgeNeverAttachesToProvenanceNodes(t *testing.T) {
+	ctx := context.Background()
+	corpus, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = corpus.Close() })
+	source := ingestLatentReadPathDocument(t, corpus, "source")
+	target := ingestLatentReadPathDocument(t, corpus, "target")
+	if err := corpus.PutLatentLinkCells(ctx, []LatentLinkCell{
+		latentReadPathCell(source.Document.ID, target.Document.ID, 42, false),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	corpus.mu.Lock()
+	defer corpus.mu.Unlock()
+	if err := corpus.ensureGraphLocked(); err != nil {
+		t.Fatal(err)
+	}
+	var provenance []shoal.ID
+	for id, node := range corpus.graphNodes {
+		if graph.IsProvenanceKind(node.Kind) {
+			provenance = append(provenance, id)
+		}
+	}
+	if len(provenance) == 0 {
+		t.Fatal("fixture has no provenance nodes")
+	}
+	for i, id := range provenance {
+		edge := graph.Edge{
+			ID: shoal.ID(fmt.Sprintf("app/provenance-%d", i)), From: source.Document.ID, To: id,
+			Type: "mentions", Weight: 1,
+		}
+		corpus.edges[edge.ID] = persistedEdge{Edge: edge, PublishedAt: time.Now().UTC()}
+	}
+	if err := corpus.rebuildCurrentGraphLocked(); err != nil {
+		t.Fatal(err)
+	}
+	for i := range provenance {
+		if edge, ok := corpus.graphEdges[shoal.ID(fmt.Sprintf("app/provenance-%d", i))]; ok {
+			t.Fatalf("application edge attached to a provenance node: %+v", edge)
+		}
+	}
+	if len(corpus.applicationEdgeCollisions) != 0 {
+		t.Fatalf("skipped edges reported as collisions: %v", corpus.applicationEdgeCollisions)
+	}
 }

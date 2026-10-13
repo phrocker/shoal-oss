@@ -1179,8 +1179,11 @@ func (e *Explorer) computeCurrentGraph() (
 // reported through ApplicationEdgeCollisions, never to readers. Identical
 // content is the same edge and is not a collision.
 //
-// An endpoint of an interaction or provenance kind is never attached to:
-// Connect refuses those, and such a node is placed only after this pass.
+// An endpoint of an interaction or provenance kind is never attached to.
+// Interaction and fold nodes, and the producer and assertion nodes of
+// derived assertions, are already in nodes when this pass runs, so the kind
+// is checked here; Connect refuses such endpoints too, so only stored state
+// can name one.
 func placeApplicationEdges(
 	nodes map[shoal.ID]graph.Node,
 	edges map[shoal.ID]graph.Edge,

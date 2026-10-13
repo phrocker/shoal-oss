@@ -159,14 +159,19 @@ Now:
   - a warning log line, `explorer: application edges withheld ...`, with
     the count and the first 16 IDs, written each time the set changes.
 
-  New collisions can't be made: `Connect` refuses an ID that any stored
-  application edge or shown edge already holds. Old state can still hold
-  one. Before #699 an authorized `Connect` accepted any ID, and a document's
+  New collisions can't be made through `authorized.Client`, whose
+  application edge IDs live in the writer's namespace (#699). `Connect`
+  refuses an ID that any stored application edge or shown edge already
+  holds, but an unwrapped `Explorer.Connect` can still take the ID of a
+  derived edge that doesn't exist yet. That edge is withheld and reported
+  once the derived edge appears. Old state can also hold one. Before #699 an authorized `Connect` accepted any ID, and a document's
   root `contains` edge ID can be derived from its URI, so an application edge
   could take the intrinsic ID of a document ingested later. Through the
   authorized client a withheld collision fails closed. The catalog keeps the
   application registration, so the derived edge doesn't match it and is
-  withheld from readers too.
+  withheld from readers too. Such a legacy pre-#699 application ID is not in
+  any writer's namespace, so it appears verbatim in the collision log line,
+  usually as a document's intrinsic edge ID.
 
 **If an operator finds a collision:**
 
