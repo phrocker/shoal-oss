@@ -115,7 +115,21 @@ type Event struct {
 	// entry that points at it.
 	ConsumedEvidenceVisibility [][]string
 	CitedEvidenceVisibility    [][]string
-	OccurredAt                 time.Time
+	// ConsumedEvidenceBinding and CitedEvidenceBinding carry, index for
+	// index with their group, the registration set each reference's graph
+	// members were recorded over (#705). Empty means the whole group is
+	// unbound; otherwise the length equals the group's, and a nil entry
+	// marks one unbound reference.
+	//
+	// Here for the same reason the visibility pair is: the delivery-time
+	// check asks each *subscriber* about the reference, and a graph member's
+	// identity does not depend on a revision, so deciding on the current
+	// registrations alone would open evidence recorded over a revision that
+	// has since been relabelled. An unbound reference is held to every
+	// registered revision, which over-closes rather than opens.
+	ConsumedEvidenceBinding [][]byte
+	CitedEvidenceBinding    [][]byte
+	OccurredAt              time.Time
 }
 
 // PublishRequest contains the immutable event, an idempotency token, and the
@@ -275,6 +289,22 @@ func cloneEvent(event Event) Event {
 		event.ConsumedEvidenceVisibility)
 	result.CitedEvidenceVisibility = cloneVisibilityGroup(
 		event.CitedEvidenceVisibility)
+	result.ConsumedEvidenceBinding = cloneBindingGroup(
+		event.ConsumedEvidenceBinding)
+	result.CitedEvidenceBinding = cloneBindingGroup(event.CitedEvidenceBinding)
+	return result
+}
+
+func cloneBindingGroup(values [][]byte) [][]byte {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([][]byte, len(values))
+	for i, value := range values {
+		if len(value) > 0 {
+			result[i] = append([]byte(nil), value...)
+		}
+	}
 	return result
 }
 
@@ -436,16 +466,31 @@ func normalizeEvent(event Event, requireSequence bool) (Event, error) {
 		result.ConsumedEvidenceVisibility)
 	result.CitedEvidenceVisibility = canonicalVisibilityGroup(
 		result.CitedEvidenceVisibility)
+	// Bindings are canonicalised and checked the same way, for the same
+	// reason plus one: a misaligned group holds a reference to another's
+	// registrations, and poisons every delivery page that reads it (#705).
+	result.ConsumedEvidenceBinding = canonicalBindingGroup(
+		result.ConsumedEvidenceBinding)
+	result.CitedEvidenceBinding = canonicalBindingGroup(
+		result.CitedEvidenceBinding)
 	for _, group := range []struct {
 		references []interaction.EvidenceReference
 		visibility [][]string
+		binding    [][]byte
 	}{
-		{consumed, result.ConsumedEvidenceVisibility},
-		{cited, result.CitedEvidenceVisibility},
+		{consumed, result.ConsumedEvidenceVisibility,
+			result.ConsumedEvidenceBinding},
+		{cited, result.CitedEvidenceVisibility, result.CitedEvidenceBinding},
 	} {
 		if err := validateEvidenceVisibility(
 			group.references, group.visibility); err != nil {
 			return Event{}, err
+		}
+		if len(group.binding) != 0 &&
+			len(group.binding) != len(group.references) {
+			return Event{}, shoal.NewError(
+				shoal.ErrorInvalidArgument,
+				"event evidence binding does not align with its references")
 		}
 	}
 	if err := validateAuthorizationReferences(

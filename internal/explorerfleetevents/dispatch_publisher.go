@@ -98,6 +98,7 @@ func (p *ActionEventPublisher) PublishActionEvent(
 		// the event is the durable record of the transition, which stays
 		// complete. fleetevents asks each subscriber at delivery (#562).
 		ConsumedEvidenceVisibility: actionEvidenceVisibility(record.Evidence),
+		ConsumedEvidenceBinding:    actionEvidenceBinding(record.Evidence),
 		OccurredAt:                 record.UpdatedAt,
 	}
 
@@ -230,6 +231,33 @@ func cloneActionEvidenceReference(
 	value.Assertions = append(
 		[]interaction.AssertionReference(nil), value.Assertions...)
 	return value
+}
+
+// actionEvidenceBinding returns each reference's registration binding, index
+// for index with actionEvidenceReferences, or nil when none is bound (#705).
+//
+// Carried, not applied, for the reason the visibility is: the publisher is
+// the wrong identity to ask about labels, and the event is the durable record
+// of the transition. Delivery asks each subscriber, and an unbound reference
+// is held to every registered revision there — over-closing, never opening.
+func actionEvidenceBinding(values []fleet.EvidenceRef) [][]byte {
+	bound := false
+	for _, value := range values {
+		if len(value.Binding) > 0 {
+			bound = true
+			break
+		}
+	}
+	if !bound {
+		return nil
+	}
+	result := make([][]byte, len(values))
+	for i, value := range values {
+		if len(value.Binding) > 0 {
+			result[i] = append([]byte(nil), value.Binding...)
+		}
+	}
+	return result
 }
 
 // actionEvidenceVisibility returns each evidence reference's visibility

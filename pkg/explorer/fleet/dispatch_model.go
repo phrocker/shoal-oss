@@ -156,6 +156,18 @@ type EvidenceRef struct {
 	EdgeIDs    []shoal.ID
 	Assertions []interaction.AssertionReference
 	Visibility []string
+	// Binding is the encoded registration set this reference's graph members
+	// were recorded over, from NodeGate.BindGraphEvidence at completion, and
+	// is passed back on every read (#705).
+	//
+	// Opaque here on purpose: the fleet plane stores and returns it and never
+	// reads it. Node and edge identities do not depend on a revision — a
+	// document node is hashed from its URI, a span from its text — so a
+	// relabel moves the registrations a reference's members belong to, and
+	// deciding on the current ones alone opened evidence recorded over a
+	// labelled revision. Nil marks a reference recorded before bindings
+	// existed, which the gate holds to every registered revision.
+	Binding []byte
 }
 
 // AmbiguityOutcome is what a worker observed before it lost the right to
@@ -1884,6 +1896,7 @@ func cloneActionEvidence(input []EvidenceRef) []EvidenceRef {
 		result[i].Assertions = append(
 			[]interaction.AssertionReference(nil), evidence.Assertions...)
 		result[i].Visibility = append([]string(nil), evidence.Visibility...)
+		result[i].Binding = append([]byte(nil), evidence.Binding...)
 	}
 	return result
 }

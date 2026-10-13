@@ -288,7 +288,34 @@ func (s *Service) Publish(ctx context.Context, request PublishRequest) (PublishR
 			"fleet lifecycle event kinds require trusted publication",
 		)
 	}
+	// A binding is the registration set a node gate resolved at record time,
+	// and the read gate trusts it to decide which registrations the evidence
+	// is held to. Only PublishLifecycle carries one, because only the
+	// completion path has a gate to ask. A caller-supplied binding on this
+	// route would be forged — the same opening closed for executors in the
+	// dispatch plane (#705) — and a misaligned one poisons delivery for
+	// every subscriber page. Dropped rather than refused: this route never
+	// had a reason to set them, so nothing is being taken away.
+	request.Event = withoutCallerBindings(request.Event)
 	return s.publish(ctx, auth.OperationEventPublish, request, true, nil)
+}
+
+// withoutCallerBindings drops the evidence bindings from an event published
+// through the public route.
+//
+// A binding is the registration set a node gate resolved at record time, and
+// the read gate trusts it to decide which registrations the evidence is held
+// to. Only PublishLifecycle carries one, because only the completion path has
+// a gate to ask. A caller-supplied binding here would be forged — the same
+// opening closed for executors in the dispatch plane (#705) — and a
+// misaligned one poisons delivery for every subscriber page.
+//
+// Dropped rather than refused: this route never had a reason to set them, so
+// nothing a correct caller does is being taken away.
+func withoutCallerBindings(event Event) Event {
+	event.ConsumedEvidenceBinding = nil
+	event.CitedEvidenceBinding = nil
+	return event
 }
 
 // PublishLifecycle is the trusted dispatch lifecycle publication path. It
@@ -816,10 +843,21 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 		for _, group := range []struct {
 			references []interaction.EvidenceReference
 			visibility [][]string
+			binding    [][]byte
 		}{
-			{event.ConsumedEvidence, event.ConsumedEvidenceVisibility},
-			{event.CitedEvidence, event.CitedEvidenceVisibility},
+			{event.ConsumedEvidence, event.ConsumedEvidenceVisibility,
+				event.ConsumedEvidenceBinding},
+			{event.CitedEvidence, event.CitedEvidenceVisibility,
+				event.CitedEvidenceBinding},
 		} {
+			if len(group.binding) != 0 &&
+				len(group.binding) != len(group.references) {
+				// Same reason as the visibility check below: a misaligned
+				// binding would hold a reference to another's registrations.
+				return nil, shoal.NewError(
+					shoal.ErrorInternal,
+					"stored event evidence binding does not align with its references")
+			}
 			if len(group.visibility) != 0 && len(group.visibility) != len(group.references) {
 				// normalizeEvent refuses this at publish; a stored event
 				// that carries it is corrupt, and guessing an alignment
@@ -832,6 +870,9 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 				value := labelledReference{reference: group.references[i]}
 				if len(group.visibility) != 0 {
 					value.visibility = group.visibility[i]
+				}
+				if len(group.binding) != 0 {
+					value.binding = group.binding[i]
 				}
 				labelled = append(labelled, value)
 			}
@@ -846,6 +887,7 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 			// them; a document reference also names its cited revision.
 			graph := evidencelabels.Graph{
 				NodeIDs: value.reference.NodeIDs, EdgeIDs: value.reference.EdgeIDs,
+				Binding: value.binding,
 			}
 			if value.reference.Kind == interaction.EvidenceDocument {
 				graph.DocumentID = value.reference.Citation.DocumentID
@@ -858,23 +900,27 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 	}
 	result := make([]Event, len(events))
 	offset := 0
-	take := func(references []interaction.EvidenceReference, visibility [][]string) (
-		[]interaction.EvidenceReference, [][]string, bool, error,
-	) {
+	take := func(
+		references []interaction.EvidenceReference,
+		visibility [][]string, binding [][]byte,
+	) ([]interaction.EvidenceReference, [][]string, [][]byte, bool, error) {
 		count := len(references)
 		group := labelled[offset : offset+count]
 		decided := verdicts[offset : offset+count]
 		offset += count
-		return readableEvidenceGroup(references, visibility, group, decided)
+		return readableEvidenceGroup(
+			references, visibility, binding, group, decided)
 	}
 	for index, event := range events {
-		consumed, consumedVisibility, consumedWithheld, err := take(
-			event.ConsumedEvidence, event.ConsumedEvidenceVisibility)
+		consumed, consumedVisibility, consumedBinding, consumedWithheld, err := take(
+			event.ConsumedEvidence, event.ConsumedEvidenceVisibility,
+			event.ConsumedEvidenceBinding)
 		if err != nil {
 			return nil, err
 		}
-		cited, citedVisibility, citedWithheld, err := take(
-			event.CitedEvidence, event.CitedEvidenceVisibility)
+		cited, citedVisibility, citedBinding, citedWithheld, err := take(
+			event.CitedEvidence, event.CitedEvidenceVisibility,
+			event.CitedEvidenceBinding)
 		if err != nil {
 			return nil, err
 		}
@@ -885,8 +931,10 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 		projected := cloneEvent(event)
 		projected.ConsumedEvidence = cloneEvidenceReferences(consumed)
 		projected.ConsumedEvidenceVisibility = cloneVisibilityGroup(consumedVisibility)
+		projected.ConsumedEvidenceBinding = cloneBindingGroup(consumedBinding)
 		projected.CitedEvidence = cloneEvidenceReferences(cited)
 		projected.CitedEvidenceVisibility = cloneVisibilityGroup(citedVisibility)
+		projected.CitedEvidenceBinding = cloneBindingGroup(citedBinding)
 		join := make([]Evidence, 0, len(projected.Evidence))
 		for _, item := range projected.Evidence {
 			// An entry naming a withheld reference names material in a
@@ -908,6 +956,7 @@ func (s *Service) readableEvents(ctx context.Context, events []Event) ([]Event, 
 type labelledReference struct {
 	reference  interaction.EvidenceReference
 	visibility []string
+	binding    []byte
 }
 
 // readableEvidenceGroup applies one group's verdicts. Verdicts that do not
@@ -915,30 +964,51 @@ type labelledReference struct {
 // rather than delivering the group unfiltered.
 func readableEvidenceGroup(
 	references []interaction.EvidenceReference, visibility [][]string,
-	labelled []labelledReference, verdicts []bool,
-) ([]interaction.EvidenceReference, [][]string, bool, error) {
+	binding [][]byte, labelled []labelledReference, verdicts []bool,
+) ([]interaction.EvidenceReference, [][]string, [][]byte, bool, error) {
 	kept, withheld, err := evidencelabels.Apply(labelled, verdicts)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, nil, false, err
 	}
 	if !withheld {
-		return references, visibility, false, nil
+		return references, visibility, binding, false, nil
 	}
 	if len(kept) == 0 {
-		return nil, nil, true, nil
+		return nil, nil, nil, true, nil
 	}
 	keptReferences := make([]interaction.EvidenceReference, len(kept))
 	keptVisibility := make([][]string, len(kept))
+	keptBinding := make([][]byte, len(kept))
 	for i, value := range kept {
 		keptReferences[i] = value.reference
 		keptVisibility[i] = value.visibility
+		keptBinding[i] = value.binding
 	}
 	// The visibility group's shape must not outlive what it described. A
 	// group whose every remaining entry is empty is returned as nil (the
 	// exact shape of an event that never carried labelled evidence) because
 	// a non-nil array of empty entries would itself say "a labelled
 	// reference was here and was withheld" (#398).
-	return keptReferences, canonicalVisibilityGroup(keptVisibility), true, nil
+	//
+	// The binding group is filtered for the same reason and one more: a
+	// withheld reference's binding names the kind, document and revision of
+	// every member it was recorded over, so carrying it past the reference
+	// it belonged to hands over exactly what withholding the reference
+	// refused. Left unfiltered it also misaligns the group, which the
+	// delivered event then fails on if it is ever read again.
+	return keptReferences, canonicalVisibilityGroup(keptVisibility),
+		canonicalBindingGroup(keptBinding), true, nil
+}
+
+// canonicalBindingGroup returns nil for a group with nothing bound, so a
+// delivered event carries the shape of one that never had a binding.
+func canonicalBindingGroup(values [][]byte) [][]byte {
+	for _, value := range values {
+		if len(value) > 0 {
+			return values
+		}
+	}
+	return nil
 }
 
 func containsReference(

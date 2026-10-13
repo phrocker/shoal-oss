@@ -257,7 +257,13 @@ type eventWire struct {
 	// decodes as an all-unlabelled group.
 	ConsumedEvidenceVisibility [][]string `json:",omitempty"`
 	CitedEvidenceVisibility    [][]string `json:",omitempty"`
-	OccurredAt                 time.Time
+	// Registration bindings for the same groups, index for index (#705).
+	// Absent on an event written before the field existed, which decodes as
+	// an all-unbound group and is held to every registered revision at
+	// delivery — over-closing, never opening.
+	ConsumedEvidenceBinding [][]byte `json:",omitempty"`
+	CitedEvidenceBinding    [][]byte `json:",omitempty"`
+	OccurredAt              time.Time
 }
 
 func subscriptionToWire(value fleetevents.Subscription) subscriptionWire {
@@ -310,8 +316,24 @@ func eventToWire(value fleetevents.Event) eventWire {
 			value.ConsumedEvidenceVisibility),
 		CitedEvidenceVisibility: visibilityGroupCopy(
 			value.CitedEvidenceVisibility),
-		OccurredAt: value.OccurredAt,
+		ConsumedEvidenceBinding: bindingGroupCopy(
+			value.ConsumedEvidenceBinding),
+		CitedEvidenceBinding: bindingGroupCopy(value.CitedEvidenceBinding),
+		OccurredAt:           value.OccurredAt,
 	}
+}
+
+func bindingGroupCopy(values [][]byte) [][]byte {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([][]byte, len(values))
+	for i, value := range values {
+		if len(value) > 0 {
+			result[i] = append([]byte(nil), value...)
+		}
+	}
+	return result
 }
 
 func visibilityGroupCopy(values [][]string) [][]string {
@@ -355,7 +377,10 @@ func (value eventWire) domain() fleetevents.Event {
 			value.ConsumedEvidenceVisibility),
 		CitedEvidenceVisibility: visibilityGroupCopy(
 			value.CitedEvidenceVisibility),
-		OccurredAt: value.OccurredAt,
+		ConsumedEvidenceBinding: bindingGroupCopy(
+			value.ConsumedEvidenceBinding),
+		CitedEvidenceBinding: bindingGroupCopy(value.CitedEvidenceBinding),
+		OccurredAt:           value.OccurredAt,
 	}
 }
 
