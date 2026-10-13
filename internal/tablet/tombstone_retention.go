@@ -88,9 +88,12 @@ import (
 //
 // Upgrades: a files.json written before exports were recorded says nothing
 // about them. Its files are given an export time when first read (their
-// tombstones are kept one horizon), but the tablet is not marked exported,
-// so on a tablet that never exports, data written after the upgrade behaves
-// as before (see assumeExportedUntracked).
+// tombstones are kept one horizon), but the tablet is not marked exported.
+// Deletes written in the horizon after that read are kept too, by the read's
+// time (assumed_export_at), since a producer may not export again until
+// after them; after it, a tablet that never exports behaves exactly as
+// before (see assumeExportedUntracked, effectiveExportTime). The same holds
+// after a rollback's rewrite of files.json.
 //
 // Export times and their ages are wall-clock milliseconds. A clock stepped
 // back only delays expiry; a clock jumped forward by more than the horizon
@@ -146,9 +149,30 @@ func assumeExportedUntracked(state *immutableState) {
 		return
 	}
 	now := exportClock()
+	state.assumedAt = now
 	for _, path := range state.active {
 		state.exported[filepath.Base(path)] = now
 	}
+}
+
+// effectiveExportTime is the export time a file's tombstones are kept by,
+// and whether they are kept at all, on a tablet with no exported lineage
+// (an exported one keeps a file without a time as pending). A file with a
+// recorded export time uses it. A file without one is new since an upgrade
+// (or a rollback's rewrite) that this tablet has not exported since: it uses
+// the read's time (assumedAt), so it is kept for one horizon after that
+// untracked read, since a producer that upgraded before its next export may
+// be about to ship it to consumers that hold what it deletes. On a tablet
+// never read untracked nothing outside holds its data, and it is dropped.
+func (t *Tablet) effectiveExportTime(name string) (int64, bool) {
+	if at := t.exported[name]; at > 0 {
+		return at, true
+	}
+	if t.assumedAt > 0 {
+		// Past the horizon the caller expires it like any export time.
+		return t.assumedAt, true
+	}
+	return 0, false
 }
 
 // ExportLineage is RFileLineage for an export: it also records, durably and
@@ -223,6 +247,9 @@ func (t *Tablet) recompactionIsNoOpLocked(inputs []compaction.Input, retained []
 			free++
 		}
 	}
+	// free != 1 is defensive: with the other checks it does not change the
+	// answer for any tablet this code writes, but a main output that held
+	// tombstones (a stack emitting them) must not be skipped.
 	if free != 1 || len(retained) != len(inputs)-1 {
 		return false
 	}
@@ -268,7 +295,10 @@ func (t *Tablet) planRetainedTombstones(inputs []compaction.Input) []tombstoneGr
 		}
 		at := t.exported[filepath.Base(in.Name)]
 		if at == 0 && !t.exportedLineage {
-			continue // never exported: nobody outside holds its data
+			var keep bool
+			if at, keep = t.effectiveExportTime(filepath.Base(in.Name)); !keep {
+				continue // never exported: nobody outside holds its data
+			}
 		}
 		bucket := pending
 		if at > 0 {

@@ -427,18 +427,23 @@ func writeLatest(t *testing.T, tb *Tablet, row string, del bool) {
 }
 
 // TestUpgradeFromUntrackedManifest: a files.json from an older binary (or
-// none) does not say what was exported. The files it lists are treated as
-// exported when first read, so their tombstones are kept for one horizon;
-// the tablet itself is NOT marked exported, so for a tablet that never
-// exports (a store, a pure consumer) data written after the upgrade behaves
-// exactly as before: its deletes are dropped at the next full compaction and
-// a re-put after a compacted DeleteLatest is visible. A real producer is
-// marked by its first export and keeps them as usual.
+// none) does not say what was exported, and the tablet is not marked
+// exported. For one horizon after that untracked read, its files' tombstones
+// AND those of deletes written since are kept (by the read's time): a
+// producer that upgraded, or rolled back and forward, may not export again
+// until after them, and its consumers hold what they delete. After that
+// horizon a tablet that never exports (a store, a pure consumer) behaves
+// exactly as before: deletes are dropped at the next full compaction and a
+// re-put after a compacted DeleteLatest is visible, and nothing is kept
+// pending forever. A real producer is marked by its export and keeps them as
+// usual.
 func TestUpgradeFromUntrackedManifest(t *testing.T) {
-	for _, kind := range []string{"never exported", "pure consumer", "producer"} {
+	for _, kind := range []string{"never exported", "pure consumer", "producer", "rolled back producer"} {
 		t.Run(kind, func(t *testing.T) {
 			now := int64(1_000_000_000)
 			withExportClock(t, &now)
+			horizon := testRetention.Milliseconds()
+			producer := kind == "producer" || kind == "rolled back producer"
 			backend := memory.New()
 			dir := t.TempDir()
 			tb := openRetaining(t, dir, backend)
@@ -460,19 +465,48 @@ func TestUpgradeFromUntrackedManifest(t *testing.T) {
 				deleteRow(t, tb, "x", 2)
 				flushTablet(t, tb)
 			}
+			putRow(t, tb, "w", 1) // shipped before the delete below
+			flushTablet(t, tb)
+			if kind == "rolled back producer" {
+				exportTablet(t, tb) // tracked and exported, then rolled back
+			}
 			if err := tb.Close(); err != nil {
 				t.Fatal(err)
 			}
 			downgradeManifest(t, backend, dir)
+			now += 1000
 
+			// The window: a delete before the first export after the upgrade
+			// survives a full compaction, and that export ships it.
 			tb = openRetaining(t, dir, backend)
 			defer func() { _ = tb.Close() }()
 			if tb.exportedLineage {
 				t.Fatal("an untracked tablet was marked exported")
 			}
-			if kind == "producer" {
+			deleteRow(t, tb, "w", 2)
+			flushTablet(t, tb)
+			compactTablet(t, tb)
+			if rows, _ := tombstoneRows(t, tb); !rows["x"] || !rows["w"] {
+				t.Fatalf("tombstones %v; the window must keep the legacy one and w's", rows)
+			}
+			if producer {
 				exportTablet(t, tb)
 			}
+			if err := tb.Close(); err != nil { // the record survives a reopen
+				t.Fatal(err)
+			}
+			tb = openRetaining(t, dir, backend)
+			// Still in the window after the reopen (the read's time is
+			// persisted): a delete now is kept too.
+			deleteRow(t, tb, "v", 2)
+			flushTablet(t, tb)
+			compactTablet(t, tb)
+			if rows, _ := tombstoneRows(t, tb); !rows["w"] || !rows["v"] {
+				t.Fatalf("tombstones %v after a reopen in the window", rows)
+			}
+
+			// After the window.
+			now += horizon
 			putRow(t, tb, "q1", 1)
 			flushTablet(t, tb)
 			deleteRow(t, tb, "q1", 2)
@@ -482,34 +516,29 @@ func TestUpgradeFromUntrackedManifest(t *testing.T) {
 			flushTablet(t, tb)
 			compactTablet(t, tb)
 			rows, _ := tombstoneRows(t, tb)
-			if !rows["x"] {
-				t.Fatal("the legacy tombstone (possibly exported) was dropped at once")
+			if rows["x"] || rows["w"] || rows["v"] != producer {
+				t.Fatalf("tombstones %v kept past the window", rows)
 			}
-			if exported := kind == "producer"; rows["q1"] != exported || rows["r"] != exported {
-				t.Fatalf("post-upgrade tombstones %v; kept = %v, want %v", rows, rows["q1"], exported)
+			if rows["q1"] != producer || rows["r"] != producer {
+				t.Fatalf("post-window tombstones %v; kept = %v, want %v", rows, rows["q1"], producer)
 			}
 			// A re-put after the compacted DeleteLatest is visible unless the
 			// tablet really exported (then the kept tombstone shadows it).
 			writeLatest(t, tb, "r", false)
-			if visible := liveRows(t, tb)["r"]; visible == (kind == "producer") {
+			if visible := liveRows(t, tb)["r"]; visible == producer {
 				t.Fatalf("re-put visible = %v", visible)
 			}
-			// After one horizon nothing pending-forever remains on a tablet
-			// that never exports; a producer keeps only what it has not yet
-			// exported.
+			// Nothing is kept pending forever: 150 days on, exporting or not,
+			// no tombstone is left.
 			for i := 0; i < 5; i++ {
 				now += 30 * 24 * time.Hour.Milliseconds()
-				if kind == "producer" {
+				if producer {
 					exportTablet(t, tb)
 				}
 				compactTablet(t, tb)
 			}
-			rows, _ = tombstoneRows(t, tb)
-			if kind != "producer" && len(rows) != 0 {
+			if rows, _ := tombstoneRows(t, tb); len(rows) != 0 {
 				t.Fatalf("tombstones %v kept 150 days after the upgrade", rows)
-			}
-			if kind == "producer" && len(rows) != 0 {
-				t.Fatalf("producer kept %v past the horizon of their export", rows)
 			}
 		})
 	}
@@ -749,14 +778,56 @@ func TestUpgradedMultiRunOutputsKeepAssumedExportTime(t *testing.T) {
 	defer tb.Close()
 	assumed := now
 	now += 1000
+	// A run made only of a delete written after the upgrade, in the window.
+	if err := tb.SetDefaultEmbedding(embeddingspace.Has("space-c")); err != nil {
+		t.Fatal(err)
+	}
+	deleteRow(t, tb, "dc", 2)
+	flushTablet(t, tb)
 	compactTablet(t, tb)
-	if len(tb.exported) != 2 {
+	if len(tb.exported) != 3 {
 		t.Fatalf("multi-run outputs carry %v; want the assumed export time", tb.exported)
 	}
 	for name, at := range tb.exported {
 		if at != assumed {
 			t.Fatalf("%s carries %d, want %d", name, at, assumed)
 		}
+	}
+}
+
+// TestFormatMigrationRewritesKeptTombstoneOutputs: the idle-compaction
+// short-circuit does not apply once the table's format changed: a migration
+// compaction rewrites the main output and the kept-tombstone outputs into
+// the new format, and the data and tombstones survive it.
+func TestFormatMigrationRewritesKeptTombstoneOutputs(t *testing.T) {
+	now := int64(1_000_000_000)
+	withExportClock(t, &now)
+	tb := openRetaining(t, t.TempDir(), memory.New())
+	defer tb.Close()
+	putRow(t, tb, "x", 1)
+	putRow(t, tb, "y", 1)
+	flushTablet(t, tb)
+	exportTablet(t, tb)
+	deleteRow(t, tb, "x", 2)
+	flushTablet(t, tb)
+	compactTablet(t, tb)
+	if tb.FileCount() != 2 {
+		t.Fatalf("premise: %v", tb.RFiles())
+	}
+	if err := tb.SetFileFormat(FormatParquet); err != nil {
+		t.Fatal(err)
+	}
+	compactTablet(t, tb)
+	for _, path := range tb.RFiles() {
+		if filepath.Ext(path) != ".parquet" {
+			t.Fatalf("migration left %s", path)
+		}
+	}
+	if rows, _ := tombstoneRows(t, tb); !rows["x"] {
+		t.Fatal("migration lost the kept tombstone")
+	}
+	if live := liveRows(t, tb); !live["y"] || live["x"] {
+		t.Fatalf("after migration live rows %v, want y only", live)
 	}
 }
 

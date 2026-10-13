@@ -137,6 +137,10 @@ type Tablet struct {
 	// contain no tombstone; a full compaction need not look for tombstones
 	// to keep in them.
 	tombstoneFree map[string]struct{}
+	// assumedAt is when this binary first read the tablet's files.json
+	// without an export record (an upgrade, or a rollback's rewrite): see
+	// assumeExportedUntracked. 0: never.
+	assumedAt int64
 }
 
 // state returns the tablet's generation with the given active list and
@@ -152,6 +156,7 @@ func (t *Tablet) state(active []string, obsolete map[string]struct{}) immutableS
 		exported:        t.exported,
 		exportedLineage: t.exportedLineage,
 		tombstoneFree:   t.tombstoneFree,
+		assumedAt:       t.assumedAt,
 	}
 }
 
@@ -310,6 +315,7 @@ func Open(dir string, opts Options) (*Tablet, error) {
 	t.exported = found.exported
 	t.exportedLineage = found.exportedLineage
 	t.tombstoneFree = found.tombstoneFree
+	t.assumedAt = found.assumedAt
 
 	// Open WAL
 	walPath := filepath.Join(dir, "wal.log")
@@ -984,7 +990,7 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		// there would mean dropped.
 		if !full && !output.tombstoneFree && !t.exportedLineage {
 			for _, in := range run.inputs {
-				if at := t.exported[filepath.Base(in.Name)]; at > output.exportedAt {
+				if at, ok := t.effectiveExportTime(filepath.Base(in.Name)); ok && at > output.exportedAt {
 					output.exportedAt = at
 				}
 			}
@@ -1293,6 +1299,7 @@ func (t *Tablet) RefreshFiles() (int, error) {
 	t.exported = found.exported
 	t.exportedLineage = found.exportedLineage
 	t.tombstoneFree = found.tombstoneFree
+	t.assumedAt = found.assumedAt
 	return len(t.files), nil
 }
 
@@ -1696,6 +1703,9 @@ type immutableManifest struct {
 	// TombstoneFree lists live files this tablet wrote that hold no
 	// tombstone. A file not listed may hold some.
 	TombstoneFree []string `json:"tombstone_free,omitempty"`
+	// AssumedExportAt is when this binary first read an untracked
+	// generation of this tablet (see assumeExportedUntracked).
+	AssumedExportAt int64 `json:"assumed_export_at,omitempty"`
 }
 
 // immutableState is a tablet's immutable generation as files.json records
@@ -1711,6 +1721,7 @@ type immutableState struct {
 	// exportedLineage: some file of this tablet has been exported.
 	exportedLineage bool
 	tombstoneFree   map[string]struct{} // live files known to hold no tombstone
+	assumedAt       int64               // first read of an untracked generation
 }
 
 const importNamePrefix = ".shoal-import-"
@@ -1894,6 +1905,7 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 		sources: sources, absorbed: absorbed, minted: minted,
 		exported:        make(map[string]int64, len(manifest.Exported)),
 		exportedLineage: manifest.ExportedLineage,
+		assumedAt:       manifest.AssumedExportAt,
 		tombstoneFree:   make(map[string]struct{}, len(manifest.TombstoneFree)),
 	}
 	for _, name := range manifest.TombstoneFree {
@@ -1968,6 +1980,7 @@ func persistImmutableManifest(b storage.Backend, dir string, state immutableStat
 	sort.Strings(manifest.AbsorbedSources)
 	manifest.ExportTracked = true
 	manifest.ExportedLineage = state.exportedLineage
+	manifest.AssumedExportAt = state.assumedAt
 	for _, path := range state.active {
 		name := filepath.Base(path)
 		if at := state.exported[name]; at > 0 {
