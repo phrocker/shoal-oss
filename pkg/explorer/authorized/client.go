@@ -300,9 +300,25 @@ func NewClient(config Config) (*Client, error) {
 // Ingest authorizes and catalogs one immutable revision. A successful base
 // commit is never reported as success until its exact policy registration is
 // complete.
+//
+// An upload name (UploadSourceURIPrefix and a bare name) is routed before
+// anything is written, usually to the caller's own upload namespace, so the
+// outcome never depends on a document the caller cannot read (#712). The
+// result's document carries the URI it was written under.
 func (c *Client) Ingest(
 	ctx context.Context,
 	source explorer.Source,
+) (explorer.IngestResult, error) {
+	return c.ingest(ctx, source, true)
+}
+
+// ingest is Ingest. routeUploads false stores an upload name at its
+// un-namespaced URI, as every ingest did before #712; only tests use it, to
+// build a catalog written before #712.
+func (c *Client) ingest(
+	ctx context.Context,
+	source explorer.Source,
+	routeUploads bool,
 ) (
 	returned explorer.IngestResult,
 	returnedErr error,
@@ -347,6 +363,14 @@ func (c *Client) Ingest(
 		return explorer.IngestResult{}, err
 	}
 	ownedSource := cloneSource(source)
+	// A namespaced upload URI outside the caller's namespace is refused here,
+	// before anything is read (#712).
+	uploadKind, uploadName, err := classifyUploadSourceURI(
+		decision, ownedSource.URI)
+	if err != nil {
+		return explorer.IngestResult{}, err
+	}
+	// The selector sees the source as requested: an upload by its name.
 	rule, err := c.selectIngestRule(
 		ctx, decision, cloneSource(ownedSource), now)
 	if err != nil {
@@ -362,6 +386,14 @@ func (c *Client) Ingest(
 	defer lease.Release()
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
+	}
+	if routeUploads && uploadKind == uploadSourceName {
+		// Under the lock, so nothing can change the route before the claim.
+		routed, err := c.routeUploadSource(ctx, decision, now, uploadName)
+		if err != nil {
+			return explorer.IngestResult{}, err
+		}
+		ownedSource.URI = routed
 	}
 	claim, declassification, err := c.claimSourceMutation(
 		ctx, ownedSource.URI, decision, rule, now)

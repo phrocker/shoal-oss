@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+### Uploads by name live in the uploader's namespace (#712)
+
+The browser upload route and the MCP `shoal.ingest` tool store a file as
+`upload://workspace/<escaped filename>`. Before this release that URI was the
+same for every principal. Ingesting at a URI whose source claim the caller
+cannot read is refused with `not_found` (writing over a hidden document is not
+acceptable), while a name never uploaded succeeds. So a reader could test
+whether a hidden document existed under a guessed filename, for example
+`merger-plan.md`, on the memory and durable catalogs alike.
+
+**Behaviour change.** `upload://workspace/<name>` is now a request to upload
+`<name>`, which `authorized.Client.Ingest` routes, under the mutation lock and
+before anything is written, to the first of:
+
+1. the caller's own URI of the name, `upload://workspace/u-<digest of the
+   caller's identity>/<name>`, when anything is stored there;
+2. the name's un-namespaced URI (every upload before this release), when the
+   caller is authorized under every rule recorded for it: its claim's rule, a
+   pending claim's previous rule and its current registration;
+3. the one other identity's URI of the name, stored in the base, under which
+   the caller is authorized the same way, when there is exactly one;
+4. the caller's own URI of the name.
+
+Steps 2 and 3 skip whatever the caller is outside, exactly as if it were
+absent. So the outcome of uploading a name never depends on a document the
+caller cannot read: a reader uploading a hidden document's name gets what it
+gets for a name never uploaded, its own new document, and the hidden one is
+untouched. The identity is the one the application edge namespace hashes
+(#699), under a different version string.
+
+What stays the same:
+
+- **Shared documents.** Principals authorized under a document still share it
+  by name. A re-upload, a relabel by any holder of its labels (#630, #680),
+  the reason policy and its ordering (#664, #685), the historical refusal
+  (#674) and per-file batch outcomes (#687, #689) all act on that document.
+- **Uploads stored before this release** keep their un-namespaced URIs, read
+  exactly as before, and stay re-uploadable and relabelable by name by
+  everyone authorized under them. Nothing is rewritten on upgrade. Uploads
+  from catalogs older than source claims (a registration and no claim) are
+  covered the same way, by their registration's rule.
+
+What changes:
+
+- New uploads get namespaced source URIs (`source_uri` in document listings
+  and the declassification listing). Titles and the `source_label` metadata
+  are still the filename.
+- Two principals who cannot read each other's document of a name now get two
+  documents, where the second used to be refused with `not_found`. A name
+  that several other uploaders' readable documents share is ambiguous, so it
+  routes to the caller's own namespace too.
+- Library callers: an ingest at a namespaced upload URI outside the caller's
+  own namespace (or any other URI under `upload://workspace/` that is not a
+  bare name) is `InvalidArgument`, before anything is read.
+  `Client.OwnUploadSourceURI(ctx, name)` returns the caller's own URI of a
+  name. The policy selector still sees the source as requested.
+
+Not changed, and documented as trusted ingest only: source URIs outside
+`upload://workspace/` (`file://`, `https://`, a host's own schemes) are stored
+as given, and ingesting one over a hidden document is still `not_found`. No
+HTTP or MCP route lets a caller choose such a URI; they come from operator
+configuration, `cmd/shoal-explore` (the unwrapped corpus) and library hosts.
+A host that ingests caller-chosen URIs of its own must namespace them itself.
+
+**Residuals.**
+
+- The namespace binds the identity, not its current authority, as #699's
+  does. A narrowed session of the same identity (a token with fewer label
+  claims, say) routes to the same namespace, so it can still tell whether
+  that identity's broader sessions uploaded a name it cannot read. Unlike
+  `Connect`, this is reachable over HTTP and MCP, but only about the caller's
+  own identity's uploads.
+- A namespaced source URI shows readers of a document a digest of its first
+  uploader's identity, so they can tell which readable uploads came from the
+  same identity, and confirm a guess of who that is by recomputing the
+  digest.
+
 ### `Connect` edge IDs live in the writer's namespace (#699)
 
 `authorized.Client.Connect` returned Conflict for any edge ID already in the
@@ -38,8 +115,8 @@ sessions, so it can still tell whether one of their local edge IDs exists:
 Conflict for a different edge under that ID. This is library-only today
 (`Connect` has no HTTP or MCP route).
 
-`Connect` no longer discloses a hidden document by URI, but Ingest still
-does, over HTTP upload and MCP (#712).
+`Connect` no longer discloses a hidden document by URI. Neither does an
+upload by name since #712 (above).
 
 Migrating callers:
 
@@ -134,8 +211,8 @@ Found while checking this and filed:
   scan limit reveals the exact count of hidden edges and interactions on a
   visible node. A `Connect` ID colliding with a hidden edge reveals that
   edge, and through intrinsic edge IDs, a hidden document by URI. `Connect`
-  no longer discloses either (#699, above); Ingest is still a URI existence
-  oracle over HTTP upload and MCP (#712). A shared
+  no longer discloses either (#699, above), and neither does an upload by
+  name (#712, above). A shared
   extracted entity first owned by a later-labelled document reveals the
   entity key.
 - #694: heuristic detection of copy-down that names no input (session

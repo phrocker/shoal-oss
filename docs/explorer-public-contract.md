@@ -34,6 +34,26 @@ Trusted edge policy selectors that
 key on the edge ID can recover the caller's local ID with
 `authorized.ApplicationEdgeLocalID`.
 
+The authorized client's `Ingest` treats `upload://workspace/<name>`
+(`authorized.UploadSourceURIPrefix` and one URI segment, as the upload route
+and the MCP ingest tool build it) as a request to upload `<name>`, not as a
+URI (#712). Before anything is written it routes the name to the caller's own
+URI of it, `upload://workspace/u-<digest of the caller's identity>/<name>`,
+when anything is stored there; else to the un-namespaced URI of the name (how
+every upload was stored before #712) when the caller is authorized under every
+rule recorded for it; else to the one other identity's URI of the name that
+the caller is authorized under the same way, when there is exactly one; else
+to its own URI. The result's document is the one written; its source URI is
+the routed one. A document the caller is outside is skipped exactly as if it
+were absent, so the outcome of an upload never depends on a document the
+caller cannot read. `Client.OwnUploadSourceURI(ctx, name)` returns the
+caller's own URI of a name. A namespaced upload URI outside the caller's
+namespace, and any other URI under the prefix that is not one segment, is
+`InvalidArgument` before anything is read. Other source URIs are stored as
+given and are trusted ingest only: ingesting one over a document the caller
+cannot read is `NotFound`. The upload namespace binds the identity, not its
+current authority, as the application edge namespace does.
+
 ## Identity, bytes, and bounds
 
 - `shoal.ID` is an opaque byte string. Implementations MUST retain every byte,
