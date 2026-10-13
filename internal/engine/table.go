@@ -301,7 +301,7 @@ func (t *table) setTargetEmbedding(identity string) error {
 // openTable opens an existing table from disk. It discovers tablets
 // by scanning subdirectories named t-NNNN. notify, when non-nil, is invoked
 // (with this table's name) each time one of its tablets writes a new RFile.
-func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, walSyncMode localwal.SyncMode, walSyncInterval time.Duration, backend storage.Backend, notify func(table, kind, file string)) (*table, error) {
+func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, walSyncMode localwal.SyncMode, walSyncInterval time.Duration, backend storage.Backend, tombstoneRetention time.Duration, notify func(table, kind, file string)) (*table, error) {
 	manifest, err := readTableManifest(dir)
 	if err != nil {
 		return nil, err
@@ -340,6 +340,8 @@ func openTable(dir, name string, logger *slog.Logger, rfCache *tablet.Cache, wal
 			FileFormat:       manifest.FileFormat,
 			DefaultEmbedding: manifest.DefaultEmbedding,
 			OnRFile:          tabletNotify(name, notify),
+
+			TombstoneRetention: tombstoneRetention,
 		})
 		if err != nil {
 			for j := 0; j < i; j++ {

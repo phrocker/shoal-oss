@@ -38,7 +38,9 @@ type skiplistMemtable struct {
 	head  *slNode
 	level int
 	count int
-	rng   *rand.Rand
+	// deletes counts the inserted tombstones.
+	deletes int
+	rng     *rand.Rand
 }
 
 const (
@@ -98,10 +100,16 @@ func (sl *skiplistMemtable) Insert(key wire.Key, value []byte) {
 		update[i].next[i] = node
 	}
 	sl.count++
+	if key.Deleted {
+		sl.deletes++
+	}
 }
 
 // Len returns the number of cells inserted.
 func (sl *skiplistMemtable) Len() int { return sl.count }
+
+// Deletes returns the number of tombstones inserted.
+func (sl *skiplistMemtable) Deletes() int { return sl.deletes }
 
 // Iterator returns an SKVI over the sorted contents. Multiple
 // iterators are safe (the skiplist is only appended to, never

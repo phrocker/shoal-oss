@@ -127,18 +127,31 @@ type Tablet struct {
 	// tablet minted was minted under, by base name. See instance.go.
 	instance string
 	minted   map[string]string
+	// exported is the millisecond each live file was first exported
+	// (absent: not exported yet); exportedLineage is set once any file of
+	// this tablet has been exported. Both decide which tombstones a full
+	// compaction must keep (see tombstone_retention.go).
+	exported        map[string]int64
+	exportedLineage bool
+	// tombstoneFree holds the live files this tablet wrote and knows to
+	// contain no tombstone; a full compaction need not look for tombstones
+	// to keep in them.
+	tombstoneFree map[string]struct{}
 }
 
 // state returns the tablet's generation with the given active list and
 // obsolete set, for persistImmutableManifest. Caller holds t.mu.
 func (t *Tablet) state(active []string, obsolete map[string]struct{}) immutableState {
 	return immutableState{
-		active:        active,
-		obsolete:      obsolete,
-		nameHighWater: t.nameHighWater,
-		sources:       t.sources,
-		absorbed:      t.absorbed,
-		minted:        t.minted,
+		active:          active,
+		obsolete:        obsolete,
+		nameHighWater:   t.nameHighWater,
+		sources:         t.sources,
+		absorbed:        t.absorbed,
+		minted:          t.minted,
+		exported:        t.exported,
+		exportedLineage: t.exportedLineage,
+		tombstoneFree:   t.tombstoneFree,
 	}
 }
 
@@ -231,6 +244,15 @@ type Options struct {
 	// held, so the callback MUST NOT block or call back into the tablet;
 	// engines wire it to a non-blocking publish.
 	OnRFile func(kind, file string)
+
+	// TombstoneRetention is how long a full major compaction keeps the
+	// tombstones of a tablet whose files have been exported, measured from
+	// when each tombstone was first exported: the consumer import horizon
+	// (see tombstone_retention.go). Zero uses DefaultTombstoneRetention; a
+	// negative value (TombstoneRetentionDisabled) drops tombstones at every
+	// full compaction, as before #708, which is unsafe for an exported
+	// tablet whose consumers hold cells it deletes.
+	TombstoneRetention time.Duration
 }
 
 // Open opens or creates a tablet in dir. On startup, it:
@@ -285,6 +307,9 @@ func Open(dir string, opts Options) (*Tablet, error) {
 	t.sources = found.sources
 	t.absorbed = found.absorbed
 	t.minted = found.minted
+	t.exported = found.exported
+	t.exportedLineage = found.exportedLineage
+	t.tombstoneFree = found.tombstoneFree
 
 	// Open WAL
 	walPath := filepath.Join(dir, "wal.log")
@@ -885,12 +910,24 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		return ErrMixedEmbeddingCompactionStack
 	}
 
-	type compactedOutput struct {
-		name    string
-		path    string
-		entries int64
+	// A full compaction (one run, so one output covering the whole tablet)
+	// drops tombstones. On an exported tablet the ones consumers may still
+	// need are written beside it, into tombstone-only outputs (#708; see
+	// tombstone_retention.go).
+	full := len(runs) == 1
+	var retained []tombstoneGroup
+	if full {
+		retained = t.planRetainedTombstones(runs[0].inputs)
 	}
-	outputs := make([]compactedOutput, 0, len(runs))
+
+	type compactedOutput struct {
+		name          string
+		path          string
+		entries       int64
+		exportedAt    int64
+		tombstoneFree bool
+	}
+	outputs := make([]compactedOutput, 0, len(runs)+len(retained))
 	cleanupOutputs := func() {
 		for _, output := range outputs {
 			_ = removeObject(t.backend, output.path)
@@ -900,7 +937,7 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	for _, path := range t.files {
 		existingNames[filepath.Base(path)] = struct{}{}
 	}
-	base, err := t.freeCompactionBaseLocked(len(runs), existingNames)
+	base, err := t.freeCompactionBaseLocked(len(runs)+len(retained), existingNames)
 	if err != nil {
 		return err
 	}
@@ -918,7 +955,7 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 			Inputs:              inputs,
 			Stack:               stack,
 			Scope:               iterrt.ScopeMajc,
-			FullMajorCompaction: len(runs) == 1,
+			FullMajorCompaction: full,
 			AdjacencyEdgeCF:     t.opts.AdjacencyEdgeCF,
 			OutputFormat:        string(t.opts.FileFormat),
 		})
@@ -936,6 +973,35 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		}
 		outputs = append(outputs, compactedOutput{
 			name: outName, path: outPath, entries: result.EntriesWritten,
+			tombstoneFree: result.TombstonesWritten == 0,
+		})
+	}
+	for index, group := range retained {
+		result, err := compaction.Compact(compaction.Spec{
+			Inputs:          group.inputs,
+			Scope:           iterrt.ScopeMajc,
+			TombstonesOnly:  true,
+			AdjacencyEdgeCF: t.opts.AdjacencyEdgeCF,
+			OutputFormat:    string(t.opts.FileFormat),
+		})
+		if err != nil {
+			cleanupOutputs()
+			return fmt.Errorf("tablet: keep exported tombstones: %w", err)
+		}
+		if result.EntriesWritten == 0 {
+			continue
+		}
+		outName := fmt.Sprintf(
+			"C%013d-%03d%s", base, len(runs)+index, t.opts.FileFormat.extension())
+		outPath := filepath.Join(t.dir, outName)
+		if err := storage.WriteAll(
+			context.Background(), t.backend, outPath, result.Output); err != nil {
+			cleanupOutputs()
+			return fmt.Errorf("tablet: write kept tombstones: %w", err)
+		}
+		outputs = append(outputs, compactedOutput{
+			name: outName, path: outPath, entries: result.EntriesWritten,
+			exportedAt: group.exportedAt,
 		})
 	}
 
@@ -946,9 +1012,20 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	}
 	outputPaths := make([]string, len(outputs))
 	minted := make(map[string]string, len(outputs))
+	// A kept-tombstone output carries its tombstones' export time; every
+	// other output starts pending. (A multi-run output may hold tombstones
+	// that were exported in its inputs: pending only keeps them longer.)
+	exported := make(map[string]int64)
+	tombstoneFree := make(map[string]struct{})
 	for index, output := range outputs {
 		outputPaths[index] = output.path
 		minted[output.name] = instance
+		if output.exportedAt > 0 {
+			exported[output.name] = output.exportedAt
+		}
+		if output.tombstoneFree {
+			tombstoneFree[output.name] = struct{}{}
+		}
 	}
 	// Imported inputs stay held after their files are folded into the
 	// outputs, so re-importing them is still a no-op: by producer identity,
@@ -970,12 +1047,16 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	next := t.state(outputPaths, obsolete)
 	next.sources, next.absorbed = sources, absorbed
 	next.minted = minted
+	next.exported = exported
+	next.tombstoneFree = tombstoneFree
 	commit := func() {
 		t.files = outputPaths
 		t.obsolete = obsolete
 		t.sources = sources
 		t.absorbed = absorbed
 		t.minted = minted
+		t.exported = exported
+		t.tombstoneFree = tombstoneFree
 	}
 	if err := persistImmutableManifest(t.backend, t.dir, next); err != nil {
 		if storage.IsCommittedWriteError(err) {
@@ -1192,6 +1273,9 @@ func (t *Tablet) RefreshFiles() (int, error) {
 	t.absorbed = found.absorbed
 	// The in-memory instance is kept: a refresh is not a new writer.
 	t.minted = found.minted
+	t.exported = found.exported
+	t.exportedLineage = found.exportedLineage
+	t.tombstoneFree = found.tombstoneFree
 	return len(t.files), nil
 }
 
@@ -1256,10 +1340,17 @@ func (t *Tablet) flushLocked() error {
 	files := append(append([]string(nil), t.files...), outPath)
 	minted := cloneMinted(t.minted)
 	minted[outName] = instance
+	tombstoneFree := t.tombstoneFree
+	if t.active.Deletes() == 0 {
+		tombstoneFree = cloneObsolete(t.tombstoneFree)
+		tombstoneFree[outName] = struct{}{}
+	}
 	next := t.state(files, t.obsolete)
 	next.minted = minted
+	next.tombstoneFree = tombstoneFree
 	if err := persistImmutableManifest(t.backend, t.dir, next); err != nil {
 		if storage.IsCommittedWriteError(err) {
+			t.tombstoneFree = tombstoneFree
 			t.minted = minted
 			t.files = files
 			t.active = newSkiplistMemtable()
@@ -1274,6 +1365,7 @@ func (t *Tablet) flushLocked() error {
 		_ = removeObject(t.backend, outPath)
 		return fmt.Errorf("flush: publish generation: %w", err)
 	}
+	t.tombstoneFree = tombstoneFree
 	t.minted = minted
 	t.files = files
 	t.active = newSkiplistMemtable()
@@ -1572,6 +1664,21 @@ type immutableManifest struct {
 	// under (see instance.go). An older binary drops it; the files it
 	// listed then have no instance and are re-shipped once by a sync.
 	Minted map[string]string `json:"minted,omitempty"`
+	// ExportTracked marks a manifest whose Exported / ExportedLineage are
+	// authoritative (written by a binary that records exports). Without it
+	// (an older binary, or no manifest at all) nothing says which files were
+	// exported, so every listed file is treated as exported when it is read
+	// (see tombstone_retention.go).
+	ExportTracked bool `json:"export_tracked,omitempty"`
+	// Exported is the millisecond each live file was first exported, for
+	// the files that have been.
+	Exported map[string]int64 `json:"exported,omitempty"`
+	// ExportedLineage records that some file of this tablet has been
+	// exported, so copies of its cells may exist outside it.
+	ExportedLineage bool `json:"exported_lineage,omitempty"`
+	// TombstoneFree lists live files this tablet wrote that hold no
+	// tombstone. A file not listed may hold some.
+	TombstoneFree []string `json:"tombstone_free,omitempty"`
 }
 
 // immutableState is a tablet's immutable generation as files.json records
@@ -1583,6 +1690,10 @@ type immutableState struct {
 	sources       map[string]string   // imported file base name -> producer identity
 	absorbed      map[string]struct{} // producer identities compacted locally
 	minted        map[string]string   // minted file base name -> instance
+	exported      map[string]int64    // live file base name -> first export ms
+	// exportedLineage: some file of this tablet has been exported.
+	exportedLineage bool
+	tombstoneFree   map[string]struct{} // live files known to hold no tombstone
 }
 
 const importNamePrefix = ".shoal-import-"
@@ -1632,26 +1743,23 @@ func namesHighWater(floor int64, names ...string) int64 {
 }
 
 func discoverImmutableFiles(b storage.Backend, dir string, adoptUnknown bool) (immutableState, error) {
-	active, obsolete, highWater, sources, absorbed, minted, err := discoverImmutableFilesRaw(b, dir, adoptUnknown)
+	state, err := discoverImmutableFilesRaw(b, dir, adoptUnknown)
 	if err != nil {
 		return immutableState{}, err
 	}
-	obsoleteNames := make([]string, 0, len(obsolete))
-	for name := range obsolete {
+	obsoleteNames := make([]string, 0, len(state.obsolete))
+	for name := range state.obsolete {
 		obsoleteNames = append(obsoleteNames, name)
 	}
-	highWater = namesHighWater(highWater, active...)
-	highWater = namesHighWater(highWater, obsoleteNames...)
-	return immutableState{
-		active: active, obsolete: obsolete, nameHighWater: highWater,
-		sources: sources, absorbed: absorbed, minted: minted,
-	}, nil
+	state.nameHighWater = namesHighWater(state.nameHighWater, state.active...)
+	state.nameHighWater = namesHighWater(state.nameHighWater, obsoleteNames...)
+	return state, nil
 }
 
-func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool) ([]string, map[string]struct{}, int64, map[string]string, map[string]struct{}, map[string]string, error) {
+func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool) (immutableState, error) {
 	keys, err := listTabletObjects(b, dir)
 	if err != nil {
-		return nil, nil, 0, nil, nil, nil, err
+		return immutableState{}, err
 	}
 	available := make(map[string]string)
 	manifestPresent := false
@@ -1680,18 +1788,25 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 			active = append(active, key)
 		}
 		legacyRecencyOrder(active)
-		return active, obsolete, highWater, map[string]string{}, map[string]struct{}{}, map[string]string{}, nil
+		state := immutableState{
+			active: active, obsolete: obsolete, nameHighWater: highWater,
+			sources: map[string]string{}, absorbed: map[string]struct{}{},
+			minted: map[string]string{}, exported: map[string]int64{},
+			tombstoneFree: map[string]struct{}{},
+		}
+		assumeExportedUntracked(&state)
+		return state, nil
 	}
 	data, err := storage.ReadAll(context.Background(), b, filepath.Join(dir, "files.json"))
 	if err != nil {
-		return nil, nil, 0, nil, nil, nil, fmt.Errorf("read immutable manifest: %w", err)
+		return immutableState{}, fmt.Errorf("read immutable manifest: %w", err)
 	}
 	var manifest immutableManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, nil, 0, nil, nil, nil, fmt.Errorf("decode immutable manifest: %w", err)
+		return immutableState{}, fmt.Errorf("decode immutable manifest: %w", err)
 	}
 	if manifest.Version != immutableManifestVersion {
-		return nil, nil, 0, nil, nil, nil, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
+		return immutableState{}, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
 	}
 	if manifest.NameHighWater > highWater {
 		highWater = manifest.NameHighWater
@@ -1712,7 +1827,7 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 	for i, name := range manifest.Active {
 		path, ok := available[name]
 		if !ok {
-			return nil, nil, 0, nil, nil, nil, fmt.Errorf("authoritative immutable file %q is missing", name)
+			return immutableState{}, fmt.Errorf("authoritative immutable file %q is missing", name)
 		}
 		if lastIndex[name] != i {
 			continue
@@ -1757,7 +1872,30 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 			minted[name] = instance
 		}
 	}
-	return active, obsolete, highWater, sources, absorbed, minted, nil
+	state := immutableState{
+		active: active, obsolete: obsolete, nameHighWater: highWater,
+		sources: sources, absorbed: absorbed, minted: minted,
+		exported:        make(map[string]int64, len(manifest.Exported)),
+		exportedLineage: manifest.ExportedLineage,
+		tombstoneFree:   make(map[string]struct{}, len(manifest.TombstoneFree)),
+	}
+	for _, name := range manifest.TombstoneFree {
+		if _, live := known[name]; live {
+			state.tombstoneFree[name] = struct{}{}
+		}
+	}
+	if !manifest.ExportTracked {
+		assumeExportedUntracked(&state)
+		return state, nil
+	}
+	// Only live, listed files keep their export time: an adopted stray was
+	// not exported by this tablet.
+	for name, at := range manifest.Exported {
+		if _, live := known[name]; live && at > 0 {
+			state.exported[name] = at
+		}
+	}
+	return state, nil
 }
 
 func listTabletObjects(b storage.Backend, dir string) ([]string, error) {
@@ -1811,6 +1949,21 @@ func persistImmutableManifest(b storage.Backend, dir string, state immutableStat
 		manifest.AbsorbedSources = append(manifest.AbsorbedSources, source)
 	}
 	sort.Strings(manifest.AbsorbedSources)
+	manifest.ExportTracked = true
+	manifest.ExportedLineage = state.exportedLineage
+	for _, path := range state.active {
+		name := filepath.Base(path)
+		if at := state.exported[name]; at > 0 {
+			if manifest.Exported == nil {
+				manifest.Exported = make(map[string]int64)
+			}
+			manifest.Exported[name] = at
+		}
+		if _, free := state.tombstoneFree[name]; free {
+			manifest.TombstoneFree = append(manifest.TombstoneFree, name)
+		}
+	}
+	sort.Strings(manifest.TombstoneFree)
 	manifest.NameHighWater = namesHighWater(
 		namesHighWater(state.nameHighWater, manifest.Active...), manifest.Obsolete...)
 	// Active is written in the caller's (recency) order, NOT sorted: the
@@ -1869,6 +2022,11 @@ func PublishImmutableFiles(b storage.Backend, dir string, files []ImportedFile) 
 		}
 		if previous.NameHighWater > state.nameHighWater {
 			state.nameHighWater = previous.NameHighWater
+		}
+		// A directory whose earlier generation was exported keeps that
+		// fact (an untracked one with files may have been).
+		if previous.ExportedLineage || (!previous.ExportTracked && len(previous.Active) > 0) {
+			state.exportedLineage = true
 		}
 	}
 	activeNames := make(map[string]struct{}, len(files))

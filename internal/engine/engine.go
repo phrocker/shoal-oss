@@ -67,9 +67,10 @@ type Engine struct {
 	logger *slog.Logger
 	cache  *tablet.Cache
 
-	walSyncMode     localwal.SyncMode
-	walSyncInterval time.Duration
-	backend         storage.Backend
+	walSyncMode        localwal.SyncMode
+	walSyncInterval    time.Duration
+	backend            storage.Backend
+	tombstoneRetention time.Duration
 
 	metrics engineCounters
 
@@ -123,6 +124,16 @@ type Options struct {
 	// keeps each tablet's WAL local while flushing RFiles elsewhere — the
 	// basis for a locally-resident, cloud-durable subgraph.
 	Backend storage.Backend
+
+	// TombstoneRetention is the consumer import horizon for exported
+	// tables: how long, after a table's files are first exported, a full
+	// compaction keeps the tombstones consumers holding the deleted cells
+	// need (#708). Zero uses tablet.DefaultTombstoneRetention; negative
+	// (tablet.TombstoneRetentionDisabled) drops them at every full
+	// compaction. It applies to every table this engine opens or creates.
+	// A table's TabletOptions may set their own at creation; like the WAL
+	// settings it is not persisted, so a reopened table uses this one.
+	TombstoneRetention time.Duration
 }
 
 // Open opens or creates an engine rooted at dir.
@@ -149,6 +160,8 @@ func Open(dir string, opts Options) (*Engine, error) {
 		walSyncMode:     opts.WALSyncMode,
 		walSyncInterval: opts.WALSyncInterval,
 		backend:         backend,
+
+		tombstoneRetention: opts.TombstoneRetention,
 	}
 
 	// Discover existing tables (each subdirectory is a table)
@@ -158,7 +171,7 @@ func Open(dir string, opts Options) (*Engine, error) {
 	}
 	for _, e := range entries {
 		if e.IsDir() {
-			tbl, err := openTable(filepath.Join(dir, e.Name()), e.Name(), opts.Logger, eng.cache, eng.walSyncMode, eng.walSyncInterval, eng.backend, eng.publishRFile)
+			tbl, err := openTable(filepath.Join(dir, e.Name()), e.Name(), opts.Logger, eng.cache, eng.walSyncMode, eng.walSyncInterval, eng.backend, eng.tombstoneRetention, eng.publishRFile)
 			if err != nil {
 				eng.Close()
 				return nil, fmt.Errorf("engine: open table %s: %w", e.Name(), err)
@@ -190,6 +203,9 @@ func (e *Engine) CreateTable(name string, opts TableOptions) error {
 	}
 	if opts.TabletOptions.Backend == nil {
 		opts.TabletOptions.Backend = e.backend
+	}
+	if opts.TabletOptions.TombstoneRetention == 0 {
+		opts.TabletOptions.TombstoneRetention = e.tombstoneRetention
 	}
 	tbl, err := createTable(tableDir, name, opts, e.logger, e.cache, e.publishRFile)
 	if err != nil {
