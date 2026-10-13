@@ -65,6 +65,42 @@ func (e interactionEdges) endpoints() []shoal.ID {
 	return endpoints
 }
 
+// edge is the resolved edge edgeID names: its registration's, or the derived
+// edge its trusted assertion builds.
+func (e interactionEdges) edge(edgeID shoal.ID) (graph.Edge, bool) {
+	if registration, ok := e.registered[edgeID]; ok {
+		return registration.Edge, registration.Edge.ID == edgeID
+	}
+	edge, ok := e.derived[edgeID]
+	return edge, ok
+}
+
+// resolveGateEdges is resolveInteractionEdges over any number of edges, in
+// lookups bounded by maxInteractionAuthorizationIDs.
+func (c *Client) resolveGateEdges(
+	ctx context.Context, edgeIDs []shoal.ID, reader *registrationReader,
+) (interactionEdges, error) {
+	edges := interactionEdges{registered: registeredEdges{}}
+	for start := 0; start < len(edgeIDs); {
+		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
+		resolved, err := c.resolveInteractionEdges(ctx, edgeIDs[start:end], reader)
+		if err != nil {
+			return interactionEdges{}, err
+		}
+		start = end
+		for id, registration := range resolved.registered {
+			edges.registered[id] = registration
+		}
+		for id, edge := range resolved.derived {
+			if edges.derived == nil {
+				edges.derived = make(map[shoal.ID]graph.Edge)
+			}
+			edges.derived[id] = edge
+		}
+	}
+	return edges, nil
+}
+
 // resolveInteractionEdges resolves touched edges as resolveEdges does, and
 // every one that resolves no registration through the trusted
 // DerivedAssertionReader. One the reader does not hold, or holds in a form
@@ -91,9 +127,31 @@ func (c *Client) resolveInteractionEdges(
 	if err != nil {
 		return interactionEdges{}, err
 	}
-	edges := interactionEdges{registered: registered}
+	derived, err := c.trustedDerivedEdges(ctx, edgeIDs)
+	if err != nil {
+		return interactionEdges{}, err
+	}
+	for edgeID := range registered {
+		delete(derived, edgeID)
+	}
+	if len(derived) == 0 {
+		derived = nil
+	}
+	return interactionEdges{registered: registered, derived: derived}, nil
+}
+
+// trustedDerivedEdges asks the trusted DerivedAssertionReader about every
+// distinct edge in edgeIDs, registered or not (see resolveInteractionEdges
+// for why every one), and returns the derived edge each held assertion
+// builds, keyed by edge ID. An assertion derivedInteractionEdge refuses, or
+// one the reader does not hold, is left out. The caller drops every edge
+// that resolves a registration: a registered edge is decided by its
+// registration alone. Without a trusted reader nothing resolves.
+func (c *Client) trustedDerivedEdges(
+	ctx context.Context, edgeIDs []shoal.ID,
+) (map[shoal.ID]graph.Edge, error) {
 	if len(edgeIDs) == 0 || isNilDependency(c.derivedAssertions) {
-		return edges, nil
+		return nil, nil
 	}
 	distinct := make([]shoal.ID, 0, len(edgeIDs))
 	seen := make(map[shoal.ID]struct{}, len(edgeIDs))
@@ -106,12 +164,10 @@ func (c *Client) resolveInteractionEdges(
 	}
 	trusted, err := c.derivedAssertions.DerivedAssertions(ctx, distinct)
 	if err != nil {
-		return interactionEdges{}, directBaseError(err)
+		return nil, directBaseError(err)
 	}
+	var derived map[shoal.ID]graph.Edge
 	for _, edgeID := range distinct {
-		if _, ok := registered[edgeID]; ok {
-			continue
-		}
 		assertion, ok := trusted[edgeID]
 		if !ok {
 			continue
@@ -120,12 +176,12 @@ func (c *Client) resolveInteractionEdges(
 		if !ok {
 			continue
 		}
-		if edges.derived == nil {
-			edges.derived = make(map[shoal.ID]graph.Edge)
+		if derived == nil {
+			derived = make(map[shoal.ID]graph.Edge)
 		}
-		edges.derived[edgeID] = edge
+		derived[edgeID] = edge
 	}
-	return edges, nil
+	return derived, nil
 }
 
 // derivedInteractionEdge is the edge a trusted derived assertion builds
