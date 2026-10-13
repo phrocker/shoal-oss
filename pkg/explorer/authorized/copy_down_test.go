@@ -21,8 +21,9 @@ package authorized_test
 
 // Copy-down through operations that name their inputs (#663). Each of them
 // stores its output under a rule that can be weaker than its inputs' rules,
-// and none of them admits a reader the inputs would refuse, because every
-// read re-checks the inputs' current rules. These tests pin that binding for
+// and none of them serves its content to a reader the inputs would refuse,
+// because every read re-checks the inputs' current rules (existence oracles
+// are #698, #699, #700). These tests pin that binding for
 // each operation, with the declared output rule demonstrably weaker, and pin
 // that no declassification record is written and that
 // RequireDeclassificationReason does not refuse the write. See
@@ -156,8 +157,12 @@ func TestCopyDownConnectEdgeStaysBoundToItsEndpoints(t *testing.T) {
 }
 
 // TestCopyDownInteractionStaysBoundToItsEvidence: a label holder records an
-// interaction over labelled evidence whose output restriction carries no
-// label at all. A reader without the label cannot tell it exists.
+// interaction over labelled evidence under an output restriction the reader
+// satisfies but which lacks the evidence's label. The stored restriction is
+// shown to be weaker than one carrying the label, and an interaction over
+// unlabelled evidence under the same restriction is readable, so the reader
+// is refused by the evidence binding alone, with the same not_found as for
+// an interaction never written.
 func TestCopyDownInteractionStaysBoundToItsEvidence(t *testing.T) {
 	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
 		w := newCopyDownWorld(t, store)
@@ -174,21 +179,73 @@ func TestCopyDownInteractionStaysBoundToItsEvidence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		session := interaction.Session{
-			ID:                       interaction.DerivedID("session", "copy-down"),
-			RecordedAt:               w.f.clock.Now(),
-			SnapshotID:               shoal.ID(snapshot.ID),
-			SnapshotAsOf:             snapshot.AsOf,
-			AuthorizationFingerprint: shoal.ID(fingerprint.String()),
-			AuthorizationExpiresAt:   recorder.AuthenticationExpires(),
-			SeedNodeIDs:              []shoal.ID{w.closed.Document.ID},
+		sourcePolicy, err := auth.NewPolicy(auth.PolicyConfig{
+			AuthorizationDomain: w.f.domain, SourceID: w.f.sourceA,
+			GrantPolicyID: w.f.policyA, Epoch: recorder.PolicyGeneration(),
+		})
+		if err != nil {
+			t.Fatal(err)
 		}
-		if err := w.client.RecordInteraction(w.f.context(t, recorder), session); err != nil {
-			t.Fatalf("record over labelled evidence without an output label: %v", err)
+		// Structured terms of the source policy, which every reader here
+		// holds: a non-empty output restriction without the label.
+		sourceTerms, err := sourcePolicy.VisibilityTerms()
+		if err != nil {
+			t.Fatal(err)
+		}
+		record := func(name string, seed shoal.ID, required []string) shoal.ID {
+			t.Helper()
+			session := interaction.Session{
+				ID:                       interaction.DerivedID("session", name),
+				RecordedAt:               w.f.clock.Now(),
+				SnapshotID:               shoal.ID(snapshot.ID),
+				SnapshotAsOf:             snapshot.AsOf,
+				AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+				AuthorizationExpiresAt:   recorder.AuthenticationExpires(),
+				SeedNodeIDs:              []shoal.ID{seed},
+				RequiredVisibility:       append([]string(nil), required...),
+			}
+			if err := w.client.RecordInteraction(w.f.context(t, recorder), session); err != nil {
+				t.Fatalf("record %s: %v", name, err)
+			}
+			return session.ID
+		}
+		copied := record("copy-down", w.closed.Document.ID, sourceTerms)
+		carrying := record("carrying", w.closed.Document.ID, []string{"secret"})
+		control := record("open-control", w.open.Document.ID, sourceTerms)
+
+		holder := w.f.labelIngester(t, "holder", "secret")
+		stored := func(id shoal.ID) []string {
+			t.Helper()
+			got, err := w.client.InteractionRecord(holder, id)
+			if err != nil {
+				t.Fatalf("the label holder cannot read %s: %v", id, err)
+			}
+			return got.Session.RequiredVisibility
+		}
+		copiedTerms, carryingTerms := stored(copied), stored(carrying)
+		if len(copiedTerms) == 0 {
+			t.Fatal("the copy-down interaction stored no output restriction")
+		}
+		held := make(map[string]bool, len(copiedTerms))
+		for _, term := range copiedTerms {
+			held[term] = true
+		}
+		missing := 0
+		for _, term := range carryingTerms {
+			if !held[term] {
+				missing++
+			}
+		}
+		if len(carryingTerms) == 0 || missing == 0 {
+			t.Fatalf("stored restriction %v is not weaker than the evidence label's %v",
+				copiedTerms, carryingTerms)
 		}
 
 		reader := w.f.labelIngester(t, "reader")
-		_, err = w.client.InteractionRecord(reader, session.ID)
+		if _, err := w.client.InteractionRecord(reader, control); err != nil {
+			t.Fatalf("the reader cannot satisfy the output restriction itself: %v", err)
+		}
+		_, err = w.client.InteractionRecord(reader, copied)
 		_, never := w.client.InteractionRecord(reader, interaction.DerivedID("session", "never"))
 		if !shoal.IsErrorCode(err, shoal.ErrorNotFound) ||
 			!shoal.IsErrorCode(never, shoal.ErrorNotFound) || err.Error() != never.Error() {
@@ -198,12 +255,8 @@ func TestCopyDownInteractionStaysBoundToItsEvidence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(listed) != 0 {
-			t.Fatalf("the reader lists the interaction: %+v", listed)
-		}
-		if _, err := w.client.InteractionRecord(
-			w.f.labelIngester(t, "holder", "secret"), session.ID); err != nil {
-			t.Fatalf("the label holder cannot read the interaction: %v", err)
+		if len(listed) != 1 || listed[0].SessionID != control {
+			t.Fatalf("the reader lists %+v, want only the unlabelled control", listed)
 		}
 		w.assertNoDeclassification(t)
 	})
@@ -211,7 +264,7 @@ func TestCopyDownInteractionStaysBoundToItsEvidence(t *testing.T) {
 
 // TestCopyDownExtractionCarriesItsSourceRule: what is extracted from a
 // labelled document is registered under that document's rule, so it is never
-// weaker, and a reader without the label sees none of it.
+// weaker, and none of it is served to a reader without the label.
 func TestCopyDownExtractionCarriesItsSourceRule(t *testing.T) {
 	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
 		f := newFixture(t)

@@ -6,9 +6,8 @@
 
 #663 asked whether labelled content written into weaker-labelled material
 through an operation that names its inputs should be audited like a relabel
-(#630). It should not: none of these writes admits a new reader when it is
-made.
-
+(#630). It should not: none of these writes serves its content to a new
+reader when it is made.
 
 - An application edge (`Connect`) is stored under the edge policy, which never
   carries a label, but every read also requires both endpoints' current rules.
@@ -20,8 +19,10 @@ made.
 
 So these writes record no declassification, and
 `-require-declassification-reason` does not refuse them. New tests pin, for
-each operation and both policy stores, that a reader without the label sees
-none of the output, although its stored rule is weaker. The binding is
+each operation and both policy stores, that no content of the output is
+served to a reader without the label, although its stored rule is weaker.
+This is a claim about content, not existence: see #698, #699 and #700
+below. The binding is
 documented in the deploy guide and in `pkg/explorer/authorized`. Nothing
 changes in behaviour, wire formats or the policy catalog.
 
@@ -33,6 +34,12 @@ Found while checking this and filed:
   while that revision itself stays closed.
 - #696: a fleet action's `Output` is served to readers whose evidence refs
   are withheld.
+- #698, #699, #700: existence and count oracles. A bounded neighborhood's
+  scan limit reveals the exact count of hidden edges and interactions on a
+  visible node. A `Connect` ID colliding with a hidden edge reveals that
+  edge, and through intrinsic edge IDs, a hidden document by URI. A shared
+  extracted entity first owned by a later-labelled document reveals the
+  entity key.
 - #694: heuristic detection of copy-down that names no input (session
   correlation, content similarity), as operator signals that never block a
   write.

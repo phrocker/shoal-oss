@@ -581,9 +581,9 @@ writes a declassification record, and `-require-declassification-reason`
 never refuses one, because none of them admits a new reader when it is
 written. Every read of such an output also requires its inputs' current
 rules. An edge needs both endpoints, an interaction needs every node and
-edge it touched, and an extracted entity or relation needs its document. A
-reader without the label sees none of them, exactly as if they had not been
-written.
+edge it touched, and an extracted entity or relation needs its document. No
+content of these outputs is served to a reader without the label. Their
+existence is not fully hidden yet: see the gaps below.
 
 Known gaps:
 
@@ -593,6 +593,12 @@ Known gaps:
   entities and relations stay closed.
 - A fleet action's `Output` is shown to readers whose view of the action's
   evidence is withheld (#696).
+- Existence and count oracles. A bounded neighborhood's scan limit reveals
+  the exact number of hidden edges and interactions on a visible node
+  (#698). A `Connect` whose edge ID collides with a hidden edge reveals that
+  edge, and through intrinsic edge IDs, a hidden document by URI (#699). An
+  extracted entity shared with a document that is labelled later reveals the
+  entity key (#700).
 - Copy-down that names no input is not detected. Examples are labelled text
   pasted into an upload under a new name, or into a graph materialization.
   Detection needs session correlation or content similarity, which can only
