@@ -378,6 +378,10 @@ func (r *Runtime) publishLocked(
 	}
 	record, err := r.persistIntent(ctx, request.Intent)
 	if err != nil {
+		var held *tokenHeldError
+		if errors.As(err, &held) {
+			r.waitForTokenHolder(ctx, held.txn, held.digest)
+		}
 		return Result{}, err
 	}
 	if hook := runtimeStageHook(r.protocolStore); hook != nil {
@@ -1137,6 +1141,48 @@ func (r *Runtime) recoverPending(
 		}
 	}
 	return transaction.ErrUnavailable
+}
+
+// waitForTokenHolder returns once the intent holding a transaction token has
+// settled, or the contention wait or the context ends first.
+//
+// A publication that finds its token held by a different, unsettled intent has
+// lost to it: the holder's transaction is the one that decides this
+// transition. Answering the conflict at once let the caller re-read before the
+// holder had written and report a conflict for a transition that was about to
+// exist. Concurrent re-requests of one approval and concurrent sweeps of one
+// expiry each derive one token from the transition and differ only in who
+// published it, and under scheduling pressure the holder routinely outlasted
+// the caller's short re-read. Waiting here, where the holder is known, lets
+// the caller's re-read observe the winner's outcome instead.
+//
+// It never changes the answer: the caller still gets the conflict, and a wait
+// that ends by timeout, cancellation or a failed read only returns sooner. It
+// runs outside recoveryMu, so other publications and recovery are not held up.
+func (r *Runtime) waitForTokenHolder(
+	ctx context.Context, txn coordination.TXN, digest coordination.Digest,
+) {
+	if r.contentionWait == 0 {
+		return
+	}
+	holder := storedIntent{TXN: txn, LogicalDigest: digest}
+	timeout := time.NewTimer(r.contentionWait)
+	defer timeout.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		unsettled, err := r.intents.hasPendingMarker(ctx, holder)
+		if err != nil || !unsettled {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-timeout.C:
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func (r *Runtime) waitForExpectedResolution(

@@ -203,6 +203,33 @@ func Partition(
 	return coordination.LPART(hash.Sum(nil)), nil
 }
 
+// tokenHeldError is Put's answer when the transaction a token derives is
+// already held by a different intent that has not settled: another publisher
+// derived the same token from the same logical transition (its provenance
+// differs, so its intent does) and its transaction is in flight.
+//
+// It is a transaction.ErrConflict, and stays one: this publication cannot
+// proceed under that token, and every caller keys on the sentinel. What it
+// adds is that the conflict's outcome is not yet decided. The holder's
+// transaction decides it, so a caller that re-reads now can see the state from
+// before the holder's write and report a conflict for a transition that is
+// about to exist. publishLocked therefore waits for the holder to settle before
+// answering, the same contention wait a busy guard gets.
+//
+// It names the holder by its transaction and logical digest alone, which is
+// what its pending marker is keyed and checked on.
+type tokenHeldError struct {
+	txn    coordination.TXN
+	digest coordination.Digest
+}
+
+func (e *tokenHeldError) Error() string {
+	return transaction.ErrConflict.Error() +
+		": the transaction token is held by an unsettled intent"
+}
+
+func (e *tokenHeldError) Unwrap() error { return transaction.ErrConflict }
+
 func (s *IntentStore) Put(
 	ctx context.Context,
 	intent Intent,
@@ -281,8 +308,12 @@ func (s *IntentStore) Put(
 						removeErr,
 					)
 				}
+				return storedIntent{}, false, transaction.ErrConflict
 			}
-			return storedIntent{}, false, transaction.ErrConflict
+			return storedIntent{}, false, &tokenHeldError{
+				txn:    append(coordination.TXN(nil), existing.TXN...),
+				digest: existing.LogicalDigest,
+			}
 		}
 		if !errors.Is(readErr, transaction.ErrNotFound) {
 			if errors.Is(writeErr, allocator.ErrConditionalUnknown) {
