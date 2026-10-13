@@ -1295,6 +1295,11 @@ type serviceConfig struct {
 	// between a committed transition and its event, which is what a crash
 	// there looks like, while the publisher behind it is the real one.
 	wrapApprovalEvents func(fleet.ApprovalEventPublisher) fleet.ApprovalEventPublisher
+	// wrapActionEvents is the same kind of seam for the dispatch service's
+	// action lifecycle events (#655): nil in production. It lets a test see
+	// each record the real publisher is handed, and lose a publication
+	// between a committed transition and its event.
+	wrapActionEvents func(fleet.ActionEventPublisher) fleet.ActionEventPublisher
 	// approverMapping returns the operator approver mapping digest in force
 	// (#451), or the zero digest. Nil means none.
 	approverMapping func(context.Context) (auth.Digest, error)
@@ -1602,9 +1607,13 @@ func openService(
 			embedded.Close()
 			return closed, err
 		}
+		var dispatchEvents fleet.ActionEventPublisher = actionEvents
+		if config.wrapActionEvents != nil {
+			dispatchEvents = config.wrapActionEvents(dispatchEvents)
+		}
 		fleetDispatch, err := explorerfleet.ComposeDispatchWithAttestations(
 			embedded.Runtime, fleetRegistry, config.resolver, actionRecorder,
-			actionEvents, nil, config.clock, attestationReader,
+			dispatchEvents, nil, config.clock, attestationReader,
 			explorerfleet.DispatchLabels{
 				Visibility: client.LabelVisibility(),
 				Translator: client.LabelTranslator(),

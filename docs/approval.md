@@ -49,6 +49,8 @@ The lifecycle is three compare-and-set steps on the approval record:
    path an enqueue uses, carrying `ApprovalRequestDigest`,
    `ApprovalPolicyGeneration`, `ApproverSubject`/`Actor`/`ClientID` and
    `ApprovedAt`. The answer is `201` with `state: enqueued` and the action.
+   Invoking the same request instead materializes it the same way and then
+   runs it ("Synchronous invoke", #655).
 
 Re-requesting is idempotent at every step: it answers `pending`, `refused`,
 `expired`, `withdrawn`, `stranded` or `enqueued`, or conflicts if anything
@@ -767,62 +769,86 @@ the approver and fleet groups disjoint.
 
 ## What enqueue, invoke and admission do
 
-- **Enqueue and invoke** of an approval-required action return
-  `ErrApprovalRequired`: HTTP `409`, code `conflict`. Conflict, deliberately:
-  the caller is authorized and the request is well formed, so neither `400` nor
-  `401` is true, and a retry of the same request will never succeed, so `503`
-  would mislead. The request conflicts with the action's registered state and
-  the remedy is a different route. Clients should branch on the `409` from these
-  two routes and resubmit through the approval route. A refused enqueue is not
-  audited: nothing is written, no action exists for an audit to name, and the
-  approval route, which is audited at every transition, is where this work goes.
-- **Invoke on an identity an approval already materialized** reaches enqueue's
-  replay branch, which returns the existing record before the guard, and Invoke
-  then claims and runs it in process if an in-process executor is bound. That
-  is the one approved request, run once, by its requester under the claim
-  fence — the same work any worker would claim — and not a way round the
-  approval. It works by accident of the replay branch rather than by design,
-  and nothing relies on it or forbids it yet; "Synchronous invoke" below is
-  the design that replaces the accident.
+- **Enqueue** of an approval-required action, and **invoke** of one not yet
+  approved, return `ErrApprovalRequired`: HTTP `409`, code `conflict`.
+  Conflict, deliberately: the caller is authorized and the request is well
+  formed, so neither `400` nor `401` is true, and a retry of the same request
+  will never succeed, so `503` would mislead. The request conflicts with the
+  action's registered state and the remedy is a different route, which the
+  message names (`POST /api/v1/fleet/approvals/request`, under the same action
+  ID). Clients should branch on the `409` from these two routes and resubmit
+  through the approval route. A refused enqueue is not audited: nothing is
+  written, no action exists for an audit to name, and the approval route,
+  which is audited at every transition, is where this work goes.
+- **Invoke of an approved request** materializes it and runs it in process,
+  once ("Synchronous invoke" below).
 - **The pre-call admission seam (Path B)** denies an approval-required action
   durably with no reason, like any other denial. Holding is not available
   there: the caller is waiting on the answer with the payload in hand.
 
-### Synchronous invoke (designed, not yet built)
+### Synchronous invoke
 
-Issue #655, item 3. Written down before it is coded, and waiting on the
-fleet owner's answer to the questions on #655, because it changes
-`DispatchService.Invoke`.
+Issue #655, item 3, as designed on the issue and agreed with the fleet owner.
+The code is `pkg/explorer/fleet/approval_invoke.go`.
 
-1. **Invoke before approval stays a `409` `ErrApprovalRequired`**, and its
+1. **Before approval, Invoke stays a `409` `ErrApprovalRequired`**, and its
    message names the approval route. The approval's identity is the action
    ID the caller already chose, so nothing more needs returning. Invoke does
-   **not** create the hold: a refused call writes nothing, and holding is the
-   requester's `dispatch` authority where Invoke is `invoke`.
-2. **Invoke after approval materializes and runs it.** Past enqueue's replay
-   branch, where an `ActionRecord` at the identity already replays exactly as
-   today, Invoke asks the approval service — through an optional hook the
-   approval service installs on `DispatchService` — to materialize an
-   **approved** request at that identity for this caller: the same
-   `approved → enqueued` compare-and-set, under the same equal-request check
-   Request applies, with the request rebuilt under the caller's own decision.
-   Invoke then claims and runs the one record under the requester's
-   credential and `ClaimID`, as for any queued record.
-3. **Exactly once, replay-safe.** There is one `ActionRecord`, written once
-   (the existing second write), and the claim fence decides who runs it. A
-   retried Invoke finds the action and takes today's replay or claim path; a
-   crash between materialization and the claim is recovered by the same
-   Invoke.
-4. **Never by the approver.** Invoke requires `invoke` and the requester's
-   principal, and the materialization is the requester's transition; an
-   approver holds neither. A pending, refused, expired, withdrawn or stranded
-   request is answered as before and runs nothing.
-
-Open questions for the fleet owner: whether a hook on `DispatchService` or a
-branch in the invoke route is preferred; whether materializing through Invoke
-should require `dispatch` as well as `invoke`, since the hold was made under
-`dispatch`; and whether a record whose stored `AuthorizedOperations` are
-`[dispatch]` may be claimed in process under `invoke`.
+   **not** create the hold, and a refused call writes nothing: with nothing
+   held, and with a request held and undecided, no approval or action is
+   written and no event is published.
+2. **After approval, Invoke materializes and runs it.** Invoke consults an
+   optional hook the approval service installs on `DispatchService`
+   (`approvalMaterializer`, the shape of `graphEvidenceBinder`), at one
+   point: after enqueue's replay branch, when the enqueue was refused for
+   want of approval. A record that already exists at the identity has
+   replayed by then, as it always did, and is never materialized over. The
+   hook makes the same `approved → enqueued` compare-and-set Request makes,
+   under the same equal-request check, with the request rebuilt under the
+   caller's own decision, and writes the one `ActionRecord`. Invoke then
+   claims and runs it under the requester's credential and `ClaimID`, as for
+   any queued record.
+3. **Both `dispatch` and `invoke`.** Materializing is an enqueue and needs
+   `dispatch`, checked against the live decision when it happens, before any
+   approval is read: a requester whose `dispatch` was revoked after making
+   the hold cannot turn it into work, and is answered as approval required
+   whether or not anything is held. Running needs `invoke`, which Invoke
+   checks first. `AuthorizedOperations` is not consulted: it accumulates and
+   is not what authorized any one transition. The record starts `[dispatch]`
+   from the request and the claim widens it to `[dispatch, invoke]`.
+4. **Each event under its own operation.** The materialized record's
+   `TransitionOperation` is `dispatch` — the materialization, whichever
+   route made it — and the claim's and the completion's are `invoke`. The
+   publisher selects each event's operation by kind — `action.enqueued`
+   from `AuthorizedOperations`, which is `[dispatch]` at that point, and the
+   claim and completion from `TransitionOperation` — so `action.enqueued` is
+   published under `dispatch` and `action.claimed` and `action.completed`
+   under `invoke`, within one call. A test asks the real publisher which
+   operation each published record authorizes under.
+5. **Nothing is left behind by a refusal.** The claim ID and lease are
+   validated before the approval is touched, and the work must be runnable
+   in process (the same check Invoke makes before claiming, #455) before the
+   compare-and-set: a dispatch-only reference is refused with the approval
+   still `approved`. A request whose window has closed has its expiry
+   written, as Request writes it.
+6. **Exactly once, replay-safe.** There is one `ActionRecord` and the claim
+   fence decides who runs it; concurrent Invokes with different `ClaimID`s
+   run it once, and the losers get the outcome or a conflict. A retried
+   Invoke finds the action through enqueue's replay branch and takes the
+   replay or claim path. A crash inside the materialization (the approval
+   `enqueued`, the action not yet written) is recovered by the same Invoke,
+   which completes the materialization. If the materialization succeeds and
+   the claim does not, the record is left `queued` and the caller gets an
+   error; a retry is the recovery.
+7. **Never by the approver.** Invoke requires `invoke` and the requester's
+   principal; an approver holds neither and is refused before anything is
+   read, as for an identity nobody holds.
+8. **Final states are answers.** A refused, expired or withdrawn request is
+   answered with `ErrApprovalRefused`, `ErrApprovalExpired` or
+   `ErrApprovalWithdrawn` (`409`), and runs nothing. A stranded request is
+   answered `ErrApprovalStranded` where Invoke can reach it; in practice the
+   causes that strand one also refuse Invoke earlier (a moved target fails
+   the pinned resolve, a passed deadline the request context).
 
 ### Beside executor attestation
 
@@ -1139,7 +1165,8 @@ tests remain the right tool for service-level properties below the transport.
   check and the commit leaves the approval `enqueued` under someone else's
   action, which Status reports, and records, as `stranded` / `identity_taken`
   (#655). A conflict on request also reveals that something exists at
-  an identity. Both are the existing dispatch identity properties.
+  an identity, and so does one on Invoke, to a caller holding both dispatch
+  and invoke on the scope (#655). Both are the existing dispatch identity properties.
 - **An in-scope approver can learn that an approval ID exists.** Without a
   narrowing, a caller that holds `action_approve` on a request's scope but is
   ineligible to decide it — not independent of it, holding dispatch, invoke or
@@ -1197,6 +1224,13 @@ tests remain the right tool for service-level properties below the transport.
   event did not answers `503`; a later Status publishes the caller's own row
   quietly, never failing for it, so a persistent failure there loses that
   event once #653's 22h window passes, as any unretried row does.
+- **An Invoke whose `approval.enqueued` event did not publish (#655)** has
+  committed the materialization and written the action, and answers the
+  unpublished event (`503`) without running it. The retry runs it, through
+  enqueue's replay branch — which is consulted before the approval service,
+  so it does not retry the approval row. That row is published by the
+  requester's next Request or Status of the approval, within #653's window,
+  as for any approval transition whose maker does not come back.
 - **A withdrawal reason is recorded, not served.** It is on the record and its
   audit, as the request's own reason is, and no route or event returns it.
 - **Audits record attempts.** Approval audits precede their write, and each
@@ -1220,6 +1254,3 @@ tests remain the right tool for service-level properties below the transport.
 - Approver pools per action or descriptor (a later ATPL version may only
   reference an operator-defined pool), a second approver-only issuer, and
   quorum.
-- Synchronous invoke of an approval-required action, by design rather than
-  through the replay branch: designed above ("Synchronous invoke"), and
-  waiting on the fleet owner's answers on #655 before it is built.
