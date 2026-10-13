@@ -304,7 +304,7 @@ func (c *Client) existingRevisionRegistration(
 	if err != nil {
 		return RevisionRegistration{}, inconsistentBase()
 	}
-	intrinsicEdges, err := c.intrinsicEdges(ctx, nodeIDs)
+	intrinsicEdges, err := c.intrinsicEdges(ctx, view, nodeIDs)
 	if err != nil {
 		return RevisionRegistration{}, err
 	}
