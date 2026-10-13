@@ -303,22 +303,25 @@ func NewClient(config Config) (*Client, error) {
 //
 // An upload name (UploadSourceURIPrefix and a bare name) is routed before
 // anything is written, usually to the caller's own upload namespace, so the
-// outcome never depends on a document the caller cannot read (#712). The
-// result's document carries the URI it was written under.
+// outcome never depends on another identity's document the caller is not
+// authorized to ingest under (#712). The result's document is the one
+// written; IngestUpload also reports the route.
 func (c *Client) Ingest(
 	ctx context.Context,
 	source explorer.Source,
 ) (explorer.IngestResult, error) {
-	return c.ingest(ctx, source, true)
+	return c.ingest(ctx, source, true, nil)
 }
 
-// ingest is Ingest. routeUploads false stores an upload name at its
-// un-namespaced URI, as every ingest did before #712; only tests use it, to
-// build a catalog written before #712.
+// ingest is Ingest. It sets *route (when route is not nil) once an upload is
+// routed. routeUploads false stores an upload name at its un-namespaced URI,
+// as every ingest did before #712; only tests use it, to build a catalog
+// written before #712.
 func (c *Client) ingest(
 	ctx context.Context,
 	source explorer.Source,
 	routeUploads bool,
+	route *UploadRoute,
 ) (
 	returned explorer.IngestResult,
 	returnedErr error,
@@ -387,13 +390,24 @@ func (c *Client) ingest(
 	if err := guard.Check(ctx); err != nil {
 		return explorer.IngestResult{}, err
 	}
-	if routeUploads && uploadKind == uploadSourceName {
-		// Under the lock, so nothing can change the route before the claim.
-		routed, err := c.routeUploadSource(ctx, decision, now, uploadName)
-		if err != nil {
-			return explorer.IngestResult{}, err
-		}
-		ownedSource.URI = routed
+	// Under the lock, so nothing can change the route before the claim.
+	var routed UploadRoute
+	switch {
+	case uploadKind == uploadSourceName && routeUploads:
+		routed, err = c.routeUploadSource(ctx, decision, now, uploadName)
+	case uploadKind == uploadSourceTarget:
+		routed, err = c.routeUploadTarget(ctx, decision, now, ownedSource.URI)
+	case uploadKind == uploadSourceOwn:
+		routed = UploadRoute{Kind: UploadRouteOwn, SourceURI: ownedSource.URI}
+	}
+	if err != nil {
+		return explorer.IngestResult{}, err
+	}
+	if routed.SourceURI != "" {
+		ownedSource.URI = routed.SourceURI
+	}
+	if route != nil {
+		*route = routed
 	}
 	claim, declassification, err := c.claimSourceMutation(
 		ctx, ownedSource.URI, decision, rule, now)

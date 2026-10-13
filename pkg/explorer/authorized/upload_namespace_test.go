@@ -66,6 +66,7 @@ const (
 type uploadWorld struct {
 	t         *testing.T
 	f         *fixture
+	base      explorer.Client
 	store     authorized.PolicyStore
 	client    *authorized.Client
 	decisions map[string]auth.Decision
@@ -76,7 +77,16 @@ func newUploadWorld(
 	t *testing.T, f *fixture, store authorized.PolicyStore, requireReason bool,
 ) *uploadWorld {
 	t.Helper()
-	w := &uploadWorld{t: t, f: f, store: store, decisions: map[string]auth.Decision{
+	return newUploadWorldOver(t, f, f.base, store, requireReason)
+}
+
+// newUploadWorldOver is newUploadWorld over another base corpus.
+func newUploadWorldOver(
+	t *testing.T, f *fixture, base explorer.Client,
+	store authorized.PolicyStore, requireReason bool,
+) *uploadWorld {
+	t.Helper()
+	w := &uploadWorld{t: t, f: f, base: base, store: store, decisions: map[string]auth.Decision{
 		uploadHolder:       f.bindingDecision(t, uploadHolder, "secret"),
 		uploadCollaborator: f.bindingDecision(t, uploadCollaborator, "secret"),
 		uploadReader:       f.bindingDecision(t, uploadReader),
@@ -113,9 +123,9 @@ func (w *uploadWorld) newClient(
 	store authorized.PolicyStore, requireReason bool,
 ) *authorized.Client {
 	w.t.Helper()
-	base := w.f.base
+	base := w.base
 	selector := w.f.staticSelector(w.t, w.f.sourceA, w.f.policyA)
-	proposals, _ := explorer.Client(base).(explorer.OntologyProposalStore)
+	proposals, _ := base.(explorer.OntologyProposalStore)
 	client, err := authorized.NewClient(authorized.Config{
 		Base:                          base,
 		VectorScorer:                  trustedVectorScorer(base),
@@ -181,7 +191,7 @@ func (w *uploadWorld) ownURI(subject, name string) string {
 // sourceURIs maps each base document to its source URI, read as trusted.
 func (w *uploadWorld) sourceURIs() map[shoal.ID]string {
 	w.t.Helper()
-	summaries, err := w.f.base.Documents(context.Background())
+	summaries, err := w.base.Documents(context.Background())
 	if err != nil {
 		w.t.Fatal(err)
 	}
@@ -221,6 +231,10 @@ type probeOutcome struct {
 	Spans       int
 	ProbersOwn  bool
 	Files       int
+	// Others and Ambiguous are the upload's name notice: the documents of
+	// the name it left unchanged that the prober may upload to.
+	Others    int
+	Ambiguous bool
 }
 
 type uploadSurface struct {
@@ -242,7 +256,7 @@ func (w *uploadWorld) libraryUpload(subject, name, content, reason string) probe
 	if reason != "" {
 		ctx = withReason(w.t, ctx, reason)
 	}
-	result, err := w.client.Ingest(ctx, uploadSource(name, content, ""))
+	result, route, err := w.client.IngestUpload(ctx, uploadSource(name, content, ""))
 	if err != nil {
 		code := ""
 		var failure *shoal.Error
@@ -256,6 +270,7 @@ func (w *uploadWorld) libraryUpload(subject, name, content, reason string) probe
 		Spans: result.SpanCount, Files: 1,
 		ProbersOwn: result.Document.ID ==
 			explorer.SourceDocumentID(w.ownURI(subject, name)),
+		Others: route.OtherDocuments, Ambiguous: route.Ambiguous,
 	}
 }
 
@@ -291,6 +306,16 @@ func (w *uploadWorld) outcomeOf(
 			outcome.Sections, outcome.Spans = file.SectionCount, file.SpanCount
 			outcome.ProbersOwn = file.Document.ID ==
 				explorer.SourceDocumentID(w.ownURI(subject, name))
+			if notice := file.NameNotice; notice != nil {
+				wantURI, wantRoute := w.ownURI(subject, name), "own"
+				if !outcome.ProbersOwn {
+					wantURI, wantRoute = authorized.UploadSourceURIPrefix+url.PathEscape(name), "legacy"
+				}
+				if notice.SourceURI != wantURI || notice.Route != wantRoute || notice.Message == "" {
+					w.t.Fatalf("name notice %+v is not of the document written", notice)
+				}
+				outcome.Others, outcome.Ambiguous = notice.OtherDocuments, notice.Ambiguous
+			}
 		}
 		return outcome
 	}
@@ -698,7 +723,9 @@ func TestUploadsStoredBefore712StayWithTheirReaders(t *testing.T) {
 			relabelled := w.httpUpload(uploadCollaborator, "legacy.md", "# Legacy\n\npublic\n",
 				"ticket:SEC-712")
 			if relabelled.Status != http.StatusOK || relabelled.Files != 1 ||
-				relabelled.Disposition != explorer.IngestApplied || relabelled.ProbersOwn {
+				relabelled.Disposition != explorer.IngestApplied || relabelled.ProbersOwn ||
+				// The reader's own public document of the name was left as it was.
+				relabelled.Others != 1 || relabelled.Ambiguous {
 				t.Fatalf("relabel of a pre-#712 upload = %+v", relabelled)
 			}
 			records := declassifications(t, after)
@@ -723,15 +750,18 @@ func TestUploadsStoredBefore712StayWithTheirReaders(t *testing.T) {
 	}
 }
 
-// TestUploadNamespaceRefusesOtherNamespaces: a namespaced upload URI is
-// accepted only in the caller's own namespace. Any other is refused with one
-// InvalidArgument whatever is stored there, before anything is written.
-// Other schemes are not routed: they are trusted ingest, and a hidden
-// document there is still refused with not_found.
+// TestUploadNamespaceRefusesOtherNamespaces: a URI in another uploader's
+// namespace is a target, written only when the caller is authorized to
+// ingest under the document there. A hidden document there and nothing at
+// all are refused with the same InvalidArgument, and a malformed URI under
+// the upload prefix with another one, before anything is written. Other
+// schemes are not routed: they are trusted ingest, and a hidden document
+// there is still refused with not_found.
 func TestUploadNamespaceRefusesOtherNamespaces(t *testing.T) {
 	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
 		w := newUploadWorld(t, newFixture(t), store, false)
 		hidden := w.ingest(w.client, uploadHolder, "x.md", "# X\n\nsecret\n", "secret")
+		target := w.ingest(w.client, uploadReaderTwo, "t.md", "# T\n\npublic\n", "")
 		count := len(w.sourceURIs())
 		holderNamespace := strings.TrimSuffix(w.ownURI(uploadHolder, "x.md"), "x.md")
 		reader := w.as(uploadReader)
@@ -741,29 +771,52 @@ func TestUploadNamespaceRefusesOtherNamespaces(t *testing.T) {
 			_, err := w.client.Ingest(reader, source)
 			return err
 		}
-		refusal := ingestAt(holderNamespace + "absent.md")
-		if !shoal.IsErrorCode(refusal, shoal.ErrorInvalidArgument) ||
-			!strings.Contains(refusal.Error(), "upload namespace") {
-			t.Fatalf("another namespace = %v, want the namespace refusal", refusal)
+		absentTarget := ingestAt(holderNamespace + "absent.md")
+		if !shoal.IsErrorCode(absentTarget, shoal.ErrorInvalidArgument) ||
+			!strings.Contains(absentTarget.Error(), "another uploader's namespace") {
+			t.Fatalf("absent target = %v, want the target refusal", absentTarget)
 		}
 		for _, uri := range []string{
 			holderNamespace + "x.md",
 			authorized.UploadSourceURIPrefix + "u-" + strings.Repeat("0", 32) + "/x.md",
-			authorized.UploadSourceURIPrefix,
+		} {
+			if err := ingestAt(uri); err == nil || err.Error() != absentTarget.Error() {
+				t.Fatalf("ingest at %q = %v, want %v", uri, err, absentTarget)
+			}
+		}
+		malformed := ingestAt(authorized.UploadSourceURIPrefix)
+		if !shoal.IsErrorCode(malformed, shoal.ErrorInvalidArgument) ||
+			!strings.Contains(malformed.Error(), "upload namespace") {
+			t.Fatalf("malformed upload URI = %v, want the namespace refusal", malformed)
+		}
+		for _, uri := range []string{
 			authorized.UploadSourceURIPrefix + "a/b",
 			authorized.UploadSourceURIPrefix + "u-short/x.md",
+			authorized.UploadSourceURIPrefix + "u-" + strings.Repeat("A", 32) + "/x.md",
+			holderNamespace,
 			holderNamespace + "x.md/y",
 			w.ownURI(uploadReader, "x.md") + "/y",
 			strings.TrimSuffix(w.ownURI(uploadReader, "x.md"), "x.md"),
 		} {
-			if err := ingestAt(uri); err == nil || err.Error() != refusal.Error() {
-				t.Fatalf("ingest at %q = %v, want %v", uri, err, refusal)
+			if err := ingestAt(uri); err == nil || err.Error() != malformed.Error() {
+				t.Fatalf("ingest at %q = %v, want %v", uri, err, malformed)
 			}
 		}
 		if got := len(w.sourceURIs()); got != count {
 			t.Fatalf("refused ingests wrote %d documents", got-count)
 		}
 		w.requireCurrent(uploadHolder, hidden, "after the refusals")
+
+		// A document of another uploader the caller may upload to is a
+		// target by its source URI.
+		source := uploadSource("t.md", "# T\n\ntargeted by URI\n", "")
+		source.URI = w.ownURI(uploadReaderTwo, "t.md")
+		byURI, route, err := w.client.IngestUpload(reader, source)
+		if err != nil || byURI.Document.ID != target.Document.ID ||
+			route.Kind != authorized.UploadRouteShared {
+			t.Fatalf("target by URI = %+v, %+v (%v), want a revision of %s",
+				byURI, route, err, target.Document.ID)
+		}
 
 		// The caller's own namespaced URI is accepted, as the same
 		// document its name routes to.
@@ -968,5 +1021,159 @@ func TestUploadNamespaceBindsTheIdentityNotItsAuthority(t *testing.T) {
 		}
 		w.requireCurrent(uploadHolder, hidden, "after the narrowed session")
 		w.requireCurrent(uploadReader, readers, "after the narrowed session")
+	})
+}
+
+// TestUploadByNameReportsTheDocumentsItLeftUnchanged: a name that reaches
+// several documents the caller may upload to is never silently forked. A
+// holder's relabel by name that finds the name ambiguous goes to its own
+// document and says so, leaving the labelled document and the audit as they
+// were; the holder then reaches the labelled document by its source URI. An
+// upload to the caller's own document while others of the name are eligible
+// says so too.
+func TestUploadByNameReportsTheDocumentsItLeftUnchanged(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		w := newUploadWorld(t, newFixture(t), store, false)
+		var labelled explorer.IngestResult
+		for _, surface := range uploadSurfaces() {
+			name := "r-" + surface.name + ".md"
+			document := w.ingest(w.client, uploadHolder, name, "# R\n\nsecret\n", "secret")
+			if surface.name == "library" {
+				labelled = document
+			}
+			w.ingest(w.client, uploadReader, name, "# R\n\nreader\n", "")
+			got := surface.probe(w, uploadCollaborator, name, "# R\n\nrelabel attempt\n",
+				"ticket:SEC-712")
+			if got.Code != "" || !got.ProbersOwn || got.Others != 2 || !got.Ambiguous {
+				t.Fatalf("%s: ambiguous relabel by name = %+v, want the collaborator's own "+
+					"document with an ambiguity notice of 2", surface.name, got)
+			}
+			w.requireCurrent(uploadHolder, document, "after the ambiguous relabel")
+		}
+		if _, err := w.client.Document(w.as(uploadReader), labelled.Document.ID, ""); !shoal.IsErrorCode(
+			err, shoal.ErrorNotFound) {
+			t.Fatalf("an ambiguous relabel opened the labelled document: %v", err)
+		}
+		if records := declassifications(t, store); len(records) != 0 {
+			t.Fatalf("an ambiguous upload was audited: %+v", records)
+		}
+		// Now the collaborator has its own document of the name, and the
+		// two others stay eligible: every upload by name says so.
+		again := w.libraryUpload(uploadCollaborator, "r-library.md", "# R\n\nmine\n", "")
+		if !again.ProbersOwn || again.Others != 2 || again.Ambiguous {
+			t.Fatalf("own document beside two others = %+v", again)
+		}
+		// The holder's document by its source URI is a target.
+		source := uploadSource("r-library.md", "# R\n\npublic\n", "")
+		source.URI = w.ownURI(uploadHolder, "r-library.md")
+		relabelled, route, err := w.client.IngestUpload(
+			withReason(t, w.as(uploadCollaborator), "ticket:SEC-712"), source)
+		if err != nil || relabelled.Document.ID != labelled.Document.ID ||
+			route.Kind != authorized.UploadRouteShared || route.OtherDocuments != 0 {
+			t.Fatalf("relabel by source URI = %+v, %+v (%v)", relabelled, route, err)
+		}
+		if records := declassifications(t, store); len(records) != 2 ||
+			records[0].SourceURI != source.URI {
+			t.Fatalf("relabel by source URI audit = %+v", records)
+		}
+		// With a single other document of the name and none of its own, a
+		// reader's upload shares it, with no notice.
+		shared := w.libraryUpload(uploadReaderTwo, "solo.md", "# S\n", "")
+		if shared.Others != 0 || !shared.ProbersOwn {
+			t.Fatalf("first upload of a name = %+v", shared)
+		}
+		edit := w.httpUpload(uploadReader, "solo.md", "# S\n\nedited\n", "")
+		if edit.Status != http.StatusOK || edit.ProbersOwn || edit.Others != 0 {
+			t.Fatalf("shared edit = %+v, want no notice", edit)
+		}
+	})
+}
+
+// ingestFailingBase fails the next ingest it is armed for before writing
+// anything, as indeterminate, so the claim is left pending with no document.
+type ingestFailingBase struct {
+	*explorer.Explorer
+	fail bool
+}
+
+func (b *ingestFailingBase) Ingest(
+	ctx context.Context, source explorer.Source,
+) (explorer.IngestResult, error) {
+	if b.fail {
+		b.fail = false
+		return explorer.IngestResult{}, explorer.MarkIndeterminateCommit(
+			shoal.NewError(shoal.ErrorUnavailable, "injected indeterminate ingest"))
+	}
+	return b.Explorer.Ingest(ctx, source)
+}
+
+// TestUploadByNameRetriesTheCallersOwnPendingClaim: a first upload whose base
+// write was indeterminate leaves the caller's own claim pending with no
+// document. The retry goes back to that claim, not to another uploader's
+// document of the name the caller may upload to.
+func TestUploadByNameRetriesTheCallersOwnPendingClaim(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		f := newFixture(t)
+		base := &ingestFailingBase{Explorer: f.base}
+		w := newUploadWorldOver(t, f, base, store, false)
+		base.fail = true
+		if _, err := w.client.Ingest(w.as(uploadReader),
+			uploadSource("p.md", "# P\n\nmine\n", "")); !explorer.IsIndeterminateCommit(err) {
+			t.Fatalf("injected failure = %v", err)
+		}
+		// The pending claim has no document, so another reader's upload of
+		// the name does not see it and starts its own.
+		other := w.ingest(w.client, uploadReaderTwo, "p.md", "# P\n\nshared\n", "")
+		if other.Document.ID != explorer.SourceDocumentID(w.ownURI(uploadReaderTwo, "p.md")) {
+			t.Fatalf("reader two's upload went to %s", other.Document.ID)
+		}
+		own := w.ownURI(uploadReader, "p.md")
+		if claim, ok, err := store.SourceClaim(context.Background(), own); err != nil || !ok ||
+			!claim.Pending {
+			t.Fatalf("own claim = %+v, %v (%v), want pending", claim, ok, err)
+		}
+		if _, documented := w.sourceURIs()[explorer.SourceDocumentID(own)]; documented {
+			t.Fatal("the failed ingest wrote a document")
+		}
+		retry := w.ingest(w.client, uploadReader, "p.md", "# P\n\nmine\n", "")
+		if retry.Document.ID != explorer.SourceDocumentID(own) {
+			t.Fatalf("retry went to %s, want the caller's own pending document", retry.Document.ID)
+		}
+		w.requireCurrent(uploadReaderTwo, other, "after the retry")
+	})
+}
+
+// TestUploadByNameKeepsTheCallersOwnRegistration: a registration in the
+// caller's own namespace with no claim and no base document (a corpus
+// restored from an older backup than its catalog) still holds the name for
+// the caller.
+func TestUploadByNameKeepsTheCallersOwnRegistration(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		f := newFixture(t)
+		old := newUploadWorld(t, f, store, false)
+		own := old.ownURI(uploadReader, "q.md")
+		if _, err := f.base.Ingest(context.Background(),
+			labelledSource(own, "registered before claims", "")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := old.client.BackfillExistingDocumentsForDevelopment(
+			old.as(uploadHolder), devbackfill.NewCapability()); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := store.SourceClaim(context.Background(), own); err != nil || ok {
+			t.Fatalf("backfill created a claim (%v)", err)
+		}
+		restored, err := explorer.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = restored.Close() })
+		w := newUploadWorldOver(t, f, restored, store, false)
+		other := w.ingest(w.client, uploadReaderTwo, "q.md", "# Q\n\nshared\n", "")
+		mine := w.ingest(w.client, uploadReader, "q.md", "# Q\n\nmine\n", "")
+		if mine.Document.ID != explorer.SourceDocumentID(own) {
+			t.Fatalf("upload went to %s, want the caller's own registration", mine.Document.ID)
+		}
+		w.requireCurrent(uploadReaderTwo, other, "after the upload")
 	})
 }

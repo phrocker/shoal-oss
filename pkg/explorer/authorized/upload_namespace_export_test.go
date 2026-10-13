@@ -31,5 +31,5 @@ import (
 func IngestAsBefore712(
 	c *Client, ctx context.Context, source explorer.Source,
 ) (explorer.IngestResult, error) {
-	return c.ingest(ctx, source, false)
+	return c.ingest(ctx, source, false, nil)
 }
