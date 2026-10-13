@@ -236,17 +236,27 @@ func TestV2CasesWellFormed(t *testing.T) {
 	if counts["train"] == 0 || counts["dev"] == 0 {
 		t.Fatalf("v2 cases: %d train, %d dev", counts["train"], counts["dev"])
 	}
-	// The train split's texts are disjoint from dev's, so dev measures
-	// phrasings the model was not trained on.
-	train := map[string]bool{}
+	// The train split's texts are disjoint from dev's, verbatim and as
+	// templates (entity mentions abstracted, as the leak guard abstracts
+	// them), so dev measures phrasings the model was not trained on.
+	abstractor := NewLeakAuditor(w.SurfaceForms(), nil, nil, nil)
+	template := func(text string) string { return strings.Join(abstractor.abstract(words(text)), " ") }
+	train, trainTemplates := map[string]bool{}, map[string]bool{}
 	for _, c := range cases.all {
 		if c.Split == "train" {
 			train[strings.ToLower(c.Text)] = true
+			trainTemplates[template(c.Text)] = true
 		}
 	}
 	for _, c := range cases.all {
-		if c.Split == "dev" && train[strings.ToLower(c.Text)] {
+		if c.Split != "dev" {
+			continue
+		}
+		if train[strings.ToLower(c.Text)] {
 			t.Errorf("dev case %s repeats a train text", c.ID)
+		}
+		if trainTemplates[template(c.Text)] {
+			t.Errorf("dev case %s repeats a train template", c.ID)
 		}
 	}
 }

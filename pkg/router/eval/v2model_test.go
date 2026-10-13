@@ -82,7 +82,10 @@ func trainV2Model(t testing.TB, w *World, cases *Cases, config router.TrainConfi
 	if err != nil {
 		t.Fatal(err)
 	}
-	weights, bias := router.TrainVectors(vectorExamples(t, w, train), router.NumFeaturesV2, config)
+	weights, bias, err := router.TrainVectors(vectorExamples(t, w, train), router.NumFeaturesV2, config)
+	if err != nil {
+		t.Fatal(err)
+	}
 	task, err := router.TaskSpecFor(router.FeatureSchemaV2ID)
 	if err != nil {
 		t.Fatal(err)

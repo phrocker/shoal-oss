@@ -72,6 +72,10 @@ func TestFeaturesV2ExtendV1(t *testing.T) {
 	c := catalog(t, grammarSet(t, restartGrammar, riskGrammar, ownerGrammar), restartTarget("agent:a"), riskTarget(), ownerTarget())
 	a := analyze(t, w, c, "restart payments in prod")
 	v1 := a.Features()
+	// Serving a v1 model computes no v2 feature.
+	if _, err := a.FeatureArtifactFor(FeatureSchemaID); err != nil || a.featurizedV2 {
+		t.Fatalf("v1 serving computed v2 features (%v)", err)
+	}
 	v2, err := a.FeaturesFor(FeatureSchemaV2ID)
 	if err != nil {
 		t.Fatal(err)
@@ -216,6 +220,15 @@ func TestFillRefusesASurplusMention(t *testing.T) {
 	if p, _ := b.Propose(choose(b, "action:ops/restart"), b.Receipt()); p.Kind != KindAction {
 		t.Fatalf("single service: %+v", p)
 	}
+	// The same node mentioned twice is one service, not two.
+	d := analyze(t, w, c, "restart payments in prod the payments service")
+	p, err = d.Propose(choose(d, "action:ops/restart"), d.Receipt())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Kind != KindAction || len(p.Slots) != 2 || p.Slots[1].NodeIDs[0] != "n:payments" {
+		t.Fatalf("repeated mention: %+v", p)
+	}
 }
 
 func TestTrainVectorsMatchesTrain(t *testing.T) {
@@ -232,7 +245,10 @@ func TestTrainVectorsMatchesTrain(t *testing.T) {
 		}
 	}
 	w1, b1 := Train(examples, DefaultTrainConfig())
-	w2, b2 := TrainVectors(vectors, NumFeatures, DefaultTrainConfig())
+	w2, b2, err := TrainVectors(vectors, NumFeatures, DefaultTrainConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
 	for k := range w1 {
 		if w1[k] != w2[k] {
 			t.Fatalf("weight %d: %v vs %v", k, w1[k], w2[k])
@@ -243,8 +259,12 @@ func TestTrainVectorsMatchesTrain(t *testing.T) {
 	}
 	config := DefaultTrainConfig()
 	config.InterceptOffset = -1
-	if _, b3 := TrainVectors(vectors, NumFeatures, config); b3 != b1-1 {
-		t.Fatalf("offset bias %v, want %v", b3, b1-1)
+	if _, b3, err := TrainVectors(vectors, NumFeatures, config); err != nil || b3 != b1-1 {
+		t.Fatalf("offset bias %v, want %v (%v)", b3, b1-1, err)
+	}
+	short := append(append([]VectorExample(nil), vectors...), VectorExample{Features: []float64{1}, Match: true})
+	if _, _, err := TrainVectors(short, NumFeatures, DefaultTrainConfig()); err == nil {
+		t.Fatal("an example of the wrong width was trained on")
 	}
 	if DefaultTrainConfig().Digest() != "f980ade09baeca799f961069942255665dd9fe65f64ce189e3b5db705e4040a6" {
 		t.Fatal("v1's recipe digest changed")

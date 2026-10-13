@@ -206,9 +206,10 @@ func (a *Analysis) FeatureArtifact() FeatureArtifact {
 	return out
 }
 
-// FeatureArtifactFor encodes the analysis's features of one schema. Every
-// schema's features are computed by Analyze, so the choice of schema (the
-// served model's) changes no other part of the analysis.
+// FeatureArtifactFor encodes the analysis's features of one schema. The
+// choice of schema (the served model's) changes no other part of the
+// analysis: Analyze computes the matches and router.pair/v1's features, and
+// router.pair/v2's, which only add to them, are computed on first use.
 func (a *Analysis) FeatureArtifactFor(schema string) (FeatureArtifact, error) {
 	vectors, err := a.FeaturesFor(schema)
 	if err != nil {
@@ -240,8 +241,13 @@ func (a *Analysis) FeatureArtifactFor(schema string) (FeatureArtifact, error) {
 }
 
 // FeaturesFor returns each candidate's feature vector of one schema, in
-// catalog order.
+// catalog order. Like the rest of an Analysis, it is not safe for concurrent
+// use: its first call for router.pair/v2 computes those features.
 func (a *Analysis) FeaturesFor(schema string) ([][]float64, error) {
+	if schema == FeatureSchemaV2ID && !a.featurizedV2 {
+		a.featurizeV2()
+		a.featurizedV2 = true
+	}
 	out := make([][]float64, len(a.cands))
 	for i, c := range a.cands {
 		switch schema {

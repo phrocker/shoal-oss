@@ -106,8 +106,8 @@ func TestHiddenIsIndistinguishableFromNonexistent(t *testing.T) {
 // with router v2's model served. router.pair/v2 compares candidates within a
 // catalog, so a hidden target must still change nothing alice sees.
 func TestHiddenIsIndistinguishableFromNonexistentV2(t *testing.T) {
-	servedModel = modelV2Raw
-	t.Cleanup(func() { servedModel = modelRaw })
+	servedModel, servedRelease = modelV2Raw, "router-pair-v2:test"
+	t.Cleanup(func() { servedModel, servedRelease = modelRaw, "router-pair-v1:test" })
 	withPolicyStores(t, func(t *testing.T, store func() authorized.PolicyStore) {
 		hidden := newWorld(t, store(), true)
 		absent := newWorld(t, store(), false)

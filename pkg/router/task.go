@@ -112,7 +112,8 @@ func Train(examples []Example, c TrainConfig) (weights [NumFeatures]float64, bia
 	for i, ex := range examples {
 		vectors[i] = VectorExample{Features: append([]float64(nil), ex.Features[:]...), Match: ex.Match}
 	}
-	w, b := TrainVectors(vectors, NumFeatures, c)
+	// Every vector has the width, so TrainVectors cannot refuse them.
+	w, b, _ := TrainVectors(vectors, NumFeatures, c)
 	copy(weights[:], w)
 	return weights, b
 }
@@ -121,8 +122,14 @@ func Train(examples []Example, c TrainConfig) (weights [NumFeatures]float64, bia
 // examples' order. It is deterministic: no randomness, and every product is
 // rounded explicitly so a compiler cannot fuse operations differently on
 // another architecture. The recipe's InterceptOffset is added to the
-// averaged intercept.
-func TrainVectors(examples []VectorExample, width int, c TrainConfig) (weights []float64, bias float64) {
+// averaged intercept. An example of another width is refused, never
+// skipped.
+func TrainVectors(examples []VectorExample, width int, c TrainConfig) (weights []float64, bias float64, err error) {
+	for _, ex := range examples {
+		if len(ex.Features) != width {
+			return nil, 0, invalid("router training example has the wrong feature width")
+		}
+	}
 	w, sum := make([]float64, width), make([]float64, width)
 	weights = make([]float64, width)
 	var b, sumB float64
@@ -133,9 +140,6 @@ func TrainVectors(examples []VectorExample, width int, c TrainConfig) (weights [
 	}
 	for epoch := 0; epoch < c.Epochs; epoch++ {
 		for _, ex := range examples {
-			if len(ex.Features) != width {
-				continue
-			}
 			y := -1.0
 			n := 1
 			if ex.Match {
@@ -161,12 +165,12 @@ func TrainVectors(examples []VectorExample, width int, c TrainConfig) (weights [
 		}
 	}
 	if steps == 0 {
-		return weights, c.InterceptOffset
+		return weights, c.InterceptOffset, nil
 	}
 	for k := range w {
 		weights[k] = float64(sum[k] / steps)
 	}
-	return weights, float64(float64(sumB/steps) + c.InterceptOffset)
+	return weights, float64(float64(sumB/steps) + c.InterceptOffset), nil
 }
 
 // TrainingRuntimeSHA256 names the trainer implementation.

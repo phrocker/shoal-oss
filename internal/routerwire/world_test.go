@@ -471,7 +471,7 @@ func newWorld(t testing.TB, store authorized.PolicyStore, hidden bool) *world {
 		Concepts:  Concepts(w.reader),
 		Validator: Validator(),
 		Lexicon:   w.bundle, Grammars: w.grammars,
-		Decider:  &routershadow.Decider{Predictor: Predictor(provider, "router-pair-v1:test"), Clock: clock},
+		Decider:  &routershadow.Decider{Predictor: Predictor(provider, servedRelease), Clock: clock},
 		Recorder: w.recorder, HostKey: hostKey, Clock: clock,
 	}
 	w.service, err = routershadow.New(w.config)
@@ -490,13 +490,16 @@ var modelV2Raw = func() []byte {
 	return b
 }()
 
-// servedModel is the model new worlds serve: v1's unless a test swaps in
-// v2's. No test here runs in parallel.
-var servedModel = modelRaw
+// servedModel and servedRelease are what new worlds serve: v1's unless a
+// test swaps in v2's. No test here runs in parallel.
+var (
+	servedModel            = modelRaw
+	servedRelease shoal.ID = "router-pair-v1:test"
+)
 
 func newProvider() (*decisionlinear.Provider, error) {
 	sum := sha256.Sum256(servedModel)
-	return decisionlinear.New(decisionlinear.Config{ModelBytes: servedModel, ExpectedSHA256: hex.EncodeToString(sum[:]), ReleaseID: "router-pair-v1:test"})
+	return decisionlinear.New(decisionlinear.Config{ModelBytes: servedModel, ExpectedSHA256: hex.EncodeToString(sum[:]), ReleaseID: servedRelease})
 }
 
 func withPolicyStores(t *testing.T, run func(*testing.T, func() authorized.PolicyStore)) {

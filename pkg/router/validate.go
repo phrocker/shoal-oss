@@ -117,14 +117,15 @@ func (a *Analysis) fill(index int, receipt Receipt) (Proposal, error) {
 	// A node slot the pattern tier filled is still ambiguous when another
 	// mention that no slot used could have filled it with a node of the same
 	// kind: "restart ledger and inventory in staging" names two services for
-	// one service slot.
+	// one service slot. A second mention of the same node is no rival:
+	// "restart ledger in prod, the ledger service" names one service.
 	for si, s := range g.slots {
 		filled, ok := patternMention[si]
 		if !ok || values[si] == nil {
 			continue
 		}
 		for mi, m := range t.mentions {
-			if !usedMention[mi] && s.kindFits(m) && shareKind(m, t.mentions[filled]) {
+			if !usedMention[mi] && s.kindFits(m) && shareKind(m, t.mentions[filled]) && !sameNodes(m, t.mentions[filled]) {
 				ambiguous = append(ambiguous, s.name)
 				break
 			}
@@ -193,6 +194,23 @@ func (a *Analysis) fill(index int, receipt Receipt) (Proposal, error) {
 		return slotAbstain(ReasonInvalidInput, nil), nil
 	}
 	return seal(Proposal{Kind: c.kind, Target: &ref, Slots: slots, Input: canonical, Receipt: receipt}), nil
+}
+
+// sameNodes reports whether two mentions name exactly the same nodes.
+func sameNodes(a, b lexicon.Mention) bool {
+	if len(a.NodeIDs) != len(b.NodeIDs) {
+		return false
+	}
+	set := map[shoal.ID]bool{}
+	for _, id := range a.NodeIDs {
+		set[id] = true
+	}
+	for _, id := range b.NodeIDs {
+		if !set[id] {
+			return false
+		}
+	}
+	return true
 }
 
 func shareKind(a, b lexicon.Mention) bool {

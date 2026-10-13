@@ -46,6 +46,9 @@ type Analysis struct {
 	concepts map[shoal.ID]shoal.ID
 	early    Reason
 	cands    []candAnalysis
+	// featurizedV2 reports that the router.pair/v2 features are computed.
+	// They are computed on first use, so only when a v2 model is served.
+	featurizedV2 bool
 }
 
 // Analyze matches the text against every visible candidate. It fails only on
@@ -77,7 +80,6 @@ func Analyze(in Input) (*Analysis, error) {
 		best := c.grammar.bestMatch(a.text)
 		a.cands[i] = candAnalysis{best: best, features: c.features(a.text, best)}
 	}
-	a.featurizeV2()
 	return a, nil
 }
 
