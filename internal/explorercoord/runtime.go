@@ -1191,10 +1191,12 @@ func (r *Runtime) recoverPending(
 //     there is no periodic recovery, so a wait would always run the full
 //     bound. Resolve it now, as recovery would, then answer.
 //
-// The answer is the caller's original conflict whichever way this ends,
-// except that a context ending during the wait is answered with ctx.Err(), as
-// waitForExpectedResolution does. Runs outside r.mu, taking it only per read,
-// so Close is never held up by a waiter for longer than one poll.
+// The answer is the caller's original conflict, except that a context ending
+// during the wait is answered with ctx.Err(), as waitForExpectedResolution
+// does, and a runtime closed during it with transaction.ErrUnavailable. A read
+// that fails for any other reason ends the wait with the conflict. Runs
+// outside r.mu, taking it only per read, so Close is never held up by a
+// waiter for longer than one poll.
 func (r *Runtime) resolveTokenHolder(
 	ctx context.Context, held *tokenHeldError,
 ) error {
@@ -1208,15 +1210,28 @@ func (r *Runtime) resolveTokenHolder(
 	for {
 		unsettled, running, err := r.tokenHolderState(ctx, held)
 		if err != nil {
-			// A read the context ended is the context's answer.
-			return ctx.Err()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if errors.Is(err, errRuntimeClosed) {
+				return transaction.ErrUnavailable
+			}
+			return nil
 		}
 		if !unsettled {
 			return nil
 		}
 		if !running {
-			r.recoverTokenHolder(ctx, held)
-			return nil
+			recovered, err := r.recoverTokenHolder(ctx, held)
+			if err != nil {
+				return err
+			}
+			if recovered {
+				return nil
+			}
+			// A retry of the holder's own intent took it back before
+			// recovery could; it is running again, so wait for it like
+			// any running holder.
 		}
 		select {
 		case <-ctx.Done():
@@ -1228,6 +1243,10 @@ func (r *Runtime) resolveTokenHolder(
 	}
 }
 
+// errRuntimeClosed is internal: the runtime closed while a publication was
+// resolving the holder of its token.
+var errRuntimeClosed = errors.New("explorer coordination: runtime closed")
+
 // tokenHolderState reports whether the holder's pending marker is still
 // present, and whether its publication is still running in this process.
 func (r *Runtime) tokenHolderState(
@@ -1236,7 +1255,7 @@ func (r *Runtime) tokenHolderState(
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.closed {
-		return false, false, transaction.ErrUnavailable
+		return false, false, errRuntimeClosed
 	}
 	unsettled, err = r.intents.hasPendingMarker(
 		ctx, storedIntent{TXN: held.txn, LogicalDigest: held.digest})
@@ -1248,22 +1267,29 @@ func (r *Runtime) tokenHolderState(
 
 // recoverTokenHolder resolves a holder no publication here is running, the
 // way RecoverPage would: under recoveryMu, so it cannot interleave with an
-// intent being persisted or with a recovery pass. Its error is not the
+// intent being persisted or with a recovery pass. It reports false, having
+// done nothing, when a retry of the holder's own intent is running again by
+// the time it holds recoveryMu: that publication owns the transaction, and
+// the caller waits for it instead. recoverIntent's own error is not the
 // caller's; the caller's re-read sees whatever it achieved.
-func (r *Runtime) recoverTokenHolder(ctx context.Context, held *tokenHeldError) {
+func (r *Runtime) recoverTokenHolder(
+	ctx context.Context, held *tokenHeldError,
+) (bool, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.closed {
-		return
+		return false, transaction.ErrUnavailable
 	}
 	r.recoveryMu.Lock()
 	defer r.recoveryMu.Unlock()
-	// A retry of the holder's own intent may have started meanwhile; it
-	// owns the transaction again.
+	if hook := runtimeStageHook(r.protocolStore); hook != nil {
+		_ = hook(recoveryStageTokenRecover)
+	}
 	if r.isInFlight(held.txn, held.digest) {
-		return
+		return false, nil
 	}
 	_ = r.recoverIntent(ctx, held.txn)
+	return true, nil
 }
 
 func inFlightKey(txn coordination.TXN, digest coordination.Digest) string {
@@ -1638,6 +1664,9 @@ const (
 	// recoveryStageTokenHeld is reported, not injected: a publication has
 	// lost its token to an unsettled intent and is about to resolve it.
 	recoveryStageTokenHeld
+	// recoveryStageTokenRecover is reported, not injected: that publication is
+	// about to recover a holder it found not running, under recoveryMu.
+	recoveryStageTokenRecover
 )
 
 type stageStore struct {

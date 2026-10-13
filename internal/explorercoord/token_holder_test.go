@@ -44,6 +44,9 @@ type tokenHolderHarness struct {
 	release chan struct{}
 	// resolving receives once per publication that lost its token.
 	resolving chan struct{}
+	// onRecover, when set, runs when a loser is about to recover a holder
+	// it found not running, before it re-checks that.
+	onRecover atomic.Pointer[func()]
 }
 
 const (
@@ -67,6 +70,10 @@ func newTokenHolderHarness(
 		switch {
 		case stage == recoveryStageTokenHeld:
 			h.resolving <- struct{}{}
+		case stage == recoveryStageTokenRecover:
+			if run := h.onRecover.Load(); run != nil {
+				(*run)()
+			}
 		case stage == recoveryStageIntent && fired.CompareAndSwap(false, true):
 			close(h.held)
 			if mode == failTheHolder {
@@ -263,14 +270,7 @@ func TestALostTokenWaiterDoesNotHoldUpClose(t *testing.T) {
 	// Count the unsettled holder as running here, so the loser waits on it
 	// rather than resolving it; that is the waiter Close must not queue
 	// behind.
-	normalized, _, digest, err := canonicalIntent(h.intent(t, "first"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	txn, err := DeriveTXN(h.config.Domain, normalized.Operation, normalized.Token)
-	if err != nil {
-		t.Fatal(err)
-	}
+	txn, digest := h.holderKey(t)
 	defer h.runtime.markInFlight(txn, digest)()
 
 	loser := h.publish(context.Background(), t, "second")
@@ -289,7 +289,74 @@ func TestALostTokenWaiterDoesNotHoldUpClose(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Close waited behind a publication waiting for a token holder")
 	}
-	if lost := await(t, loser, "a waiter on a closed runtime"); lost.err == nil {
-		t.Fatal("a publication that lost its token succeeded")
+	lost := await(t, loser, "a waiter on a closed runtime")
+	if !errors.Is(lost.err, transaction.ErrUnavailable) {
+		t.Fatalf("a waiter on a closed runtime = %v, want unavailable: "+
+			"the runtime closed, which is not a conflict", lost.err)
+	}
+}
+
+// holderKey is the in-flight key of the "first" publisher's intent.
+func (h *tokenHolderHarness) holderKey(
+	t *testing.T,
+) (coordination.TXN, coordination.Digest) {
+	t.Helper()
+	normalized, _, digest, err := canonicalIntent(h.intent(t, "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn, err := DeriveTXN(h.config.Domain, normalized.Operation, normalized.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return txn, digest
+}
+
+// TestALostTokenWaitsForAHolderRetryThatTookItBack: the loser found the
+// holder not running and went to recover it, but by the time it held
+// recoveryMu a retry of the holder's own intent was running again. Recovery
+// is skipped, because that publication owns the transaction, and the loser
+// must then wait for it like any running holder rather than answer its
+// conflict while the retry is still deciding the outcome (#729's early
+// answer).
+func TestALostTokenWaitsForAHolderRetryThatTookItBack(t *testing.T) {
+	h := newTokenHolderHarness(t, time.Minute, failTheHolder)
+	if won := await(t, h.publish(context.Background(), t, "first"),
+		"the holder"); !errors.Is(won.err, ErrIndeterminatePublication) {
+		t.Fatalf("the failed holder = %v", won.err)
+	}
+	txn, digest := h.holderKey(t)
+	retryRunning := make(chan struct{})
+	var endRetry func()
+	var once atomic.Bool
+	takeBack := func() {
+		if once.CompareAndSwap(false, true) {
+			endRetry = h.runtime.markInFlight(txn, digest)
+			close(retryRunning)
+		}
+	}
+	h.onRecover.Store(&takeBack)
+
+	loser := h.publish(context.Background(), t, "second")
+	select {
+	case <-retryRunning:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the loser never went to recover the holder")
+	}
+	select {
+	case lost := <-loser:
+		t.Fatalf("the loser answered %v while the holder's retry was "+
+			"running, before the outcome that decides it", lost.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// The retry returns without settling, as the holder did; the loser,
+	// still polling, recovers it this time and answers with it resolved.
+	endRetry()
+	lost := await(t, loser, "the loser after the retry ended")
+	if !errors.Is(lost.err, transaction.ErrConflict) {
+		t.Fatalf("the loser = %v, want a conflict", lost.err)
+	}
+	if !lost.committed {
+		t.Fatal("the loser answered with the holder still unresolved")
 	}
 }
