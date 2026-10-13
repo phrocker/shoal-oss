@@ -580,17 +580,22 @@ func (c *Client) structuredLabels(
 		end := chunkEnd(start, len(edgeIDs), maxInteractionAuthorizationIDs)
 		chunk := edgeIDs[start:end]
 		start = end
-		edges, err := c.resolveEdges(ctx, chunk, reader)
+		edges, err := c.resolveInteractionEdges(ctx, chunk, reader)
 		if err != nil {
 			return nil, err
 		}
 		for _, edgeID := range chunk {
-			registration, ok := edges[edgeID]
-			if !ok {
-				complete = false
+			if registration, ok := edges.registered[edgeID]; ok {
+				nodes = append(nodes, registration.Edge.From, registration.Edge.To)
 				continue
 			}
-			nodes = append(nodes, registration.Edge.From, registration.Edge.To)
+			// A derived edge's terms are its endpoints' (#719).
+			// Load-bearing: TestDerivedEdgeSessionTranslatesItsOutputLabels.
+			if edge, ok := edges.derived[edgeID]; ok {
+				nodes = append(nodes, edge.From, edge.To)
+				continue
+			}
+			complete = false
 		}
 	}
 	registrations := make(registeredNodes, len(nodes))

@@ -52,9 +52,13 @@ type citedEvidence struct {
 //     (#700): each revision its evidence cites and each node of its evidence
 //     paths, with path edges limited to the session's own authorized edges.
 //     A derived assertion is skipped. Assertion.Validate requires it to carry
-//     exactly one derivation evidence and no citation, so there is nothing
-//     to check, and a derived (latent) edge has no policy edge registration,
-//     so the touched-edge check already refuses any session touching one.
+//     exactly one derivation evidence and no citation or path, so it cites
+//     no document. Its edge is a touched edge, which the touched-edge check
+//     admits only through the trusted derived assertion under that edge's
+//     ID, whose derivation must be over exactly the edge's endpoints and
+//     both endpoints readable by the recorder (#719,
+//     derivedInteractionEdge); the trusted validator then requires the cited
+//     assertion to be that edge's assertion in the pinned snapshot.
 //
 // Every refusal is auth.ObjectNotFound, whether the revision or assertion is
 // hidden, unregistered, or never existed, so the outcome does not depend on
