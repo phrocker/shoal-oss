@@ -46,6 +46,9 @@ type approvalHarness struct {
 	// wrapEvents wraps the approval event publisher (#653); nil in every
 	// test that does not lose a publication on purpose.
 	wrapEvents func(fleet.ApprovalEventPublisher) fleet.ApprovalEventPublisher
+	// wrapActionEvents wraps the dispatch service's action event publisher
+	// (#655); nil in every test that does not watch or lose one.
+	wrapActionEvents func(fleet.ActionEventPublisher) fleet.ActionEventPublisher
 	// mapping is the approver mapping digest the service is opened with;
 	// nil means none, as in the shipped binary without the mapping file.
 	mapping func(context.Context) (auth.Digest, error)
@@ -114,6 +117,7 @@ func (h *approvalHarness) tryOpen() error {
 		generationReader:    h.reader,
 		wrapApprovalStore:   h.wrap,
 		wrapApprovalEvents:  h.wrapEvents,
+		wrapActionEvents:    h.wrapActionEvents,
 		approverMapping:     h.mapping,
 		identityScheme:      h.scheme,
 		executorAttestation: h.attestation,
@@ -408,12 +412,40 @@ func (h *approvalHarness) assertNotWork(request heldRequest) {
 		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
 		h.t.Fatalf("enqueue of held request = %v, want approval required", err)
 	}
+	// Invoke is the one dispatch route that can make approved work (#655),
+	// and it does not make this: whatever state the request is in, Invoke
+	// is refused with that state's answer, and there is still no action
+	// afterwards. These harnesses bind no runnable executor, so an approved
+	// request is refused as not runnable here, before it is materialized;
+	// approval_invoke_test.go binds one.
 	if _, err := h.opened.fleetDispatch.Invoke(h.as(requester), fleet.InvokeRequest{
 		Enqueue: h.enqueue(request), ClaimID: []byte("invoke-claim"),
 		Lease: time.Minute,
-	}); !errors.Is(err, fleet.ErrApprovalRequired) {
-		h.t.Fatalf("invoke of held request = %v, want approval required", err)
+	}); !invokeRefusedAsNotWork(err) {
+		h.t.Fatalf("invoke of held request = %v, want it refused", err)
 	}
+	if _, err := h.opened.fleetDispatch.Status(h.as(requester), fleet.StatusRequest{
+		ID: request.id, Context: h.context(h.now().Add(time.Minute)),
+	}); !shoal.IsErrorCode(err, shoal.ErrorNotFound) {
+		h.t.Fatalf("status of held request after invoke = %v, want not found", err)
+	}
+}
+
+// invokeRefusedAsNotWork reports whether an Invoke of a held request was
+// refused with one of the answers a request that is not work gets (#655).
+func invokeRefusedAsNotWork(err error) bool {
+	for _, sentinel := range []error{
+		fleet.ErrApprovalRequired, fleet.ErrApprovalExpired,
+		fleet.ErrApprovalRefused, fleet.ErrApprovalWithdrawn,
+		fleet.ErrApprovalStranded, fleet.ErrApprovalSuperseded,
+		fleet.ErrApproverMappingMoved, fleet.ErrIdentitySchemeMoved,
+	} {
+		if errors.Is(err, sentinel) {
+			return shoal.IsErrorCode(err, shoal.ErrorConflict)
+		}
+	}
+	return shoal.IsErrorCode(err, shoal.ErrorUnavailable) &&
+		strings.Contains(err.Error(), "does not implement action execution")
 }
 
 func (h *approvalHarness) admit(id string) (fleet.AdmissionGrant, error) {

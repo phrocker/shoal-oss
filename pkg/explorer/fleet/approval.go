@@ -98,6 +98,12 @@ var (
 	// become work.
 	ErrApprovalStranded = errors.New(
 		"fleet approval: the request can no longer progress")
+	// ErrApprovalRefused reports an Invoke of an action whose request an
+	// approver refused (#655). Request answers a refusal as a state rather
+	// than an error; Invoke has only an action to answer with, and there is
+	// none.
+	ErrApprovalRefused = errors.New(
+		"fleet approval: the request was refused")
 	// ErrApprovalTerminalStatesDisabled reports a withdrawal, or a sweep, on
 	// a host whose operator has not enabled the withdrawn and stranded
 	// states (ApprovalConfig.TerminalStates, #655). A build before #655
@@ -118,11 +124,36 @@ var (
 // is the closest thing this code set has to a failed precondition: the request
 // conflicts with the registered state of the action, and the remedy is a
 // different route, not a different request. The message names that route.
+//
+// The message names the route (#655), because the identity a caller asks for
+// approval under is the action ID it just invoked: the approval ID is the
+// action ID. Once approved, Invoke at the same identity materializes and runs
+// the work (see ApprovalService.materializeForInvoke).
 func approvalRequired() error {
 	return shoal.WrapError(
 		shoal.ErrorConflict,
-		"action requires approval; request it through the approval route",
+		"action requires approval; request it through the approval route "+
+			"(POST /api/v1/fleet/approvals/request) under this action ID, "+
+			"and invoke it again once it is approved",
 		ErrApprovalRequired)
+}
+
+// approvalAwaitingDecision is what Invoke answers for a request that is held
+// and not yet decided (#655). It is still approval required: the remedy is a
+// decision, not a different request.
+func approvalAwaitingDecision() error {
+	return shoal.WrapError(
+		shoal.ErrorConflict,
+		"action requires approval; the request under this action ID is "+
+			"awaiting a decision", ErrApprovalRequired)
+}
+
+// approvalRefusedAnswer is what Invoke answers for a request an approver
+// refused (#655). The refusal is final; Request answers it as a state.
+func approvalRefusedAnswer() error {
+	return shoal.WrapError(
+		shoal.ErrorConflict, "the request under this action ID was refused",
+		ErrApprovalRefused)
 }
 
 const (
@@ -941,6 +972,12 @@ func NewApprovalService(config ApprovalConfig) (*ApprovalService, error) {
 			outbox: config.Outbox, publisher: config.Events,
 		}
 	}
+	// Invoke of an approved action materializes it through this service
+	// (#655). Installed last, so a dispatch service never reaches an
+	// approval service that failed to construct.
+	if err := config.Dispatch.installApprovalMaterializer(service); err != nil {
+		return nil, err
+	}
 	return service, nil
 }
 
@@ -1117,10 +1154,47 @@ func (s *ApprovalService) Request(
 			shoal.ErrorInvalidArgument,
 			"action does not require approval; enqueue it directly")
 	}
+	return s.reach(ctx, decision, base, now, approvalAttempt{})
+}
+
+// approvalAttempt is what a call that reaches an approval may do with it.
+// The zero value is Request's: hold an absent request, and move an existing
+// one as far as it can go.
+type approvalAttempt struct {
+	// invoke is Invoke's materialization (#655). It never holds — a refused
+	// Invoke writes nothing, and holding is the approval route's — and it
+	// answers a request still awaiting a decision as approval required,
+	// writing nothing there either.
+	invoke bool
+	// ready, when set, is asked immediately before anything is written that
+	// makes work: the approved → enqueued commit, and the action write of an
+	// enqueued approval. A refusal there leaves the approval as it was.
+	//
+	// It is asked at the attempt's own time, not the call's: a retry after a
+	// lost compare-and-set runs later, and a descriptor lease that lapsed in
+	// between must refuse here rather than at the claim, which would leave
+	// a queued record that never runs.
+	ready func(now time.Time) error
+}
+
+// reach is the body of Request, shared with Invoke's materialization: read
+// the approval at the request's identity and, for the same request, advance
+// it, re-reading after a lost compare-and-set.
+func (s *ApprovalService) reach(
+	ctx context.Context,
+	decision auth.Decision,
+	base ActionRecord,
+	now time.Time,
+	mode approvalAttempt,
+) (ApprovalReceipt, error) {
+	dispatch := s.dispatch
 	digest := ApprovalRequestDigest(base)
 	for attempt := 0; attempt < maxApprovalAttempts; attempt++ {
 		current, readErr := s.store.GetApproval(ctx, base.ID)
 		if errors.Is(readErr, ErrApprovalNotFound) {
+			if mode.invoke {
+				return ApprovalReceipt{}, approvalRequired()
+			}
 			receipt, err := s.hold(ctx, decision, base, digest, now)
 			if errors.Is(err, ErrApprovalConflict) {
 				continue
@@ -1151,7 +1225,12 @@ func (s *ApprovalService) Request(
 				attemptNow = fresh
 			}
 		}
-		receipt, err := s.advance(ctx, decision, current, attemptNow)
+		if mode.invoke && current.State == ApprovalPending &&
+			attemptNow.Before(current.ExpiresAt) {
+			return ApprovalReceipt{}, approvalAwaitingDecision()
+		}
+		receipt, err := s.advanceReady(
+			ctx, decision, current, attemptNow, mode.ready)
 		if errors.Is(err, ErrApprovalConflict) {
 			continue
 		}
@@ -1215,6 +1294,18 @@ func (s *ApprovalService) advance(
 	decision auth.Decision,
 	current ApprovalRecord,
 	now time.Time,
+) (ApprovalReceipt, error) {
+	return s.advanceReady(ctx, decision, current, now, nil)
+}
+
+// advanceReady is advance that asks ready, when it is set, immediately before
+// each write that makes work (see approvalAttempt.ready).
+func (s *ApprovalService) advanceReady(
+	ctx context.Context,
+	decision auth.Decision,
+	current ApprovalRecord,
+	now time.Time,
+	ready func(now time.Time) error,
 ) (ApprovalReceipt, error) {
 	switch current.State {
 	case ApprovalPending:
@@ -1308,6 +1399,11 @@ func (s *ApprovalService) advance(
 		if mapping != current.ApproverMappingDigest {
 			return ApprovalReceipt{}, approverMappingMoved()
 		}
+		if ready != nil {
+			if err := ready(now); err != nil {
+				return ApprovalReceipt{}, err
+			}
+		}
 		next := CloneApprovalRecord(current)
 		next.Version++
 		next.State = ApprovalEnqueued
@@ -1343,6 +1439,11 @@ func (s *ApprovalService) advance(
 		// the agent and policy generations hold (queuedRecord resolves the
 		// request's generation). Past those the row stays enqueued with no
 		// action, and Status reports it as unresolvable.
+		if ready != nil {
+			if err := ready(now); err != nil {
+				return ApprovalReceipt{}, err
+			}
+		}
 		action, err := s.materialize(ctx, decision, current)
 		if err != nil {
 			return ApprovalReceipt{}, err
@@ -1385,6 +1486,15 @@ func (s *ApprovalService) materialize(
 	record.AuthorizationExpiresAt = decision.AuthenticationExpires()
 	record.TransitionRequestID = decision.RequestID()
 	record.TransitionCorrelationID = decision.CorrelationID()
+	// The transition this record is in is the materialization, which is
+	// authorized under dispatch whichever route reached it (#655). Invoke
+	// materializes and claims in one call, under two operations, and the
+	// record's provenance must not credit the enqueue to the invoke that
+	// follows it. Provenance only: the publisher authorizes action.enqueued
+	// from AuthorizedOperations ([dispatch] here), and reads
+	// TransitionOperation for the claim and completion, which applyClaim
+	// and the completion overwrite.
+	record.TransitionOperation = auth.OperationDispatch
 	if err := record.Validate(); err != nil {
 		return ActionRecord{}, err
 	}

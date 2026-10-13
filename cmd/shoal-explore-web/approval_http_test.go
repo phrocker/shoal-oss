@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,8 +94,13 @@ func TestApprovalRequiredOverHTTP(t *testing.T) {
 			"action": action("http-invoke"), "claim_id": encode([]byte("claim")),
 			"lease": int64(time.Minute),
 		})
-	if status != http.StatusConflict || body["code"] != string(shoal.ErrorConflict) {
-		t.Fatalf("direct invoke = %d %v, want 409 conflict", status, body)
+	// The body names the approval route (#655): the approval ID is this
+	// action ID, so the caller knows where to go and under what name.
+	if message, _ := body["message"].(string); status != http.StatusConflict ||
+		body["code"] != string(shoal.ErrorConflict) ||
+		!strings.Contains(message, "/api/v1/fleet/approvals/request") {
+		t.Fatalf("direct invoke = %d %v, want 409 conflict naming the route",
+			status, body)
 	}
 
 	status, body = serve(approvalHandler, h.as(requester),

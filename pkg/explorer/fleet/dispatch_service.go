@@ -43,6 +43,9 @@ type DispatchService struct {
 	// because the caller was not entitled to publish them. See
 	// SkippedTransitionPublications.
 	skippedPublications atomic.Uint64
+	// approvals materializes an approved request for Invoke (#655). Nil
+	// until an approval service installs itself; see approvalMaterializer.
+	approvals atomic.Pointer[approvalMaterializerHook]
 }
 
 // SkippedTransitionPublications is the number of pending transition rows this
@@ -332,6 +335,14 @@ func (s *DispatchService) Invoke(ctx context.Context, request InvokeRequest) (Ac
 	}
 	queued, err := s.enqueue(
 		ctx, request.Enqueue, auth.OperationInvoke, tolerateLapse)
+	if errors.Is(err, ErrApprovalRequired) {
+		// The one point the approval materializer is consulted (#655):
+		// after enqueue's replay branch found no record at this identity,
+		// so an existing record has already replayed above and is never
+		// materialized over. What it returns is the queued record, claimed
+		// and run below like any other.
+		queued, err = s.materializeApproved(ctx, request, err)
+	}
 	if err != nil {
 		return ActionRecord{}, err
 	}
