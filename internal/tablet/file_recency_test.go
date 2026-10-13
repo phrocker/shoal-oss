@@ -459,14 +459,14 @@ func TestRegisterByProducerIdentity(t *testing.T) {
 		}
 	}
 	on, off, onAgain := importPath('a', "1"), importPath('b', "1"), importPath('a', "2")
-	register(ImportedFile{on, "p/F1"}, ImportedFile{off, "p/F2"}, ImportedFile{onAgain, "p/F3"})
+	register(ImportedFile{Path: on, Source: "p/F1"}, ImportedFile{Path: off, Source: "p/F2"}, ImportedFile{Path: onAgain, Source: "p/F3"})
 	if want := []string{on, off, onAgain}; fmt.Sprint(tb.files) != fmt.Sprint(want) {
 		t.Fatalf("toggle registered %v, want %v", baseNames(tb.files), baseNames(want))
 	}
 	local := filepath.Join(dir, "F0000000000100.rf")
 	tb.files = append(tb.files, local)
 
-	again := []ImportedFile{{importPath('a', "3"), "p/F1"}, {importPath('b', "3"), "p/F2"}, {importPath('a', "4"), "p/F3"}}
+	again := []ImportedFile{{Path: importPath('a', "3"), Source: "p/F1"}, {Path: importPath('b', "3"), Source: "p/F2"}, {Path: importPath('a', "4"), Source: "p/F3"}}
 	register(again...)
 	if want := []string{on, off, onAgain, local}; fmt.Sprint(tb.files) != fmt.Sprint(want) {
 		t.Fatalf("unchanged re-register moved files: %v, want %v", baseNames(tb.files), baseNames(want))
@@ -478,8 +478,8 @@ func TestRegisterByProducerIdentity(t *testing.T) {
 	}
 
 	grown := importPath('c', "5")
-	register(append(again[:0:0], ImportedFile{importPath('a', "6"), "p/F1"}, ImportedFile{importPath('b', "6"), "p/F2"},
-		ImportedFile{importPath('a', "7"), "p/F3"}, ImportedFile{grown, "p/F4"})...)
+	register(append(again[:0:0], ImportedFile{Path: importPath('a', "6"), Source: "p/F1"}, ImportedFile{Path: importPath('b', "6"), Source: "p/F2"},
+		ImportedFile{Path: importPath('a', "7"), Source: "p/F3"}, ImportedFile{Path: grown, Source: "p/F4"})...)
 	if want := []string{on, off, onAgain, local, grown}; fmt.Sprint(tb.files) != fmt.Sprint(want) {
 		t.Fatalf("growth %v, want %v", baseNames(tb.files), baseNames(want))
 	}
@@ -500,9 +500,9 @@ func TestRegisterClaimsLegacyContentOnce(t *testing.T) {
 		files: []string{legacyOn, legacyOff, local}}
 	manifest := func(nonce string) []ImportedFile {
 		files := []ImportedFile{
-			{importPath('a', nonce+"a"), "p/F1"},
-			{importPath('b', nonce+"b"), "p/F2"},
-			{importPath('a', nonce+"c"), "p/F3"},
+			{Path: importPath('a', nonce+"a"), Source: "p/F1"},
+			{Path: importPath('b', nonce+"b"), Source: "p/F2"},
+			{Path: importPath('a', nonce+"c"), Source: "p/F3"},
 		}
 		for _, f := range files {
 			putFiles(backend, dir, filepath.Base(f.Path))
@@ -561,7 +561,7 @@ func TestRegisterAbsorbedLegacyDigestClaimedOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	register(ImportedFile{importPath('a', "1"), "p/F1"})
+	register(ImportedFile{Path: importPath('a', "1"), Source: "p/F1"})
 	if want := []string{compacted}; fmt.Sprint(tb.files) != fmt.Sprint(want) {
 		t.Fatalf("absorbed claim appended: %v", baseNames(tb.files))
 	}
@@ -569,7 +569,7 @@ func TestRegisterAbsorbedLegacyDigestClaimedOnce(t *testing.T) {
 		t.Fatalf("claim not recorded: %v", tb.absorbed)
 	}
 	later := importPath('a', "2")
-	register(ImportedFile{later, "p/F3"})
+	register(ImportedFile{Path: later, Source: "p/F3"})
 	if want := []string{compacted, later}; fmt.Sprint(tb.files) != fmt.Sprint(want) {
 		t.Fatalf("later identical file %v, want appended %v", baseNames(tb.files), baseNames(want))
 	}

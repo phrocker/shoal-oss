@@ -68,6 +68,10 @@ type RFileExportManifest struct {
 	AuthorizationsStamp string              `json:"authorizations_stamp,omitempty"`
 	Tablets             []RFileExportTablet `json:"tablets"`
 	RFiles              []RFileExportFile   `json:"rfiles"`
+	// Deltas are optional replacements for RFiles entries a consumer has
+	// partly received already (see rfile_lineage.go). Older importers and
+	// Accumulo promotion ignore them.
+	Deltas []RFileExportFile `json:"deltas,omitempty"`
 }
 
 // RFileExportTablet describes one destination tablet's key-range
@@ -219,6 +223,12 @@ type RFileExportFile struct {
 	// Empty values are the legacy encoding of rfile/authoritative.
 	Format string `json:"format,omitempty"`
 	Role   string `json:"role,omitempty"`
+	// Lineage is the leaves the file holds (tablet.Lineage, #704); nil from
+	// an older producer.
+	Lineage *tablet.Lineage `json:"lineage,omitempty"`
+	// DeltaOf is set only on a Deltas entry: the RelativePath of the RFiles
+	// entry (same tablet) it is a delta of.
+	DeltaOf string `json:"delta_of,omitempty"`
 }
 
 const (
@@ -303,7 +313,16 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
 
-	files := tbl.rfiles()
+	manifestPath := opts.ManifestPath
+	if manifestPath == "" {
+		manifestPath = joinBackendPath(dst, opts.DestinationRoot, "manifest.json")
+	}
+	// What the destination was sent last time, for deltas.
+	prior := priorManifestEntries(ctx, dst, manifestPath, tableName)
+	files, err := tbl.exportFiles()
+	if err != nil {
+		return nil, err
+	}
 	compatibility := exportCompatibility(files)
 	manifest := &RFileExportManifest{
 		Version:             RFileExportManifestVersion,
@@ -337,6 +356,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 			BCFileVersion:   bcVersion,
 			Format:          string(fileFormatForPath(f.Path)),
 			Role:            ExportRoleAuthoritative,
+			Lineage:         exportLineage(f.Lineage, opts),
 		})
 	}
 	// Group by tablet but keep each tablet's recency order (from rfiles):
@@ -346,11 +366,8 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 		return manifest.RFiles[i].TabletIndex < manifest.RFiles[j].TabletIndex
 	})
 	manifest.Version = exportManifestVersion(manifest)
+	manifest.Deltas = e.buildExportDeltas(ctx, dst, opts, manifest.RFiles, prior)
 
-	manifestPath := opts.ManifestPath
-	if manifestPath == "" {
-		manifestPath = joinBackendPath(dst, opts.DestinationRoot, "manifest.json")
-	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("engine: marshal manifest: %w", err)
@@ -968,6 +985,14 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	if err := verifyImmutableExport(ctx, e.backend, manifest, newVerificationSnapshot); err != nil {
 		return err
 	}
+	deltas, deltasByBase := manifestDeltas(manifest)
+	if len(deltas) > 0 {
+		deltaManifest := *manifest
+		deltaManifest.RFiles = deltas
+		if err := verifyImmutableExport(ctx, e.backend, &deltaManifest, newVerificationSnapshot); err != nil {
+			return err
+		}
+	}
 	splits, err := manifestSplits(manifest)
 	if err != nil {
 		return err
@@ -976,7 +1001,8 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	if err != nil {
 		return err
 	}
-	stagedFiles, err := stageVerifiedImportFiles(ctx, e.backend, manifest.RFiles)
+	stagedFiles, err := stageVerifiedImportFiles(ctx, e.backend,
+		append(append([]RFileExportFile(nil), manifest.RFiles...), deltas...))
 	if err != nil {
 		return err
 	}
@@ -997,12 +1023,27 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 			return fmt.Errorf("engine: mkdir imported tablet: %w", err)
 		}
 	}
+	// Each tablet's files in manifest order, every delta right after its
+	// base file.
 	filesByTablet := make(map[int][]tablet.ImportedFile)
-	for _, file := range stagedFiles {
+	for i, file := range stagedFiles[:len(manifest.RFiles)] {
+		source := importSourceIdentity(file)
 		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], tablet.ImportedFile{
-			Path:   file.DestinationPath,
-			Source: importSourceIdentity(file),
+			Path:    file.DestinationPath,
+			Source:  source,
+			Lineage: file.Lineage,
 		})
+		for _, d := range deltasByBase[i] {
+			// manifestDeltas only keeps deltas of entries with a relative
+			// path, so source (the base's identity) is never empty here.
+			delta := stagedFiles[len(manifest.RFiles)+d]
+			filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], tablet.ImportedFile{
+				Path:    delta.DestinationPath,
+				Source:  importSourceIdentity(delta),
+				Lineage: delta.Lineage,
+				DeltaOf: source,
+			})
+		}
 	}
 	importedPaths := func(files []tablet.ImportedFile) []string {
 		paths := make([]string, len(files))
@@ -1388,6 +1429,7 @@ func hashObject(ctx context.Context, b storage.Backend, path string) (int64, str
 type tableRFile struct {
 	TabletIndex int
 	Path        string
+	Lineage     *tablet.Lineage // set by exportFiles only
 }
 
 func (t *table) rfiles() []tableRFile {
