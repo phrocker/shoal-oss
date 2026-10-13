@@ -311,8 +311,10 @@ func readChildBlock(
 // sound, because an entry's key is the last key of its block: every block
 // after the first of an equal run holds only that key, a seek lands on the
 // first entry whose key is >= the target, and the reader then scans
-// forward across block boundaries. Current writers never emit equal keys.
-// A key that sorts before its predecessor is always rejected.
+// forward across block boundaries. The current writer emits equal keys
+// only when a single run of identical keys outgrows rfile.MaxRunBlockSize
+// and has to be cut. A key that sorts before its predecessor is always
+// rejected.
 func ValidateBlock(block *IndexBlock) error {
 	if err := validateRootLevel(block); err != nil {
 		return err

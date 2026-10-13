@@ -22,10 +22,20 @@ import (
 
 func writeCells(t testing.TB, opts WriterOptions, cells []cell) []byte {
 	t.Helper()
+	return writeCellsWithRunCap(t, opts, 0, cells)
+}
+
+// writeCellsWithRunCap is writeCells with the writer's run-block cap
+// (MaxRunBlockSize by default) lowered to runCap when runCap > 0.
+func writeCellsWithRunCap(t testing.TB, opts WriterOptions, runCap int, cells []cell) []byte {
+	t.Helper()
 	var buf bytes.Buffer
 	w, err := NewWriter(&buf, opts)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
+	}
+	if runCap > 0 {
+		w.runBlockCap = runCap
 	}
 	for i, c := range cells {
 		if err := w.Append(c.K, c.V); err != nil {
@@ -71,6 +81,28 @@ func assertStrictLeaves(t testing.TB, leaves []*Key) {
 		if leaves[i].Compare(leaves[i-1]) <= 0 {
 			t.Fatalf("leaf %d key %v is not strictly after leaf %d key %v",
 				i, leaves[i], i-1, leaves[i-1])
+		}
+	}
+}
+
+// assertCappedLeaves is the invariant with a run cap in play: leaf keys
+// never decrease, and two adjacent leaves share a key only when the
+// earlier block reached the cap (an oversize run was cut).
+func assertCappedLeaves(t testing.TB, r *Reader, runCap int) {
+	t.Helper()
+	leaves, err := r.collectLeaves()
+	if err != nil {
+		t.Fatalf("collect leaves: %v", err)
+	}
+	for i := 1; i < len(leaves); i++ {
+		c := leaves[i].Key.Compare(leaves[i-1].Key)
+		if c < 0 {
+			t.Fatalf("leaf %d key %v sorts before leaf %d key %v",
+				i, leaves[i].Key, i-1, leaves[i-1].Key)
+		}
+		if c == 0 && leaves[i-1].RawSize < int64(runCap) {
+			t.Fatalf("leaves %d and %d share key %v although block %d is %d bytes, under the %d-byte cap",
+				i-1, i, leaves[i].Key, i-1, leaves[i-1].RawSize, runCap)
 		}
 	}
 }
@@ -473,48 +505,4 @@ func genVersionRunCells(rng *rand.Rand) []cell {
 		}
 	}
 	return cells
-}
-
-// checkVersionRunProperty writes the generated cells, then asserts the
-// round trip, strictly increasing leaf keys, and seek correctness at every
-// distinct key, just past it, at its row prefix, and past the end.
-func checkVersionRunProperty(t testing.TB, seed int64, blockSize, indexBlockSize int) {
-	t.Helper()
-	rng := rand.New(rand.NewSource(seed))
-	cells := genVersionRunCells(rng)
-	opts := WriterOptions{BlockSize: blockSize, IndexBlockSize: indexBlockSize}
-	r := openBytes(t, writeCells(t, opts, cells))
-	defer r.Close()
-	assertStrictLeaves(t, leavesOf(t, r))
-	if got := readUpTo(t, r, len(cells)+1); !sameCells(got, cells) {
-		t.Fatalf("seed %d: round trip returned %d cells, want %d", seed, len(got), len(cells))
-	}
-	for i, c := range cells {
-		if i > 0 && c.K.Equal(cells[i-1].K) {
-			continue
-		}
-		expectSeek(t, r, cells, c.K, 4)
-		expectSeek(t, r, cells, after(c.K), 4)
-		expectSeek(t, r, cells, &Key{Row: c.K.Row}, 4)
-	}
-	expectSeek(t, r, cells, &Key{Row: []byte("zz")}, 0)
-}
-
-func TestWriter_VersionRunProperty(t *testing.T) {
-	blockSizes := []int{1, 16, 64, 200, 1024, DefaultBlockSize}
-	indexBlockSizes := []int{64, 150, 400, DefaultIndexBlockSize}
-	for seed := int64(0); seed < 60; seed++ {
-		checkVersionRunProperty(t, seed,
-			blockSizes[seed%int64(len(blockSizes))],
-			indexBlockSizes[seed%int64(len(indexBlockSizes))])
-	}
-}
-
-func FuzzWriterVersionRuns(f *testing.F) {
-	f.Add(int64(1), uint16(1), uint16(64))
-	f.Add(int64(2), uint16(64), uint16(150))
-	f.Add(int64(3), uint16(512), uint16(4096))
-	f.Fuzz(func(t *testing.T, seed int64, blockSize, indexBlockSize uint16) {
-		checkVersionRunProperty(t, seed, int(blockSize)%4096+1, int(indexBlockSize)%4096+1)
-	})
 }

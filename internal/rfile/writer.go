@@ -30,6 +30,13 @@ const DefaultBlockSize = 100 * 1024
 // data block and a parent-level entry pointing at it is created.
 const DefaultIndexBlockSize = 128 * 1024
 
+// MaxRunBlockSize is the raw-byte size at which a data block is cut even
+// inside a run of identical keys. Below it, the writer never cuts between
+// equal keys (see Writer). It sits well under bcfile.MaxRawBlockSize so a
+// block that reaches it, plus the cell that crosses it, stays readable.
+// A BlockSize above it raises the cap to BlockSize.
+const MaxRunBlockSize = 64 * 1024 * 1024
+
 // Writer produces an RFile by streaming bytes to an io.Writer. Use:
 //
 //	w := rfile.NewWriter(out, rfile.WriterOptions{Codec: "gz"})
@@ -46,12 +53,17 @@ const DefaultIndexBlockSize = 128 * 1024
 //     timestamp math.MaxInt64).
 //
 // Block boundaries: every index entry's key is the last key of its data
-// block, and the writer keeps those keys strictly increasing. It never
-// cuts a block between two equal keys: once a block reaches BlockSize it
-// is cut just before the next key that differs from its last key. A run
-// of identical keys therefore stays in one block even when it exceeds
-// BlockSize. Writers before issue #690 cut inside such runs; the reader
-// still accepts the equal adjacent index keys those files carry.
+// block. Once a block reaches BlockSize it is cut just before the next key
+// that differs from its last key, so a run of identical keys normally
+// stays in one block and index keys are strictly increasing. The one
+// exception is a run so long that its block reaches MaxRunBlockSize: the
+// block is then cut inside the run, and consecutive index entries carry
+// the same key. Without that cap a perpetually overwritten cell would grow
+// one block past bcfile.MaxRawBlockSize and every later flush or
+// compaction would fail. Equal adjacent index keys are readable by this
+// reader (it accepts them, never decreasing ones) but not by readers from
+// before #690 was fixed, which reject them; files written before the fix
+// may carry them too, from shorter runs.
 //
 // Multi-level index: the writer mirrors Java's
 // MultiLevelIndex.Writer.flush(int level, Key lastKey, boolean last).
@@ -77,6 +89,10 @@ type Writer struct {
 	// group. Unlike blockLast it survives block flushes, so Append can
 	// enforce key order across block boundaries.
 	lastKey *Key
+
+	// runBlockCap is the block size at which a run of identical keys is
+	// cut anyway: max(MaxRunBlockSize, BlockSize). Tests lower it.
+	runBlockCap int
 
 	// Multi-level index state.
 	levels     []*indexLevel
@@ -180,7 +196,12 @@ func NewWriter(out io.Writer, opts WriterOptions) (*Writer, error) {
 	if !opts.Compressor.Has(opts.Codec) {
 		return nil, fmt.Errorf("rfile: codec %q not registered in compressor", opts.Codec)
 	}
+	runBlockCap := MaxRunBlockSize
+	if opts.BlockSize > runBlockCap {
+		runBlockCap = opts.BlockSize
+	}
 	return &Writer{
+		runBlockCap:    runBlockCap,
 		out:            bcfile.NewWriter(out, opts.Codec),
 		comp:           opts.Compressor,
 		opts:           opts,
@@ -213,8 +234,9 @@ var ErrKeyOutOfOrder = errors.New("rfile: key appended out of order")
 // When the current block has reached the block-size threshold and key
 // differs from the block's last key, the block is flushed first:
 // compressed, written via bcfile.Writer, and recorded in the in-memory
-// RFile-level index. A key equal to the block's last key always joins
-// the current block, so no two blocks end on the same key.
+// RFile-level index. A key equal to the block's last key joins the
+// current block, so no two blocks end on the same key, unless the block
+// has reached MaxRunBlockSize, in which case it is flushed regardless.
 func (w *Writer) Append(key *Key, value []byte) error {
 	if w.closed {
 		return errors.New("rfile: writer closed")
@@ -227,11 +249,12 @@ func (w *Writer) Append(key *Key, value []byte) error {
 		if c < 0 {
 			return fmt.Errorf("%w: %v sorts before %v", ErrKeyOutOfOrder, key, w.lastKey)
 		}
-		// Cut only between distinct keys. Cutting inside a run of equal
-		// keys would give two blocks the same last key, i.e. two index
-		// entries with the same key (#690). The reader tolerates that
-		// only so files from older writers stay readable.
-		if c > 0 && w.blockBuf.Len() >= w.opts.BlockSize {
+		// Cut between distinct keys. Cutting inside a run of equal keys
+		// gives two blocks the same last key, i.e. two index entries with
+		// the same key (#690), which readers before the fix reject; do it
+		// only when the run would otherwise grow the block without bound.
+		size := w.blockBuf.Len()
+		if (c > 0 && size >= w.opts.BlockSize) || size >= w.runBlockCap {
 			if err := w.flushDataBlock(); err != nil {
 				return err
 			}
