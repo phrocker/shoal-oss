@@ -122,18 +122,54 @@ type Tablet struct {
 	// import is registered (see RegisterImmutableFiles).
 	sources  map[string]string
 	absorbed map[string]struct{}
+	// Name lineage (see lineage.go). sourceLineage: a live import's
+	// producer lineage, by base name; absorbedLineage: an absorbed
+	// identity's lineage; marks: the highest registered name per producer
+	// lineage. instance/instanceDir: this tablet's own name epoch and the
+	// directory identity it was drawn for; dirIdentity: the directory's
+	// identity now; minted: the instance each live file this tablet minted
+	// was minted under, by base name.
+	sourceLineage   map[string]ProducerLineage
+	absorbedLineage map[string]ProducerLineage
+	marks           map[lineageKey]int64
+	instance        string
+	instanceDir     string
+	dirIdentity     string
+	minted          map[string]string
 }
 
 // state returns the tablet's generation with the given active list and
 // obsolete set, for persistImmutableManifest. Caller holds t.mu.
 func (t *Tablet) state(active []string, obsolete map[string]struct{}) immutableState {
 	return immutableState{
-		active:        active,
-		obsolete:      obsolete,
-		nameHighWater: t.nameHighWater,
-		sources:       t.sources,
-		absorbed:      t.absorbed,
+		active:          active,
+		obsolete:        obsolete,
+		nameHighWater:   t.nameHighWater,
+		sources:         t.sources,
+		absorbed:        t.absorbed,
+		sourceLineage:   t.sourceLineage,
+		absorbedLineage: t.absorbedLineage,
+		marks:           t.marks,
+		instance:        t.instance,
+		instanceDir:     t.instanceDir,
+		minted:          t.minted,
 	}
+}
+
+// adopt installs a discovered generation's file list and bookkeeping.
+// Caller holds t.mu (or owns t exclusively).
+func (t *Tablet) adopt(found immutableState) {
+	t.files = found.active
+	t.obsolete = found.obsolete
+	t.nameHighWater = found.nameHighWater
+	t.sources = found.sources
+	t.absorbed = found.absorbed
+	t.sourceLineage = found.sourceLineage
+	t.absorbedLineage = found.absorbedLineage
+	t.marks = found.marks
+	t.instance = found.instance
+	t.instanceDir = found.instanceDir
+	t.minted = found.minted
 }
 
 // ConditionKind identifies the predicate evaluated by a conditional mutation.
@@ -273,11 +309,8 @@ func Open(dir string, opts Options) (*Tablet, error) {
 	}
 	// found.active is already in recency order (oldest first): see
 	// discoverImmutableFiles.
-	t.files = found.active
-	t.obsolete = found.obsolete
-	t.nameHighWater = found.nameHighWater
-	t.sources = found.sources
-	t.absorbed = found.absorbed
+	t.adopt(found)
+	t.dirIdentity = tabletDirIdentity(dir)
 
 	// Open WAL
 	walPath := filepath.Join(dir, "wal.log")
@@ -897,6 +930,10 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	if err != nil {
 		return err
 	}
+	instance, err := t.mintInstanceLocked()
+	if err != nil {
+		return err
+	}
 	t.nameHighWater = base
 	for index, run := range runs {
 		inputs := make([]compaction.Input, len(run.inputs))
@@ -934,33 +971,47 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		obsolete[filepath.Base(old)] = struct{}{}
 	}
 	outputPaths := make([]string, len(outputs))
+	minted := make(map[string]string, len(outputs))
 	for index, output := range outputs {
 		outputPaths[index] = output.path
+		minted[output.name] = instance
 	}
 	// Imported inputs stay held after their files are folded into the
 	// outputs, so re-importing them is still a no-op: by producer identity,
 	// or — for a legacy import that has none — by content digest, which
 	// the first matching incoming file may claim (see
-	// RegisterImmutableFiles).
+	// RegisterImmutableFiles). An input with a producer lineage keeps it,
+	// so a later import can retire the entry (see advanceLineage).
 	sources := make(map[string]string)
+	sourceLineage := make(map[string]ProducerLineage)
 	absorbed := make(map[string]struct{}, len(t.absorbed))
 	for source := range t.absorbed {
 		absorbed[source] = struct{}{}
 	}
+	absorbedLineage := cloneLineage(t.absorbedLineage)
 	for _, old := range oldFiles {
-		if source := t.sources[filepath.Base(old)]; source != "" {
+		name := filepath.Base(old)
+		if source := t.sources[name]; source != "" {
 			absorbed[source] = struct{}{}
+			if lineage, ok := t.sourceLineage[name]; ok && lineage.valid() {
+				absorbedLineage[source] = lineage
+			}
 		} else if digest, ok := legacyContentIdentity(old); ok {
 			absorbed[digest] = struct{}{}
 		}
 	}
 	next := t.state(outputPaths, obsolete)
 	next.sources, next.absorbed = sources, absorbed
+	next.sourceLineage, next.absorbedLineage = sourceLineage, absorbedLineage
+	next.minted = minted
 	commit := func() {
 		t.files = outputPaths
 		t.obsolete = obsolete
 		t.sources = sources
 		t.absorbed = absorbed
+		t.sourceLineage = sourceLineage
+		t.absorbedLineage = absorbedLineage
+		t.minted = minted
 	}
 	if err := persistImmutableManifest(t.backend, t.dir, next); err != nil {
 		if storage.IsCommittedWriteError(err) {
@@ -1170,11 +1221,7 @@ func (t *Tablet) RefreshFiles() (int, error) {
 	if err := persistImmutableManifest(t.backend, t.dir, found); err != nil {
 		return 0, fmt.Errorf("tablet: refresh manifest %s: %w", t.dir, err)
 	}
-	t.files = found.active
-	t.obsolete = found.obsolete
-	t.nameHighWater = found.nameHighWater
-	t.sources = found.sources
-	t.absorbed = found.absorbed
+	t.adopt(found)
 	return len(t.files), nil
 }
 
@@ -1226,6 +1273,10 @@ func (t *Tablet) flushLocked() error {
 	if err != nil {
 		return fmt.Errorf("flush: %w", err)
 	}
+	instance, err := t.mintInstanceLocked()
+	if err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
 	t.nameHighWater = namesHighWater(t.nameHighWater, outName)
 	outPath := filepath.Join(t.dir, outName)
 	if err := storage.WriteAll(context.Background(), t.backend, outPath, data); err != nil {
@@ -1233,8 +1284,16 @@ func (t *Tablet) flushLocked() error {
 	}
 
 	files := append(append([]string(nil), t.files...), outPath)
-	if err := persistImmutableManifest(t.backend, t.dir, t.state(files, t.obsolete)); err != nil {
+	minted := make(map[string]string, len(t.minted)+1)
+	for name, inst := range t.minted {
+		minted[name] = inst
+	}
+	minted[outName] = instance
+	next := t.state(files, t.obsolete)
+	next.minted = minted
+	if err := persistImmutableManifest(t.backend, t.dir, next); err != nil {
 		if storage.IsCommittedWriteError(err) {
+			t.minted = minted
 			t.files = files
 			t.active = newSkiplistMemtable()
 			if truncateErr := t.wal.Truncate(); truncateErr != nil {
@@ -1248,6 +1307,7 @@ func (t *Tablet) flushLocked() error {
 		_ = removeObject(t.backend, outPath)
 		return fmt.Errorf("flush: publish generation: %w", err)
 	}
+	t.minted = minted
 	t.files = files
 	t.active = newSkiplistMemtable()
 
@@ -1538,19 +1598,40 @@ type immutableManifest struct {
 	// compaction merged into its output — producer identities, or
 	// "content:<digest>" for legacy imports that had none: the tablet still
 	// holds their cells, so re-importing them must not add them again as
-	// newest. The set only grows (about 70 bytes per compacted imported
-	// file, rewritten with every manifest update); pruning is a follow-up.
+	// newest. An entry with a producer lineage (AbsorbedLineage) is dropped
+	// once a registered snapshot shows the producer retired it; the lineage
+	// mark covers it from then on (see lineage.go). Entries without one
+	// are kept.
 	AbsorbedSources []string `json:"absorbed_sources,omitempty"`
+	// SourceLineage is a live import's producer lineage, by name;
+	// AbsorbedLineage is an absorbed identity's; ProducerMarks are the
+	// lineage marks. An older binary drops all three, which only loses
+	// pruning (and, for entries already pruned, replay idempotence).
+	SourceLineage   map[string]ProducerLineage `json:"source_lineage,omitempty"`
+	AbsorbedLineage map[string]ProducerLineage `json:"absorbed_lineage,omitempty"`
+	ProducerMarks   []producerMark             `json:"producer_marks,omitempty"`
+	// Instance is this tablet's name epoch, drawn for the directory
+	// identity InstanceDir; Minted is the instance each live file this
+	// tablet minted was minted under. See lineage.go.
+	Instance    string            `json:"instance,omitempty"`
+	InstanceDir string            `json:"instance_dir,omitempty"`
+	Minted      map[string]string `json:"minted,omitempty"`
 }
 
 // immutableState is a tablet's immutable generation as files.json records
 // it: what discoverImmutableFiles reads and persistImmutableManifest writes.
 type immutableState struct {
-	active        []string // recency order, oldest first
-	obsolete      map[string]struct{}
-	nameHighWater int64
-	sources       map[string]string   // imported file base name -> producer identity
-	absorbed      map[string]struct{} // producer identities compacted locally
+	active          []string // recency order, oldest first
+	obsolete        map[string]struct{}
+	nameHighWater   int64
+	sources         map[string]string          // imported file base name -> producer identity
+	absorbed        map[string]struct{}        // producer identities compacted locally
+	sourceLineage   map[string]ProducerLineage // imported file base name -> lineage
+	absorbedLineage map[string]ProducerLineage // absorbed identity -> lineage
+	marks           map[lineageKey]int64
+	instance        string
+	instanceDir     string
+	minted          map[string]string // minted file base name -> instance
 }
 
 const importNamePrefix = ".shoal-import-"
@@ -1600,26 +1681,23 @@ func namesHighWater(floor int64, names ...string) int64 {
 }
 
 func discoverImmutableFiles(b storage.Backend, dir string, adoptUnknown bool) (immutableState, error) {
-	active, obsolete, highWater, sources, absorbed, err := discoverImmutableFilesRaw(b, dir, adoptUnknown)
+	state, err := discoverImmutableFilesRaw(b, dir, adoptUnknown)
 	if err != nil {
 		return immutableState{}, err
 	}
-	obsoleteNames := make([]string, 0, len(obsolete))
-	for name := range obsolete {
+	obsoleteNames := make([]string, 0, len(state.obsolete))
+	for name := range state.obsolete {
 		obsoleteNames = append(obsoleteNames, name)
 	}
-	highWater = namesHighWater(highWater, active...)
-	highWater = namesHighWater(highWater, obsoleteNames...)
-	return immutableState{
-		active: active, obsolete: obsolete, nameHighWater: highWater,
-		sources: sources, absorbed: absorbed,
-	}, nil
+	state.nameHighWater = namesHighWater(state.nameHighWater, state.active...)
+	state.nameHighWater = namesHighWater(state.nameHighWater, obsoleteNames...)
+	return state, nil
 }
 
-func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool) ([]string, map[string]struct{}, int64, map[string]string, map[string]struct{}, error) {
+func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool) (immutableState, error) {
 	keys, err := listTabletObjects(b, dir)
 	if err != nil {
-		return nil, nil, 0, nil, nil, err
+		return immutableState{}, err
 	}
 	available := make(map[string]string)
 	manifestPresent := false
@@ -1648,18 +1726,23 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 			active = append(active, key)
 		}
 		legacyRecencyOrder(active)
-		return active, obsolete, highWater, map[string]string{}, map[string]struct{}{}, nil
+		return immutableState{
+			active: active, obsolete: obsolete, nameHighWater: highWater,
+			sources: map[string]string{}, absorbed: map[string]struct{}{},
+			sourceLineage: map[string]ProducerLineage{}, absorbedLineage: map[string]ProducerLineage{},
+			marks: map[lineageKey]int64{}, minted: map[string]string{},
+		}, nil
 	}
 	data, err := storage.ReadAll(context.Background(), b, filepath.Join(dir, "files.json"))
 	if err != nil {
-		return nil, nil, 0, nil, nil, fmt.Errorf("read immutable manifest: %w", err)
+		return immutableState{}, fmt.Errorf("read immutable manifest: %w", err)
 	}
 	var manifest immutableManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, nil, 0, nil, nil, fmt.Errorf("decode immutable manifest: %w", err)
+		return immutableState{}, fmt.Errorf("decode immutable manifest: %w", err)
 	}
 	if manifest.Version != immutableManifestVersion {
-		return nil, nil, 0, nil, nil, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
+		return immutableState{}, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
 	}
 	if manifest.NameHighWater > highWater {
 		highWater = manifest.NameHighWater
@@ -1680,7 +1763,7 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 	for i, name := range manifest.Active {
 		path, ok := available[name]
 		if !ok {
-			return nil, nil, 0, nil, nil, fmt.Errorf("authoritative immutable file %q is missing", name)
+			return immutableState{}, fmt.Errorf("authoritative immutable file %q is missing", name)
 		}
 		if lastIndex[name] != i {
 			continue
@@ -1717,7 +1800,36 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 	for _, source := range manifest.AbsorbedSources {
 		absorbed[source] = struct{}{}
 	}
-	return active, obsolete, highWater, sources, absorbed, nil
+	// Lineage entries are only kept for what they describe: a live import
+	// with a source, an identity still absorbed, a live file this tablet
+	// minted (a name in Minted that an older binary has since deleted, or
+	// that the manifest does not list, is not trusted).
+	sourceLineage := make(map[string]ProducerLineage, len(manifest.SourceLineage))
+	for name, lineage := range manifest.SourceLineage {
+		if _, ok := sources[name]; ok && lineage.valid() {
+			sourceLineage[name] = lineage
+		}
+	}
+	absorbedLineage := make(map[string]ProducerLineage, len(manifest.AbsorbedLineage))
+	for identity, lineage := range manifest.AbsorbedLineage {
+		if _, ok := absorbed[identity]; ok && lineage.valid() {
+			absorbedLineage[identity] = lineage
+		}
+	}
+	minted := make(map[string]string, len(manifest.Minted))
+	for name, instance := range manifest.Minted {
+		if _, live := known[name]; live && instance != "" {
+			minted[name] = instance
+		}
+	}
+	return immutableState{
+		active: active, obsolete: obsolete, nameHighWater: highWater,
+		sources: sources, absorbed: absorbed,
+		sourceLineage: sourceLineage, absorbedLineage: absorbedLineage,
+		marks:    decodeMarks(manifest.ProducerMarks),
+		instance: manifest.Instance, instanceDir: manifest.InstanceDir,
+		minted: minted,
+	}, nil
 }
 
 func listTabletObjects(b storage.Backend, dir string) ([]string, error) {
@@ -1747,7 +1859,11 @@ func listTabletObjects(b storage.Backend, dir string) ([]string, error) {
 // current mark; the written mark also covers every listed name. Only live
 // files' source entries are written.
 func persistImmutableManifest(b storage.Backend, dir string, state immutableState) error {
-	manifest := immutableManifest{Version: immutableManifestVersion, Ordered: true}
+	manifest := immutableManifest{
+		Version: immutableManifestVersion, Ordered: true,
+		ProducerMarks: encodeMarks(state.marks),
+		Instance:      state.instance, InstanceDir: state.instanceDir,
+	}
 	for _, path := range state.active {
 		name := filepath.Base(path)
 		manifest.Active = append(manifest.Active, name)
@@ -1756,6 +1872,18 @@ func persistImmutableManifest(b storage.Backend, dir string, state immutableStat
 				manifest.Sources = make(map[string]string)
 			}
 			manifest.Sources[name] = source
+			if lineage, ok := state.sourceLineage[name]; ok && lineage.valid() {
+				if manifest.SourceLineage == nil {
+					manifest.SourceLineage = make(map[string]ProducerLineage)
+				}
+				manifest.SourceLineage[name] = lineage
+			}
+		}
+		if instance := state.minted[name]; instance != "" {
+			if manifest.Minted == nil {
+				manifest.Minted = make(map[string]string)
+			}
+			manifest.Minted[name] = instance
 		}
 	}
 	for name := range state.obsolete {
@@ -1763,6 +1891,12 @@ func persistImmutableManifest(b storage.Backend, dir string, state immutableStat
 	}
 	for source := range state.absorbed {
 		manifest.AbsorbedSources = append(manifest.AbsorbedSources, source)
+		if lineage, ok := state.absorbedLineage[source]; ok && lineage.valid() {
+			if manifest.AbsorbedLineage == nil {
+				manifest.AbsorbedLineage = make(map[string]ProducerLineage)
+			}
+			manifest.AbsorbedLineage[source] = lineage
+		}
 	}
 	sort.Strings(manifest.AbsorbedSources)
 	manifest.NameHighWater = namesHighWater(
@@ -1792,8 +1926,11 @@ func cloneObsolete(in map[string]struct{}) map[string]struct{} {
 // files must be in recency order, oldest first (see Tablet.files).
 //
 // It replaces the directory's generation wholesale: only the given files'
-// sources are recorded, and any earlier sources / absorbed identities are
-// discarded (only the name high-water mark carries over). It is meant for a
+// sources and lineages are recorded, and the lineage marks start from
+// them; any earlier sources, absorbed identities, lineage marks and name
+// instance are discarded (only the name high-water mark carries over; a
+// tablet opened here draws a new instance when it first mints a name).
+// It is meant for a
 // directory no open tablet serves — the first import of a table; an open
 // tablet merges imports through RegisterImmutableFiles.
 func PublishImmutableFiles(b storage.Backend, dir string, files []ImportedFile) error {
@@ -1802,8 +1939,10 @@ func PublishImmutableFiles(b storage.Backend, dir string, files []ImportedFile) 
 		return err
 	}
 	state := immutableState{
-		obsolete: make(map[string]struct{}),
-		sources:  make(map[string]string),
+		obsolete:      make(map[string]struct{}),
+		sources:       make(map[string]string),
+		sourceLineage: make(map[string]ProducerLineage),
+		marks:         make(map[lineageKey]int64),
 	}
 	// Every object present counts toward the name high-water mark: each is
 	// listed below as active or obsolete, and persistImmutableManifest
@@ -1832,8 +1971,12 @@ func PublishImmutableFiles(b storage.Backend, dir string, files []ImportedFile) 
 		state.active = append(state.active, file.Path)
 		if file.Source != "" {
 			state.sources[name] = file.Source
+			if file.Lineage.valid() {
+				state.sourceLineage[name] = file.Lineage
+			}
 		}
 	}
+	advanceLineage(files, state.marks, map[string]struct{}{}, map[string]ProducerLineage{})
 	for _, key := range keys {
 		if ext := filepath.Ext(key); ext == ".rf" || ext == ".parquet" {
 			name := filepath.Base(key)
@@ -1855,6 +1998,10 @@ type ImportedFile struct {
 	// files never share a Source, even with identical bytes. Empty means
 	// unknown; the content digest is then the identity.
 	Source string
+	// Lineage places the file in its producer's name lineage (see
+	// lineage.go). The zero value means none: the file is then held only
+	// by its explicit identity. Ignored without a Source.
+	Lineage ProducerLineage
 }
 
 // legacyContentIdentity is the identity of an imported file that carries no
@@ -1888,6 +2035,15 @@ func legacyContentIdentity(path string) (string, bool) {
 //     below it by claiming an older position; it is appended instead.
 //   - A file with no Source is matched by content digest against live files
 //     (the pre-#692 rule).
+//   - A file with a producer lineage named at or below its lineage's mark
+//     is held even when its identity is not: the producer retired it before
+//     a snapshot this tablet registered (see lineage.go). This is what
+//     makes a replay of an old manifest a no-op once absorbed entries are
+//     pruned.
+//
+// files are a full snapshot of one producer tablet; after matching, the
+// lineage marks rise to the snapshot's names and absorbed entries the
+// snapshot proves retired are dropped (advanceLineage).
 //
 // The redundant incoming object of a matched file is removed.
 func (t *Tablet) RegisterImmutableFiles(files []ImportedFile) ([]string, error) {
@@ -1902,6 +2058,9 @@ func (t *Tablet) RegisterImmutableFiles(files []ImportedFile) ([]string, error) 
 	for identity := range t.absorbed {
 		absorbed[identity] = struct{}{}
 	}
+	sourceLineage := cloneLineage(t.sourceLineage)
+	absorbedLineage := cloneLineage(t.absorbedLineage)
+	marks := cloneMarks(t.marks)
 	held := func(source string) bool {
 		if _, ok := absorbed[source]; ok {
 			return true
@@ -1920,12 +2079,15 @@ func (t *Tablet) RegisterImmutableFiles(files []ImportedFile) ([]string, error) 
 		isActive[path] = struct{}{}
 	}
 	// claimLegacy claims a legacy import with path's content for source.
-	claimLegacy := func(path, source string) bool {
+	claimLegacy := func(path, source string, lineage ProducerLineage) bool {
 		identity := immutableFileIdentity(path)
 		for _, existing := range active {
 			name := filepath.Base(existing)
 			if immutableFileIdentity(existing) == identity && sources[name] == "" {
 				sources[name] = source
+				if lineage.valid() {
+					sourceLineage[name] = lineage
+				}
 				return true
 			}
 		}
@@ -1933,6 +2095,9 @@ func (t *Tablet) RegisterImmutableFiles(files []ImportedFile) ([]string, error) 
 			if _, found := absorbed[digest]; found {
 				delete(absorbed, digest)
 				absorbed[source] = struct{}{}
+				if lineage.valid() {
+					absorbedLineage[source] = lineage
+				}
 				return true
 			}
 		}
@@ -1958,8 +2123,14 @@ func (t *Tablet) RegisterImmutableFiles(files []ImportedFile) ([]string, error) 
 			matched = contentHeld(file.Path)
 		case held(file.Source):
 			matched = true
-		case len(adopted) == 0:
-			matched = claimLegacy(file.Path, file.Source)
+		case len(adopted) == 0 && claimLegacy(file.Path, file.Source, file.Lineage):
+			matched = true
+		case markHeld(marks, file.Lineage):
+			// At or below its lineage's mark and not held by identity: a
+			// file the producer retired before a snapshot this tablet
+			// registered (or one whose absorbed entry was retired), so
+			// its cells are already here in the producer's newer files.
+			matched = true
 		}
 		if matched {
 			if err := removeObject(t.backend, file.Path); err != nil {
@@ -1972,15 +2143,23 @@ func (t *Tablet) RegisterImmutableFiles(files []ImportedFile) ([]string, error) 
 		adopted = append(adopted, file.Path)
 		if file.Source != "" {
 			sources[filepath.Base(file.Path)] = file.Source
+			if file.Lineage.valid() {
+				sourceLineage[filepath.Base(file.Path)] = file.Lineage
+			}
 		}
 		delete(t.obsolete, filepath.Base(file.Path))
 	}
+	advanceLineage(files, marks, absorbed, absorbedLineage)
 	state := t.state(active, t.obsolete)
 	state.sources, state.absorbed = sources, absorbed
+	state.sourceLineage, state.absorbedLineage, state.marks = sourceLineage, absorbedLineage, marks
 	commit := func() {
 		t.files = active
 		t.sources = sources
 		t.absorbed = absorbed
+		t.sourceLineage = sourceLineage
+		t.absorbedLineage = absorbedLineage
+		t.marks = marks
 	}
 	if err := persistImmutableManifest(t.backend, t.dir, state); err != nil {
 		if storage.IsCommittedWriteError(err) {

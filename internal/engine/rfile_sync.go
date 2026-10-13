@@ -136,7 +136,15 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 		// name: local names stay above the persisted name high-water mark
 		// (even after deletion or a clock step back), and import names carry
 		// a random nonce. A path therefore always names the same bytes.
-		if prev, ok := priorShipped[rel]; ok && prev.DestinationPath == dstPath {
+		//
+		// The shipped copy is only reused under the name epoch it was
+		// shipped with: the epoch also names the export transform (a
+		// different stamp makes different bytes), and every file this
+		// manifest lists under an epoch must be in that epoch's bytes, or
+		// an importer would take the snapshot as complete for bytes it
+		// never received (see producerEpoch and tablet's lineage marks).
+		epoch := producerEpoch(f.Instance, opts)
+		if prev, ok := priorShipped[rel]; ok && prev.DestinationPath == dstPath && prev.ProducerEpoch == epoch {
 			prev.Format = string(fileFormatForPath(f.Path))
 			prev.Role = ExportRoleAuthoritative
 			manifest.RFiles = append(manifest.RFiles, prev)
@@ -159,6 +167,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 			BCFileVersion:   bcVersion,
 			Format:          string(fileFormatForPath(f.Path)),
 			Role:            ExportRoleAuthoritative,
+			ProducerEpoch:   epoch,
 		}
 		manifest.RFiles = append(manifest.RFiles, entry)
 		state.Shipped[rel] = entry

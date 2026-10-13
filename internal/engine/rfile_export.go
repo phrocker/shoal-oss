@@ -219,6 +219,11 @@ type RFileExportFile struct {
 	// Empty values are the legacy encoding of rfile/authoritative.
 	Format string `json:"format,omitempty"`
 	Role   string `json:"role,omitempty"`
+	// ProducerEpoch is the name epoch the producer minted this file's name
+	// under (see producerEpoch): within one epoch a producer tablet's names
+	// strictly increase. Empty when unknown; an importer then holds the
+	// file by its identity alone. Older importers ignore it.
+	ProducerEpoch string `json:"producer_epoch,omitempty"`
 }
 
 const (
@@ -337,6 +342,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 			BCFileVersion:   bcVersion,
 			Format:          string(fileFormatForPath(f.Path)),
 			Role:            ExportRoleAuthoritative,
+			ProducerEpoch:   producerEpoch(f.Instance, opts),
 		})
 	}
 	// Group by tablet but keep each tablet's recency order (from rfiles):
@@ -1000,8 +1006,9 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	filesByTablet := make(map[int][]tablet.ImportedFile)
 	for _, file := range stagedFiles {
 		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], tablet.ImportedFile{
-			Path:   file.DestinationPath,
-			Source: importSourceIdentity(file),
+			Path:    file.DestinationPath,
+			Source:  importSourceIdentity(file),
+			Lineage: importLineage(file),
 		})
 	}
 	importedPaths := func(files []tablet.ImportedFile) []string {
@@ -1388,14 +1395,16 @@ func hashObject(ctx context.Context, b storage.Backend, path string) (int64, str
 type tableRFile struct {
 	TabletIndex int
 	Path        string
+	// Instance is the name instance the tablet minted the file under
+	// (empty for a file it did not mint); see producerEpoch.
+	Instance string
 }
 
 func (t *table) rfiles() []tableRFile {
 	var out []tableRFile
 	for i, tab := range t.tablets {
-		tabFiles := tab.RFiles()
-		for _, p := range tabFiles {
-			out = append(out, tableRFile{TabletIndex: i, Path: p})
+		for _, f := range tab.RFileLineage() {
+			out = append(out, tableRFile{TabletIndex: i, Path: f.Path, Instance: f.Instance})
 		}
 	}
 	// Within a tablet, keep the tablet's recency order (oldest first), not
