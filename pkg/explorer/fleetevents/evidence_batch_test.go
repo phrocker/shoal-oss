@@ -88,10 +88,11 @@ func TestAPageOfEventsAsksTheGateOnce(t *testing.T) {
 func TestMisalignedVerdictsFailClosed(t *testing.T) {
 	references := []interaction.EvidenceReference{{AnchorID: "a"}, {AnchorID: "b"}}
 	labelled := []labelledReference{{reference: references[0]}, {reference: references[1]}}
-	kept, visibility, withheld, err := readableEvidenceGroup(
-		references, nil, labelled, []bool{true})
-	if err == nil || kept != nil || visibility != nil || withheld {
-		t.Fatalf("misaligned verdicts returned %v, %v, %v, %v; want an error and nothing",
-			kept, visibility, withheld, err)
+	kept, visibility, binding, withheld, err := readableEvidenceGroup(
+		references, nil, nil, labelled, []bool{true})
+	if err == nil || kept != nil || visibility != nil || binding != nil ||
+		withheld {
+		t.Fatalf("misaligned verdicts returned %v, %v, %v, %v, %v; want an "+
+			"error and nothing", kept, visibility, binding, withheld, err)
 	}
 }
