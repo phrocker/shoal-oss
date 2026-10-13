@@ -261,6 +261,12 @@ func (r DocumentRequest) MarshalJSON() ([]byte, error) {
 }
 
 func (r RetrievalRequest) MarshalJSON() ([]byte, error) {
+	if r.Query.Bound != nil {
+		// The wire query has no source bound field, and the server's strict
+		// decoder accepts none, so encoding a bounded query would drop the
+		// bound and retrieve unbounded (#560).
+		return nil, retrieval.ErrBoundUnsupported()
+	}
 	documentIDs := make([]string, 0, len(r.Query.Scope.DocumentIDs))
 	for _, id := range r.Query.Scope.DocumentIDs {
 		documentIDs = append(documentIDs, encodeID(id))

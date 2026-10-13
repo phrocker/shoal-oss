@@ -501,6 +501,15 @@ func neighborhoodShowsTarget(
 	return visible
 }
 
+// labelWorldBound names both of the world's source scopes, so it excludes
+// nothing a label does not already decide.
+func labelWorldBound(w *labelWorld) *retrieval.SourceBound {
+	return &retrieval.SourceBound{Scopes: []retrieval.BoundScope{
+		{SourceID: w.f.sourceA, PolicyID: w.f.policyA},
+		{SourceID: w.f.sourceB, PolicyID: w.f.policyB},
+	}}
+}
+
 func labelBoundedRequest(seed shoal.ID) explorer.BoundedNeighborhoodRequest {
 	return explorer.BoundedNeighborhoodRequest{
 		NodeIDs: []shoal.ID{seed}, Depth: 1, Fanout: 64, MaxNodes: 64,
@@ -640,6 +649,42 @@ func labelRows() []labelRow {
 				requireNotFound(t, "BoundedNeighborhood(target)", err)
 			}
 			return visible
+		}},
+		// A source bound (#560) covering every source of the world must leave
+		// label enforcement exactly as it is: labels on a bound source are
+		// within the bound, and still hide from a principal who lacks them.
+		{"document within bound", "DocumentWithin", func(t *testing.T, w *labelWorld, ctx context.Context, target *labelTarget) bool {
+			_, err := w.clientA.DocumentWithin(
+				ctx, labelWorldBound(w), target.current.Document.ID, "")
+			if err != nil {
+				requireNotFound(t, "DocumentWithin(current)", err)
+				return false
+			}
+			return true
+		}},
+		{"bounded neighborhood within bound", "BoundedNeighborhoodWithin", func(t *testing.T, w *labelWorld, ctx context.Context, target *labelTarget) bool {
+			request := labelBoundedRequest(w.hub.Document.ID)
+			request.EdgeTypes = []string{labelHubEdgeType}
+			around, err := w.clientA.BoundedNeighborhoodWithin(
+				ctx, labelWorldBound(w), request)
+			requireNoError(t, "BoundedNeighborhoodWithin(hub)", err)
+			visible := neighborhoodShowsTarget(
+				t, "BoundedNeighborhoodWithin", around.Neighborhood, target)
+			_, err = w.clientA.BoundedNeighborhoodWithin(
+				ctx, labelWorldBound(w), labelBoundedRequest(target.current.Document.ID))
+			if visible {
+				requireNoError(t, "BoundedNeighborhoodWithin(target)", err)
+			} else {
+				requireNotFound(t, "BoundedNeighborhoodWithin(target)", err)
+			}
+			return visible
+		}},
+		{"retrieve within bound", "Retrieve", func(t *testing.T, w *labelWorld, ctx context.Context, target *labelTarget) bool {
+			response, err := w.clientA.Retrieve(ctx, retrieval.Request{
+				Text: target.token, TopK: 10, Bound: labelWorldBound(w),
+			})
+			requireNoError(t, "Retrieve(bound)", err)
+			return responseCites(response, target.current.Document.ID)
 		}},
 		{"analytics materialization", "MaterializeAnalytics", func(t *testing.T, w *labelWorld, ctx context.Context, target *labelTarget) bool {
 			request := labelBoundedRequest(w.hub.Document.ID)

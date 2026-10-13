@@ -29,6 +29,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer/fleet"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/model"
+	"github.com/phrocker/shoal-oss/pkg/retrieval"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
 
@@ -131,17 +132,19 @@ type AskExecutorConfig struct {
 	Clock func() time.Time
 }
 
-// AskExecutor implements fleet.ActionExecutor.
+// AskExecutor implements fleet.ActionExecutor and fleet.RetrievalConfiner.
 //
-// It does not implement fleet.RetrievalConfiner, and that is accurate rather
-// than an omission: it passes only the question and a top-K to its provider,
-// so the invocation's source, policy and object reach nothing, and
-// ChatService authorizes OperationRetrieve domain-wide. So fleet refuses an
-// invocation whose principal may retrieve beyond the action's own scope,
-// rather than letting the record carry evidence the descriptor's scope does
-// not cover (#370). Implementing the interface is a promise about retrieval;
-// it must not be added before the provider seam can carry a source/policy
-// bound, which retrieval.Scope cannot express today.
+// Every invocation is asked with a retrieval bound of exactly the action's
+// own (SourceID, PolicyID) scope (#560), so retrieval, document reads, graph
+// expansion and citation hydration reach only content that scope governs,
+// and the record names nothing the descriptor's scope does not cover (#370).
+// The bound only narrows what the invoking principal may already read; it is
+// a filter in the authorized client, not a narrowed decision, so the record's
+// authorization fingerprint is the principal's own.
+//
+// The confinement promise is made only when the provider can keep it: see
+// ConfinesRetrievalToScope. The invocation's ObjectID is not part of the
+// bound, because a descriptor declares scopes by source and policy alone.
 type AskExecutor struct {
 	provider   AskProvider
 	capability string
@@ -163,7 +166,37 @@ type AskExecutor struct {
 	limit  int
 }
 
-var _ fleet.ActionExecutor = (*AskExecutor)(nil)
+var (
+	_ fleet.ActionExecutor    = (*AskExecutor)(nil)
+	_ fleet.RetrievalConfiner = (*AskExecutor)(nil)
+)
+
+// ConfinesRetrievalToScope reports whether this executor confines what it
+// retrieves to the invoked action's scope (fleet.RetrievalConfiner, #560).
+//
+// Execute always asks with the action's scope as a bound, but only a provider
+// that reports BoundedAskProvider.HonoursRetrievalBound applies it end to
+// end. Any other provider may drop the bound, so for one the answer is false
+// and fleet keeps refusing invocations whose principal may retrieve beyond
+// the scope — which is the fail-closed behaviour #370 introduced.
+func (e *AskExecutor) ConfinesRetrievalToScope() bool {
+	if e == nil || isAbsentInterface(e.provider) {
+		return false
+	}
+	bounded, ok := e.provider.(BoundedAskProvider)
+	return ok && bounded.HonoursRetrievalBound()
+}
+
+// invocationBound is the retrieval bound of exactly one invocation's scope.
+func invocationBound(invocation fleet.Invocation) (*retrieval.SourceBound, error) {
+	if len(invocation.SourceID) == 0 || len(invocation.PolicyID) == 0 {
+		return nil, shoal.NewError(shoal.ErrorInvalidArgument,
+			"ask executor requires the invoked action's source and policy scope")
+	}
+	return (&retrieval.SourceBound{Scopes: []retrieval.BoundScope{{
+		SourceID: invocation.SourceID, PolicyID: invocation.PolicyID,
+	}}}).Normalize()
+}
 
 // NewAskExecutor validates the configuration and returns a ready executor.
 func NewAskExecutor(config AskExecutorConfig) (*AskExecutor, error) {
@@ -360,6 +393,15 @@ func (e *AskExecutor) Execute(
 	if err != nil {
 		return fleet.ExecutionResult{ErrorCode: AskErrorInvalidInput}, err
 	}
+	// Every read the answer makes is confined to the action's own scope
+	// (#560). That is what ConfinesRetrievalToScope promises fleet, so an
+	// invocation that names no complete scope is refused rather than run
+	// unbounded: fleet always supplies one, and an executor that silently
+	// widened when it did not would make the promise conditional.
+	bound, err := invocationBound(invocation)
+	if err != nil {
+		return fleet.ExecutionResult{ErrorCode: AskErrorInvalidInput}, err
+	}
 	if cached, ok := e.recall(invocation.IdempotencyKey); ok {
 		return cached, nil
 	}
@@ -367,8 +409,9 @@ func (e *AskExecutor) Execute(
 	// its own workspace-aware default. Substituting a constant here would
 	// exceed a workspace whose retrieval limit is lower and fail the action
 	// for a question the same principal can ask over chat.
-	envelope, err := e.provider.Ask(
-		ctx, AskRequest{Question: input.Question, TopK: input.TopK})
+	envelope, err := e.provider.Ask(ctx, AskRequest{
+		Question: input.Question, TopK: input.TopK, Bound: bound,
+	})
 	if err != nil {
 		if shoal.IsErrorCode(err, shoal.ErrorUnauthorized) {
 			// Distinguish an authorization refusal from a model or transport

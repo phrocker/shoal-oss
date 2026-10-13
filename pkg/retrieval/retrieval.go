@@ -21,6 +21,7 @@
 package retrieval
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -42,6 +43,13 @@ const (
 	MaxScopeIDs                = 10_000
 	MaxModes                   = 4
 	MaxExplanationBytes        = 16 * 1024
+
+	// MaxBoundScopes bounds the (SourceID, PolicyID) pairs one SourceBound
+	// may name, and MaxBoundComponentBytes each identity in a pair. The byte
+	// bound matches the authorization policy component bound: a longer
+	// identity names no policy, so it could only ever match nothing.
+	MaxBoundScopes         = 64
+	MaxBoundComponentBytes = 128
 
 	// MaxIdempotencyTokenBytes is reserved for future additive generic
 	// mutation APIs. Retrieval requests do not carry such a token.
@@ -66,6 +74,171 @@ type Scope struct {
 	NodeIDs     []shoal.ID
 }
 
+// BoundScope is one (SourceID, PolicyID) pair a SourceBound admits. It has
+// the shape a fleet.Descriptor declares a scope in, so an invocation's own
+// scope can be handed to retrieval unchanged.
+type BoundScope struct {
+	SourceID []byte
+	PolicyID []byte
+}
+
+// SourceBound confines retrieval to content governed by its scopes (#560).
+//
+// It is a filter and never a grant. An authorizing retriever applies it after
+// its own authorization of the caller, so content the caller may not read is
+// withheld exactly as it is without a bound, and content the caller may read
+// but the bound does not cover is withheld as if it were not there. A bound
+// naming a scope the caller holds no grant on therefore reaches nothing, and
+// says nothing about what that scope contains.
+//
+// Content is within a bound when every policy term of its access rule names a
+// scope of the bound, or is a label policy on the source of a scope it also
+// names. Labels only narrow their source, so a labelled document on a bound
+// source is within the bound; a document on another source is not, whatever
+// labels the caller holds.
+//
+// A retriever that cannot honour a bound must refuse a request carrying one
+// rather than ignore it: an ignored bound is a silent widening. Only the
+// authorized Explorer client honours one today; the base engine, the gRPC
+// transport and the remote web client refuse.
+//
+// A nil *SourceBound on a Request means no bound. A non-nil bound with no
+// scopes is a bound that admits nothing, and retrieval under it is empty.
+type SourceBound struct {
+	Scopes []BoundScope
+}
+
+// Clone returns an independently owned copy.
+func (b *SourceBound) Clone() *SourceBound {
+	if b == nil {
+		return nil
+	}
+	cloned := &SourceBound{Scopes: make([]BoundScope, 0, len(b.Scopes))}
+	for _, scope := range b.Scopes {
+		cloned.Scopes = append(cloned.Scopes, BoundScope{
+			SourceID: append([]byte(nil), scope.SourceID...),
+			PolicyID: append([]byte(nil), scope.PolicyID...),
+		})
+	}
+	return cloned
+}
+
+// Normalize returns an independently owned bound with duplicate scopes
+// removed and the rest in canonical (SourceID, PolicyID) order, or an error
+// when the bound is malformed. A nil bound normalizes to nil.
+func (b *SourceBound) Normalize() (*SourceBound, error) {
+	if b == nil {
+		return nil, nil
+	}
+	if len(b.Scopes) > MaxBoundScopes {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument, "retrieval source bound has too many scopes")
+	}
+	for _, scope := range b.Scopes {
+		if err := validateBoundComponent(
+			"retrieval source bound source ID", scope.SourceID); err != nil {
+			return nil, err
+		}
+		if err := validateBoundComponent(
+			"retrieval source bound policy ID", scope.PolicyID); err != nil {
+			return nil, err
+		}
+	}
+	cloned := b.Clone()
+	sort.Slice(cloned.Scopes, func(i, j int) bool {
+		return compareBoundScope(cloned.Scopes[i], cloned.Scopes[j]) < 0
+	})
+	unique := cloned.Scopes[:0]
+	for _, scope := range cloned.Scopes {
+		if len(unique) > 0 &&
+			compareBoundScope(unique[len(unique)-1], scope) == 0 {
+			continue
+		}
+		unique = append(unique, scope)
+	}
+	cloned.Scopes = unique
+	return cloned, nil
+}
+
+// Admits reports whether the bound names the exact (source, policy) pair. A
+// nil bound admits every pair.
+func (b *SourceBound) Admits(sourceID, policyID []byte) bool {
+	if b == nil {
+		return true
+	}
+	for _, scope := range b.Scopes {
+		if bytes.Equal(scope.SourceID, sourceID) &&
+			bytes.Equal(scope.PolicyID, policyID) {
+			return true
+		}
+	}
+	return false
+}
+
+// AdmitsSource reports whether any scope of the bound names sourceID. A nil
+// bound admits every source.
+func (b *SourceBound) AdmitsSource(sourceID []byte) bool {
+	if b == nil {
+		return true
+	}
+	for _, scope := range b.Scopes {
+		if bytes.Equal(scope.SourceID, sourceID) {
+			return true
+		}
+	}
+	return false
+}
+
+// IntersectBounds returns the bound admitting exactly what both admit. Nil is
+// the unbounded identity, so intersecting with nil returns the other bound;
+// two bounds intersect to the scopes they share, which may be none. The
+// result is independently owned.
+func IntersectBounds(left, right *SourceBound) *SourceBound {
+	switch {
+	case left == nil:
+		return right.Clone()
+	case right == nil:
+		return left.Clone()
+	}
+	result := &SourceBound{Scopes: []BoundScope{}}
+	for _, scope := range left.Scopes {
+		if right.Admits(scope.SourceID, scope.PolicyID) &&
+			!result.Admits(scope.SourceID, scope.PolicyID) {
+			result.Scopes = append(result.Scopes, BoundScope{
+				SourceID: append([]byte(nil), scope.SourceID...),
+				PolicyID: append([]byte(nil), scope.PolicyID...),
+			})
+		}
+	}
+	return result
+}
+
+func compareBoundScope(left, right BoundScope) int {
+	if compared := bytes.Compare(left.SourceID, right.SourceID); compared != 0 {
+		return compared
+	}
+	return bytes.Compare(left.PolicyID, right.PolicyID)
+}
+
+func validateBoundComponent(name string, value []byte) error {
+	if len(value) == 0 {
+		return shoal.NewError(shoal.ErrorInvalidArgument, name+" is required")
+	}
+	if len(value) > MaxBoundComponentBytes {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument, name+" exceeds the byte bound")
+	}
+	return nil
+}
+
+// ErrBoundUnsupported is the refusal a retriever that cannot honour a
+// SourceBound returns for a request carrying one.
+func ErrBoundUnsupported() error {
+	return shoal.NewError(
+		shoal.ErrorUnavailable,
+		"source-bounded retrieval requires an authorizing retriever that honours the bound")
+}
+
 // Request describes one coarse knowledge retrieval operation.
 type Request struct {
 	Text    string
@@ -74,6 +247,11 @@ type Request struct {
 	Scope   Scope
 	AsOf    time.Time
 	Explain bool
+	// Bound optionally confines retrieval to content governed by named
+	// (SourceID, PolicyID) scopes. Nil is today's unbounded retrieval. See
+	// SourceBound: it only narrows, and a retriever that cannot honour it
+	// refuses the request.
+	Bound *SourceBound
 }
 
 // Normalize returns an independently owned, canonical request and never
@@ -96,6 +274,11 @@ func (r Request) Normalize() (Request, error) {
 	if !r.AsOf.IsZero() {
 		normalized.AsOf = r.AsOf.UTC()
 	}
+	bound, err := r.Bound.Normalize()
+	if err != nil {
+		return Request{}, err
+	}
+	normalized.Bound = bound
 	if err := normalized.validateNormalized(); err != nil {
 		return Request{}, err
 	}

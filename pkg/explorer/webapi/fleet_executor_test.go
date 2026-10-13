@@ -132,9 +132,105 @@ type stubAskProvider struct {
 	egresses bool
 }
 
+// The scope every test invocation names, as fleet always supplies one.
+var (
+	askTestSourceID = []byte("ask-test-source")
+	askTestPolicyID = []byte("ask-test-policy")
+)
+
 // EgressesOffHost makes this stub classifiable, the way ChatService is through
 // its configured generator.
 func (p *stubAskProvider) EgressesOffHost() bool { return p.egresses }
+
+// boundedStubAskProvider is a stub that claims, or disclaims, honouring a
+// retrieval bound.
+type boundedStubAskProvider struct {
+	stubAskProvider
+	honours bool
+}
+
+func (p *boundedStubAskProvider) HonoursRetrievalBound() bool { return p.honours }
+
+// TestAskExecutorAsksWithTheInvocationScopeAsBound pins #560's seam: the
+// provider is asked with a bound of exactly the action's own scope, not
+// handed the question alone.
+func TestAskExecutorAsksWithTheInvocationScopeAsBound(t *testing.T) {
+	provider := &stubAskProvider{envelope: verifiedAskEnvelope(t, time.Now().UTC().Add(-time.Minute))}
+	executor, err := NewAskExecutor(AskExecutorConfig{Provider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executor.Execute(context.Background(), fleet.Invocation{
+		Capability: AskCapability, Action: AskAction,
+		SourceID: askTestSourceID, PolicyID: askTestPolicyID,
+		Input: json.RawMessage(`{"question":"anything"}`),
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	bound := provider.last.Bound
+	if bound == nil || len(bound.Scopes) != 1 ||
+		!bytes.Equal(bound.Scopes[0].SourceID, askTestSourceID) ||
+		!bytes.Equal(bound.Scopes[0].PolicyID, askTestPolicyID) {
+		t.Fatalf("asked with bound %#v, want exactly the invocation's scope", bound)
+	}
+}
+
+// TestAskExecutorRefusesAnUnscopedInvocation pins that the executor never runs
+// unbounded: it declares confinement, so an invocation it cannot bound is
+// refused before the provider is asked.
+func TestAskExecutorRefusesAnUnscopedInvocation(t *testing.T) {
+	for name, invocation := range map[string]fleet.Invocation{
+		"no source": {
+			Capability: AskCapability, Action: AskAction, PolicyID: askTestPolicyID,
+			Input: json.RawMessage(`{"question":"anything"}`),
+		},
+		"no policy": {
+			Capability: AskCapability, Action: AskAction, SourceID: askTestSourceID,
+			Input: json.RawMessage(`{"question":"anything"}`),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			provider := &stubAskProvider{}
+			executor, err := NewAskExecutor(AskExecutorConfig{Provider: provider})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := executor.Execute(context.Background(), invocation)
+			if err == nil || result.ErrorCode != AskErrorInvalidInput {
+				t.Fatalf("result = %#v, err = %v; want invalid input", result, err)
+			}
+			if provider.calls != 0 {
+				t.Fatal("an unscoped invocation must not reach the provider")
+			}
+		})
+	}
+}
+
+// TestAskExecutorConfinesOnlyWithABoundHonouringProvider pins that the
+// RetrievalConfiner promise follows the provider: a provider that may drop
+// the bound leaves fleet's #370 refusal in force.
+func TestAskExecutorConfinesOnlyWithABoundHonouringProvider(t *testing.T) {
+	for name, test := range map[string]struct {
+		provider AskProvider
+		want     bool
+	}{
+		"plain provider":       {provider: &stubAskProvider{}, want: false},
+		"disclaiming provider": {provider: &boundedStubAskProvider{honours: false}, want: false},
+		"honouring provider":   {provider: &boundedStubAskProvider{honours: true}, want: true},
+		"chat service":         {provider: &ChatService{}, want: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			executor, err := NewAskExecutor(AskExecutorConfig{Provider: test.provider})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var confiner fleet.RetrievalConfiner = executor
+			if got := confiner.ConfinesRetrievalToScope(); got != test.want {
+				t.Fatalf("ConfinesRetrievalToScope = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
 
 func (p *stubAskProvider) Ask(
 	_ context.Context, request AskRequest,
@@ -255,6 +351,7 @@ func TestAskExecutorAcceptsAValidEnvelope(t *testing.T) {
 	}
 	result, err := executor.Execute(context.Background(), fleet.Invocation{
 		Capability: AskCapability, Action: AskAction,
+		SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 		Input: json.RawMessage(`{"question":"what gates promotion?"}`),
 	})
 	if err != nil {
@@ -302,6 +399,7 @@ func TestAskExecutorForwardsAbsentTopKForWorkspaceClamping(t *testing.T) {
 	}
 	if _, err := executor.Execute(context.Background(), fleet.Invocation{
 		Capability: AskCapability, Action: AskAction,
+		SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 		Input: json.RawMessage(`{"question":"anything"}`),
 	}); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -311,6 +409,7 @@ func TestAskExecutorForwardsAbsentTopKForWorkspaceClamping(t *testing.T) {
 	}
 	if _, err := executor.Execute(context.Background(), fleet.Invocation{
 		Capability: AskCapability, Action: AskAction,
+		SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 		Input: json.RawMessage(`{"question":"anything","top_k":3}`),
 	}); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -348,6 +447,7 @@ func TestAskExecutorAppliesChatFinalizationContract(t *testing.T) {
 			}
 			result, err := executor.Execute(context.Background(), fleet.Invocation{
 				Capability: AskCapability, Action: AskAction,
+				SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 				Input: json.RawMessage(`{"question":"anything"}`),
 			})
 			if err != nil {
@@ -384,6 +484,7 @@ func TestAskExecutorRejectsFutureSnapshot(t *testing.T) {
 	}
 	result, err := executor.Execute(context.Background(), fleet.Invocation{
 		Capability: AskCapability, Action: AskAction,
+		SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 		Input: json.RawMessage(`{"question":"anything"}`),
 	})
 	if err != nil {
@@ -453,6 +554,7 @@ func TestAskExecutorOutputCarriesNoDocumentContent(t *testing.T) {
 	}
 	result, err := executor.Execute(context.Background(), fleet.Invocation{
 		Capability: AskCapability, Action: AskAction,
+		SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 		Input: json.RawMessage(`{"question":"anything"}`),
 	})
 	if err != nil {
@@ -516,6 +618,7 @@ func TestAskExecutorSeparatesAuthorizationRefusal(t *testing.T) {
 	}
 	result, err := refused.Execute(context.Background(), fleet.Invocation{
 		Capability: AskCapability, Action: AskAction,
+		SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 		Input: json.RawMessage(`{"question":"anything"}`),
 	})
 	if err == nil || result.ErrorCode != AskErrorReasoningUnauthorized {
@@ -530,6 +633,7 @@ func TestAskExecutorSeparatesAuthorizationRefusal(t *testing.T) {
 	}
 	result, err = broken.Execute(context.Background(), fleet.Invocation{
 		Capability: AskCapability, Action: AskAction,
+		SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 		Input: json.RawMessage(`{"question":"anything"}`),
 	})
 	if !errors.Is(err, failure) || result.ErrorCode != AskErrorReasoningFailed {
@@ -649,6 +753,7 @@ func TestAskExecutorSeparatesStructuralRejection(t *testing.T) {
 			}
 			result, err := executor.Execute(context.Background(), fleet.Invocation{
 				Capability: AskCapability, Action: AskAction,
+				SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 				Input: json.RawMessage(`{"question":"anything"}`),
 			})
 			if err != nil {
@@ -680,6 +785,7 @@ func TestAskExecutorIsIdempotentForOneExecutorKey(t *testing.T) {
 	}
 	invocation := fleet.Invocation{
 		Capability: AskCapability, Action: AskAction,
+		SourceID: askTestSourceID, PolicyID: askTestPolicyID,
 		IdempotencyKey: []byte("executor-key"),
 		Input:          json.RawMessage(`{"question":"anything"}`),
 	}

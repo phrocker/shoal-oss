@@ -198,6 +198,18 @@ func (c *Client) retrieve(
 			report.Disclosure.Suppressed++
 			continue
 		}
+		if !ruleWithinBound(registration.Rule, normalized.Bound) {
+			// A source bound (#560) narrows what this caller may already read,
+			// and is applied after authorization, never before it: the
+			// suppressed count above is therefore exactly what the same
+			// request reports unbounded, so a bound cannot be used to count
+			// what is hidden on a source it names. A document dropped here is
+			// readable by this caller, so it is not counted at all; counting
+			// it would only report how much of the caller's own reach lies
+			// outside the bound. Like a denial it never reaches the scorer,
+			// the co-occurrence budget below, or the response.
+			continue
+		}
 		if _, duplicate := visible[summary.Document.ID]; duplicate {
 			return retrieval.Response{}, inconsistentBase()
 		}
@@ -285,6 +297,11 @@ func (c *Client) retrieve(
 		DocumentIDs: append([]shoal.ID(nil), documentIDs...),
 		NodeIDs:     append([]shoal.ID(nil), nodeIDs...),
 	}
+	// The bound is spent: it already shaped the projection, which is the only
+	// thing the base scorer may search, and every returned citation and path
+	// is validated against the corpus hydrated from that projection. The base
+	// engine refuses a bound it cannot interpret, so it is not forwarded.
+	projected.Bound = nil
 	authorizedCandidates = vectorRequest
 	corpus, err := c.hydrateRetrievalCorpus(
 		ctx, documentIDs, selected, decision, now)
