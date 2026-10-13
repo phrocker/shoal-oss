@@ -33,7 +33,8 @@ import (
 //
 // Each co-owner is its own row, so recording one more extractor of a popular
 // entity writes one small record instead of rewriting an ever-growing node
-// row. The row key is a digest of (registration, document, revision), and
+// row. Owners are kept per document, so the row key is a digest of
+// (registration, document), a newer revision overwrites its row, and
 // load requires the record to name exactly that key.
 //
 // Existing catalogs need no migration: a registration with no co-owner rows
@@ -70,9 +71,11 @@ type persistedOwner struct {
 	Rule       persistedRule
 }
 
+// policyOwnerRow is one document's co-owner row of one registration: owners
+// are kept per document, so a newer revision of it overwrites the row.
 func policyOwnerRow(prefix string, key ownerKey) []byte {
-	encoded := make([]byte, 0, 24+len(key.objectID)+len(key.documentID)+len(key.revisionID))
-	for _, part := range []shoal.ID{key.objectID, key.documentID, key.revisionID} {
+	encoded := make([]byte, 0, 16+len(key.objectID)+len(key.documentID))
+	for _, part := range []shoal.ID{key.objectID, key.documentID} {
 		encoded = binary.BigEndian.AppendUint64(encoded, uint64(len(part)))
 		encoded = append(encoded, part...)
 	}
@@ -154,7 +157,7 @@ func (s *MemoryPolicyStore) snapshotOwner(
 		owners = registration.CoOwners
 	}
 	for _, owner := range owners {
-		if owner.DocumentID == key.documentID && owner.RevisionID == key.revisionID {
+		if owner.DocumentID == key.documentID {
 			rule, err := owner.Rule.clone()
 			if err != nil {
 				return ExtractionOwner{}, false
@@ -226,7 +229,7 @@ func (s *DurablePolicyStore) reconstructOwners(
 				fmt.Errorf("a co-owner names no extracted node"))
 		}
 		sortOwners(owners)
-		if !canonicalOwners(registration.DocumentID, registration.RevisionID, owners) {
+		if !canonicalOwners(registration.DocumentID, owners) {
 			return corruptPolicyRecord("extraction co-owner",
 				fmt.Errorf("node co-owners are not a canonical set"))
 		}
@@ -248,7 +251,7 @@ func (s *DurablePolicyStore) reconstructOwners(
 				fmt.Errorf("a co-owner names no extracted edge"))
 		}
 		sortOwners(owners)
-		if !canonicalOwners(registration.DocumentID, registration.RevisionID, owners) {
+		if !canonicalOwners(registration.DocumentID, owners) {
 			return corruptPolicyRecord("extraction co-owner",
 				fmt.Errorf("edge co-owners are not a canonical set"))
 		}

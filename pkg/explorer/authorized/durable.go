@@ -935,14 +935,14 @@ func (s *DurablePolicyStore) PutNode(
 			return err
 		}
 	}
-	added, err := s.memory.putNode(ctx, nodeID, registration)
+	change, err := s.memory.putNode(ctx, nodeID, registration)
 	if err != nil {
 		return err
 	}
-	if added != nil {
+	if change.owner != nil {
 		return s.persisted(s.persistOwner(false, ownerKey{
-			objectID: nodeID, documentID: added.DocumentID,
-			revisionID: added.RevisionID,
+			objectID: nodeID, documentID: change.owner.DocumentID,
+			revisionID: change.owner.RevisionID,
 		}))
 	}
 	return s.persisted(s.persistNode(nodeID))
@@ -1060,18 +1060,17 @@ func (s *DurablePolicyStore) PutEdge(
 			return err
 		}
 	}
-	added, err := s.memory.putEdge(ctx, registration)
+	change, err := s.memory.putEdge(ctx, registration)
 	if err != nil {
 		return err
 	}
-	if added != nil {
-		if err := s.persisted(s.persistOwner(true, ownerKey{
-			objectID: registration.Edge.ID, documentID: added.DocumentID,
-			revisionID: added.RevisionID,
-		})); err != nil {
-			return err
-		}
-		return s.persisted(s.persistEdgeClaim(registration.Edge.ID))
+	if change.owner != nil {
+		// Only the co-owner changed; an extracted edge has no reservation
+		// (see putEdge), so there is no claim row to tombstone.
+		return s.persisted(s.persistOwner(true, ownerKey{
+			objectID: registration.Edge.ID, documentID: change.owner.DocumentID,
+			revisionID: change.owner.RevisionID,
+		}))
 	}
 	if err := s.persisted(s.persistApplicationEdge(registration.Edge.ID)); err != nil {
 		return err

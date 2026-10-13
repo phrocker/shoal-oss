@@ -20,6 +20,7 @@
 package authorized
 
 import (
+	"slices"
 	"sort"
 
 	"github.com/phrocker/shoal-oss/pkg/shoal"
@@ -38,7 +39,8 @@ import (
 // Now every extracting document revision owns the registration. The first
 // keeps the registration's DocumentID, RevisionID and Rule, as before, so a
 // registration recorded before this change is simply a registration with one
-// owner; every later one is recorded as a co-owner. A reader sees the
+// owner; every later document is recorded as a co-owner, one entry per
+// document naming the revision that extracted it last. A reader sees the
 // registration when ANY owner's effective rule allows it, and each owner's
 // effective rule is bound to the revision that extracted it (#570, #695):
 //
@@ -57,9 +59,11 @@ import (
 // reader may read. A reader who can read no owner gets the first surviving
 // owner, which denies.
 //
-// Owners never change the node's content: a co-owner is only recorded when
-// its extraction produced exactly the stored node (or edge), so there is
-// nothing per-owner to show.
+// Owners never change the node's content, and no owner's presentation is
+// part of it: a shared node or relation carries only what its identity
+// determines (explorer.CanonicalExtractedNode, CanonicalExtractedRelation),
+// whichever extractor produced it, so every extraction of it agrees and
+// there is nothing per-owner to show or to conflict over.
 
 // ExtractionOwner is one document revision, beyond a registration's first
 // owner, that extracted a shared node or relation, with the rule it was
@@ -75,23 +79,17 @@ func (o ExtractionOwner) reference() RevisionReference {
 }
 
 func compareOwners(left, right ExtractionOwner) int {
-	return compareRevisionReferences(left.reference(), right.reference())
+	return shoal.CompareID(left.DocumentID, right.DocumentID)
 }
 
+// cloneOwners copies the owner list. Rules are immutable values once stored
+// (every change builds a new one), so they are shared, not rebuilt: a read
+// of a popular entity copies its owners, never their rules.
 func cloneOwners(owners []ExtractionOwner) ([]ExtractionOwner, error) {
 	if len(owners) == 0 {
 		return nil, nil
 	}
-	cloned := make([]ExtractionOwner, len(owners))
-	for index, owner := range owners {
-		rule, err := owner.Rule.clone()
-		if err != nil {
-			return nil, err
-		}
-		owner.Rule = rule
-		cloned[index] = owner
-	}
-	return cloned, nil
+	return append([]ExtractionOwner(nil), owners...), nil
 }
 
 // ownerMerge is what recording one more extraction of a shared registration
@@ -103,57 +101,73 @@ const (
 	// ownerMergeKeep: the extracting revision already owns it, under the
 	// same rule.
 	ownerMergeKeep
-	// ownerMergeAdd: the extracting revision becomes a co-owner.
-	ownerMergeAdd
+	// ownerMergeChanged: the extracting document became an owner, or its
+	// owner entry moved to the extracting revision.
+	ownerMergeChanged
 )
 
-// mergeOwner decides an extraction by (documentID, revisionID) under rule of
-// a registration whose content already matched. A revision that already owns
-// it under a different rule conflicts: that is the extracting document's own
-// state, never another document's.
-func mergeOwner(
+// ownerChange is the outcome of recordOwner.
+type ownerChange struct {
+	merge ownerMerge
+	// primary: the first owner's entry moved to the extracting revision.
+	primary bool
+	// owner: the co-owner entry added or moved.
+	owner *ExtractionOwner
+}
+
+// recordOwner records an extraction by incoming of a registration whose
+// content already matched. Owners are kept per DOCUMENT: a document's entry
+// names the revision that extracted it most recently, so re-ingesting a
+// popular entity's documents does not grow the list. Moving an entry only
+// ever drops one disjunct of who may read the registration (the older
+// revision's), so it can only narrow, never widen; outputs derived earlier
+// keep the revisions they were bound to (#695), which are recorded on them,
+// not here. A revision that already owns it under a different rule
+// conflicts: that is the extracting document's own state, never another
+// document's.
+//
+// coOwners is updated in place (binary search, one insertion) and returned;
+// the caller stores it. Readers only ever hold copies (cloneOwners).
+func recordOwner(
 	primaryDocument, primaryRevision shoal.ID,
 	primaryRule AccessRule,
 	coOwners []ExtractionOwner,
 	incoming ExtractionOwner,
-) ownerMerge {
-	if incoming.DocumentID == primaryDocument &&
-		incoming.RevisionID == primaryRevision {
+) ([]ExtractionOwner, ownerChange) {
+	if incoming.DocumentID == primaryDocument {
+		if incoming.RevisionID != primaryRevision {
+			return coOwners, ownerChange{merge: ownerMergeChanged, primary: true}
+		}
 		if primaryRule.equal(incoming.Rule) {
-			return ownerMergeKeep
+			return coOwners, ownerChange{merge: ownerMergeKeep}
 		}
-		return ownerMergeConflict
+		return coOwners, ownerChange{merge: ownerMergeConflict}
 	}
-	for _, owner := range coOwners {
-		if owner.DocumentID == incoming.DocumentID &&
-			owner.RevisionID == incoming.RevisionID {
-			if owner.Rule.equal(incoming.Rule) {
-				return ownerMergeKeep
-			}
-			return ownerMergeConflict
-		}
-	}
-	return ownerMergeAdd
-}
-
-// insertOwner returns owners with incoming added in canonical order.
-func insertOwner(
-	owners []ExtractionOwner, incoming ExtractionOwner,
-) []ExtractionOwner {
-	next := make([]ExtractionOwner, 0, len(owners)+1)
-	next = append(next, owners...)
-	next = append(next, incoming)
-	sort.Slice(next, func(left, right int) bool {
-		return compareOwners(next[left], next[right]) < 0
+	index := sort.Search(len(coOwners), func(i int) bool {
+		return compareOwners(coOwners[i], incoming) >= 0
 	})
-	return next
+	recorded := incoming
+	if index < len(coOwners) && coOwners[index].DocumentID == incoming.DocumentID {
+		existing := coOwners[index]
+		if existing.RevisionID == incoming.RevisionID {
+			if existing.Rule.equal(incoming.Rule) {
+				return coOwners, ownerChange{merge: ownerMergeKeep}
+			}
+			return coOwners, ownerChange{merge: ownerMergeConflict}
+		}
+		coOwners[index] = incoming
+		return coOwners, ownerChange{merge: ownerMergeChanged, owner: &recorded}
+	}
+	coOwners = slices.Insert(coOwners, index, incoming)
+	return coOwners, ownerChange{merge: ownerMergeChanged, owner: &recorded}
 }
 
-// canonicalOwners reports whether owners is strictly ascending, holds valid
-// identities and rules, and never repeats the first owner. It is what the
-// durable store requires of a reconstructed registration.
+// canonicalOwners reports whether owners is strictly ascending by document,
+// holds valid identities and rules, and never names the first owner's
+// document. It is what the durable store requires of a reconstructed
+// registration.
 func canonicalOwners(
-	primaryDocument, primaryRevision shoal.ID,
+	primaryDocument shoal.ID,
 	owners []ExtractionOwner,
 ) bool {
 	for index, owner := range owners {
@@ -164,7 +178,7 @@ func canonicalOwners(
 		if len(owner.Rule.components()) == 0 {
 			return false
 		}
-		if owner.DocumentID == primaryDocument && owner.RevisionID == primaryRevision {
+		if owner.DocumentID == primaryDocument {
 			return false
 		}
 		if index > 0 && compareOwners(owners[index-1], owner) >= 0 {

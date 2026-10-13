@@ -26,6 +26,7 @@ package authorized_test
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -34,6 +35,7 @@ import (
 	"github.com/phrocker/shoal-oss/pkg/explorer"
 	"github.com/phrocker/shoal-oss/pkg/explorer/auth"
 	"github.com/phrocker/shoal-oss/pkg/explorer/authorized"
+	"github.com/phrocker/shoal-oss/pkg/graph"
 	"github.com/phrocker/shoal-oss/pkg/interaction"
 	"github.com/phrocker/shoal-oss/pkg/shoal"
 )
@@ -325,6 +327,104 @@ func TestSharedRelationShowsOnlyReadableEvidence(t *testing.T) {
 			t.Fatal("the base never attached the hidden assertion; the test is vacuous")
 		}
 	})
+}
+
+// TestRecordingOverASharedRelationCitesTheReadersAssertion: a session whose
+// graph evidence is a shared relation is recorded with the assertion its
+// recorder was shown, even when the base attaches a hidden document's
+// assertion to the edge; an assertion nobody made is still refused.
+func TestRecordingOverASharedRelationCitesTheReadersAssertion(t *testing.T) {
+	exercised := 0
+	for index, uri := range sharedHiddenURIs {
+		f := newFixture(t)
+		selector := f.staticSelector(t, f.sourceA, f.policyA)
+		w := &extractedEdgeWorld{
+			t: t, f: f,
+			client: f.labelClient(t, f.base, authorized.NewMemoryPolicyStore(), selector, selector),
+			owner:  f.labelIngester(t, "owner", "secret"),
+			reader: f.labelIngester(t, "reader"),
+		}
+		relation, from, hidden, baseQuotesHidden := sharedRelationWorld(t, w, uri)
+		if !baseQuotesHidden {
+			continue
+		}
+		exercised++
+		alternatives, err := f.base.ExtractionAssertions(context.Background(), []shoal.ID{relation})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var own, theirs []interaction.AssertionReference
+		for _, assertion := range alternatives[relation] {
+			reference := []interaction.AssertionReference{{
+				AssertionID: assertion.ID(), EdgeID: relation, Origin: assertion.Origin(),
+			}}
+			if assertion.Evidence()[0].Citation().DocumentID == hidden {
+				theirs = reference
+			} else {
+				own = reference
+			}
+		}
+		if own == nil || theirs == nil {
+			t.Fatalf("%s: alternatives = %d", uri, len(alternatives[relation]))
+		}
+		var to shoal.ID
+		raw, err := f.base.Neighborhood(context.Background(), explorer.NeighborhoodRequest{
+			NodeIDs: []shoal.ID{from}, Depth: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, edge := range raw.Edges {
+			if edge.ID == relation {
+				to = edge.To
+			}
+		}
+		edge := graph.Edge{ID: relation, From: from, To: to}
+		record := func(id shoal.ID, assertions []interaction.AssertionReference) error {
+			snapshot, err := w.client.Snapshot(w.f.labelIngester(t, "attacker"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.clock.Set(snapshot.AsOf.Add(time.Second))
+			decision := f.bindingDecision(t, "attacker")
+			fingerprint, err := auth.AuthorizationFingerprint(decision)
+			if err != nil {
+				t.Fatal(err)
+			}
+			evidence := exactAuthorizedGraphEvidenceWith(t, f.base, edge, assertions)
+			_, err = w.client.RecordInteractionResult(f.context(t, decision), interaction.Session{
+				ID:                       id,
+				RecordedAt:               f.clock.Now().UTC(),
+				Operation:                interaction.OperationRetrieval,
+				SnapshotID:               shoal.ID(snapshot.ID),
+				SnapshotAsOf:             snapshot.AsOf,
+				AuthorizationFingerprint: shoal.ID(fingerprint.String()),
+				AuthorizationExpiresAt:   decision.AuthenticationExpires(),
+				SeedNodeIDs:              evidence.NodeIDs,
+				SeedEvidence:             []interaction.EvidenceReference{evidence},
+			})
+			return err
+		}
+		if err := record(shoal.ID(fmt.Sprintf("interaction.session_shared_own_%d", index)), own); err != nil {
+			t.Fatalf("%s: recording with the reader's own assertion: %v", uri, err)
+		}
+		never := []interaction.AssertionReference{{
+			AssertionID: "assertion:never-made", EdgeID: relation, Origin: theirs[0].Origin,
+		}}
+		if err := record(shoal.ID(fmt.Sprintf("interaction.session_shared_never_%d", index)), never); err == nil {
+			t.Fatalf("%s: recorded a session citing an assertion nobody made", uri)
+		}
+		if err := record(shoal.ID(fmt.Sprintf("interaction.session_shared_none_%d", index)), nil); err == nil {
+			t.Fatalf("%s: recorded a session omitting the relation's assertion", uri)
+		}
+		both := append(append([]interaction.AssertionReference(nil), own...), theirs...)
+		if err := record(shoal.ID(fmt.Sprintf("interaction.session_shared_both_%d", index)), both); err == nil {
+			t.Fatalf("%s: recorded a session citing two assertions of one edge", uri)
+		}
+	}
+	if exercised == 0 {
+		t.Fatal("the base never attached the hidden assertion; the test is vacuous")
+	}
 }
 
 // opaqueValidator exposes only ValidateSnapshot, so NewClient promotes no

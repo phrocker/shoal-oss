@@ -1457,11 +1457,12 @@ func extractionAssertionMatchesEdge(
 	if !ok {
 		return false
 	}
+	// An extracted relation's weight is canonical (#700); its confidence is
+	// the assertion's alone.
 	return edge.From == assertion.Subject() &&
 		edge.To == target &&
 		edge.Properties[extractionRelationshipIDProperty] ==
-			string(assertion.Predicate()) &&
-		scoresEqual(edge.Weight, assertion.Confidence())
+			string(assertion.Predicate())
 }
 
 func producerDerivationEdgeMatches(

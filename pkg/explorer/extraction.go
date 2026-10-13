@@ -460,6 +460,9 @@ func extractionPublication(
 			node.Properties[extraction.GraphPropertyEntityNamespace] = entityNamespace
 		}
 		sort.Strings(node.Labels)
+		// A shared entity carries only its identity (#700): every
+		// extraction of it, by any extractor, publishes the same node.
+		node, _ = CanonicalExtractedNode(node)
 		if err := node.Validate(); err != nil {
 			return persistedExtraction{}, err
 		}
@@ -502,6 +505,8 @@ func extractionPublication(
 				"ontology_relationship_id": string(relation.TypeID),
 			},
 		}
+		// Likewise a shared relation; its confidence stays on its assertion.
+		edge, _ = CanonicalExtractedRelation(edge)
 		if err := edge.Validate(); err != nil {
 			return persistedExtraction{}, err
 		}
@@ -699,31 +704,45 @@ func (e *Explorer) ExtractionRecords(ctx context.Context) ([]ExtractionRecord, e
 	return records, nil
 }
 
-// ExtractionAssertions returns, for each requested edge of the current graph,
-// every relationship assertion an extraction contributing to the current
-// graph makes of it, in extraction-ID order and without repeats. Several
-// documents can assert the very same relation edge, but the graph keeps one
-// assertion per edge (the last such extraction's), and its evidence cites
-// that extraction's document. An authorizing caller uses this trusted read
-// to show each reader an assertion whose evidence that reader may read
-// (#700). Edges with no extraction assertion are omitted.
+// ExtractionAssertions returns, for each requested edge of the current graph
+// that several contributing extractions assert, every one of their
+// assertions, in extraction-ID order. The graph keeps one assertion per edge
+// (the last such extraction's), and its evidence cites that extraction's
+// document. An authorizing caller uses this trusted read to show each reader
+// an assertion whose evidence that reader may read (#700). Edges asserted by
+// one extraction alone, or by none, are omitted: their graph assertion is
+// the only one.
 func (e *Explorer) ExtractionAssertions(
 	ctx context.Context, edgeIDs []shoal.ID,
 ) (map[shoal.ID][]ontology.Assertion, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	wanted := make(map[shoal.ID]struct{}, len(edgeIDs))
 	for _, id := range edgeIDs {
 		if err := shoal.ValidateRequiredID("extraction edge ID", id); err != nil {
 			return nil, err
 		}
-		wanted[id] = struct{}{}
 	}
 	if err := e.acquireReadWithGraph(); err != nil {
 		return nil, err
 	}
 	defer e.mu.RUnlock()
+	result := make(map[shoal.ID][]ontology.Assertion)
+	for _, id := range edgeIDs {
+		if set, ok := e.extractionAssertionSets[id]; ok {
+			result[id] = append([]ontology.Assertion(nil), set...)
+		}
+	}
+	return result, nil
+}
+
+// extractionAssertionSetsLocked indexes, once per graph build, every
+// assertion of each relation edge that more than one contributing
+// extraction asserts, under the contribution rule computeCurrentGraph
+// applies.
+func (e *Explorer) extractionAssertionSetsLocked(
+	nodes map[shoal.ID]graph.Node, edges map[shoal.ID]graph.Edge,
+) (map[shoal.ID][]ontology.Assertion, error) {
 	extractionIDs := make([]shoal.ID, 0, len(e.extractions))
 	for id := range e.extractions {
 		extractionIDs = append(extractionIDs, id)
@@ -731,37 +750,60 @@ func (e *Explorer) ExtractionAssertions(
 	sort.Slice(extractionIDs, func(i, j int) bool {
 		return shoal.CompareID(extractionIDs[i], extractionIDs[j]) < 0
 	})
-	result := make(map[shoal.ID][]ontology.Assertion)
-	seen := make(map[shoal.ID]map[shoal.ID]struct{})
+	all := make(map[shoal.ID][]ontology.Assertion)
 	for _, id := range extractionIDs {
 		record := e.extractions[id]
 		if record == nil {
 			continue
 		}
-		// The same contribution rule computeCurrentGraph applies.
-		if _, ok := e.graphNodes[record.DocumentID]; !ok {
+		if _, ok := nodes[record.DocumentID]; !ok {
 			continue
 		}
 		for _, persisted := range record.Assertions {
-			if _, ok := wanted[persisted.EdgeID]; !ok {
-				continue
-			}
-			if _, ok := e.graphEdges[persisted.EdgeID]; !ok {
+			if _, ok := edges[persisted.EdgeID]; !ok {
 				continue
 			}
 			assertion, err := restoreAssertion(persisted)
 			if err != nil {
 				return nil, err
 			}
-			if seen[persisted.EdgeID] == nil {
-				seen[persisted.EdgeID] = make(map[shoal.ID]struct{})
+			duplicate := false
+			for _, known := range all[persisted.EdgeID] {
+				if known.ID() == assertion.ID() {
+					duplicate = true
+					break
+				}
 			}
-			if _, duplicate := seen[persisted.EdgeID][assertion.ID()]; duplicate {
-				continue
+			if !duplicate {
+				all[persisted.EdgeID] = append(all[persisted.EdgeID], assertion)
 			}
-			seen[persisted.EdgeID][assertion.ID()] = struct{}{}
-			result[persisted.EdgeID] = append(result[persisted.EdgeID], assertion)
 		}
 	}
-	return result, nil
+	sets := make(map[shoal.ID][]ontology.Assertion)
+	for edgeID, set := range all {
+		if len(set) > 1 {
+			sets[edgeID] = set
+		}
+	}
+	return sets, nil
+}
+
+// edgeAssertionLocked returns the authoritative assertion reference names
+// for its edge: the graph's own, or one of a shared relation's.
+func (e *Explorer) edgeAssertionLocked(
+	reference interaction.AssertionReference,
+) (ontology.Assertion, bool) {
+	matches := func(assertion ontology.Assertion) bool {
+		return assertion.ID() == reference.AssertionID &&
+			assertion.Origin() == reference.Origin
+	}
+	if assertion, ok := e.graphAssertions[reference.EdgeID]; ok && matches(assertion) {
+		return assertion, true
+	}
+	for _, assertion := range e.extractionAssertionSets[reference.EdgeID] {
+		if matches(assertion) {
+			return assertion, true
+		}
+	}
+	return ontology.Assertion{}, false
 }

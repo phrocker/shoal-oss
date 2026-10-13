@@ -678,3 +678,205 @@ func TestSharedNodeOutlivesItsFirstOwner(t *testing.T) {
 		}
 	}
 }
+
+// TestOwnersAreKeptPerDocument: a document that extracts the entity again
+// from a newer revision moves its owner entry there instead of adding one,
+// for the first owner and a co-owner alike, durably.
+func TestOwnersAreKeptPerDocument(t *testing.T) {
+	withTightenStores(t, func(t *testing.T, store PolicyStore, reopen func() PolicyStore) {
+		w := newTightenWorld(t)
+		ctx := context.Background()
+		for _, registration := range []NodeRegistration{
+			extractedBy("doc-1", "rev-1", w.bare),
+			extractedBy("doc-2", "rev-2", w.bare),
+			extractedBy("doc-3", "rev-3", w.bare),
+			extractedBy("doc-2", "rev-2b", w.secret),
+			extractedBy("doc-1", "rev-1b", w.secret),
+		} {
+			if err := store.PutNode(ctx, sharedNode, registration); err != nil {
+				t.Fatalf("put %s@%s: %v", registration.DocumentID, registration.RevisionID, err)
+			}
+		}
+		check := func(store PolicyStore, when string) {
+			t.Helper()
+			registration, ok, err := store.Node(ctx, sharedNode)
+			if err != nil || !ok {
+				t.Fatalf("%s: %v %v", when, ok, err)
+			}
+			if registration.DocumentID != "doc-1" || registration.RevisionID != "rev-1b" ||
+				!registration.Rule.equal(w.secret) {
+				t.Fatalf("%s: first owner = %s@%s", when, registration.DocumentID, registration.RevisionID)
+			}
+			if got := strings.Join(ownerKeys(registration.CoOwners), ","); got != "doc-2@rev-2b,doc-3@rev-3" {
+				t.Fatalf("%s: co-owners = %s", when, got)
+			}
+			if !registration.CoOwners[0].Rule.equal(w.secret) {
+				t.Fatalf("%s: moved co-owner kept its old rule", when)
+			}
+		}
+		check(store, "before reopen")
+		check(reopen(), "after reopen")
+	})
+}
+
+// TestTighteningOneOwnerLeavesTheOthers: a tightening of the first owner's
+// document rewrites no co-owner of another document.
+func TestTighteningOneOwnerLeavesTheOthers(t *testing.T) {
+	withTightenStores(t, func(t *testing.T, store PolicyStore, reopen func() PolicyStore) {
+		w := newTightenWorld(t)
+		ctx := context.Background()
+		putSharedRevision(t, store, "doc-1", "rev-1", w.bare, true)
+		putSharedRevision(t, store, "doc-2", "rev-2", w.bare, true)
+		for _, registration := range []NodeRegistration{
+			extractedBy("doc-1", "rev-1", w.bare),
+			extractedBy("doc-2", "rev-2", w.bare),
+		} {
+			if err := store.PutNode(ctx, sharedNode, registration); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, registration := range []EdgeRegistration{
+			assertedBy("doc-1", "rev-1", w.bare),
+			assertedBy("doc-2", "rev-2", w.bare),
+		} {
+			if err := store.PutEdge(ctx, registration); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if changed, err := tightenFor(store, "doc-1", "rev-1", "file:///doc-1", w.bare, w.secret); err != nil || !changed {
+			t.Fatalf("tighten = %v, %v", changed, err)
+		}
+		check := func(store PolicyStore) {
+			t.Helper()
+			node, _, err := store.Node(ctx, sharedNode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !node.Rule.equal(w.secret) || !node.CoOwners[0].Rule.equal(w.bare) {
+				t.Fatal("tightening doc-1 did not tighten exactly doc-1's ownership of the node")
+			}
+			edge, _, err := store.Edge(ctx, sharedRelation().ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !edge.Rule.equal(w.secret) || !edge.CoOwners[0].Rule.equal(w.bare) {
+				t.Fatal("tightening doc-1 did not tighten exactly doc-1's ownership of the relation")
+			}
+		}
+		check(store)
+		check(reopen())
+	})
+}
+
+// TestSharedContentIsCanonical: an extracted entity or relation is stored as
+// its identity alone, so extractions that present it differently share it,
+// and a stored record from before that rule loads canonical.
+func TestSharedContentIsCanonical(t *testing.T) {
+	withTightenStores(t, func(t *testing.T, store PolicyStore, reopen func() PolicyStore) {
+		w := newTightenWorld(t)
+		ctx := context.Background()
+		const id shoal.ID = "inferred-entity:0000000000000000000000000000000000000000000000000000000000000001"
+		presented := func(document, revision shoal.ID, name, confidence string) NodeRegistration {
+			node := sharedEntity()
+			node.ID = id
+			node.Labels = []string{"skill", name}
+			node.Properties = cloneMetadata(node.Properties)
+			node.Properties["confidence"] = confidence
+			registration := extractedBy(document, revision, w.bare)
+			registration.Node = node
+			return registration
+		}
+		if err := store.PutNode(ctx, id, presented("doc-1", "rev-1", "zeta", "0.9")); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PutNode(ctx, id, presented("doc-2", "rev-2", "ZETA!", "0.1")); err != nil {
+			t.Fatalf("a differently presented extraction was refused: %v", err)
+		}
+		const relation shoal.ID = "inferred-edge:0000000000000000000000000000000000000000000000000000000000000001"
+		weighed := func(document, revision shoal.ID, weight shoal.Score) EdgeRegistration {
+			registration := assertedBy(document, revision, w.bare)
+			registration.Edge = graph.Edge{
+				ID: relation, From: id, To: id, Type: "provides_tool", Weight: weight,
+				Properties: shoal.Metadata{"ontology_relationship_id": "rel-1", "note": "x"},
+			}
+			return registration
+		}
+		if err := store.PutEdge(ctx, weighed("doc-1", "rev-1", 0.9)); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PutEdge(ctx, weighed("doc-2", "rev-2", 0.2)); err != nil {
+			t.Fatalf("a differently weighed relation was refused: %v", err)
+		}
+		check := func(store PolicyStore) {
+			t.Helper()
+			node, _, err := store.Node(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := node.Node.Properties["confidence"]; ok ||
+				strings.Join(node.Node.Labels, ",") != "skill,zeta" || len(node.CoOwners) != 1 {
+				t.Fatalf("stored node is not canonical: %+v", node)
+			}
+			edge, _, err := store.Edge(ctx, relation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if edge.Edge.Weight != 1 || len(edge.Edge.Properties) != 1 || len(edge.CoOwners) != 1 {
+				t.Fatalf("stored relation is not canonical: %+v", edge)
+			}
+		}
+		check(store)
+		check(reopen())
+	})
+	t.Run("legacy durable row", func(t *testing.T) {
+		w := newTightenWorld(t)
+		dir := t.TempDir()
+		store, err := OpenDurablePolicyStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rule, err := ruleToPersisted(w.bare)
+		if err != nil {
+			t.Fatal(err)
+		}
+		node := sharedEntity()
+		node.ID = "inferred-entity:0000000000000000000000000000000000000000000000000000000000000001"
+		node.Labels = []string{"Zeta", "skill"}
+		node.Properties = cloneMetadata(node.Properties)
+		node.Properties["confidence"] = "0.500000"
+		store.mu.Lock()
+		err = store.writeRow(policyNodeRow(node.ID), policyKindNode, persistedNode{
+			Seq: 1 << 40, NodeID: string(node.ID), DocumentID: "doc-1", RevisionID: "rev-1",
+			Node: graphNodeToPersisted(node), Rule: rule, Kind: uint8(RegistrationExtracted),
+		})
+		store.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := OpenDurablePolicyStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		loaded, _, err := reopened.Node(context.Background(), node.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(loaded.Node.Labels, ",") != "skill,zeta" {
+			t.Fatalf("legacy node loaded as %+v", loaded.Node)
+		}
+		if err := reopened.PutNode(context.Background(), node.ID, extractedByNode(
+			"doc-2", "rev-2", w.bare, loaded.Node)); err != nil {
+			t.Fatalf("a co-owner of a legacy node was refused: %v", err)
+		}
+	})
+}
+
+func extractedByNode(document, revision shoal.ID, rule AccessRule, node graph.Node) NodeRegistration {
+	registration := extractedBy(document, revision, rule)
+	registration.Node = node
+	return registration
+}
