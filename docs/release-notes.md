@@ -22,11 +22,14 @@ again) was told it worked.
   directory is re-uploaded after switching branches back.
 - A multi-file upload that fails on any file after the first now reports an
   indeterminate commit outcome, as the remote client already did, because
-  earlier files of the batch were applied. Like every indeterminate write it
-  is a 503 `unavailable` with the `Shoal-Commit-Outcome: indeterminate`
-  header and `"indeterminate": true`, and it keeps the file's message. This
-  covers the historical refusal and the missing-reason 400. A failure on the
-  first file keeps its own status.
+  earlier files of the batch may have been applied (an earlier file that was
+  unchanged wrote nothing). Like every indeterminate write it is a 503
+  `unavailable` with the `Shoal-Commit-Outcome: indeterminate` header and
+  `"indeterminate": true`, and it keeps the file's message. This covers the
+  historical refusal and the missing-reason 400. A failure on the first file
+  keeps its own status. Those two refusals are deterministic: retrying the
+  same batch returns the same response. Change the named file's content, or
+  supply a reason, before retrying.
 
 ### Declassification reason codes and an offline listing (#664)
 

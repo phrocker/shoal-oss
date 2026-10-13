@@ -165,6 +165,22 @@ func TestHTTPIngestNamesTheHistoricalFile(t *testing.T) {
 	}
 }
 
+// TestHTTPIngestNamesOnlyAConflictRefusal pins that the named message is
+// keyed on the conflict refusal, not on the sentinel alone: the sentinel
+// wrapped under another code (here an internal fault) keeps that code and
+// the generic public message, so no file is named for an error that is not
+// the refusal.
+func TestHTTPIngestNamesOnlyAConflictRefusal(t *testing.T) {
+	server, _ := newRefusingUploadServer(t, "old content\n", shoal.WrapError(
+		shoal.ErrorInternal, "injected", authorized.ErrHistoricalRevision))
+	got := postUpload(t, server, filePart("old.txt", "old content\n"))
+	if got.status != http.StatusInternalServerError ||
+		got.code != string(shoal.ErrorInternal) ||
+		got.message != "internal: upload failed" {
+		t.Fatalf("non-conflict sentinel = %+v", got)
+	}
+}
+
 // TestHTTPIngestMarksAPartlyAppliedBatchIndeterminate pins that a refusal
 // after an earlier file of the batch went through reports the indeterminate
 // outcome (so a caller does not believe nothing happened), still naming the
