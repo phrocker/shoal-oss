@@ -173,14 +173,9 @@ type Graph struct {
 	// read. It names the registration (kind, document, revision) every node,
 	// edge and edge endpoint was recorded over, so that a relabel after the
 	// record cannot open the evidence. Nil marks a reference recorded before
-	// bindings existed, which the gate holds to the legacy bound below.
+	// bindings existed, which the gate holds to every registered revision of
+	// the documents its members belong to.
 	Binding []byte
-	// EvidenceAsOf is the time the legacy bound is taken at, for a reference
-	// with no Binding: the stored EvidenceSnapshotAsOf of the record the
-	// reference belongs to, read before anything redacts the record. A
-	// later time keeps more revisions in the bound; a zero time holds the
-	// reference to every registered revision. Ignored when Binding is set.
-	EvidenceAsOf time.Time
 }
 
 // Empty reports whether the reference names nothing current to consult.
@@ -194,7 +189,8 @@ func (g Graph) Empty() bool {
 // every edge's effective rule and both of its endpoints, and the cited
 // revision's own rule; and, since #705, under the rules of the revisions
 // those members were recorded over (Graph.Binding, or for a reference with no
-// binding the legacy bound at Graph.EvidenceAsOf). It is the gate interaction reads already apply
+// binding every registered revision of their documents). It is the gate
+// interaction reads already apply
 // (#567), offered to the planes that store evidence references, so that a
 // document relabelled after an action recorded evidence from it governs that
 // evidence as it governs the document. Implemented by the host that owns the

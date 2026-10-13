@@ -43,7 +43,8 @@ package authorized
 //     named at either point is bound.
 //   - The fleet plane stores each reference's encoded binding verbatim with the
 //     reference, and passes it back on every read in evidencelabels.Graph's
-//     Binding, with the record's EvidenceSnapshotAsOf in EvidenceAsOf.
+//     Binding. No record time is needed: a bound reference does not use one,
+//     and an unbound one is not given one (below).
 //   - GraphsVisibleToReader keeps requiring every current rule it always
 //     required, and adds what the binding records (below).
 //
@@ -72,36 +73,33 @@ package authorized
 // current registration could have been recorded as (bindingCovers); an
 // uncovered member denies.
 //
-// Evidence with no binding (every fleet record written before this change)
-// gets #703's legacy session bound: the rules of every revision of each
-// document its members now belong to that the corpus published, by
-// publication sequence, up to the newest revision published at or before
-// Graph.EvidenceAsOf, plus the current revision and every revision with no
-// sequence. A zero EvidenceAsOf holds it to every registered revision. A
-// document reference's members of the document it cites are the exception:
-// they were recorded over the cited revision, which the gate already holds
-// the reference to, so the citation is their binding and no history bound is
-// taken for that document.
+// Evidence with no binding (every fleet record written before this change) is
+// held to the rules of EVERY registered revision of each document its members
+// now belong to, as #703 holds legacy application edges. It is not given a
+// time bound like #703's legacy sessions, because no time on a fleet record
+// is safe to bound by. The only candidate, the record's EvidenceSnapshotAsOf,
+// is executor-supplied. The dispatch service refuses one later than the
+// completion or the authorization's expiry, but nothing stops an earlier one:
 //
-// EvidenceAsOf is the record's EvidenceSnapshotAsOf. It is executor-supplied,
-// and bounded rather than trusted:
+//   - records written before #623 were never checked against a corpus
+//     frontier;
+//   - neither was any record written while the dispatch plane had no node gate;
+//   - nor a record whose references are all document references
+//     (GraphEvidenceValid checks graph references only).
 //
-//   - The dispatch service refuses one after the completion time or after the
-//     authorization's expiry, so it cannot be later than the record. A later
-//     time only keeps more revisions in the bound (over-closing).
-//   - An earlier time moves the bound earlier and keeps fewer revisions, which
-//     is the direction that would open. What bounds it is the record-time
-//     check (NodeGate.GraphEvidenceValid): the (snapshot, AsOf) pair must be a
-//     frontier the corpus itself recorded, and every node and edge must match
-//     its state at that snapshot and still be current. So the revision a
-//     member belonged to at AsOf is the one it belonged to when recorded, and
-//     that revision was published no later than AsOf, which keeps it, and
-//     every revision before it, inside the bound.
-//   - A record written while the dispatch plane had no node gate was checked
-//     against nothing but the execution bounds, so for such a record an
-//     understated AsOf could leave out revisions published between it and
-//     the record. That is a residual risk of legacy records only; a bound
-//     record does not use the time at all.
+// An understated time moves a sequence bound earlier and leaves out revisions
+// published between it and the record, so a labelled revision the action did
+// use would no longer be required once the document is relabelled.
+// TestLegacyFleetEvidenceIgnoresAnUnderstatedRecordTime pins that.
+//
+// The one exception is a legacy document reference's members of the document
+// it cites. They were recorded over the cited revision, which the gate already
+// holds the reference to (revisionAllows on the citation), so the citation is
+// their binding and no history is required for that document. That keeps
+// current-revision citations open to their readers. Its residual: a reference
+// citing an old revision that was public, R0, opens after the document is
+// relabelled public again even if a labelled revision came between. R0's
+// content is public, so what is exposed is only that the action cited it.
 //
 // A binding that does not decode is denied, never an error, exactly as an
 // unknown member is: every denial is the same false verdict a never-recorded
@@ -154,6 +152,14 @@ type GraphEvidenceBinding struct {
 }
 
 // graphEvidenceBindingVersion is the first byte of every encoded binding.
+//
+// Fleet records keep their bindings for as long as the record lives, so the
+// decoder must accept EVERY version ever written: a newer encoding gets a new
+// version byte and DecodeGraphEvidenceBinding keeps decoding the old ones.
+// Refusing a stored version does not leak, because a binding that does not
+// decode denies its reference, but it would close that evidence for good.
+// TestGraphEvidenceBindingDecodesEveryVersionEverWritten pins version 1's
+// exact bytes.
 const graphEvidenceBindingVersion byte = 1
 
 // maxGraphEvidenceBindingBytes bounds an encoded binding, so a corrupt
@@ -592,7 +598,11 @@ func legacyGraphDocuments(
 // revision of documentID. Its members of that document were recorded over
 // the cited revision, which the gate already holds the reference to
 // (revisionAllows on the citation), so a legacy reference needs no history
-// bound for that document: the citation is its binding.
+// for that document: the citation is its binding. This is the only legacy
+// path that requires less than every registered revision. Its residual is an
+// existence-of-action exposure only: a reference citing an old public
+// revision opens again once the document is relabelled public, even if a
+// labelled revision came between, and the cited content is public.
 func citesDocument(graph evidencelabels.Graph, documentID shoal.ID) bool {
 	return graph.RevisionID != "" && graph.DocumentID == documentID
 }
@@ -607,10 +617,9 @@ func citesDocument(graph evidencelabels.Graph, documentID shoal.ID) bool {
 //     file): revisionAllows for a document or extracted revision, nothing
 //     more for a materialized or application registration, and denial for
 //     an unspecified one.
-//   - A legacy graph: every document a member now belongs to is held to its
-//     revisions up to the publication sequence bound at graph.EvidenceAsOf
-//     (revisionRuleCache.sequenceBound), plus its current revision; a zero
-//     EvidenceAsOf holds it to every registered revision.
+//   - A legacy graph: every document a member now belongs to, other than the
+//     document a document reference cites, is held to every registered
+//     revision of it.
 func (r *graphEvidenceRevisions) rules(
 	index int, graph evidencelabels.Graph,
 	nodes registeredNodes, edges registeredEdges,
@@ -665,8 +674,9 @@ func (r *graphEvidenceRevisions) rules(
 				continue
 			}
 			seen[reference.DocumentID] = struct{}{}
-			rules, ok := r.cache.documentRules(reference.DocumentID,
-				r.cache.sequenceBound(reference.DocumentID, graph.EvidenceAsOf))
+			// Bound zero: every registered revision. No record time is
+			// safe to bound by (see the comment at the top of this file).
+			rules, ok := r.cache.documentRules(reference.DocumentID, 0)
 			if !ok {
 				return nil, false
 			}

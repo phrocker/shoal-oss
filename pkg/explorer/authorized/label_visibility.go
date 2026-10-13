@@ -250,7 +250,7 @@ func (c *Client) LabelVisibility() *LabelVisibility {
 // recorded over the labelled revision. Each graph is therefore also held to
 // the revisions it was recorded over: its recorded binding
 // (BindGraphEvidence, evidencelabels.Graph.Binding) or, for evidence recorded
-// before bindings existed, the legacy bound at Graph.EvidenceAsOf. See
+// before bindings existed, every registered revision of its documents. See
 // graph_evidence_binding.go.
 type NodeGate struct {
 	client *Client

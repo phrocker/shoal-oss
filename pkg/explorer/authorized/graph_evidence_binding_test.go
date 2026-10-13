@@ -84,13 +84,6 @@ func (e fleetEvidence) bound() evidencelabels.Graph {
 
 // legacy is the same reference as a record written before bindings existed.
 func (e fleetEvidence) legacy() evidencelabels.Graph {
-	return evidencelabels.Graph{
-		NodeIDs: e.reference.NodeIDs, EdgeIDs: e.reference.EdgeIDs, EvidenceAsOf: e.asOf,
-	}
-}
-
-// untimed is a legacy record with no usable time.
-func (e fleetEvidence) untimed() evidencelabels.Graph {
 	return evidencelabels.Graph{NodeIDs: e.reference.NodeIDs, EdgeIDs: e.reference.EdgeIDs}
 }
 
@@ -219,13 +212,13 @@ func TestFleetGraphEvidenceStaysClosedAfterARelabel(t *testing.T) {
 				{"application edge", w.edgeRef, false},
 			} {
 				graphs := []evidencelabels.Graph{
-					probe.evidence.bound(), probe.evidence.legacy(), probe.evidence.untimed(),
+					probe.evidence.bound(), probe.evidence.legacy(),
 				}
 				requireVerdicts(t, stage+": reader, "+probe.name,
 					gateVerdicts(t, w.client, reader, graphs...),
-					probe.reader, probe.reader, probe.reader)
+					probe.reader, probe.reader)
 				requireVerdicts(t, stage+": holder, "+probe.name,
-					gateVerdicts(t, w.client, holder, graphs...), true, true, true)
+					gateVerdicts(t, w.client, holder, graphs...), true, true)
 			}
 			// The materialization's rule is what decides its node: no
 			// reader outside it sees it, bound or not.
@@ -449,7 +442,7 @@ func TestFleetGraphEvidenceBindingCoversEveryMember(t *testing.T) {
 		}, selector, selector)
 		requireVerdicts(t, "an unspecified registration",
 			gateVerdicts(t, unspecified, holder,
-				w.open.bound(), w.open.legacy(), w.open.untimed()), false, false, false)
+				w.open.bound(), w.open.legacy()), false, false)
 		// An entry naming a revision the catalog never registered denies.
 		requireVerdicts(t, "an unregistered revision", gateVerdicts(t, w.client, holder,
 			rebind(t, w.open, func(entries []authorized.GraphBindingEntry) []authorized.GraphBindingEntry {
@@ -540,11 +533,11 @@ func TestFleetGraphEvidenceOverARelabelledExtractedEntity(t *testing.T) {
 			entries[0].RevisionID != labelled.Revision.ID {
 			t.Fatalf("entity binding %+v, want extracted from R1", entries)
 		}
-		graphs := []evidencelabels.Graph{recorded.bound(), recorded.legacy(), recorded.untimed()}
+		graphs := []evidencelabels.Graph{recorded.bound(), recorded.legacy()}
 		requireVerdicts(t, "reader before", gateVerdicts(t, w.client, w.reader, graphs...),
-			false, false, false)
+			false, false)
 		requireVerdicts(t, "holder before", gateVerdicts(t, w.client, w.owner, graphs...),
-			true, true, true)
+			true, true)
 
 		declassify, err := authorized.WithDeclassificationReason(w.owner, "ticket:SEC-705")
 		if err != nil {
@@ -555,9 +548,9 @@ func TestFleetGraphEvidenceOverARelabelledExtractedEntity(t *testing.T) {
 			t.Fatal("the relabel did not make a new revision")
 		}
 		requireVerdicts(t, "reader after", gateVerdicts(t, w.client, w.reader, graphs...),
-			false, false, false)
+			false, false)
 		requireVerdicts(t, "holder after", gateVerdicts(t, w.client, w.owner, graphs...),
-			true, true, true)
+			true, true)
 
 		// The owner entry moved to R2, under R2's rule (the document node's).
 		document, ok, err := store.Node(context.Background(), public.Document.ID)
@@ -574,9 +567,9 @@ func TestFleetGraphEvidenceOverARelabelledExtractedEntity(t *testing.T) {
 			t.Fatal("the moved entity is not readable through R2")
 		}
 		requireVerdicts(t, "reader after the owner moved",
-			gateVerdicts(t, moved, w.reader, graphs...), false, false, false)
+			gateVerdicts(t, moved, w.reader, graphs...), false, false)
 		requireVerdicts(t, "holder after the owner moved",
-			gateVerdicts(t, moved, w.owner, graphs...), true, true, true)
+			gateVerdicts(t, moved, w.owner, graphs...), true, true)
 	})
 }
 
@@ -629,30 +622,81 @@ func TestFleetEvidenceOverASharedEntityBindsTheRecordersOwner(t *testing.T) {
 	})
 }
 
-// TestLegacyFleetEvidenceIsHeldToWhatExistedWhenRecorded: evidence with no
-// binding is held to the revisions published, by publication sequence, up to
-// the newest one at or before its record time, plus the current one. A
-// revision labelled after the record does not close it; with no usable time,
-// every registered revision does.
-func TestLegacyFleetEvidenceIsHeldToWhatExistedWhenRecorded(t *testing.T) {
+// TestLegacyFleetEvidenceIgnoresAnUnderstatedRecordTime is the review's
+// repro, kept for good: open R_a at t0, secret R_b at t0+1m, an action at
+// t0+90s whose executor reports an evidence snapshot time of t0, then a
+// relabel to open R_c. A legacy record's time is executor-supplied and was
+// not always checked against a corpus frontier, so the gate takes none:
+// legacy evidence is held to every registered revision, closed to the
+// non-holder whatever time the record claims. Evidence the same action
+// records with a binding names R_b and is closed for the same reason.
+func TestLegacyFleetEvidenceIgnoresAnUnderstatedRecordTime(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		w := newBindingWorld(t, newFixture(t), store)
+		const uri = "file:///fleet/understated.txt"
+		t0 := w.f.clock.Now()
+		at := func(offset time.Duration) {
+			w.f.clock.Set(t0.Add(offset))
+			w.holder = w.f.bindingDecision(t, "holder", "secret")
+			w.reader = w.f.bindingDecision(t, "reader")
+		}
+		first, err := w.client.Ingest(w.as(w.holder), labelledSource(uri, "an open start", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		at(time.Minute)
+		if _, err := w.client.Ingest(w.as(w.holder),
+			labelledSource(uri, "a secret middle", "secret")); err != nil {
+			t.Fatal(err)
+		}
+		at(90 * time.Second)
+		w.resnapshot()
+		used := w.bindFleetEvidence(w.client, w.as(w.holder),
+			nodeEvidence(t, w.f.base, first.Document.ID))[0]
+		declassify, err := authorized.WithDeclassificationReason(
+			w.as(w.holder), "ticket:SEC-705")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.client.Ingest(declassify,
+			labelledSource(uri, "an open end", "")); err != nil {
+			t.Fatal(err)
+		}
+		at(3 * time.Minute)
+		// Not vacuous: the document is open to the reader now.
+		if _, err := w.client.Document(w.as(w.reader), first.Document.ID, ""); err != nil {
+			t.Fatalf("the relabelled document is not readable: %v", err)
+		}
+		requireVerdicts(t, "reader", gateVerdicts(t, w.client, w.as(w.reader),
+			used.legacy(), used.bound()), false, false)
+		requireVerdicts(t, "holder", gateVerdicts(t, w.client, w.as(w.holder),
+			used.legacy(), used.bound()), true, true)
+	})
+}
+
+// TestLegacyFleetEvidenceIsHeldToEveryRevision: evidence with no binding is
+// held to every registered revision, so even a revision labelled after the
+// record closes it (fail closed; availability only), while the same evidence
+// recorded with a binding names only the open revision it used and stays
+// open once the document is relabelled open again.
+func TestLegacyFleetEvidenceIsHeldToEveryRevision(t *testing.T) {
 	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
 		w := newBindingWorld(t, newFixture(t), store)
 		const uri = "file:///fleet/legacy.txt"
-		holder := w.as(w.holder)
-		first, err := w.client.Ingest(holder, labelledSource(uri, "an open start", ""))
+		first, err := w.client.Ingest(w.as(w.holder), labelledSource(uri, "an open start", ""))
 		if err != nil {
 			t.Fatal(err)
 		}
 		w.resnapshot()
 		recorded := w.bindFleetEvidence(w.client, w.as(w.holder),
 			nodeEvidence(t, w.f.base, first.Document.ID))[0]
-		// Labelled a minute after the record, then relabelled open again a
-		// minute later.
 		at := func(offset time.Duration) {
 			w.f.clock.Set(recorded.asOf.Add(offset))
 			w.holder = w.f.bindingDecision(t, "holder", "secret")
 			w.reader = w.f.bindingDecision(t, "reader")
 		}
+		requireVerdicts(t, "reader before", gateVerdicts(t, w.client, w.as(w.reader),
+			recorded.bound(), recorded.legacy()), true, true)
 		at(time.Minute)
 		if _, err := w.client.Ingest(w.as(w.holder),
 			labelledSource(uri, "a secret middle", "secret")); err != nil {
@@ -670,17 +714,86 @@ func TestLegacyFleetEvidenceIsHeldToWhatExistedWhenRecorded(t *testing.T) {
 		}
 		at(3 * time.Minute)
 		requireVerdicts(t, "reader", gateVerdicts(t, w.client, w.as(w.reader),
-			recorded.bound(), recorded.legacy(), recorded.untimed()),
-			true, true, false)
+			recorded.bound(), recorded.legacy()), true, false)
 		requireVerdicts(t, "holder", gateVerdicts(t, w.client, w.as(w.holder),
-			recorded.bound(), recorded.legacy(), recorded.untimed()),
-			true, true, true)
-		// A record time inside the labelled revision's life includes it.
-		inside := recorded.legacy()
-		inside.EvidenceAsOf = recorded.asOf.Add(90 * time.Second)
-		requireVerdicts(t, "reader, recorded while labelled",
-			gateVerdicts(t, w.client, w.as(w.reader), inside), false)
+			recorded.bound(), recorded.legacy()), true, true)
 	})
+}
+
+// TestACorruptBindingDeniesEvenWhereLegacyWouldAdmit: a binding that does not
+// decode is denied, not treated as a legacy record, even for a holder and
+// even when the same batch loads the document's history for a legacy
+// reference that the holder is admitted by.
+func TestACorruptBindingDeniesEvenWhereLegacyWouldAdmit(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		w := newFleetWorld(t, store)
+		w.relabel(w.client)
+		for _, corrupt := range [][]byte{
+			append(append([]byte(nil), w.closed.binding...), 0),
+			{0xff},
+			w.closed.binding[:len(w.closed.binding)-1],
+		} {
+			damaged := w.closed.bound()
+			damaged.Binding = corrupt
+			requireVerdicts(t, "holder", gateVerdicts(t, w.client, w.as(w.holder),
+				w.closed.legacy(), damaged, w.closed.bound()), true, false, true)
+		}
+	})
+}
+
+// TestGraphEvidenceBindingDecodesEveryVersionEverWritten pins the exact bytes
+// of every binding version a fleet record may hold. Fleet records keep their
+// bindings for life, so a change to the encoding must add a version and keep
+// decoding these.
+func TestGraphEvidenceBindingDecodesEveryVersionEverWritten(t *testing.T) {
+	for _, stored := range []struct {
+		version string
+		data    []byte
+		entries []authorized.GraphBindingEntry
+	}{{
+		version: "1",
+		data: []byte{
+			1, 2, // version, entry count
+			1, 1, 1, 'n', 1, 'd', 1, 'r', // node, document, "n", "d", "r"
+			2, 4, 1, 'e', 0, 0, // edge, application, "e"
+		},
+		entries: []authorized.GraphBindingEntry{
+			{Object: authorized.GraphBindingNode, ID: "n",
+				Kind: authorized.RegistrationDocument, DocumentID: "d", RevisionID: "r"},
+			{Object: authorized.GraphBindingEdge, ID: "e",
+				Kind: authorized.RegistrationApplication},
+		},
+	}} {
+		binding, err := authorized.DecodeGraphEvidenceBinding(stored.data)
+		if err != nil {
+			t.Fatalf("version %s no longer decodes: %v", stored.version, err)
+		}
+		entries := binding.Entries()
+		if len(entries) != len(stored.entries) {
+			t.Fatalf("version %s: %+v, want %+v", stored.version, entries, stored.entries)
+		}
+		for index := range entries {
+			if entries[index] != stored.entries[index] {
+				t.Fatalf("version %s: %+v, want %+v", stored.version, entries, stored.entries)
+			}
+		}
+	}
+	// The current encoder still writes version 1 exactly.
+	binding, err := authorized.NewGraphEvidenceBinding(
+		authorized.GraphBindingEntry{Object: authorized.GraphBindingEdge, ID: "e",
+			Kind: authorized.RegistrationApplication},
+		authorized.GraphBindingEntry{Object: authorized.GraphBindingNode, ID: "n",
+			Kind: authorized.RegistrationDocument, DocumentID: "d", RevisionID: "r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := binding.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{1, 2, 1, 1, 1, 'n', 1, 'd', 1, 'r', 2, 4, 1, 'e', 0, 0}; string(encoded) != string(want) {
+		t.Fatalf("Encode = %v, want %v", encoded, want)
+	}
 }
 
 // TestFleetBindingIsWhatTheCatalogNamedAtEitherRead: the resolver's binding
