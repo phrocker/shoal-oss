@@ -111,7 +111,10 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 		Sequence: priorSeq + 1,
 		Shipped:  map[string]RFileExportFile{},
 	}
-	files := tbl.rfiles()
+	files, err := tbl.exportFiles()
+	if err != nil {
+		return nil, err
+	}
 	manifest := &RFileExportManifest{
 		Version:             RFileExportManifestVersion,
 		CreatedAt:           time.Now().UTC(),
@@ -139,6 +142,9 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 		if prev, ok := priorShipped[rel]; ok && prev.DestinationPath == dstPath {
 			prev.Format = string(fileFormatForPath(f.Path))
 			prev.Role = ExportRoleAuthoritative
+			// The file's bytes are unchanged; its lineage is the current
+			// one (a state written by an older binary has none).
+			prev.Lineage = exportLineage(f.Lineage, opts)
 			manifest.RFiles = append(manifest.RFiles, prev)
 			state.Shipped[rel] = prev
 			skipped = append(skipped, rel)
@@ -159,6 +165,7 @@ func (e *Engine) ExportRFilesIncremental(ctx context.Context, tableName string, 
 			BCFileVersion:   bcVersion,
 			Format:          string(fileFormatForPath(f.Path)),
 			Role:            ExportRoleAuthoritative,
+			Lineage:         exportLineage(f.Lineage, opts),
 		}
 		manifest.RFiles = append(manifest.RFiles, entry)
 		state.Shipped[rel] = entry

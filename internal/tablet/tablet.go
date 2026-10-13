@@ -105,7 +105,9 @@ type Tablet struct {
 	// rely on it to resolve identical keys newest-first (see
 	// iterrt.MergingIterator), and it is persisted as the order of
 	// files.json's "active" list. Flush appends, a compaction output takes
-	// its inputs' place, and imported files are appended as newest.
+	// its inputs' place, and an imported file is appended as newest unless
+	// its lineage shows the tablet already holds some of its data (see
+	// RegisterImmutableFiles).
 	files    []string
 	wal      *localwal.WAL
 	seq      atomic.Int64
@@ -122,6 +124,30 @@ type Tablet struct {
 	// import is registered (see RegisterImmutableFiles).
 	sources  map[string]string
 	absorbed map[string]struct{}
+	// lineage maps a live file's base name to the leaves it holds (see
+	// Lineage); files.json "lineage". A file without an entry (written by
+	// an older binary, or adopted by RefreshFiles) gets one on first use
+	// (ensureLineageLocked).
+	lineage map[string]Lineage
+	// origin and leafSeq name the leaves this tablet session issues: a
+	// random origin drawn at Open and a sequence number. They are not
+	// persisted — a new session draws a new origin — so a leaf name is never
+	// issued twice, even by a copied or restored data directory.
+	origin  string
+	leafSeq uint64
+	// lineageUnsaved is set when ensureLineageLocked assigned a lineage
+	// that no files.json write has recorded yet.
+	lineageUnsaved bool
+}
+
+// persistLocked writes state as files.json (see persistImmutableManifest).
+// Caller holds t.mu.
+func (t *Tablet) persistLocked(state immutableState) error {
+	err := persistImmutableManifest(t.backend, t.dir, state)
+	if err == nil {
+		t.lineageUnsaved = false
+	}
+	return err
 }
 
 // state returns the tablet's generation with the given active list and
@@ -133,7 +159,81 @@ func (t *Tablet) state(active []string, obsolete map[string]struct{}) immutableS
 		nameHighWater: t.nameHighWater,
 		sources:       t.sources,
 		absorbed:      t.absorbed,
+		lineage:       t.lineage,
 	}
+}
+
+// newLeafLocked issues a fresh leaf of this session. Caller holds t.mu.
+func (t *Tablet) newLeafLocked() Lineage {
+	if t.origin == "" {
+		t.origin = newOrigin()
+	}
+	t.leafSeq++
+	return singleLeaf(t.origin, t.leafSeq)
+}
+
+// capLineageLocked returns l, or a fresh leaf when l is larger than
+// MaxLineageEntries: the file then reads, to every consumer, as data it has
+// never seen (appended newest — the behaviour before lineage). Caller holds
+// t.mu.
+func (t *Tablet) capLineageLocked(l Lineage) Lineage {
+	if l.Size() > MaxLineageEntries {
+		return t.newLeafLocked()
+	}
+	return l
+}
+
+// ensureLineageLocked gives every live file that has none a lineage: an
+// import with a producer identity is named by it (an opaque leaf), any other
+// file is a fresh leaf of its own. It reports whether it assigned any.
+// Caller holds t.mu.
+func (t *Tablet) ensureLineageLocked() bool {
+	changed := false
+	for _, path := range t.files {
+		name := filepath.Base(path)
+		if _, ok := t.lineage[name]; ok {
+			continue
+		}
+		if t.lineage == nil {
+			t.lineage = make(map[string]Lineage)
+		}
+		if source := t.sources[name]; source != "" {
+			t.lineage[name] = OpaqueLineage(source)
+		} else {
+			t.lineage[name] = t.newLeafLocked()
+		}
+		changed = true
+	}
+	if changed {
+		t.lineageUnsaved = true
+	}
+	return changed
+}
+
+// FileLineage is one live immutable file and the leaves it holds.
+type FileLineage struct {
+	Path    string
+	Lineage Lineage
+}
+
+// FilesWithLineage returns the tablet's live files in recency order (oldest
+// first) with their lineage, for an export. Files that had no lineage yet
+// get one, and that assignment is persisted before it is returned, so an
+// exported lineage is never re-issued differently.
+func (t *Tablet) FilesWithLineage() ([]FileLineage, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ensureLineageLocked()
+	if t.lineageUnsaved {
+		if err := t.persistLocked(t.state(t.files, t.obsolete)); err != nil {
+			return nil, fmt.Errorf("tablet: record lineage %s: %w", t.dir, err)
+		}
+	}
+	out := make([]FileLineage, len(t.files))
+	for i, path := range t.files {
+		out[i] = FileLineage{Path: path, Lineage: t.lineage[filepath.Base(path)].Clone()}
+	}
+	return out, nil
 }
 
 // ConditionKind identifies the predicate evaluated by a conditional mutation.
@@ -278,6 +378,8 @@ func Open(dir string, opts Options) (*Tablet, error) {
 	t.nameHighWater = found.nameHighWater
 	t.sources = found.sources
 	t.absorbed = found.absorbed
+	t.lineage = found.lineage
+	t.origin = newOrigin()
 
 	// Open WAL
 	walPath := filepath.Join(dir, "wal.log")
@@ -852,7 +954,11 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	type inputRun struct {
 		state  embeddingspace.FileState
 		inputs []compaction.Input // oldest first; reversed for compaction
+		// lineage is the union of the inputs' lineages: the output holds
+		// exactly their leaves (#704).
+		lineage Lineage
 	}
+	t.ensureLineageLocked()
 	var runs []*inputRun
 	states := make(map[string]struct{})
 	for _, path := range t.files {
@@ -873,6 +979,7 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		run.inputs = append(run.inputs, compaction.Input{
 			Name: path, Bytes: data, MetadataEmbedding: state,
 		})
+		run.lineage = run.lineage.Union(t.lineage[filepath.Base(path)])
 	}
 	if len(states) > 1 && len(stack) > 0 {
 		return ErrMixedEmbeddingCompactionStack
@@ -882,6 +989,7 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		name    string
 		path    string
 		entries int64
+		lineage Lineage
 	}
 	outputs := make([]compactedOutput, 0, len(runs))
 	cleanupOutputs := func() {
@@ -893,12 +1001,10 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 	for _, path := range t.files {
 		existingNames[filepath.Base(path)] = struct{}{}
 	}
-	base := uniqueCompactionBase(
-		t.nextNameMillis(),
-		len(runs),
-		t.opts.FileFormat.extension(),
-		existingNames,
-	)
+	base, err := t.freeCompactionBaseLocked(len(runs), existingNames)
+	if err != nil {
+		return err
+	}
 	t.nameHighWater = base
 	for index, run := range runs {
 		inputs := make([]compaction.Input, len(run.inputs))
@@ -917,6 +1023,13 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 			cleanupOutputs()
 			return fmt.Errorf("tablet: compact %s: %w", run.state, err)
 		}
+		// An iterator stack may write cells no input held (a derived link,
+		// a rewritten value): such an output also holds a fresh leaf of its
+		// own, so no consumer mistakes it for data it already has.
+		outputLineage := run.lineage
+		if len(stack) > 0 {
+			outputLineage = outputLineage.Union(t.newLeafLocked())
+		}
 		outName := fmt.Sprintf(
 			"C%013d-%03d%s", base, index, t.opts.FileFormat.extension())
 		outPath := filepath.Join(t.dir, outName)
@@ -927,6 +1040,7 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 		}
 		outputs = append(outputs, compactedOutput{
 			name: outName, path: outPath, entries: result.EntriesWritten,
+			lineage: t.capLineageLocked(outputLineage),
 		})
 	}
 
@@ -956,15 +1070,20 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 			absorbed[digest] = struct{}{}
 		}
 	}
+	lineage := make(map[string]Lineage, len(outputs))
+	for _, output := range outputs {
+		lineage[output.name] = output.lineage
+	}
 	next := t.state(outputPaths, obsolete)
-	next.sources, next.absorbed = sources, absorbed
+	next.sources, next.absorbed, next.lineage = sources, absorbed, lineage
 	commit := func() {
 		t.files = outputPaths
 		t.obsolete = obsolete
 		t.sources = sources
 		t.absorbed = absorbed
+		t.lineage = lineage
 	}
-	if err := persistImmutableManifest(t.backend, t.dir, next); err != nil {
+	if err := t.persistLocked(next); err != nil {
 		if storage.IsCommittedWriteError(err) {
 			commit()
 			return fmt.Errorf("tablet: publish compacted generation committed with cleanup error: %w", err)
@@ -985,7 +1104,7 @@ func (t *Tablet) Compact(stack []iterrt.IterSpec) error {
 				slog.String("err", err.Error()))
 		}
 	}
-	if err := persistImmutableManifest(t.backend, t.dir, t.state(t.files, t.obsolete)); err != nil {
+	if err := t.persistLocked(t.state(t.files, t.obsolete)); err != nil {
 		t.logger.Warn("compaction cleanup manifest update failed", slog.String("err", err.Error()))
 	}
 
@@ -1021,6 +1140,66 @@ func uniqueCompactionBase(
 		}
 		base++
 	}
+}
+
+// freeCompactionBaseLocked is uniqueCompactionBase, also skipping names an
+// object already has under the tablet directory although the tablet does not
+// track it — a file another engine exported straight into this directory
+// after Open (see objectExists). Caller holds t.mu.
+func (t *Tablet) freeCompactionBaseLocked(outputs int, existing map[string]struct{}) (int64, error) {
+	extension := t.opts.FileFormat.extension()
+	for {
+		base := uniqueCompactionBase(t.nextNameMillis(), outputs, extension, existing)
+		taken := false
+		for index := 0; index < outputs; index++ {
+			name := fmt.Sprintf("C%013d-%03d%s", base, index, extension)
+			present, err := objectExists(t.backend, filepath.Join(t.dir, name))
+			if err != nil {
+				return 0, fmt.Errorf("tablet: probe compaction name %s: %w", name, err)
+			}
+			if present {
+				existing[name] = struct{}{}
+				taken = true
+			}
+		}
+		if !taken {
+			return base, nil
+		}
+	}
+}
+
+// freeFlushNameLocked is uniqueFlushName, also skipping names an untracked
+// object already has (see freeCompactionBaseLocked). Caller holds t.mu.
+func (t *Tablet) freeFlushNameLocked(existing map[string]struct{}) (string, error) {
+	for {
+		name := uniqueFlushName(t.nextNameMillis(), t.opts.FileFormat.extension(), existing)
+		present, err := objectExists(t.backend, filepath.Join(t.dir, name))
+		if err != nil {
+			return "", fmt.Errorf("tablet: probe flush name %s: %w", name, err)
+		}
+		if !present {
+			return name, nil
+		}
+		existing[name] = struct{}{}
+	}
+}
+
+// objectExists reports whether an object is present at path. A tablet's
+// names are unique among the files it tracks, but an export made without a
+// ProducerID writes "F<ms>.rf" objects straight into the destination tablet
+// directory, which may be a live engine's: one shipped after Open is in no
+// list the tablet keeps, and a flush or compaction choosing its name would
+// replace it (#704). One probe per chosen name avoids that.
+func objectExists(b storage.Backend, path string) (bool, error) {
+	f, err := b.Open(context.Background(), path)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	_ = f.Close()
+	return true, nil
 }
 
 // wallMillis is the clock file names are derived from (a variable so tests
@@ -1099,9 +1278,19 @@ func (t *Tablet) RefreshFiles() (int, error) {
 	if found.nameHighWater < t.nameHighWater {
 		found.nameHighWater = t.nameHighWater
 	}
+	// Keep lineage this session assigned but has not written yet.
+	for _, path := range found.active {
+		name := filepath.Base(path)
+		if _, ok := found.lineage[name]; ok {
+			continue
+		}
+		if l, ok := t.lineage[name]; ok {
+			found.lineage[name] = l
+		}
+	}
 	// found.active keeps the manifest's recency order, with newly adopted
 	// files appended as newest (see discoverImmutableFiles).
-	if err := persistImmutableManifest(t.backend, t.dir, found); err != nil {
+	if err := t.persistLocked(found); err != nil {
 		return 0, fmt.Errorf("tablet: refresh manifest %s: %w", t.dir, err)
 	}
 	t.files = found.active
@@ -1109,6 +1298,7 @@ func (t *Tablet) RefreshFiles() (int, error) {
 	t.nameHighWater = found.nameHighWater
 	t.sources = found.sources
 	t.absorbed = found.absorbed
+	t.lineage = found.lineage
 	return len(t.files), nil
 }
 
@@ -1156,7 +1346,10 @@ func (t *Tablet) flushLocked() error {
 	for _, path := range t.files {
 		existingNames[filepath.Base(path)] = struct{}{}
 	}
-	outName := uniqueFlushName(t.nextNameMillis(), t.opts.FileFormat.extension(), existingNames)
+	outName, err := t.freeFlushNameLocked(existingNames)
+	if err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
 	t.nameHighWater = namesHighWater(t.nameHighWater, outName)
 	outPath := filepath.Join(t.dir, outName)
 	if err := storage.WriteAll(context.Background(), t.backend, outPath, data); err != nil {
@@ -1164,9 +1357,16 @@ func (t *Tablet) flushLocked() error {
 	}
 
 	files := append(append([]string(nil), t.files...), outPath)
-	if err := persistImmutableManifest(t.backend, t.dir, t.state(files, t.obsolete)); err != nil {
+	// The flushed cells are one new leaf (#704).
+	t.ensureLineageLocked()
+	lineage := cloneLineageMap(t.lineage)
+	lineage[outName] = t.newLeafLocked()
+	state := t.state(files, t.obsolete)
+	state.lineage = lineage
+	if err := t.persistLocked(state); err != nil {
 		if storage.IsCommittedWriteError(err) {
 			t.files = files
+			t.lineage = lineage
 			t.active = newSkiplistMemtable()
 			if truncateErr := t.wal.Truncate(); truncateErr != nil {
 				return errors.Join(
@@ -1180,6 +1380,7 @@ func (t *Tablet) flushLocked() error {
 		return fmt.Errorf("flush: publish generation: %w", err)
 	}
 	t.files = files
+	t.lineage = lineage
 	t.active = newSkiplistMemtable()
 
 	if err := t.wal.Truncate(); err != nil {
@@ -1472,6 +1673,11 @@ type immutableManifest struct {
 	// newest. The set only grows (about 70 bytes per compacted imported
 	// file, rewritten with every manifest update); pruning is a follow-up.
 	AbsorbedSources []string `json:"absorbed_sources,omitempty"`
+	// Lineage maps a live file's name to the leaves it holds (see Lineage
+	// and RegisterImmutableFiles). An older binary drops it; the files then
+	// get fresh leaves on first use, which only costs their consumers the
+	// pre-lineage behaviour (#704).
+	Lineage map[string]Lineage `json:"lineage,omitempty"`
 }
 
 // immutableState is a tablet's immutable generation as files.json records
@@ -1482,6 +1688,7 @@ type immutableState struct {
 	nameHighWater int64
 	sources       map[string]string   // imported file base name -> producer identity
 	absorbed      map[string]struct{} // producer identities compacted locally
+	lineage       map[string]Lineage  // live file base name -> leaves it holds
 }
 
 const importNamePrefix = ".shoal-import-"
@@ -1531,7 +1738,7 @@ func namesHighWater(floor int64, names ...string) int64 {
 }
 
 func discoverImmutableFiles(b storage.Backend, dir string, adoptUnknown bool) (immutableState, error) {
-	active, obsolete, highWater, sources, absorbed, err := discoverImmutableFilesRaw(b, dir, adoptUnknown)
+	active, obsolete, highWater, sources, absorbed, lineage, err := discoverImmutableFilesRaw(b, dir, adoptUnknown)
 	if err != nil {
 		return immutableState{}, err
 	}
@@ -1543,14 +1750,14 @@ func discoverImmutableFiles(b storage.Backend, dir string, adoptUnknown bool) (i
 	highWater = namesHighWater(highWater, obsoleteNames...)
 	return immutableState{
 		active: active, obsolete: obsolete, nameHighWater: highWater,
-		sources: sources, absorbed: absorbed,
+		sources: sources, absorbed: absorbed, lineage: lineage,
 	}, nil
 }
 
-func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool) ([]string, map[string]struct{}, int64, map[string]string, map[string]struct{}, error) {
+func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool) ([]string, map[string]struct{}, int64, map[string]string, map[string]struct{}, map[string]Lineage, error) {
 	keys, err := listTabletObjects(b, dir)
 	if err != nil {
-		return nil, nil, 0, nil, nil, err
+		return nil, nil, 0, nil, nil, nil, err
 	}
 	available := make(map[string]string)
 	manifestPresent := false
@@ -1579,18 +1786,18 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 			active = append(active, key)
 		}
 		legacyRecencyOrder(active)
-		return active, obsolete, highWater, map[string]string{}, map[string]struct{}{}, nil
+		return active, obsolete, highWater, map[string]string{}, map[string]struct{}{}, map[string]Lineage{}, nil
 	}
 	data, err := storage.ReadAll(context.Background(), b, filepath.Join(dir, "files.json"))
 	if err != nil {
-		return nil, nil, 0, nil, nil, fmt.Errorf("read immutable manifest: %w", err)
+		return nil, nil, 0, nil, nil, nil, fmt.Errorf("read immutable manifest: %w", err)
 	}
 	var manifest immutableManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, nil, 0, nil, nil, fmt.Errorf("decode immutable manifest: %w", err)
+		return nil, nil, 0, nil, nil, nil, fmt.Errorf("decode immutable manifest: %w", err)
 	}
 	if manifest.Version != immutableManifestVersion {
-		return nil, nil, 0, nil, nil, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
+		return nil, nil, 0, nil, nil, nil, fmt.Errorf("unsupported immutable manifest version %d", manifest.Version)
 	}
 	if manifest.NameHighWater > highWater {
 		highWater = manifest.NameHighWater
@@ -1611,7 +1818,7 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 	for i, name := range manifest.Active {
 		path, ok := available[name]
 		if !ok {
-			return nil, nil, 0, nil, nil, fmt.Errorf("authoritative immutable file %q is missing", name)
+			return nil, nil, 0, nil, nil, nil, fmt.Errorf("authoritative immutable file %q is missing", name)
 		}
 		if lastIndex[name] != i {
 			continue
@@ -1648,7 +1855,19 @@ func discoverImmutableFilesRaw(b storage.Backend, dir string, adoptUnknown bool)
 	for _, source := range manifest.AbsorbedSources {
 		absorbed[source] = struct{}{}
 	}
-	return active, obsolete, highWater, sources, absorbed, nil
+	lineage := make(map[string]Lineage, len(manifest.Lineage))
+	for name, l := range manifest.Lineage {
+		if _, live := known[name]; !live {
+			continue
+		}
+		// A malformed or oversized entry is dropped; the file gets a fresh
+		// leaf on first use.
+		if normalized, ok := l.Normalize(); ok && !normalized.IsEmpty() &&
+			normalized.Size() <= MaxLineageEntries {
+			lineage[name] = normalized
+		}
+	}
+	return active, obsolete, highWater, sources, absorbed, lineage, nil
 }
 
 func listTabletObjects(b storage.Backend, dir string) ([]string, error) {
@@ -1688,6 +1907,12 @@ func persistImmutableManifest(b storage.Backend, dir string, state immutableStat
 			}
 			manifest.Sources[name] = source
 		}
+		if l, ok := state.lineage[name]; ok && !l.IsEmpty() {
+			if manifest.Lineage == nil {
+				manifest.Lineage = make(map[string]Lineage)
+			}
+			manifest.Lineage[name] = l
+		}
 	}
 	for name := range state.obsolete {
 		manifest.Obsolete = append(manifest.Obsolete, name)
@@ -1709,219 +1934,20 @@ func persistImmutableManifest(b storage.Backend, dir string, state immutableStat
 	return storage.WriteAll(context.Background(), b, filepath.Join(dir, "files.json"), append(data, '\n'))
 }
 
+func cloneLineageMap(in map[string]Lineage) map[string]Lineage {
+	out := make(map[string]Lineage, len(in)+1)
+	for name, l := range in {
+		out[name] = l
+	}
+	return out
+}
+
 func cloneObsolete(in map[string]struct{}) map[string]struct{} {
 	out := make(map[string]struct{}, len(in))
 	for name := range in {
 		out[name] = struct{}{}
 	}
 	return out
-}
-
-// PublishImmutableFiles records the authoritative immutable generation for a
-// tablet directory. Importers call it after checksum verification so stale
-// objects already present under the destination prefix are not rediscovered.
-// files must be in recency order, oldest first (see Tablet.files).
-//
-// It replaces the directory's generation wholesale: only the given files'
-// sources are recorded, and any earlier sources / absorbed identities are
-// discarded (only the name high-water mark carries over). It is meant for a
-// directory no open tablet serves — the first import of a table; an open
-// tablet merges imports through RegisterImmutableFiles.
-func PublishImmutableFiles(b storage.Backend, dir string, files []ImportedFile) error {
-	keys, err := listTabletObjects(b, dir)
-	if err != nil {
-		return err
-	}
-	state := immutableState{
-		obsolete: make(map[string]struct{}),
-		sources:  make(map[string]string),
-	}
-	// Every object present counts toward the name high-water mark: each is
-	// listed below as active or obsolete, and persistImmutableManifest
-	// covers both. So does a mark an earlier files.json recorded for names
-	// whose objects are already gone.
-	for _, key := range keys {
-		if filepath.Base(key) != "files.json" {
-			continue
-		}
-		data, err := storage.ReadAll(context.Background(), b, key)
-		if err != nil {
-			return fmt.Errorf("read immutable manifest: %w", err)
-		}
-		var previous immutableManifest
-		if err := json.Unmarshal(data, &previous); err != nil {
-			return fmt.Errorf("decode immutable manifest: %w", err)
-		}
-		if previous.NameHighWater > state.nameHighWater {
-			state.nameHighWater = previous.NameHighWater
-		}
-	}
-	activeNames := make(map[string]struct{}, len(files))
-	for _, file := range files {
-		name := filepath.Base(file.Path)
-		activeNames[name] = struct{}{}
-		state.active = append(state.active, file.Path)
-		if file.Source != "" {
-			state.sources[name] = file.Source
-		}
-	}
-	for _, key := range keys {
-		if ext := filepath.Ext(key); ext == ".rf" || ext == ".parquet" {
-			name := filepath.Base(key)
-			if _, ok := activeNames[name]; !ok {
-				state.obsolete[name] = struct{}{}
-			}
-		}
-	}
-	return persistImmutableManifest(b, dir, state)
-}
-
-// ImportedFile is one checksum-verified import object to register.
-type ImportedFile struct {
-	// Path is the object's (staged, engine-owned) path in this tablet.
-	Path string
-	// Source is the file's PRODUCER identity: a stable key for "this file
-	// of that producer" (its producer-side path plus content digest).
-	// Producer file names are never reissued, so two different producer
-	// files never share a Source, even with identical bytes. Empty means
-	// unknown; the content digest is then the identity.
-	Source string
-}
-
-// legacyContentIdentity is the identity of an imported file that carries no
-// producer identity: its content digest, as recorded in the absorbed set
-// once a compaction merges it. Local (non-import) files have none.
-func legacyContentIdentity(path string) (string, bool) {
-	identity := immutableFileIdentity(path)
-	if identity == path {
-		return "", false
-	}
-	return "content:" + identity, true
-}
-
-// RegisterImmutableFiles adds only checksum-verified import objects to the
-// authoritative generation. The returned paths became authoritative even when
-// the returned error reports cleanup after a committed manifest write.
-//
-// files are given oldest first (an import passes its manifest's recency
-// order). Files are identified by producer identity (ImportedFile.Source):
-//
-//   - A file whose producer identity the tablet holds — live, or absorbed by
-//     a local compaction — is not re-added and never moves. Re-importing an
-//     unchanged manifest is a no-op.
-//   - Every other file is appended as newest, in the given order. On, off,
-//     on is three producer files; the third is appended like any other.
-//   - Legacy imports (registered before producer identities were recorded)
-//     are matched by content digest instead: a live one is claimed in place,
-//     an absorbed one is claimed in the absorbed set — each only once, and
-//     only by a file that comes BEFORE anything this call appends. A file
-//     after an appended one is newer than it, so it must not be ranked
-//     below it by claiming an older position; it is appended instead.
-//   - A file with no Source is matched by content digest against live files
-//     (the pre-#692 rule).
-//
-// The redundant incoming object of a matched file is removed.
-func (t *Tablet) RegisterImmutableFiles(files []ImportedFile) ([]string, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	active := append([]string(nil), t.files...)
-	sources := make(map[string]string, len(t.sources)+len(files))
-	for name, source := range t.sources {
-		sources[name] = source
-	}
-	absorbed := make(map[string]struct{}, len(t.absorbed))
-	for identity := range t.absorbed {
-		absorbed[identity] = struct{}{}
-	}
-	held := func(source string) bool {
-		if _, ok := absorbed[source]; ok {
-			return true
-		}
-		for _, s := range sources {
-			if s == source {
-				return true
-			}
-		}
-		return false
-	}
-	// isActive is defensive: an import stages every object under a fresh
-	// nonce name, so an incoming path never equals a live one today.
-	isActive := make(map[string]struct{}, len(active))
-	for _, path := range active {
-		isActive[path] = struct{}{}
-	}
-	// claimLegacy claims a legacy import with path's content for source.
-	claimLegacy := func(path, source string) bool {
-		identity := immutableFileIdentity(path)
-		for _, existing := range active {
-			name := filepath.Base(existing)
-			if immutableFileIdentity(existing) == identity && sources[name] == "" {
-				sources[name] = source
-				return true
-			}
-		}
-		if digest, ok := legacyContentIdentity(path); ok {
-			if _, found := absorbed[digest]; found {
-				delete(absorbed, digest)
-				absorbed[source] = struct{}{}
-				return true
-			}
-		}
-		return false
-	}
-	contentHeld := func(path string) bool {
-		identity := immutableFileIdentity(path)
-		for _, existing := range active {
-			if immutableFileIdentity(existing) == identity {
-				return true
-			}
-		}
-		return false
-	}
-	adopted := make([]string, 0, len(files))
-	for _, file := range files {
-		if _, ok := isActive[file.Path]; ok {
-			continue
-		}
-		var matched bool
-		switch {
-		case file.Source == "":
-			matched = contentHeld(file.Path)
-		case held(file.Source):
-			matched = true
-		case len(adopted) == 0:
-			matched = claimLegacy(file.Path, file.Source)
-		}
-		if matched {
-			if err := removeObject(t.backend, file.Path); err != nil {
-				return nil, fmt.Errorf("tablet: remove redundant immutable file %s: %w", file.Path, err)
-			}
-			continue
-		}
-		active = append(active, file.Path)
-		isActive[file.Path] = struct{}{}
-		adopted = append(adopted, file.Path)
-		if file.Source != "" {
-			sources[filepath.Base(file.Path)] = file.Source
-		}
-		delete(t.obsolete, filepath.Base(file.Path))
-	}
-	state := t.state(active, t.obsolete)
-	state.sources, state.absorbed = sources, absorbed
-	commit := func() {
-		t.files = active
-		t.sources = sources
-		t.absorbed = absorbed
-	}
-	if err := persistImmutableManifest(t.backend, t.dir, state); err != nil {
-		if storage.IsCommittedWriteError(err) {
-			commit()
-			return adopted, err
-		}
-		return nil, err
-	}
-	commit()
-	return adopted, nil
 }
 
 func immutableFileIdentity(path string) string {

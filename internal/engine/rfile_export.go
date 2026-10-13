@@ -219,6 +219,9 @@ type RFileExportFile struct {
 	// Empty values are the legacy encoding of rfile/authoritative.
 	Format string `json:"format,omitempty"`
 	Role   string `json:"role,omitempty"`
+	// Lineage is the leaves the file holds (tablet.Lineage, #704); nil from
+	// an older producer. Older importers ignore it.
+	Lineage *tablet.Lineage `json:"lineage,omitempty"`
 }
 
 const (
@@ -303,7 +306,10 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 		return nil, fmt.Errorf("engine: table %q not found", tableName)
 	}
 
-	files := tbl.rfiles()
+	files, err := tbl.exportFiles()
+	if err != nil {
+		return nil, err
+	}
 	compatibility := exportCompatibility(files)
 	manifest := &RFileExportManifest{
 		Version:             RFileExportManifestVersion,
@@ -337,6 +343,7 @@ func (e *Engine) ExportRFiles(ctx context.Context, tableName string, dst storage
 			BCFileVersion:   bcVersion,
 			Format:          string(fileFormatForPath(f.Path)),
 			Role:            ExportRoleAuthoritative,
+			Lineage:         exportLineage(f.Lineage, opts),
 		})
 	}
 	// Group by tablet but keep each tablet's recency order (from rfiles):
@@ -1000,8 +1007,9 @@ func (e *Engine) ImportRFileManifest(ctx context.Context, manifest *RFileExportM
 	filesByTablet := make(map[int][]tablet.ImportedFile)
 	for _, file := range stagedFiles {
 		filesByTablet[file.TabletIndex] = append(filesByTablet[file.TabletIndex], tablet.ImportedFile{
-			Path:   file.DestinationPath,
-			Source: importSourceIdentity(file),
+			Path:    file.DestinationPath,
+			Source:  importSourceIdentity(file),
+			Lineage: file.Lineage,
 		})
 	}
 	importedPaths := func(files []tablet.ImportedFile) []string {
@@ -1388,6 +1396,7 @@ func hashObject(ctx context.Context, b storage.Backend, path string) (int64, str
 type tableRFile struct {
 	TabletIndex int
 	Path        string
+	Lineage     *tablet.Lineage // set by exportFiles only
 }
 
 func (t *table) rfiles() []tableRFile {
