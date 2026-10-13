@@ -501,7 +501,267 @@ rules apply from this commit until the run.
 
 ## Amendments
 
-None yet.
+### A1 (2026-10-13): router v2's artefacts, features and dev tuning
+
+**Reason.** Rule 2 allows amendments to add v2 artefacts under
+`pkg/router/testdata/eval/v2/` and pin them. This one adds router v2. Nothing
+above "## Amendments" changes. The split, the world, the baseline corpus, the
+metrics code, the comparators, the success criteria, the judge and the run
+harness (`v2run_test.go`) are unchanged. The leak guard and its grandfathered
+set are unchanged too. **No session doing this work opened the sealed
+split.**
+
+**Artefacts.**
+
+| File | Contents | SHA-256 |
+|---|---|---|
+| `cases.jsonl` | 503 train and 128 dev cases, no test case | `3e1fd3e1269f45815f9c9719ddb70bf391d3c8d92362cdc11050b7a7c0319082` |
+| `grammars/*.json` | 18 grammars, one per target, in `shoal.router.grammar/v1` | — |
+| `model/router-pair-v2.json` | the trained model, `router.pair/v2` | `6e7b0ab6c01ad938f8666aadeb214217ab59ab928af108541b7afba0476b82f3` |
+| `report-dev.md` | the harness's dev report (a golden, `TestV2DevReport`) | — |
+
+- **Train split.** v1's 292 cases, every split, relabelled train (v1's test
+  is spent), and 211 new cases `v2r-*`.
+- **Dev split.** 128 new cases `v2d-*`: 80 answerable and 48 unanswerable.
+- **Model.** It is trained on the train split alone (`TestV2ModelIsReproducible`
+  retrains it byte for byte). The recipe is v1's averaged perceptron, 30
+  epochs, 4 positive repeats, with an intercept offset of −1. The recipe
+  records the offset in a new `intercept_offset` field, omitted when zero, so
+  v1's recipe digest is unchanged.
+
+**Provenance (rule 5).** Each set was written once, on 2026-10-13, by its
+own agent session. Each session was told not to open the sealed split, and
+reports that it did not.
+
+- **Train (`v2r-*`).** Written by one session that read only `world.json`,
+  v1's `cases.jsonl` and v1's grammars.
+- **Dev (`v2d-*`).** Written by a second session that read only `world.json`
+  and v1's `cases.jsonl`. It saw no grammar, v1's or v2's, and no train case.
+- **Grammars and code.** Written by a third session, the author of this
+  amendment, from v1's grammars, v1's 292 cases, the new train texts and the
+  world. That session did not read dev texts until the first dev run, and
+  added no cue, pattern or enum phrase from dev afterwards.
+- **Overlap.**
+  - 11 train cases whose text repeated a dev text were dropped from train.
+  - After review, 15 dev cases whose template (entity mentions abstracted,
+    as the leak guard abstracts them) equalled a train template were dropped
+    from dev: 8 answerable and 7 unanswerable. They were removed, not
+    rewritten, because the only author available to rewrite them was the
+    grammar author.
+  - `TestV2CasesWellFormed` requires the two splits to be disjoint in both
+    texts and templates. It also checks every train and dev label against the
+    world, as `TestV2TestLabelsWellFormed` checks the sealed one.
+- **One model family.** The train, dev and test splits were all written by
+  sessions of one model family. Dev therefore likely correlates with test in
+  style more than independent human authors' splits would. Dev results are
+  not evidence about test-split behaviour beyond that correlation.
+- **The guard biases dev away from test.** The guard removed every dev case
+  that repeated a test phrase or template (below). What remains of dev is,
+  by construction, less test-like than what was written.
+- **Word audit (`TestV2GrammarWordsHaveProvenance`).** Every grammar word
+  occurs in some train or dev text, except six. Each of the six is an enum
+  phrase word kept from v1's grammars, and v1's erratum lists them as
+  occurring in no fixture text: `sev`, `1`, `2`, `3`, `forcefully` and
+  `graceful`.
+
+**Leak-guard findings (rule 4), before any commit.** Each flagged unit was
+removed from its source by a script that read only the guard's output
+(source, location, check). No flagged unit was looked at or re-added.
+
+- 48 train and dev cases were removed for phrase or template findings: 25
+  from dev and 23 from train.
+- 99 grammar strings were removed for word or bigram findings, each a cue, a
+  pattern or an enum phrase.
+- Removing test vocabulary from the grammars biases v2 against H1 and H2 by
+  construction. The dev numbers below are after these removals.
+
+**Code (what is evaluated).**
+
+- **`router.pair/v2` features** (`pkg/router/featuresv2.go`). The vector is
+  v1's nine features, unchanged and in the same positions, followed by twelve
+  more:
+  - stemmed cue and vocabulary recall;
+  - cue scoring: evidence weighted by 1/df over the visible candidates,
+    and the candidate's share, top flag, lead and deficit;
+  - partial, slot-anchored pattern matching: in order, gaps allowed, slots
+    only over whole fitting mentions;
+  - slot satisfiability from the lexicon (lookups use the graph-derived
+    templates' subject concepts);
+  - mention fit;
+  - the share of words no candidate knows.
+
+  Every feature is a scope-free number in [0, 1]. Comparisons are made within
+  the caller's visible catalog only.
+- **Schema selection.** `routershadow.Decider` takes the feature schema from
+  the served predictor's preprocessing ID. It builds the task
+  (`router.TaskSpecFor`) and the feature artifact for that schema. The task
+  differs per schema only in its input schema ID. A v1 model gets exactly
+  v1's task, artifact and receipt.
+- **Loading is unchanged.** No loader was added: `LoadWorld` and
+  `TestV2Readiness` are as sealed, and the readiness run now uses the real v2
+  artefacts, with no placeholder.
+- **Slot filling.** A node slot that the pattern tier filled now abstains as
+  `ambiguous_mention` when an unused mention of the same kind could have
+  filled it ("restart ledger and inventory in staging"). Before, the first
+  service won silently. This is the documented contract of `fill`. It applies
+  to the baseline too. v1's train, dev and test reports are unchanged by it,
+  so frozen v1 scores as before.
+  - **Same-node exception (found in review, not on dev).** A second mention
+    of the node already filled is no rival: "restart ledger in prod, the
+    ledger service" names one service. A unit test pins it. Dev numbers did
+    not move.
+- **v2 features only when served.** `Analyze` computes v1's features alone.
+  `router.pair/v2`'s are computed on first use, when a v2 model is served, so
+  v1 serving does the same work as before and v1's benchmarks stand.
+- **Training refuses bad input.** `router.TrainVectors` refuses an example of
+  the wrong width instead of skipping it.
+
+**Dev tuning decisions.**
+
+1. The intercept offset of −1 was chosen from a sweep on dev: epochs {30,
+   60} × positive repeats {2, 4, 8} × offset {0, −0.25, −0.5, −1, −1.5, −2}.
+   The pick was 30, 4 and −1, the smallest offset that left at most 2 wrong
+   proposals at no loss of end-to-end accuracy. The sweep ran before the
+   leak-guard removals, and was not rerun after them.
+2. The slot-filling rule above was added after a dev case named two services
+   for one slot and got a proposal.
+3. Three enum inflections without train or dev provenance were removed. The
+   word audit drove this, not a dev result.
+
+**Dev runs, exactly.** This is the author's reconstruction from the session
+log. A "run" is one test invocation that computed router v2's dev results.
+
+| Phase | Runs | What was seen |
+|---|---|---|
+| Before any v2 grammar or model existed (`TestV2Readiness` inside full-package runs, with v1's model as placeholder) | 2 | pass or fail only |
+| First v2 model, intercept offset 0 | 3 | the report twice; once the list of wrong dev cases, with their texts (24 cases) |
+| The recipe sweep, one invocation of 36 recipes | 1 | per-recipe counts |
+| Offset −1 chosen; before the guard's grammar removals | 3 | the report, and once more the list of wrong dev cases (23) |
+| After the 99 grammar removals and the 3 inflection removals | 7 | the report; pass or fail |
+| After the review fixes (same-node exception, the 15 dev removals) | 4 | the report; pass or fail |
+
+- **What changed after a dev run:** the intercept offset (decision 1) and the
+  slot-filling rule (decision 2). Nothing else.
+- **What did not change after any dev run:** the `router.pair/v2` feature
+  definitions, the stemmer's suffix rules and the `partial` matcher. All
+  three were written once, before the train and dev cases existed, and so
+  before the first dev run and before the guard's 99 grammar removals. The
+  later edits to `featuresv2.go` only make the computation lazy; they change
+  no value, and the unchanged dev report shows it.
+- **Grammar edits after a dev run:** only removals. These are the guard's 99
+  (rule 4) and the audit's 3. No cue, pattern or enum phrase was added after
+  the first dev run.
+
+**Dev results** (`TestV2DevReport`, 128 cases, 80 answerable and 48
+unanswerable, after the review fixes):
+
+| Metric | router v2 | baseline (v2 grammars) | frozen v1 | baseline (v1 grammars) |
+|---|---|---|---|---|
+| Target precision | 55 of 56 (98.2%) | 31 of 31 | 5 of 5 | 24 of 24 |
+| End-to-end | 103 of 128 (80.5%) | 79 of 128 (61.7%) | 53 of 128 (41.4%) | 72 of 128 (56.2%) |
+| Coverage | 56 of 80 (70.0%) | 31 of 80 (38.8%) | 5 of 80 (6.2%) | 24 of 80 (30.0%) |
+| Abstention | 72 of 128 | 97 of 128 | 123 of 128 | 104 of 128 |
+| Correct abstention | 48 of 48 | 48 of 48 | 48 of 48 | 48 of 48 |
+| Slot exact-match | 55 of 55 | 31 of 31 | 5 of 5 | 24 of 24 |
+
+Paired comparisons on dev:
+
+| Pair | First only | Second only | Exact McNemar p |
+|---|---|---|---|
+| router v2 against the baseline, end-to-end | 27 | 3 | 8.4 × 10⁻⁶ |
+| router v2 against frozen v1, end-to-end | 50 | 0 | 1.8 × 10⁻¹⁵ |
+| router v2 against frozen v1, coverage | 51 | 0 | 8.9 × 10⁻¹⁶ |
+
+The harness prints "Primary outcome: negative" on dev. That verdict is not
+about the router: `judgeV2` requires G2's denominator to be the sealed
+split's 112 unanswerable cases, and dev has 48, so G2 cannot hold on dev. Dev
+numbers are a tuning signal, not a result. They are optimistic for the test
+split because the recipe was chosen on dev.
+
+**Leak-guard findings on the model.** The guard reported two word findings
+in `model/router-pair-v2.json`, at fixed strings of the
+`internal/decisionlinear` model format. Rule 4's remedy (remove the unit) is
+not available for them, and this amendment does not change the guard. A2
+resolves them.
+
+### A2 (2026-10-13): model files are audited with the phrase and template checks only
+
+**Reason.** This resolves the open item of A1. Rule 4 of "Leak prevention"
+says the guard's rules change only by amendment, and this is that
+amendment. Nothing above
+"## Amendments" changes. The split, the world, the baseline corpus, the
+metrics, the comparators, the success criteria, the judge, the run harness,
+the grammars, the cases and the model are unchanged. So are the router and
+the grandfathered set. **The author of this amendment never opened,
+decompressed or read the sealed split, and never saw the two flagged units.**
+The author knows of them only through the guard's output (source, string
+index, check, hash), as A1 reports it.
+
+**What changed.**
+
+- Files under `pkg/router/testdata/eval/v2/model/` now get **only the phrase
+  and template checks**, as `external/` resources and Go literals already
+  do. Before, they got every check, as "Which checks apply where" in rule 3
+  says ("the model").
+- Grammars, lexicon files, recipes and every other data cue source under the
+  v2 fixture tree still get every check. Case texts and `external/` are
+  unchanged.
+- The code: `phraseOnlyFixture` in `pkg/router/eval/leakaudit.go`, which the
+  collector `v2CueSources` in `leak_test.go` uses.
+- The mutation check changes to match. A test-only word "as a model feature"
+  no longer fails the guard. These now do fail it:
+  - planting a test text in a model file;
+  - planting a test template in a model file;
+  - planting a test-only word in a recipe;
+  - planting a test-only pair in a lexicon file.
+
+  A model file holding every test-only word and a test-only pair gets no
+  word or bigram finding.
+- `TestV2PhraseOnlyScope` pins which paths the collector marks phrase-only:
+  model files, `external/` files and case files are; grammar, lexicon and
+  recipe files are not. `TestLeakGuardCatchesLeaks` plants one test-only
+  word, through the real collector, in a grammar, a lexicon file, a recipe
+  and a model. Only the model gets no word finding. Making grammars
+  phrase-only fails both tests; this was checked before this commit.
+
+**Why.**
+
+1. **The two findings are at fixed strings of the model format.** The model
+   is `internal/decisionlinear`'s format, and both flagged strings are fixed
+   by it. Neither was written for this evaluation, and neither can be
+   changed for one.
+2. **Rule 4's remedy is not available.** The harness fixes the model's path
+   and the provider's strict format fixes those strings. Removing the unit
+   would make a model the harness cannot load. Changing the format would
+   change the provider that serves v1's frozen model too, which is outside
+   what this evaluation tests.
+3. **A model's cue content comes from sources that are already audited.** The
+   model is generated: `TestV2ModelIsReproducible` retrains it byte for byte
+   from the train split, with features computed over the grammars (A1). Its
+   weights are numbers. Every
+   grammar string gets the word and bigram checks, and every train text gets
+   the phrase and template checks. A test word can therefore reach the model
+   only through one of these sources, and the guard audits those sources.
+   Word checks on the model add nothing for its cue content. They catch only
+   the format's own keys and labels, which are the same for every model and
+   which no author chose.
+
+**Residual.** A model could in principle encode a test word only through a
+string of its own: a feature name, a label or a key. In this format none of
+those strings is learned from text. Feature names, labels and keys are fixed
+by the format and the feature schema (`router.pair/v2`'s features are
+positional, scope-free numbers, A1). A future model format that learned
+strings from text, such as a vocabulary or a hashed-feature table written
+out as words, would fall under the phrase and template checks alone. Such a
+format needs its own amendment to restore the word and bigram checks on it,
+or to audit its learned strings as a separate source. The phrase and template
+checks still catch a test text or template copied into any model file.
+
+**Effect.** `TestNoTestPhrasingInCueSources` now passes on the v2 artefacts
+of A1, unchanged. Because of this amendment, the two word findings of A1 do
+not occur. They never reached a commit on the main branch. They are
+recorded here by source, location and check (`model/router-pair-v2.json`,
+strings 10 and 14, word), and their hashes are not repeated.
 
 ## Results
 

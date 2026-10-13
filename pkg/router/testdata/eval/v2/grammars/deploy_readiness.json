@@ -1,0 +1,45 @@
+{
+  "schema": "shoal.router.grammar/v1",
+  "target": {
+    "kind": "decision",
+    "profile": "deploy-readiness"
+  },
+  "cues": [
+    "ready",
+    "readiness",
+    "ship",
+    "deploy",
+    "release",
+    "green"
+  ],
+  "patterns": [
+    "is {service} ready to deploy to {environment}",
+    "is {service} ready for {environment}",
+    "can {service} ship to {environment}",
+    "are we clear to deploy {service} to {environment}",
+    "is it ok to release {service} to {environment}",
+    "ready to release {service} to {environment}",
+    "is {service} release ready for {environment}",
+    "deploy readiness for {service} in {environment}",
+    "can {service} be promoted to {environment}",
+    "green light for {service} in {environment}"
+  ],
+  "slots": [
+    {
+      "name": "service",
+      "node_kinds": [
+        "service"
+      ]
+    },
+    {
+      "name": "environment",
+      "node_kinds": [
+        "environment"
+      ]
+    }
+  ],
+  "input": {
+    "service": "$service",
+    "environment": "$environment"
+  }
+}

@@ -179,6 +179,26 @@ accurate. It proposed nothing wrong. v2 is pre-registered in
 [router-evaluation-v2.md](router-evaluation-v2.md), with a fresh test split
 sealed before any v2 grammar or model work.
 
+**Router v2 (dev-tuned; its test split is still sealed).** v2 depends less on
+whole-pattern matches. It adds the `router.pair/v2` features, which are v1's
+nine followed by twelve more:
+
+- stemmed cue and vocabulary recall;
+- cue evidence weighted by how few visible candidates share a word, and
+  compared across the caller's catalog;
+- partial, slot-anchored pattern matching (in order, gaps allowed, slots only
+  over whole fitting mentions);
+- slot satisfiability from the lexicon, using the graph-derived lookup
+  templates' subject concepts.
+
+How it fits the rest:
+
+- The decider serves whichever schema the model pins, so v1's model still
+  gets exactly v1's task and evidence.
+- The authority structure is unchanged.
+- Its artefacts, provenance and dev results are amendment A1 of the v2
+  protocol.
+
 **Disclosure.** Tests compose the real authorized client (memory and durable
 policy stores), fleet registry and auth decisions. They build two worlds:
 one with a hidden descriptor, action executor, decision profile, node and

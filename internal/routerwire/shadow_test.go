@@ -102,6 +102,36 @@ func TestHiddenIsIndistinguishableFromNonexistent(t *testing.T) {
 	})
 }
 
+// TestHiddenIsIndistinguishableFromNonexistentV2 repeats the disclosure check
+// with router v2's model served. router.pair/v2 compares candidates within a
+// catalog, so a hidden target must still change nothing alice sees.
+func TestHiddenIsIndistinguishableFromNonexistentV2(t *testing.T) {
+	servedModel, servedRelease = modelV2Raw, "router-pair-v2:test"
+	t.Cleanup(func() { servedModel, servedRelease = modelRaw, "router-pair-v1:test" })
+	withPolicyStores(t, func(t *testing.T, store func() authorized.PolicyStore) {
+		hidden := newWorld(t, store(), true)
+		absent := newWorld(t, store(), false)
+		for _, text := range disclosureTexts {
+			h := hidden.route(hidden.alice(), text)
+			a := absent.route(absent.alice(), text)
+			if !bytes.Equal(h.Proposal, a.Proposal) || h.Err != a.Err {
+				t.Errorf("%q differs:\nhidden %s %s\nabsent %s %s", text, h.Proposal, h.Err, a.Proposal, a.Err)
+			}
+		}
+		p := decodeProposal(t, hidden.route(hidden.alice(), "restart payments in prod"))
+		if p.Receipt.FeatureSchemaID != router.FeatureSchemaV2ID {
+			t.Fatalf("receipt feature schema = %q, want %q", p.Receipt.FeatureSchemaID, router.FeatureSchemaV2ID)
+		}
+		task, err := router.TaskSpecFor(router.FeatureSchemaV2ID)
+		if err != nil || p.Receipt.TaskID != task.ID() {
+			t.Fatalf("receipt task = %s, want the router.pair/v2 task (%v)", p.Receipt.TaskID, err)
+		}
+		if p := decodeProposal(t, hidden.route(hidden.alice(), "rotate credentials for payments")); p.Kind != router.KindAbstain {
+			t.Fatalf("hidden target fired under v2: %+v", p)
+		}
+	})
+}
+
 // TestProposalCannotBypassApproval: the router's proposal for an action that
 // requires approval, passed verbatim to Enqueue, is still held; nothing is
 // stored.

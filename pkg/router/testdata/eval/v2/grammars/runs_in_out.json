@@ -1,0 +1,28 @@
+{
+  "schema": "shoal.router.grammar/v1",
+  "target": {
+    "kind": "lookup",
+    "template": "lookup:runs_in:out"
+  },
+  "cues": [
+    "run",
+    "running",
+    "where",
+    "deployed",
+    "environments",
+    "envs"
+  ],
+  "patterns": [
+    "where does {subject} run",
+    "which environments does {subject} run in",
+    "where is {subject} running",
+    "where is {subject} deployed",
+    "what envs is {subject} in",
+    "{subject} where is it deployed"
+  ],
+  "slots": [
+    {
+      "name": "subject"
+    }
+  ]
+}

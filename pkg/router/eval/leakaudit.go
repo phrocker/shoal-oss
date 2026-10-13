@@ -44,7 +44,10 @@ import (
 // A source marked PhraseOnly (train and dev case texts, general-purpose
 // resources) gets only the phrase and template checks: an independent author
 // writing natural paraphrases would otherwise trip the word and bigram
-// checks by chance, and each trip would tell them a test word.
+// checks by chance, and each trip would tell them a test word. Trained model
+// files are phrase-only too (amendment A2): their strings are the model
+// format's fixed keys and labels, and their cue content derives from the
+// grammars and train texts, which are audited themselves.
 //
 // A finding names the source, a location in it, the check and the SHA-256
 // of "<check>:<unit>". It never holds the unit itself, so a CI log is not an
@@ -66,6 +69,16 @@ type LeakSource struct {
 	Locations []string
 	// PhraseOnly limits the source to the phrase and template checks.
 	PhraseOnly bool
+}
+
+// phraseOnlyFixture reports whether a file of the v2 fixture tree, named by
+// its path relative to the tree, gets only the phrase and template checks:
+// general-purpose resources under external/ and trained models under model/
+// (amendment A2). Case files are phrase-only on their texts too; the
+// collector handles them by name. Everything else (grammars, lexicon files,
+// recipes) gets every check.
+func phraseOnlyFixture(p string) bool {
+	return strings.HasPrefix(p, "external/") || strings.HasPrefix(p, "model/")
 }
 
 // LeakFinding is one leak. It holds no test text and no test word.

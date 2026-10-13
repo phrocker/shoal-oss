@@ -32,8 +32,9 @@ type Input struct {
 }
 
 type candAnalysis struct {
-	best     *match
-	features [NumFeatures]float64
+	best       *match
+	features   [NumFeatures]float64
+	featuresV2 [NumFeaturesV2]float64
 }
 
 // Analysis is one text matched against one catalog: every candidate's best
@@ -45,6 +46,9 @@ type Analysis struct {
 	concepts map[shoal.ID]shoal.ID
 	early    Reason
 	cands    []candAnalysis
+	// featurizedV2 reports that the router.pair/v2 features are computed.
+	// They are computed on first use, so only when a v2 model is served.
+	featurizedV2 bool
 }
 
 // Analyze matches the text against every visible candidate. It fails only on
