@@ -408,8 +408,16 @@ Operator steps:
    table, give a bare table a WAL, or replay a WAL), it refuses a directory
    with no policy catalog, a catalog with unflushed writes (a non-empty
    `wal.log`: the workspace is running, or stopped without a clean shutdown),
-   and a catalog with no committed records. Stop the workspace cleanly and run
-   it then.
+   and a catalog with no committed records. It also refuses a catalog that a
+   running `shoal-explore-web` or `shoal-mcp` (or another listing) has open,
+   even an idle one: every process that opens the policy catalog holds an
+   exclusive lock on `.shoal-policy-catalog.lock` in its directory for as long
+   as it has the catalog open, and the listing tries that lock without
+   waiting (#686). The kernel releases the lock when its process exits, so the
+   file a crashed workspace leaves behind blocks nothing; do not delete it.
+   The listing never creates the lock file, so it refuses a catalog that no
+   workspace of this version has opened yet. Stop the workspace cleanly and
+   run it then.
 5. **Relabel** each listed document by ingesting its content again under a
    **new source URI**, with labels inside the charset, as a principal holding
    them. The original cannot be relabelled in place: the untranslatable
@@ -509,8 +517,8 @@ service role). The first line counts the attempts that have no `pre_commit`
 record: those never reached the registration. Every caller-supplied string is
 Go-quoted. The listing opens the catalog exactly as
 `-list-untranslatable-labels` does, so it writes nothing and refuses a
-directory with no catalog or with unflushed writes. Stop the workspace cleanly
-first.
+directory with no catalog, with unflushed writes, or open in a running
+workspace. Stop the workspace cleanly first.
 
 The listing is **offline only**, by design. The records hold the old and new
 label names in the clear, just as the catalog's rules do. An operator who can

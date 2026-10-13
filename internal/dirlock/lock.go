@@ -59,7 +59,19 @@ func AcquireExisting(directory, name string) (*Lock, error) {
 	return acquire(directory, name, false)
 }
 
+// AcquireExistingFile is AcquireExisting for a lock file that must already
+// exist too, for a reader that must not write the directory at all: it
+// creates neither, and only opens and locks the lock file. A missing
+// directory or lock file is an error wrapping fs.ErrNotExist.
+func AcquireExistingFile(directory, name string) (*Lock, error) {
+	return acquireLock(directory, name, false, false)
+}
+
 func acquire(directory, name string, create bool) (*Lock, error) {
+	return acquireLock(directory, name, create, true)
+}
+
+func acquireLock(directory, name string, create, createFile bool) (*Lock, error) {
 	if strings.TrimSpace(directory) == "" {
 		return nil, errors.New("directory lock: directory is required")
 	}
@@ -85,7 +97,13 @@ func acquire(directory, name string, create bool) (*Lock, error) {
 	held.paths[identity] = struct{}{}
 	held.Unlock()
 
-	file, err := os.OpenFile(filepath.Join(canonical, name), os.O_CREATE|os.O_RDWR, 0o600)
+	// Opened for writing even when it must not be created, though nothing is
+	// written to it: NFS emulates flock with a write lock, which needs it.
+	flags := os.O_RDWR
+	if createFile {
+		flags |= os.O_CREATE
+	}
+	file, err := os.OpenFile(filepath.Join(canonical, name), flags, 0o600)
 	if err != nil {
 		releaseIdentity(identity)
 		return nil, fmt.Errorf("directory lock: open lock file: %w", err)
