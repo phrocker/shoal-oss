@@ -844,6 +844,7 @@ func encodeFleetAction(record fleet.ActionRecord) fleetActionWire {
 		AgentID: encodeFleetID(record.AgentID), AgentGeneration: record.AgentGeneration,
 		Capability: record.Capability, Action: record.Action,
 		Output:          append(json.RawMessage(nil), record.Output...),
+		OutputWithheld:  record.OutputWithheld,
 		ErrorCode:       record.ErrorCode,
 		ErrorCodeOrigin: string(record.ErrorCodeOrigin),
 		Effected:        encodeEffected(record.Effected),

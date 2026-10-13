@@ -642,6 +642,16 @@ func encodeAction(record fleet.ActionRecord) ([]byte, error) {
 	if err := record.Validate(); err != nil {
 		return nil, err
 	}
+	// OutputWithheld is a read-path value: readableRecords sets it on the
+	// copy it hands a reader, and no writer produces it. Storing one would
+	// make a redaction durable — the record would then read as withheld to
+	// everyone, including the principals the marker exists to serve — so it
+	// is refused here rather than trusted not to arrive (#696).
+	if record.OutputWithheld {
+		return nil, shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"a withheld-output marker is a read-path value and is not stored")
+	}
 	var buffer bytes.Buffer
 	buffer.Write(dispatchMagic)
 	if err := gob.NewEncoder(&buffer).Encode(record); err != nil {

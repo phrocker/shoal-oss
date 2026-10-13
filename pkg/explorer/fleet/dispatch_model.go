@@ -454,7 +454,18 @@ type ActionRecord struct {
 	ObjectID        shoal.ID
 	Input           json.RawMessage
 	Output          json.RawMessage
-	ErrorCode       string
+	// OutputWithheld marks a read whose Output was removed because the
+	// reader may not see the evidence it was derived from (#696).
+	//
+	// A read-path value: no writer sets it, and the stored record never
+	// carries it. It exists so that a succeeded record without an Output is
+	// a state the system can produce and describe, rather than one Validate
+	// refuses and a reader therefore decodes as "something was withheld".
+	// The marker says that outright, which is a deliberate concession and
+	// only to the action's own principal — every other reader is answered as
+	// though the action did not exist.
+	OutputWithheld bool
+	ErrorCode      string
 	// Effected is how much of an irreversible egress happened before a
 	// failure, for the boundary where a failure follows a partial effect
 	// (#427). Zero on every other record, including every success: a
@@ -1456,8 +1467,15 @@ func (r ActionRecord) Validate() error {
 	// than asserting it, and the store refuses to let it fall (#461). So a
 	// terminal record carrying false now means something: this action could
 	// not have had an external effect.
-	if r.State == DispatchSucceeded && len(r.Output) == 0 {
+	if r.State == DispatchSucceeded && len(r.Output) == 0 && !r.OutputWithheld {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "successful action outcome is incomplete")
+	}
+	// A marker without a removal, or on a record that never had an Output to
+	// remove, would let a writer assert a redaction that did not happen.
+	if r.OutputWithheld && len(r.Output) > 0 {
+		return shoal.NewError(
+			shoal.ErrorInvalidArgument,
+			"action output cannot be both present and withheld")
 	}
 	if r.State == DispatchFailed && r.ErrorCode == "" {
 		return shoal.NewError(shoal.ErrorInvalidArgument, "failed action outcome is incomplete")

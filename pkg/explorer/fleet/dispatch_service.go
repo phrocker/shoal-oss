@@ -3905,11 +3905,51 @@ func (s *DispatchService) structuredEvidence(
 func (s *DispatchService) readableRecord(
 	ctx context.Context, record ActionRecord,
 ) (ActionRecord, error) {
-	readable, err := s.readableRecords(ctx, []ActionRecord{record})
+	readable, withheld, err := s.readableRecords(ctx, []ActionRecord{record})
 	if err != nil {
 		return ActionRecord{}, err
 	}
+	if withheld[0] {
+		// Absent, not empty: see outputReadableBy. The reply is the one an
+		// action that was never enqueued gets (#398).
+		return ActionRecord{}, auth.ObjectNotFound()
+	}
 	return readable[0], nil
+}
+
+// outputReadableBy reports whether this reader may be told that an Output
+// existed at all, which decides what a withheld record looks like to it.
+//
+// Output is executor-supplied, checked only against the descriptor's
+// OutputSchema, and carries no labels and no binding to the evidence it was
+// derived from — so a reader whose references are withheld must not be handed
+// what was derived from them (#696). The built-in ask executor also writes
+// EvidenceCount and EvidenceConsidered into it, which compared against a
+// shortened reference list say that labelled evidence existed: the count
+// oracle #398 forbids.
+//
+// Removing it has to leave a state the system can produce. Validate refuses
+// DispatchSucceeded with an empty Output, so a succeeded record carrying none
+// is impossible and a reader decodes the absence as withholding. OutputWithheld
+// makes the removal explicit and legal instead — which says outright what the
+// absence would have implied, so it is a concession, not a concealment, and
+// is made only to readers already entitled to know:
+//
+//   - The action's own principal enqueued it, and the claimant produced the
+//     Output. Both already know the action exists and what it did; telling
+//     them their own action cited evidence they may not see reveals nothing
+//     about anyone else's. A claimant whose grants have since narrowed is
+//     exactly the own-principal case and takes the same answer.
+//   - Every other reader — the TeamActions audience #696 is about — is told
+//     the action does not exist, because for them a marker would be the
+//     disclosure the marker exists to make.
+func outputReadableBy(decision auth.Decision, record ActionRecord) bool {
+	// standingOn asks exactly this: is the caller the action's own principal
+	// or its claimant. Reusing it keeps the two from drifting apart, and
+	// removes a body character-for-character identical to another function —
+	// which already cost a mutation run, where a replace-first patch
+	// mutated standingOn and the surviving mutant read as a passing test.
+	return standingOn(decision, record)
 }
 
 // readableRecords is the one funnel: every dispatch read that returns a
@@ -3924,19 +3964,41 @@ func (s *DispatchService) readableRecord(
 // bounded number of catalog reads however many references it carries.
 func (s *DispatchService) readableRecords(
 	ctx context.Context, records []ActionRecord,
-) ([]ActionRecord, error) {
+) ([]ActionRecord, []bool, error) {
+	// Resolved lazily, and only for a record that has an Output to withhold.
+	// Most reads never reach that branch, and a service assembled without a
+	// resolver must not be asked a question it cannot answer until it has to
+	// be.
+	var reader auth.Decision
+	var readerErr error
+	readerResolved := false
+	resolveReader := func() (auth.Decision, error) {
+		if readerResolved {
+			return reader, readerErr
+		}
+		readerResolved = true
+		if s.resolver == nil {
+			readerErr = shoal.NewError(
+				shoal.ErrorInternal,
+				"dispatch read cannot identify its reader")
+			return reader, readerErr
+		}
+		reader, readerErr = s.resolver.Resolve(ctx)
+		return reader, readerErr
+	}
 	var references []EvidenceRef
 	for _, record := range records {
 		references = append(references, record.Evidence...)
 	}
-	verdicts, err := evidencelabels.Verdicts(
+	verdicts, verdictErr := evidencelabels.Verdicts(
 		ctx, s.evidenceVisibility, s.evidenceNodes, references,
 		func(reference EvidenceRef) []string { return reference.Visibility },
 		evidenceGraph)
-	if err != nil {
-		return nil, err
+	if verdictErr != nil {
+		return nil, nil, verdictErr
 	}
 	result := make([]ActionRecord, len(records))
+	unreadable := make([]bool, len(records))
 	offset := 0
 	for index, record := range records {
 		count := len(record.Evidence)
@@ -3944,13 +4006,33 @@ func (s *DispatchService) readableRecords(
 			record.Evidence, verdicts[offset:offset+count])
 		offset += count
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !withheld {
 			result[index] = record
 			continue
 		}
+		if len(record.Output) > 0 {
+			// A failure to identify the reader is the question failing, not
+			// an answer about this record: a cancelled context or a resolver
+			// outage says nothing about who is asking. Returned rather than
+			// folded into not-found, so an infrastructure fault does not
+			// read to every caller — including the action's own principal —
+			// as though its action had ceased to exist.
+			decision, decisionErr := resolveReader()
+			if decisionErr != nil {
+				return nil, nil, decisionErr
+			}
+			if !outputReadableBy(decision, record) {
+				unreadable[index] = true
+				continue
+			}
+		}
 		redacted := cloneActionRecord(record)
+		if len(record.Output) > 0 {
+			redacted.Output = nil
+			redacted.OutputWithheld = true
+		}
 		if len(readable) == 0 {
 			// Exactly a record that never had evidence: Validate refuses a
 			// snapshot pin without evidence, and the wire emits the pin, so a
@@ -3965,7 +4047,7 @@ func (s *DispatchService) readableRecords(
 		}
 		result[index] = redacted
 	}
-	return result, nil
+	return result, unreadable, nil
 }
 
 // evidenceGraph is what a reference names in the corpus. Every assertion is on
@@ -3997,10 +4079,20 @@ func evidenceGraph(reference EvidenceRef) evidencelabels.Graph {
 func (s *DispatchService) readablePage(
 	ctx context.Context, page ActionPage,
 ) (ActionPage, error) {
-	readable, err := s.readableRecords(ctx, page.Actions)
+	readable, withheld, err := s.readableRecords(ctx, page.Actions)
 	if err != nil {
 		return ActionPage{}, err
 	}
-	copy(page.Actions, readable)
+	// Dropped, not emptied. Next is the scan's cursor rather than a count,
+	// so a shorter page still pages correctly, and a reader who may not be
+	// told an Output existed may not be handed the record that says so.
+	kept := page.Actions[:0]
+	for index, record := range readable {
+		if withheld[index] {
+			continue
+		}
+		kept = append(kept, record)
+	}
+	page.Actions = kept
 	return page, nil
 }

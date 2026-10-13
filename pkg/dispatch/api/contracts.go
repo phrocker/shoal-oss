@@ -300,15 +300,21 @@ type AmbiguityReport struct {
 // Action is an action record as every dispatch route returns it. Input and
 // ExecutorKey are populated on the claim response only.
 type Action struct {
-	ID               string            `json:"id"`
-	Version          uint64            `json:"version"`
-	State            DispatchState     `json:"state"`
-	AgentID          string            `json:"agent_id"`
-	AgentGeneration  int64             `json:"agent_generation"`
-	Capability       string            `json:"capability"`
-	Action           string            `json:"action"`
-	Input            json.RawMessage   `json:"input,omitempty"`
-	Output           json.RawMessage   `json:"output,omitempty"`
+	ID              string          `json:"id"`
+	Version         uint64          `json:"version"`
+	State           DispatchState   `json:"state"`
+	AgentID         string          `json:"agent_id"`
+	AgentGeneration int64           `json:"agent_generation"`
+	Capability      string          `json:"capability"`
+	Action          string          `json:"action"`
+	Input           json.RawMessage `json:"input,omitempty"`
+	Output          json.RawMessage `json:"output,omitempty"`
+	// OutputWithheld says the Output was removed because the reader may not
+	// see the evidence it was derived from (#696). Without it a succeeded
+	// action would arrive with no output at all, which is a state the
+	// service cannot produce and a client would have to decode as a
+	// redaction; this states it instead.
+	OutputWithheld   bool              `json:"output_withheld,omitempty"`
 	ErrorCode        string            `json:"error_code,omitempty"`
 	ErrorCodeOrigin  string            `json:"error_code_origin,omitempty"`
 	Effected         *Effected         `json:"effected,omitempty"`

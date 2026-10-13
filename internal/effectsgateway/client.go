@@ -339,6 +339,12 @@ type Action struct {
 	Action          string
 	Input           json.RawMessage
 	Output          json.RawMessage
+	// OutputWithheld says the Output was removed because this reader may not
+	// see the evidence it was derived from (#696). Carried so a worker does
+	// not see a succeeded action with no output and no reason, which is a
+	// state the service cannot produce and would otherwise have to be
+	// guessed at.
+	OutputWithheld  bool
 	ErrorCode       string
 	Deadline        time.Time
 	CreatedAt       time.Time
@@ -387,7 +393,8 @@ func actionFrom(record dispatchapi.Record) Action {
 		ID: record.ID, Version: record.Version, State: record.State,
 		AgentID: record.AgentID, AgentGeneration: record.AgentGeneration,
 		Capability: record.Capability, Action: record.Action,
-		Input: record.Input, Output: record.Output, ErrorCode: record.ErrorCode,
+		Input: record.Input, Output: record.Output,
+		OutputWithheld: record.OutputWithheld, ErrorCode: record.ErrorCode,
 		Deadline: record.Deadline, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 		ClaimID: record.ClaimID, ClaimFence: record.ClaimFence,
 		ClaimLeaseUntil: record.ClaimLeaseUntil, EffectPossible: record.EffectPossible,
