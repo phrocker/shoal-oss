@@ -1218,7 +1218,26 @@ type DispatchConfig struct {
 	// for the same reason Attestations takes it. A plane that cannot evaluate
 	// a label must not hand out identifiers the label exists to protect
 	// (#369).
-	EvidenceVisibility EvidenceVisibility
+	// ClosedErrorVocabulary moves executor failure codes from phase 1 of
+	// #740 to phase 2.
+	//
+	// Off, the default: a reported code is adjudicated when it fails the
+	// token shape. That takes the channel from a kilobyte of free text to
+	// one line of it, and strands nothing.
+	//
+	// On: a code the action's descriptor does not declare is adjudicated,
+	// which is what actually closes the channel — a vocabulary fixed before
+	// the work runs cannot carry what the work read.
+	//
+	// Flagged rather than switched on, because declaring a vocabulary
+	// changes the registry digest and therefore the descriptor's
+	// generation, and a record pinned to the previous generation is refused
+	// at claim. An operator must be able to declare, let in-flight work
+	// settle, and then flip — three steps whose timing is theirs, rather
+	// than a forced choice at upgrade between losing every code and
+	// stranding queued work.
+	ClosedErrorVocabulary bool
+	EvidenceVisibility    EvidenceVisibility
 	// EvidenceLabels translates, when an executor's evidence is recorded,
 	// the free-form ingest labels on each reference into the structured
 	// label-policy terms EvidenceVisibility can decide (#564, #570).
@@ -1663,11 +1682,18 @@ func validateReportedActionErrorCode(value string) error {
 // The code is not echoed. It is the caller-controlled bytes this refusal
 // exists to keep out of the record, and an error carrying it would put them
 // in a log and a response body instead.
+//
+// The shape only, not the declared vocabulary. This runs before the action
+// is resolved, and the vocabulary is a property of the action. Under a
+// closed vocabulary (#740 phase 2) an admission report naming a well-shaped
+// but undeclared code therefore still reaches the completion path and is
+// adjudicated there, spending its token — the cost this function exists to
+// avoid, narrowed to the one case it cannot see. See #758.
 func validateAdmittedActionErrorCode(value string) error {
 	if err := validateReportedActionErrorCode(value); err != nil {
 		return err
 	}
-	if reportedErrorCodeIsAdjudicated(value) {
+	if reportedErrorCodeFailsShape(value) {
 		return shoal.NewError(
 			shoal.ErrorInvalidArgument,
 			"an admitted action error code must be a lowercase token of at "+

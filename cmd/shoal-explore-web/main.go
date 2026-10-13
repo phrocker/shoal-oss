@@ -297,6 +297,24 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 			"this on only once every replica runs this build; while it is off, "+
 			"nothing writes them and rolling back is safe",
 	)
+	closedErrorVocabulary := flags.Bool(
+		"fleet-closed-error-vocabulary", false,
+		"Record an executor's failure code only when the action's "+
+			"descriptor declares it, replacing any other with "+
+			"invalid_executor_error under service origin (#740). Without "+
+			"this a reported code is checked only against the token shape, "+
+			"which bounds it to 64 bytes but does not stop an executor "+
+			"putting content it read from labelled evidence there — a "+
+			"lowercase token is still readable text. Only a vocabulary "+
+			"fixed before the work runs cannot carry what the work read. "+
+			"Declaring a vocabulary changes the descriptor's registry "+
+			"digest and so its generation, and a queued record pinned to "+
+			"the previous generation is refused at claim, so the order is: "+
+			"declare the codes, let in-flight work settle, then turn this "+
+			"on. While it is off nothing is adjudicated for being "+
+			"undeclared. An action that declares nothing has every code "+
+			"replaced once this is on",
+	)
 	movedPublicationGuard := flags.Bool(
 		"fleet-event-publication-guard", false,
 		"Write fleet-event publications under their own coordination guard "+
@@ -784,6 +802,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		// #655: off until the operator says every replica can read them.
 		terminalStates:        *approvalTerminalStates,
 		movedPublicationGuard: *movedPublicationGuard,
+		closedErrorVocabulary: *closedErrorVocabulary,
 		// #664: off unless the operator requires a reason code.
 		requireDeclassificationReason: *requireDeclassificationReason,
 		maxNodeAdjacency:              uint32(*maxNodeAdjacency),
@@ -1314,6 +1333,10 @@ type serviceConfig struct {
 	// whether new fleet-event publications take their own guard letter
 	// rather than the one fleet approvals share.
 	movedPublicationGuard bool
+	// closedErrorVocabulary is -fleet-closed-error-vocabulary (#740): that
+	// an executor-reported failure code is recorded only when the action's
+	// descriptor declares it.
+	closedErrorVocabulary bool
 	// requireDeclassificationReason is -require-declassification-reason
 	// (#664): authorized.Config.RequireDeclassificationReason.
 	requireDeclassificationReason bool
@@ -1610,6 +1633,7 @@ func openService(
 				Translator: client.LabelTranslator(),
 				Nodes:      client.NodeGate(),
 			},
+			dispatchOptions(config.closedErrorVocabulary)...,
 		)
 		if err != nil {
 			store.Close()
@@ -2060,4 +2084,17 @@ func eventComposeOptions(
 		return always
 	}
 	return append(always, explorerfleetevents.WithMovedPublicationGuard())
+}
+
+// dispatchOptions is -fleet-closed-error-vocabulary (#740) as a dispatch
+// option, or none.
+func dispatchOptions(
+	closedErrorVocabulary bool,
+) []explorerfleet.DispatchOption {
+	if !closedErrorVocabulary {
+		return nil
+	}
+	return []explorerfleet.DispatchOption{
+		explorerfleet.WithClosedErrorVocabulary(),
+	}
 }
