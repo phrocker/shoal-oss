@@ -72,6 +72,25 @@ const (
 	// dropping a requirement it does not know — which would let it grant
 	// claims on external work without an attestation.
 	codecVersionAttestation uint16 = 5
+	// codecVersionErrorCodes adds a counted list of declared failure codes
+	// per action, after the attestation byte and before the schemas (#740).
+	//
+	// The same rollout shape as approval and attestation, and the same
+	// reason for it. It is written only for a descriptor in which some
+	// action declares a vocabulary; every other descriptor keeps the
+	// version and bytes it had, so rolling back reads it unchanged. An
+	// earlier build refuses version 6 rather than reading the action and
+	// dropping a declaration it does not know — which would leave it
+	// believing the action declares nothing, and under a closed vocabulary
+	// an action that declares nothing has every reported code adjudicated.
+	// The whole agent's failures would read invalid_executor_error with no
+	// record of why.
+	codecVersionErrorCodes uint16 = 6
+	// maxEncodedErrorCodes bounds the decoded vocabulary, as
+	// maxEncodedEffects bounds the effect set: a malformed or hostile
+	// record must not be able to allocate freely. It matches
+	// fleet.MaxActionErrorCodes.
+	maxEncodedErrorCodes uint32 = 64
 	// maxEncodedEffects bounds the decoded set. The taxonomy has three classes,
 	// so anything larger is a malformed or hostile record rather than a
 	// declaration, and it must not be able to allocate freely.
@@ -452,6 +471,9 @@ func encodeDescriptor(
 	if descriptorRequiresAttestation(descriptor) {
 		version = codecVersionAttestation
 	}
+	if descriptorDeclaresErrorCodes(descriptor) {
+		version = codecVersionErrorCodes
+	}
 	writeU16(&buffer, version)
 	writeString(&buffer, string(descriptor.ID))
 	writeI64(&buffer, descriptor.Generation)
@@ -489,6 +511,12 @@ func encodeDescriptor(
 				}
 				buffer.WriteByte(flag)
 			}
+			if version >= codecVersionErrorCodes {
+				writeU32(&buffer, uint32(len(action.ErrorCodes)))
+				for _, code := range action.ErrorCodes {
+					writeString(&buffer, code)
+				}
+			}
 			writeBytes(&buffer, action.InputSchema)
 			writeBytes(&buffer, action.OutputSchema)
 		}
@@ -515,7 +543,8 @@ func decodeDescriptor(value []byte) (
 	// encoding is handled explicitly below.
 	if err != nil || (version != 1 && version != codecVersionEffect &&
 		version != codecVersion && version != codecVersionApproval &&
-		version != codecVersionAttestation) {
+		version != codecVersionAttestation &&
+		version != codecVersionErrorCodes) {
 		return fleet.Descriptor{}, [sha256.Size]byte{},
 			errors.New("unknown descriptor encoding")
 	}
@@ -642,6 +671,30 @@ func decodeDescriptor(value []byte) (
 				}
 				action.RequiresAttestation = flag == 1
 			}
+			if version >= codecVersionErrorCodes {
+				codeCount, codeErr := readU32(reader)
+				if codeErr != nil {
+					return fleet.Descriptor{}, [sha256.Size]byte{}, codeErr
+				}
+				if codeCount > maxEncodedErrorCodes {
+					return fleet.Descriptor{}, [sha256.Size]byte{},
+						shoal.NewError(shoal.ErrorInvalidArgument,
+							"fleet record declares more error codes than "+
+								"an action may")
+				}
+				if codeCount > 0 {
+					action.ErrorCodes = make([]string, codeCount)
+					for k := range action.ErrorCodes {
+						code, codeReadErr := readString(
+							reader, fleet.MaxNameBytes)
+						if codeReadErr != nil {
+							return fleet.Descriptor{}, [sha256.Size]byte{},
+								codeReadErr
+						}
+						action.ErrorCodes[k] = code
+					}
+				}
+			}
 			if action.InputSchema, err = readBytes(reader, fleet.MaxSchemaBytes); err != nil {
 				return fleet.Descriptor{}, [sha256.Size]byte{}, err
 			}
@@ -733,6 +786,20 @@ func equivalentReplay(existing, wanted fleet.Descriptor) bool {
 
 // descriptorRequiresAttestation reports whether any action needs the
 // attestation encoding.
+// descriptorDeclaresErrorCodes reports whether any action needs the
+// error-code encoding. A descriptor that declares none keeps the version and
+// the bytes it had, so an earlier build reads it unchanged.
+func descriptorDeclaresErrorCodes(descriptor fleet.Descriptor) bool {
+	for _, capability := range descriptor.Capabilities {
+		for _, action := range capability.Actions {
+			if len(action.ErrorCodes) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func descriptorRequiresAttestation(descriptor fleet.Descriptor) bool {
 	for _, capability := range descriptor.Capabilities {
 		for _, action := range capability.Actions {

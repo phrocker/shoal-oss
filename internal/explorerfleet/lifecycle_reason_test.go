@@ -286,7 +286,7 @@ func TestLifecycleRecorderReconcilesReceiptWrittenBeforeAssertedReasons(t *testi
 		store.stored.ID != previous.ID {
 		t.Fatal("reconciliation rewrote the pre-upgrade receipt")
 	}
-	requireV4Receipt(t, store, lifecycle)
+	requireCurrentReceipt(t, store, lifecycle)
 
 	// Legacy acceptance only relaxes the absent field: a different mutation
 	// still conflicts.
@@ -321,7 +321,7 @@ func TestLifecycleRecorderReconcilesV1ReceiptForAssertingRetry(t *testing.T) {
 	if err := recorder.RecordLifecycle(context.Background(), lifecycle); err != nil {
 		t.Fatalf("v1 receipt reconciliation = %v", err)
 	}
-	requireV4Receipt(t, store, lifecycle)
+	requireCurrentReceipt(t, store, lifecycle)
 }
 
 func TestLifecycleRecorderRecoversDroppedCommittedAssertingResult(t *testing.T) {

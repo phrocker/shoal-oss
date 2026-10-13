@@ -199,13 +199,25 @@ func TestRegistryDigestVersionsDiffer(t *testing.T) {
 			t.Fatalf("%s: v1 = %s, want the old build's %s",
 				fixture.name, got, fixture.v1)
 		}
-		v2 := registryMutationDigest(fixture.mutation)
+		v2 := registryMutationDigestV2(fixture.mutation)
 		if v2 == v1 {
 			t.Fatalf("%s: v1 and v2 digests are equal", fixture.name)
 		}
+		v3 := registryMutationDigest(fixture.mutation)
+		// Domain-separated by their leading tag, so no two versions of one
+		// mutation collide. A receipt's version comes from its identity,
+		// but a collision here would make a wrongly-versioned comparison
+		// succeed instead of being caught.
+		if v3 == v2 || v3 == v1 {
+			t.Fatalf("%s: the v3 digest equals an earlier version",
+				fixture.name)
+		}
 		digests := registryMutationDigests(fixture.mutation)
-		if digests.current != v2 || digests.v1 != v1 {
-			t.Fatalf("%s: receipt digests are not (v2, v1): %#v",
+		// All three, each populated: the recorder compares a retry against
+		// a prior receipt under that receipt's own version, so a digest it
+		// is never handed is a version it can never reconcile.
+		if digests.current != v3 || digests.v2 != v2 || digests.v1 != v1 {
+			t.Fatalf("%s: receipt digests are not (v3, v2, v1): %#v",
 				fixture.name, digests)
 		}
 	}
@@ -307,15 +319,23 @@ func TestRegistryDigestV2Layout(t *testing.T) {
 	if !bytes.Equal(recorded.Bytes(), want) {
 		t.Fatalf("v2 layout drifted\n got  %x\n want %x", recorded.Bytes(), want)
 	}
-	if registryMutationDigest(mutation) != sha256.Sum256(want) {
+	if registryMutationDigestV2(mutation) != sha256.Sum256(want) {
 		t.Fatal("v2 digest is not the SHA-256 of its layout")
 	}
-	// Frozen: the v2 digest of the fixture as first shipped.
+	// Frozen: the v2 digest of the fixture as first shipped. It is read,
+	// never written, so this value can never legitimately change — every
+	// fleet.lifecycle.v4 receipt in the field was written against it, and
+	// the recorder reconciles a retry with one by recomputing it here.
 	const goldenV2 = "49bd0b31c3151036a670126daf8bc3e4" +
 		"5c458b4cbb7527eb70b966b6ed0c4516"
-	digest := registryMutationDigest(mutation)
+	digest := registryMutationDigestV2(mutation)
 	if got := hex.EncodeToString(digest[:]); got != goldenV2 {
 		t.Fatalf("v2 digest = %s, want %s", got, goldenV2)
+	}
+	// And the written encoding is no longer this one, or the version bump
+	// bought nothing.
+	if registryMutationDigest(mutation) == digest {
+		t.Fatal("the written digest is still v2")
 	}
 }
 
@@ -373,5 +393,128 @@ func TestRegistryDigestV2SeparatesEveryListBoundary(t *testing.T) {
 			registryMutationDigest(Mutation{Descriptor: second}) {
 			t.Fatalf("%s: v2 digests are equal", pair.name)
 		}
+	}
+}
+
+// TestRegistryDigestV3Layout pins the v3 encoding field by field, the same
+// way the v2 test does and for the same reason: a v3 digest is stored in
+// receipts from the moment this ships, so this layout can never change
+// afterwards. A new encoding is v4.
+//
+// v3 is v2 plus each action's declared error-code vocabulary, written as a
+// counted list for every action whether or not it declares one. That is the
+// whole difference, and the empty-list case is the one to get right: an
+// action that declares nothing still writes its count, so an action is
+// always the same number of fields and the stream still has exactly one
+// parse.
+func TestRegistryDigestV3Layout(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object"}`)
+	lease := time.Unix(1_800_000_000, 0).UTC()
+	revoked := time.Unix(1_800_000_100, 0).UTC()
+	mutation := Mutation{
+		RegistrationKey: "key", ExpectedGeneration: 3,
+		Descriptor: Descriptor{
+			ID: "agent", Generation: 4, Subject: "owner", Actor: "operator",
+			ParentID: "parent", AuthorizationDomain: []byte("domain"),
+			Scopes: []Scope{
+				{SourceID: []byte("s1"), PolicyID: []byte("p1")},
+			},
+			ExecutorRef: "local",
+			Capabilities: []Capability{
+				{Name: "ops", Actions: []Action{
+					{Name: "deploy", InputSchema: schema, OutputSchema: schema,
+						// Sorted by canonicalErrorCodes before it reaches a
+						// descriptor; written in that order here.
+						ErrorCodes: []string{"input_invalid",
+							"upstream_refused"}},
+					// Declares nothing, and still writes its count.
+					{Name: "read", InputSchema: schema, OutputSchema: schema},
+				}},
+			},
+			LeaseExpiresAt: lease, RevokedAt: revoked,
+		},
+	}
+	var want []byte
+	for _, part := range [][]byte{
+		layoutField([]byte("shoal.fleet.registry-mutation.v3")),
+		layoutField([]byte("key")), layoutUint(3),
+		layoutField([]byte("agent")), layoutUint(4),
+		layoutField([]byte("owner")), layoutField([]byte("operator")),
+		layoutField([]byte("parent")), layoutField([]byte("domain")),
+		layoutUint(1),
+		layoutField([]byte("s1")), layoutField([]byte("p1")),
+		layoutField([]byte("local")),
+		layoutUint(1),
+		layoutField([]byte("ops")), layoutUint(2),
+		layoutField([]byte("deploy")),
+		layoutUint(0),
+		layoutField(schema), layoutField(schema),
+		layoutField([]byte{0}), layoutField([]byte{0}),
+		layoutUint(2),
+		layoutField([]byte("input_invalid")),
+		layoutField([]byte("upstream_refused")),
+		layoutField([]byte("read")),
+		layoutUint(0),
+		layoutField(schema), layoutField(schema),
+		layoutField([]byte{0}), layoutField([]byte{0}),
+		layoutUint(0),
+		layoutUint(uint64(lease.UnixNano())),
+		layoutUint(uint64(revoked.UnixNano())),
+	} {
+		want = append(want, part...)
+	}
+	var recorded recordingHash
+	writeRegistryMutationV3(&recorded, mutation)
+	if !bytes.Equal(recorded.Bytes(), want) {
+		t.Fatalf("v3 layout drifted\n got  %x\n want %x",
+			recorded.Bytes(), want)
+	}
+	if registryMutationDigest(mutation) != sha256.Sum256(want) {
+		t.Fatal("the written digest is not the SHA-256 of the v3 layout")
+	}
+}
+
+// TestADeclaredVocabularyChangesTheMutationIdentity is why the vocabulary is
+// in the digest at all.
+//
+// The digest is what makes a retry of the same request a deduplicated repeat
+// rather than a new mutation. The vocabulary decides which codes a
+// completion may record as the executor's word, so it is part of what the
+// descriptor authorizes: a retry that changes it has to conflict. Left out
+// of the digest, an operator could widen or narrow an action's permitted
+// failure vocabulary under a request ID whose receipt already exists, and
+// nothing would record that it changed.
+func TestADeclaredVocabularyChangesTheMutationIdentity(t *testing.T) {
+	base := func(codes ...string) Mutation {
+		return Mutation{
+			RegistrationKey: "key", ExpectedGeneration: 1,
+			Descriptor: Descriptor{
+				ID: "agent", Generation: 1, Subject: "owner", Actor: "operator",
+				AuthorizationDomain: []byte("domain"),
+				Capabilities: []Capability{{Name: "ops", Actions: []Action{
+					{Name: "deploy", ErrorCodes: codes},
+				}}},
+			},
+		}
+	}
+	none := registryMutationDigest(base())
+	declared := registryMutationDigest(base("upstream_refused"))
+	widened := registryMutationDigest(
+		base("input_invalid", "upstream_refused"))
+
+	if none == declared {
+		t.Fatal("declaring a vocabulary did not change the mutation " +
+			"identity, so a retry could add one and be deduplicated")
+	}
+	if declared == widened {
+		t.Fatal("widening a vocabulary did not change the mutation identity")
+	}
+
+	// But the superseded encodings cannot see it, which is exactly why this
+	// needed a new version rather than an append to v2.
+	if registryMutationDigestV2(base()) !=
+		registryMutationDigestV2(base("upstream_refused")) {
+		t.Fatal("the frozen v2 encoding changed; every receipt written " +
+			"under fleet.lifecycle.v4 was written against it")
 	}
 }
