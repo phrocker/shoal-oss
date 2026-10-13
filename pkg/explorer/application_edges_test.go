@@ -29,6 +29,7 @@ package explorer_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/phrocker/shoal-oss/pkg/explorer"
@@ -373,11 +374,14 @@ func neighborhoodNodes(t *testing.T, corpus *explorer.Explorer, seed shoal.ID) [
 	return around.Nodes
 }
 
-// TestDerivedWritesRefuseApplicationEdgeIDs pins that an extraction or a
-// materialization cannot publish an edge under an application edge's ID with
-// different content. Such a record would fail every later rebuild with a
-// conflict, so it is refused before anything is written.
-func TestDerivedWritesRefuseApplicationEdgeIDs(t *testing.T) {
+// TestDerivedWritesWinOverStoredApplicationEdges pins the precedence when an
+// ingest, an extraction or a materialization derives an edge under the ID of
+// a stored application edge with different content (#724): the derived write
+// commits and is served, the application edge stays stored but withheld, and
+// a shown application edge that is withheld is reported. Refusing the derived
+// write instead would keep the squatted document or extraction out forever,
+// and failing the rebuild would make the whole graph unreadable.
+func TestDerivedWritesWinOverStoredApplicationEdges(t *testing.T) {
 	ctx := context.Background()
 	t.Run("extraction", func(t *testing.T) {
 		corpus, err := explorer.Open(t.TempDir())
@@ -416,22 +420,14 @@ func TestDerivedWritesRefuseApplicationEdgeIDs(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := corpus.CommitExtraction(ctx, planned); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-			t.Fatalf("extraction over an application edge ID = %v, want conflict", err)
+		if _, err := corpus.CommitExtraction(ctx, planned); err != nil {
+			t.Fatalf("extraction over an application edge ID = %v, want it committed", err)
 		}
-		records, err := corpus.ExtractionRecords(ctx)
-		if err != nil || len(records) != 0 {
-			t.Fatalf("refused extraction left records: %v %v", records, err)
-		}
-		if _, err := corpus.Neighborhood(ctx, explorer.NeighborhoodRequest{
-			NodeIDs: []shoal.ID{skill.Document.ID}, Depth: 1,
-		}); err != nil {
-			t.Fatalf("graph broken after the refusal: %v", err)
-		}
+		requireDerivedEdgeWins(t, corpus, planned.GraphEdges[0], []shoal.ID{taken})
 	})
 	// The materialization and ingest cases squat on the ID with an edge the
-	// graph no longer shows (its source revision was superseded), so only the
-	// stored application record can refuse them.
+	// graph no longer shows (its source revision was superseded): nothing is
+	// withheld, since the application edge is not shown anyway.
 	t.Run("materialization", func(t *testing.T) {
 		corpus, err := explorer.Open(t.TempDir())
 		if err != nil {
@@ -456,12 +452,44 @@ func TestDerivedWritesRefuseApplicationEdgeIDs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := corpus.MaterializeGraph(ctx, graphRequest(snapshot)); !shoal.IsErrorCode(
-			err, shoal.ErrorConflict,
-		) {
-			t.Fatalf("materialization over an application edge ID = %v, want conflict", err)
+		if _, err := corpus.MaterializeGraph(ctx, graphRequest(snapshot)); err != nil {
+			t.Fatalf("materialization over an application edge ID = %v, want it committed", err)
 		}
-		requireGraphReadable(t, corpus)
+		requireDerivedEdgeWins(t, corpus, planned.GraphEdges[0], nil)
+	})
+	t.Run("materialization over a shown edge", func(t *testing.T) {
+		corpus, err := explorer.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = corpus.Close() }()
+		left, err := corpus.Ingest(ctx, explorer.Source{
+			URI: "file:///left.md", MediaType: explorer.MediaTypeMarkdown, Content: "# Left\n",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := corpus.Snapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		planned, err := corpus.PlanGraphMaterialization(ctx, graphRequest(snapshot))
+		if err != nil {
+			t.Fatal(err)
+		}
+		taken := planned.GraphEdges[0].ID
+		if err := corpus.Connect(ctx, graph.Edge{
+			ID: taken, From: left.Document.ID, To: left.Document.ID, Type: "squatter", Weight: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot, err = corpus.Snapshot(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := corpus.MaterializeGraph(ctx, graphRequest(snapshot)); err != nil {
+			t.Fatalf("materialization over a shown application edge = %v, want it committed", err)
+		}
+		requireDerivedEdgeWins(t, corpus, planned.GraphEdges[0], []shoal.ID{taken})
 	})
 	t.Run("ingest", func(t *testing.T) {
 		source := explorer.Source{
@@ -489,11 +517,42 @@ func TestDerivedWritesRefuseApplicationEdgeIDs(t *testing.T) {
 		}
 		defer func() { _ = corpus.Close() }()
 		squatHiddenEdge(t, corpus, around.Edges[0].ID)
-		if _, err := corpus.Ingest(ctx, source); !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-			t.Fatalf("ingest over an application edge ID = %v, want conflict", err)
+		if _, err := corpus.Ingest(ctx, source); err != nil {
+			t.Fatalf("ingest over an application edge ID = %v, want it committed", err)
 		}
-		requireGraphReadable(t, corpus)
+		requireDerivedEdgeWins(t, corpus, around.Edges[0], nil)
 	})
+}
+
+// requireDerivedEdgeWins checks the graph serves derived under its ID, the
+// application edge squatting it stays stored, every document is readable,
+// and the reported collisions are exactly collisions.
+func requireDerivedEdgeWins(
+	t *testing.T, corpus *explorer.Explorer, derived graph.Edge, collisions []shoal.ID,
+) {
+	t.Helper()
+	ctx := context.Background()
+	requireGraphReadable(t, corpus)
+	around, err := corpus.Neighborhood(ctx, explorer.NeighborhoodRequest{
+		NodeIDs: []shoal.ID{derived.From}, Depth: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsEdge(around.Edges, derived) {
+		t.Fatalf("derived edge %s is not served with its own content: %#v", derived.ID, around.Edges)
+	}
+	connected, err := corpus.ConnectedEdges(ctx, []shoal.ID{derived.ID})
+	if err != nil || !connected[derived.ID] {
+		t.Fatalf("the squatting application edge is no longer stored: %v %v", connected, err)
+	}
+	reported, err := corpus.ApplicationEdgeCollisions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(reported, collisions) {
+		t.Fatalf("reported collisions = %v, want %v", reported, collisions)
+	}
 }
 
 // squatHiddenEdge connects an application edge under id from a section that

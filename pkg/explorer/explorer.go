@@ -23,7 +23,9 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"log/slog"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -60,6 +62,7 @@ type Explorer struct {
 	ontologyMutationIndeterminate  bool
 	graphNodes                     map[shoal.ID]graph.Node
 	graphEdges                     map[shoal.ID]graph.Edge
+	applicationEdgeCollisions      []shoal.ID // withheld for a derived edge's ID (#724)
 	graphAssertions                map[shoal.ID]ontology.Assertion
 	extractionAssertionSets        map[shoal.ID][]ontology.Assertion // #700: every assertion of a shared relation, in extraction order
 	legacyRenderings               legacyExtractionRenderings        // #700: pre-canonical content, for stored evidence only
@@ -539,9 +542,6 @@ func (e *Explorer) ingest(
 		}
 	}
 	if !attempted {
-		if err := e.requireApplicationEdgeIDsFreeLocked(record.Edges); err != nil {
-			return IngestResult{}, err
-		}
 		pending, err := e.publicationPending(ctx)
 		if err != nil {
 			return IngestResult{}, err
@@ -939,6 +939,7 @@ func (e *Explorer) computeCurrentGraph() (
 	map[shoal.ID]graph.Node,
 	map[shoal.ID]graph.Edge,
 	map[shoal.ID]ontology.Assertion,
+	[]shoal.ID,
 	error,
 ) {
 	nodes := make(map[shoal.ID]graph.Node)
@@ -947,7 +948,7 @@ func (e *Explorer) computeCurrentGraph() (
 	for _, revisions := range e.documents {
 		record, err := latestRevision(revisions)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		if record == nil {
 			continue
@@ -996,7 +997,7 @@ func (e *Explorer) computeCurrentGraph() (
 				edge, _ = CanonicalExtractedRelation(edge)
 			}
 			if existing, exists := edges[edge.ID]; exists && !edgesEqual(existing, edge) {
-				return nil, nil, nil, shoal.NewError(
+				return nil, nil, nil, nil, shoal.NewError(
 					shoal.ErrorConflict,
 					"extraction edge ID already has different content",
 				)
@@ -1006,7 +1007,7 @@ func (e *Explorer) computeCurrentGraph() (
 		for _, persisted := range record.Assertions {
 			assertion, err := restoreAssertion(persisted)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, err
 			}
 			if _, ok := edges[persisted.EdgeID]; ok {
 				assertions[persisted.EdgeID] = assertion
@@ -1030,7 +1031,7 @@ func (e *Explorer) computeCurrentGraph() (
 		for _, node := range record.Nodes {
 			if existing, exists := nodes[node.ID]; exists &&
 				!nodesEqual(existing, node) {
-				return nil, nil, nil, shoal.NewError(
+				return nil, nil, nil, nil, shoal.NewError(
 					shoal.ErrorConflict,
 					"materialized graph node ID already has different content",
 				)
@@ -1039,35 +1040,26 @@ func (e *Explorer) computeCurrentGraph() (
 		}
 		for _, edge := range record.Edges {
 			if _, from := nodes[edge.From]; !from {
-				return nil, nil, nil, shoal.NewError(
+				return nil, nil, nil, nil, shoal.NewError(
 					shoal.ErrorInternal,
 					"materialized graph edge source is missing",
 				)
 			}
 			if _, to := nodes[edge.To]; !to {
-				return nil, nil, nil, shoal.NewError(
+				return nil, nil, nil, nil, shoal.NewError(
 					shoal.ErrorInternal,
 					"materialized graph edge target is missing",
 				)
 			}
 			if existing, exists := edges[edge.ID]; exists &&
 				!edgesEqual(existing, edge) {
-				return nil, nil, nil, shoal.NewError(
+				return nil, nil, nil, nil, shoal.NewError(
 					shoal.ErrorConflict,
 					"materialized graph edge ID already has different content",
 				)
 			}
 			edges[edge.ID] = cloneEdge(edge)
 		}
-	}
-	// Application edges (Connect) join only after every node an application
-	// may attach one to is in place: document, section and span nodes,
-	// extracted entities and materialized nodes. Filtering them any earlier
-	// dropped every edge touching an extracted or materialized node at the
-	// first rebuild after Connect (#724). Interaction, fold and provenance
-	// nodes come later, but Connect refuses those endpoints.
-	if err := placeApplicationEdges(nodes, edges, e.edges); err != nil {
-		return nil, nil, nil, err
 	}
 	// Interaction nodes share the corpus graph but are excluded from
 	// retrieval and from expansion that did not explicitly seed them. An
@@ -1087,12 +1079,12 @@ func (e *Explorer) computeCurrentGraph() (
 	}
 	latentAssertions, err := e.latentLinkAssertionsLocked()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	for _, assertion := range latentAssertions {
 		edge, ok, err := latentAssertionGraphEdge(assertion)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		if !ok {
 			continue
@@ -1104,7 +1096,7 @@ func (e *Explorer) computeCurrentGraph() (
 			continue
 		}
 		if existing, exists := edges[edge.ID]; exists && !edgesEqual(existing, edge) {
-			return nil, nil, nil, shoal.NewError(
+			return nil, nil, nil, nil, shoal.NewError(
 				shoal.ErrorConflict,
 				"derived assertion edge ID already has different content",
 			)
@@ -1114,7 +1106,7 @@ func (e *Explorer) computeCurrentGraph() (
 		producer, assertionNode, derivationEdge, ok, err :=
 			ProducerGraphElementsForAssertion(assertion)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		if !ok {
 			continue
@@ -1123,20 +1115,29 @@ func (e *Explorer) computeCurrentGraph() (
 		// pins that live latent reads materialize producer nodes, assertion
 		// nodes, and derivation edges in the cached graph.
 		if err := putDerivedGraphNode(nodes, producer); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		if err := putDerivedGraphNode(nodes, assertionNode); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		if existing, exists := edges[derivationEdge.ID]; exists &&
 			!edgesEqual(existing, derivationEdge) {
-			return nil, nil, nil, shoal.NewError(
+			return nil, nil, nil, nil, shoal.NewError(
 				shoal.ErrorConflict,
 				"producer derivation edge ID already has different content",
 			)
 		}
 		edges[derivationEdge.ID] = derivationEdge
 	}
+	// Application edges (Connect) join only after every node an application
+	// may attach one to is in place: document, section and span nodes,
+	// extracted entities and materialized nodes. Filtering them any earlier
+	// dropped every edge touching an extracted or materialized node at the
+	// first rebuild after Connect (#724). They also follow every intrinsic,
+	// extracted, materialized and derived assertion edge, so a derived edge
+	// always keeps its ID and an application edge colliding with one is the
+	// edge withheld.
+	withheld := placeApplicationEdges(nodes, edges, e.edges)
 	for _, record := range e.interactions {
 		for _, edge := range record.Edges {
 			if _, from := nodes[edge.From]; !from {
@@ -1159,55 +1160,96 @@ func (e *Explorer) computeCurrentGraph() (
 			edges[edge.ID] = edge
 		}
 	}
-	return nodes, edges, assertions, nil
+	return nodes, edges, assertions, withheld, nil
 }
 
 // placeApplicationEdges adds every stored application edge whose endpoints
-// are both in nodes. An application edge never displaces an intrinsic,
-// extracted or materialized edge with the same ID, and is never displaced by
-// one: different content under one ID is a conflict, exactly as two
-// extractions disagreeing about one edge are. Identical content is the same
-// edge. Ingest, extraction and materialization refuse to introduce such a
-// collision, so only state written before #724 can reach it.
+// are both in nodes, and returns, sorted, the IDs of those it withholds
+// because a derived edge already holds the ID with different content.
+//
+// The derived edge (intrinsic, extracted, materialized or derived assertion)
+// wins. Every write path that creates an application edge refuses an ID that
+// is taken (Connect), so a collision only arises from stored state: an
+// application edge connected before #699 namespaced authorized edge IDs,
+// under an ID a later document, extraction or assertion then derived, or
+// a base-API edge whose ID a later derived edge reused. Failing the rebuild
+// instead would make the whole graph unreadable until the store was edited
+// by hand, and refusing the derived write would keep the squatted document
+// from ever getting a new revision. The withheld edge stays stored and is
+// reported through ApplicationEdgeCollisions, never to readers. Identical
+// content is the same edge and is not a collision.
+//
+// An endpoint of an interaction or provenance kind is never attached to:
+// Connect refuses those, and such a node is placed only after this pass.
 func placeApplicationEdges(
 	nodes map[shoal.ID]graph.Node,
 	edges map[shoal.ID]graph.Edge,
 	stored map[shoal.ID]persistedEdge,
-) error {
+) []shoal.ID {
+	var withheld []shoal.ID
 	for id, record := range stored {
 		edge := record.Edge
-		if _, from := nodes[edge.From]; !from {
+		if !applicationEndpoint(nodes, edge.From) || !applicationEndpoint(nodes, edge.To) {
 			continue
 		}
-		if _, to := nodes[edge.To]; !to {
+		if existing, exists := edges[id]; exists {
+			if !edgesEqual(existing, edge) {
+				withheld = append(withheld, id)
+			}
 			continue
-		}
-		if existing, exists := edges[id]; exists && !edgesEqual(existing, edge) {
-			return shoal.NewError(
-				shoal.ErrorConflict,
-				"application edge ID already has different content",
-			)
 		}
 		edges[id] = edge
 	}
-	return nil
+	sort.Slice(withheld, func(i, j int) bool {
+		return shoal.CompareID(withheld[i], withheld[j]) < 0
+	})
+	return withheld
 }
 
-// requireApplicationEdgeIDsFreeLocked refuses source or derived edges that
-// would reuse a stored application edge's ID with different content. The
-// application record is checked rather than the graph, because the graph
-// omits an application edge whose endpoint is not current, and that edge
-// still owns its ID (#724).
-func (e *Explorer) requireApplicationEdgeIDsFreeLocked(edges []graph.Edge) error {
-	for _, edge := range edges {
-		if record, ok := e.edges[edge.ID]; ok && !edgesEqual(record.Edge, edge) {
-			return shoal.NewError(
-				shoal.ErrorConflict,
-				"edge ID collides with an application edge",
-			)
-		}
+func applicationEndpoint(nodes map[shoal.ID]graph.Node, id shoal.ID) bool {
+	node, ok := nodes[id]
+	return ok && !interaction.IsInteractionKind(node.Kind) &&
+		!graph.IsProvenanceKind(node.Kind)
+}
+
+// ApplicationEdgeCollisions returns, sorted, the stored application edges
+// (Connect) the current graph withholds because an intrinsic, extracted,
+// materialized or derived assertion edge holds the same ID with different
+// content (#724). It is an operator diagnostic: the withheld edges are never
+// served, and the authorized client does not expose this list. Empty means
+// no collision.
+func (e *Explorer) ApplicationEdgeCollisions(ctx context.Context) ([]shoal.ID, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
 	}
-	return nil
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.requireOpen(); err != nil {
+		return nil, err
+	}
+	if err := e.ensureGraphLocked(); err != nil {
+		return nil, err
+	}
+	return append([]shoal.ID(nil), e.applicationEdgeCollisions...), nil
+}
+
+// noteApplicationEdgeCollisionsLocked records the rebuild's withheld
+// application edges and logs once whenever the set changes.
+func (e *Explorer) noteApplicationEdgeCollisionsLocked(withheld []shoal.ID) {
+	if slices.Equal(withheld, e.applicationEdgeCollisions) {
+		return
+	}
+	e.applicationEdgeCollisions = withheld
+	if len(withheld) == 0 {
+		slog.Info("explorer: no application edge is withheld for an edge ID collision")
+		return
+	}
+	shown := withheld
+	if len(shown) > 16 {
+		shown = shown[:16]
+	}
+	slog.Warn("explorer: application edges withheld: a derived edge holds the same ID with different content (#724)",
+		"count", len(withheld), "edge_ids", shown)
 }
 
 func (e *Explorer) ensureGraphLocked() error {
@@ -1218,7 +1260,7 @@ func (e *Explorer) ensureGraphLocked() error {
 }
 
 func (e *Explorer) rebuildCurrentGraphLocked() error {
-	nodes, edges, assertions, err := e.computeCurrentGraph()
+	nodes, edges, assertions, withheld, err := e.computeCurrentGraph()
 	var sets map[shoal.ID][]ontology.Assertion
 	if err == nil {
 		sets, err = e.extractionAssertionSetsLocked(nodes, edges)
@@ -1275,6 +1317,7 @@ func (e *Explorer) rebuildCurrentGraphLocked() error {
 	e.legacyRenderings = legacy
 	e.outgoing, e.incoming = outgoing, incoming
 	e.interactionOutgoing, e.interactionIncoming = interactionOutgoing, interactionIncoming
+	e.noteApplicationEdgeCollisionsLocked(withheld)
 	e.graphErr = nil
 	e.graphInitialized = true
 	e.refreshSnapshotLocked()
