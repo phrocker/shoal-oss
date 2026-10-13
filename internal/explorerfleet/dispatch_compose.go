@@ -62,17 +62,46 @@ func ComposeDispatchWithAttestations(
 	clock func() time.Time,
 	attestations fleet.ExecutorAttestations,
 	labels DispatchLabels,
+	options ...DispatchOption,
 ) (*fleet.DispatchService, error) {
 	store, err := NewDispatchStore(runtime, visibility)
 	if err != nil {
 		return nil, err
 	}
+	var optional dispatchOptions
+	for _, option := range options {
+		option(&optional)
+	}
 	return fleet.NewDispatchService(fleet.DispatchConfig{
 		Store: store, Registry: registry, Resolver: resolver,
 		Recorder: recorder, Events: events, Clock: clock,
-		Attestations:       attestations,
-		EvidenceVisibility: labels.Visibility,
-		EvidenceLabels:     labels.Translator,
-		EvidenceNodes:      labels.Nodes,
+		Attestations:          attestations,
+		EvidenceVisibility:    labels.Visibility,
+		EvidenceLabels:        labels.Translator,
+		EvidenceNodes:         labels.Nodes,
+		ClosedErrorVocabulary: optional.closedErrorVocabulary,
 	})
+}
+
+// DispatchOption is optional dispatch configuration. An option rather than
+// another positional parameter, because the one thing it carries is a bool
+// and a bare bool at a call site says nothing about which setting it is.
+type DispatchOption func(*dispatchOptions)
+
+type dispatchOptions struct{ closedErrorVocabulary bool }
+
+// WithClosedErrorVocabulary adjudicates an executor-reported failure code
+// the action's descriptor does not declare, which is what closes the
+// channel #740 is about (phase 2). Without it a reported code is checked
+// only against the token shape, which narrows that channel without closing
+// it: a lowercase token can still read "patient_4471_hiv_positive".
+//
+// Enable it only after every action an executor fails has declared its
+// codes. Declaring changes the registry digest and so the descriptor's
+// generation, and a record pinned to the previous generation is refused at
+// claim — so the sequence is declare, let in-flight work settle, then flip.
+func WithClosedErrorVocabulary() DispatchOption {
+	return func(options *dispatchOptions) {
+		options.closedErrorVocabulary = true
+	}
 }

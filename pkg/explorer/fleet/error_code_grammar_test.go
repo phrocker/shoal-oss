@@ -75,7 +75,10 @@ func TestAMisshapenErrorCodeIsAdjudicated(t *testing.T) {
 			"patient_4471_hiv_positive", "patient_4471_hiv_positive", false},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
-			adjudicated := reportedErrorCodeIsAdjudicated(probe.value)
+			// The default service: the shape rule, no declared vocabulary.
+			// The closed rule has its own test.
+			adjudicated := (&DispatchService{}).
+				reportedErrorCodeIsAdjudicated(Action{}, probe.value)
 			if adjudicated != probe.wantService {
 				t.Fatalf("service authorship = %v for %q, want %v; this is "+
 					"what sets ErrorCodeOrigin, and #508 turns on the "+
