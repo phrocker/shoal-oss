@@ -23,8 +23,12 @@ import (
 	"testing/fstest"
 )
 
-var printGrandfather = flag.Bool("print-leak-grandfather", false,
-	"log the Go literal of goLiteralsAtRegistration for the current Go findings (files, checks and hashes only)")
+var (
+	printGrandfather = flag.Bool("print-leak-grandfather", false,
+		"log the Go literal of goLiteralsAtRegistration for the current Go findings (files, checks and hashes only)")
+	reportStale = flag.Bool("report-stale-grandfather", false,
+		"log grandfathered Go units that no longer occur; for the split's author at the run, never in CI")
+)
 
 // moduleRoot is the module root, relative to this package.
 const moduleRootRel = "../../.."
@@ -33,8 +37,11 @@ const moduleRootRel = "../../.."
 // test Go file under them (testdata included) is a cue source through its
 // string literals: the router, its harness and training code (v1's
 // trainModel is in eval_test.go), the lexicon, the shadow service and the
-// wiring. Every non-Go file under them must be either under the v2 fixture
-// tree, which is audited, or a frozen file pinned below.
+// wiring. Go literals get the phrase and template checks only: code is full
+// of ordinary words, and word or bigram findings there would tell a v2 code
+// author which words the split holds. Every non-Go file under the roots must
+// be either under the v2 fixture tree, which is audited, or a frozen file
+// pinned below.
 var auditRoots = []string{"pkg/router", "pkg/lexicon", "internal/routershadow", "internal/routerwire"}
 
 // v2FixturePrefix is the v2 fixture tree. The v2 run loads its world,
@@ -75,13 +82,15 @@ var frozenNonGo = map[string]string{
 }
 
 // goUnit is one grandfathered Go literal unit: a (file, check, unit hash)
-// that the Go literals already held at the pre-registration commit and that
-// the sealed split also uses outside the baseline corpus (function words in
-// the router's stop-word and question-word lists, words of error and test
-// messages). They predate the split, so they are not leaks. The hash is
-// UnitHash, so the list names no test vocabulary in plain sight (a dictionary
-// attack recovers single words: this is against casual reading, not a
-// determined reader).
+// for a phrase or template that a Go file already held before the split was
+// written, in code this pull request does not add. It predates the split, so
+// it is not a leak. The hash is UnitHash, unsalted: hashing the file's token
+// sequences recovers the unit, so this is against casual reading only.
+//
+// A grandfathered unit that no longer occurs is not a failure (that would
+// tell whoever removed it that it was test vocabulary). The split's author
+// reports stale units with -report-stale-grandfather, and the run prunes
+// them.
 type goUnit struct{ File, Check, Hash string }
 
 // grandfatherDigest pins goLiteralsAtRegistration: the SHA-256 over
@@ -194,8 +203,9 @@ func v2CueSources(fsys fs.FS) ([]LeakSource, error) {
 }
 
 // goLiteralSources are the string literals of every Go file under the audit
-// roots, test files and testdata included, one source per file, named by
-// its module-relative path.
+// roots, test files and testdata included, one phrase-only source per file,
+// named by its module-relative path. Only the literals of
+// goLiteralsAtRegistration itself (file paths and hashes) are skipped.
 func goLiteralSources(t testing.TB) []LeakSource {
 	t.Helper()
 	var out []LeakSource
@@ -203,9 +213,6 @@ func goLiteralSources(t testing.TB) []LeakSource {
 		err := filepath.WalkDir(filepath.Join(moduleRootRel, root), func(p string, d fs.DirEntry, err error) error {
 			if err != nil || d.IsDir() || !strings.HasSuffix(p, ".go") {
 				return err
-			}
-			if filepath.Base(p) == "leak_grandfather_test.go" {
-				return nil // the guard's own list: file paths and hashes
 			}
 			fset := token.NewFileSet()
 			f, err := parser.ParseFile(fset, p, nil, parser.SkipObjectResolution)
@@ -216,8 +223,11 @@ func goLiteralSources(t testing.TB) []LeakSource {
 			if err != nil {
 				return err
 			}
-			src := LeakSource{Name: filepath.ToSlash(rel)}
+			src := LeakSource{Name: filepath.ToSlash(rel), PhraseOnly: true}
 			ast.Inspect(f, func(n ast.Node) bool {
+				if spec, ok := n.(*ast.ValueSpec); ok && len(spec.Names) == 1 && spec.Names[0].Name == "goLiteralsAtRegistration" {
+					return false
+				}
 				if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
 					if s, err := strconv.Unquote(lit.Value); err == nil {
 						src.Strings = append(src.Strings, s)
@@ -236,11 +246,11 @@ func goLiteralSources(t testing.TB) []LeakSource {
 	return out
 }
 
-// TestNoTestPhrasingInCueSources is the leak guard: no cue source under the
-// v2 fixtures, and no string literal of the Go code under the audit roots,
-// carries a phrase, template, word or bigram that only the sealed test split
-// holds. Grandfathered Go units pass; a grandfathered unit that no longer
-// occurs is stale and fails, so the set only shrinks.
+// TestNoTestPhrasingInCueSources is the leak guard: no data cue source under
+// the v2 fixtures carries a phrase, template, word or bigram that only the
+// sealed test split holds, and no string literal of the Go code under the
+// audit roots carries such a phrase or template. Grandfathered Go units pass;
+// one that no longer occurs is reported only behind -report-stale-grandfather.
 func TestNoTestPhrasingInCueSources(t *testing.T) {
 	a := v2Auditor(t)
 	sources, err := v2CueSources(os.DirFS(v2Dir))
@@ -270,9 +280,11 @@ func TestNoTestPhrasingInCueSources(t *testing.T) {
 		}
 		t.Errorf("leak: %s", f)
 	}
-	for _, u := range goLiteralsAtRegistration {
-		if !matched[u] {
-			t.Errorf("stale grandfathered unit: %s %s sha256:%s; remove it and update the doc's digest", u.File, u.Check, u.Hash)
+	if *reportStale {
+		for _, u := range goLiteralsAtRegistration {
+			if !matched[u] {
+				t.Logf("stale grandfathered unit: %s %s sha256:%s", u.File, u.Check, u.Hash)
+			}
 		}
 	}
 	if *printGrandfather {
@@ -503,20 +515,30 @@ func TestLeakGuardCatchesLeaks(t *testing.T) {
 	if findings := a.Audit(sources); len(findings) != 0 {
 		t.Errorf("a v1 grammar copy is reported as leaking: %v", findings)
 	}
-	// A Go literal that plants a test-only word is a finding the
-	// grandfathered set does not cover.
-	probe := []LeakSource{{Name: "pkg/router/features.go", Strings: []string{testWords[0]}}}
-	grandfathered := map[goUnit]bool{}
-	for _, u := range goLiteralsAtRegistration {
-		grandfathered[u] = true
-	}
-	for _, f := range a.Audit(probe) {
-		if grandfathered[goUnit{f.Source, f.Check, f.Hash}] {
-			continue
+	// Go literals: the real collector marks every file phrase-only. A Go
+	// literal copying a test text, or a test template with other entities,
+	// is a finding; one holding test-only words or pairs is not.
+	for _, src := range goLiteralSources(t) {
+		if !src.PhraseOnly {
+			t.Fatalf("%s: a Go source gets word and bigram checks", src.Name)
 		}
-		return
 	}
-	t.Error("a Go literal with a test-only word is not a finding")
+	goProbe := func(s string) []LeakFinding {
+		return a.Audit([]LeakSource{{Name: "pkg/router/features.go", Strings: []string{s}, PhraseOnly: true}})
+	}
+	if len(goProbe(phraseText)) == 0 {
+		t.Error("a Go literal copying a test text is not a finding")
+	}
+	if len(goProbe(strings.ReplaceAll(strings.Join(template.abstract, " "), slotToken, "ledger"))) == 0 {
+		t.Error("a Go literal copying a test template is not a finding")
+	}
+	if fs := goProbe(strings.Join(testWords, " ") + " " + pair[0] + " " + pair[1]); len(fs) != 0 {
+		for _, f := range fs {
+			if f.Check == "word" || f.Check == "bigram" {
+				t.Errorf("a Go literal got a %s finding", f.Check)
+			}
+		}
+	}
 }
 
 // TestExpandOptional pins the pattern expansion the audit relies on.

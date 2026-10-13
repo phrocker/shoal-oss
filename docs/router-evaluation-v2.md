@@ -178,8 +178,15 @@ considered and rejected:
 All systems route every case of the sealed split once, in the single run.
 The run goes through the harness committed with this seal: the
 `TestEvaluationV2Test` and `v2Evaluate` functions in
-`pkg/router/eval/v2run_test.go`. `TestV2RunHarness` exercises the harness
-end to end on v1's dev split, and `TestJudgeV2` pins the decision rules.
+`pkg/router/eval/v2run_test.go`. Three tests support it:
+
+- `TestV2RunHarness` exercises the harness end to end on v1's dev split.
+- `TestJudgeV2` pins the decision rules.
+- `TestV2Readiness` loads every v2 artefact exactly as the run will, and runs
+  the harness on v2's dev split, so the run is never the first time v2's
+  artefacts load. Until v2's model and train/dev cases exist, it uses v1's
+  model and v1's dev split as **placeholders** and logs that it did.
+
 Visibility comes from the fixture world, as in v1.
 
 - **router v2**: everything is loaded only from `pkg/router/testdata/eval/v2/`:
@@ -189,6 +196,10 @@ Visibility comes from the fixture world, as in v1.
 
   These must be committed before the run. Routing goes through
   `routershadow.Decider`.
+
+  No code loads lexicon or recipe files yet. Any loader for them, and any
+  other change to how v2 artefacts are loaded, lands in an amendment before
+  the run, together with the matching change to `TestV2Readiness`.
 - **lexical baseline (primary comparator)**: `Analysis.Baseline`
   (`shoal.router.baseline/v1`). Its decision rule is unchanged, and it runs
   over the same analysis, catalog and v2 grammars as router v2. The question
@@ -242,9 +253,10 @@ The pairs are:
 Router v2's safety guards, both on the sealed split:
 
 - **G1, precision.** Wrong proposals (non-abstained and not target-correct)
-  number at most 5% of router v2's non-abstained proposals, rounded up. **With
-  no proposal at all, G1 fails:** there is no precision to guard, and a router
-  that never answers has not won.
+  number at most 5% of router v2's non-abstained proposals, **rounded down**.
+  - Below 20 proposals, no wrong proposal is allowed, so 1 wrong of 1 fails.
+  - **With no proposal at all, G1 fails:** there is no precision to guard,
+    and a router that never answers has not won.
 - **G2, abstention.** Correct abstention of at least 105 of 112.
 
 The **primary outcome (H1)**, router v2 against the lexical baseline,
@@ -308,9 +320,14 @@ What this means for the sealed split:
   them by chance only rarely:
   - G2: a router whose true correct-abstention rate is 97% fails it with
     probability 0.020, and at 98% with probability 0.002.
-  - G1: a router whose true precision is 98% fails it with probability 0.018
-    at 50 proposals, 0.015 at 100 and 0.002 at 190. At 97% precision, the
-    probability is 0.06 to 0.08 below 100 proposals.
+  - G1: a router whose true precision is 98% fails it with probability:
+    - 0.078 at 50 proposals;
+    - 0.015 at 100;
+    - 0.005 at 190.
+
+    At 97% precision, the probability is 0.06 to 0.19 across that range. G1
+    is strict on purpose: a router that makes few proposals has to make them
+    without error.
 
 ## Leak prevention
 
@@ -365,15 +382,22 @@ rules apply from this commit until the run.
      - **General-purpose resources** under `external/` (for example a
        published thesaurus, pinned by digest in an amendment) also get only
        the phrase and template checks.
-     - **Everything else under `pkg/router/testdata/eval/v2/`** gets every
-       check: grammars, lexicon files, the model, recipes, and any `.json`,
-       `.jsonl`, `.txt`, `.csv`, `.tsv` or `.py` file. The exceptions are the
-       sealed split, the frozen world and Markdown. A file of any other kind
-       fails the guard until the guard learns to read it.
+     - **Data cue sources**, meaning everything else under
+       `pkg/router/testdata/eval/v2/`, get every check. That covers grammars,
+       lexicon files, the model, recipes, and any `.json`, `.jsonl`, `.txt`,
+       `.csv`, `.tsv` or `.py` file. The exceptions are the sealed split, the
+       frozen world and Markdown. A file of any other kind fails the guard
+       until the guard learns to read it.
      - **Every string literal of every Go file** under `pkg/router`,
        `pkg/lexicon`, `internal/routershadow` and `internal/routerwire` gets
-       every check. This includes test files and testdata, so training and
-       harness code is covered (v1's `trainModel` is in `eval_test.go`).
+       **only the phrase and template checks**.
+       - This includes test files and testdata, so training and harness code
+         is covered (v1's `trainModel` is in `eval_test.go`).
+       - Code is full of ordinary words. A word or bigram finding there would
+         tell a v2 code author which words the split holds.
+       - Cue words therefore belong in data files under the v2 fixture tree,
+         where every check applies, not in Go literals. Review holds v2 code
+         to this.
    - **Only literals are seen.** Cues that code computes at run time from
      other inputs are not. Such code falls under rule 2 and review, and the
      v2 run loads its data only from the v2 fixture tree.
@@ -382,19 +406,26 @@ rules apply from this commit until the run.
      tree or one of the 26 frozen non-Go files pinned by SHA-256 (v1's
      fixtures and model, and the lexicon's fuzz corpus and golden). A new
      file elsewhere, or a changed frozen file, fails.
-   - **Grandfathered Go units.** At this commit the Go literals already hold
-     186 grandfathered units that the split also uses outside the baseline:
-     - function words in the router's stop-word and question-word lists;
-     - words of error and test messages;
-     - one pattern in a `routerwire` test grammar fixture that contains a
-       test template.
-
-     Each entry is keyed by (file, check, SHA-256 of the unit), in
-     `goLiteralsAtRegistration` (`leak_grandfather_test.go`). The set's
-     digest is `fb70e2807b7f5370b890cc4b8d4fe678b32b8c2e1c7a0f1430a5953fe3ff9d26`
-     over sorted "file, tab, check, tab, hash" lines, and the doc test pins
-     it and its size. An entry that no longer matches a finding is stale and
-     fails, so the set only shrinks.
+   - **Grandfathered Go units.** Grandfathered Go units: 1.
+     - **The entry:** a pattern in a router grammar fixture in
+       `internal/routerwire/world_test.go`. It has been on main since slice 1
+       (#519), before the split was written, and one of its expansions
+       contains one of the split's templates.
+     - **No new code is grandfathered.** No literal this pull request adds
+       trips the guard.
+     - **Keying and digest:** each entry is keyed by (file, check, SHA-256 of
+       the unit), in `goLiteralsAtRegistration` (`leak_grandfather_test.go`;
+       only that variable's own literals are skipped by the audit). The
+       set's digest is
+       `9f20344bf8e966241b7e8f8b791a1a33443c221639cd23eaca6fe79feadc091f`
+       over sorted "file, tab, check, tab, hash" lines, and the doc test pins
+       it and its size.
+     - **The hash is unsalted:** hashing the file's token sequences recovers
+       the unit. It guards against casual reading only.
+     - **Stale entries do not fail.** That would tell whoever removed the
+       literal that it was test material. The split's author lists stale
+       entries at the run with `-report-stale-grandfather`, and the results
+       record them. The pinned list is not edited before the run.
    - **Findings print** the source, a location in it (a line, a string index
      or a case ID), the check and the unit's SHA-256. They print no test text
      and no test word, so the CI log is not an oracle. A finding's location
@@ -402,17 +433,22 @@ rules apply from this commit until the run.
      unavoidable if the author is to remove it.
    - **Mutation check** (`TestLeakGuardCatchesLeaks`): each of these fails
      the guard, through the same file collector:
-     - planting a test text in a lexicon file, an external resource or a
-       train case;
-     - planting a test template as a grammar pattern;
-     - planting a test-only word as a cue, a synonym key, a model feature or
-       a Go literal;
+     - planting a test text in a lexicon file, an external resource, a train
+       case or a Go literal;
+     - planting a test template, with the same or other entities, as a
+       grammar pattern, a train case or a Go literal;
+     - planting a test-only word as a cue, a synonym key or a model feature;
      - planting a test-only pair in a pattern;
      - an unreadable file kind.
 
-     No finding prints the planted unit. A train case or external resource
-     with test-only words gets no word or bigram finding. A copy of a v1
-     grammar passes (`TestV2BaselineIsClean`).
+     These get no word or bigram finding:
+     - a train case with test-only words;
+     - an external resource with test-only words;
+     - a Go literal with test-only words, which the real collector marks
+       phrase-only.
+
+     No finding prints the planted unit. A copy of a v1 grammar passes
+     (`TestV2BaselineIsClean`).
    - **Not caught:** paraphrases, inflections, synonyms and misspellings of a
      test phrasing or word ("restarted" for "restart", a reordered
      sentence). The guard catches copying, not knowledge.
@@ -421,9 +457,8 @@ rules apply from this commit until the run.
      corpus or the guard to get past it.
    - A finding that reached a commit on the main branch is listed in the
      results, with its source, check and hash.
-   - Changing the guard's rules, or the grandfathered set other than by
-     removing stale entries, before the run takes an amendment in the same
-     pull request.
+   - Changing the guard's rules or the grandfathered set before the run takes
+     an amendment in the same pull request.
    - A removed unit is not re-added under any spelling.
 5. **v1's word audit** ("A test-only cue leaked into a grammar" in v1's
    erratum) runs before the test run, on train and dev only. Every grammar
@@ -447,7 +482,8 @@ rules apply from this commit until the run.
    things:
    - flips `V2TestRunOpen`;
    - writes `report-test.md` with `go test -run TestEvaluationV2Test -update`;
-   - appends the results here.
+   - appends the results here, including the stale grandfathered entries
+     that the split's author lists with `-report-stale-grandfather`.
 
    Results are reported whatever they are. Errors found later are fixed in
    later changes and reported as errata; the run's numbers are not replaced.

@@ -113,11 +113,12 @@ type v2Verdict struct {
 // on coverage.
 func judgeV2(r2 Report, primary, versusV1, coverage Comparison) v2Verdict {
 	var v v2Verdict
-	// G1: wrong proposals at most 5% of proposals, rounded up. With no
-	// proposal G1 fails: there is no precision to guard.
+	// G1: wrong proposals at most 5% of proposals, rounded down, so below
+	// 20 proposals no wrong one is allowed. With no proposal G1 fails: there
+	// is no precision to guard.
 	proposals := r2.TargetPrecision.D
 	wrong := proposals - r2.TargetPrecision.N
-	v.G1 = proposals > 0 && wrong <= int(math.Ceil(0.05*float64(proposals)))
+	v.G1 = proposals > 0 && wrong <= int(math.Floor(0.05*float64(proposals)))
 	v.G2 = r2.CorrectAbstention.D == v2Unanswerable && r2.CorrectAbstention.N >= v2G2Min
 	wins := func(c Comparison) bool { return c.RouterOnly > c.BaselineOnly && c.ExactP < v2Alpha }
 	loses := func(c Comparison) bool { return c.BaselineOnly > c.RouterOnly && c.ExactP < v2Alpha }
@@ -179,7 +180,7 @@ func v2Evaluate(t testing.TB, split string, cases []Case, v2, v1 v2System) (stri
 	b.WriteString(comparisonLine("Router v2 against frozen v1 (coverage, answerable cases)", "router v2", "frozen v1", coverage))
 	b.WriteString(comparisonLine("Lexical baseline, v2 grammars against v1 grammars (end-to-end)", "v2 grammars", "v1 grammars",
 		pair(v2.world, o2, o1, baselineOf, baselineOf)))
-	fmt.Fprintf(&b, "\nG1 (wrong proposals at most 5%% of %d, rounded up): %t. G2 (correct abstention at least %d of %d): %t.\n",
+	fmt.Fprintf(&b, "\nG1 (wrong proposals at most 5%% of %d, rounded down): %t. G2 (correct abstention at least %d of %d): %t.\n",
 		r2.TargetPrecision.D, v.G1, v2G2Min, v2Unanswerable, v.G2)
 	fmt.Fprintf(&b, "Primary outcome: %s. H2: %s. S1 (beats frozen v1): %t. S2 (coverage at least %d): %t. S3 (slot exact-match at least 90%%): %t.\n",
 		v.Primary, v.H2, v.S1, v2CoverageTarget, v.S2, v.S3)
@@ -223,6 +224,67 @@ func TestEvaluationV2Test(t *testing.T) {
 	}
 	if string(stored) != text {
 		t.Fatalf("%s differs from this run; the run is reported once", v2ReportPath)
+	}
+}
+
+// TestV2Readiness loads every v2 artefact the run will load, the way the run
+// loads it (the world and grammars/*.json through LoadWorld on the v2
+// fixture tree, and model/router-pair-v2.json), and runs the harness on v2's
+// dev split. The run is then never the first time v2's artefacts load.
+//
+// PLACEHOLDERS: until v2's model and train/dev cases are committed, v1's
+// model and v1's dev split stand in for them, and the test logs that it used
+// them. v2's grammars are whatever is under the v2 fixture tree (none at the
+// seal). Loaders for lexicon or recipe files, which no code reads yet, land
+// in amendments before the run, and this test then loads them too.
+func TestV2Readiness(t *testing.T) {
+	v2World, err := LoadWorld(os.DirFS(v2Dir))
+	if err != nil {
+		t.Fatalf("v2 world and grammars: %v", err)
+	}
+	v1World, v1Cases := load(t)
+	v1Model, err := os.ReadFile(modelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var placeholders []string
+	v2Model, err := os.ReadFile(v2ModelPath)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		v2Model = v1Model
+		placeholders = append(placeholders, "v1's model for "+v2ModelPath)
+	case err != nil:
+		t.Fatal(err)
+	}
+	var dev []Case
+	v2Cases, err := LoadCases(os.DirFS(v2Dir))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if dev, err = v1Cases.Split("dev"); err != nil {
+			t.Fatal(err)
+		}
+		placeholders = append(placeholders, "v1's dev split for "+v2Dir+"/cases.jsonl")
+	case err != nil:
+		t.Fatalf("v2 cases: %v", err)
+	default:
+		for _, c := range v2Cases.all {
+			if c.Split == "test" {
+				t.Fatalf("v2 cases.jsonl holds case %s of the test split; the test split is sealed apart", c.ID)
+			}
+		}
+		if dev, err = v2Cases.Split("dev"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(dev) == 0 {
+		t.Fatal("no dev cases to run")
+	}
+	text, _ := v2Evaluate(t, "dev", dev, v2System{"router v2", v2World, v2Model}, v2System{"frozen v1", v1World, v1Model})
+	if !strings.Contains(text, "Primary outcome: ") {
+		t.Fatal("the harness rendered no verdict")
+	}
+	for _, p := range placeholders {
+		t.Logf("PLACEHOLDER in use: %s", p)
 	}
 }
 
@@ -284,6 +346,8 @@ func TestJudgeV2(t *testing.T) {
 		{"loss", report(120, 120, 112, 120, 120, 120), lose, tie, tie, "negative", "inconclusive", true, true, false, true, true},
 		{"tie", report(60, 61, 112, 61, 50, 60), tie, tie, tie, "inconclusive", "inconclusive", true, true, false, false, false},
 		{"G1 at the bound", report(95, 100, 105, 100, 90, 100), tie, tie, tie, "inconclusive", "inconclusive", true, true, false, true, true},
+		{"one wrong of one", report(0, 1, 112, 1, 0, 0), win, tie, win, "negative", "contradicted", false, true, false, false, false},
+		{"G1 just over the bound", report(94, 100, 112, 100, 90, 100), win, tie, tie, "negative", "contradicted", false, true, false, true, true},
 	} {
 		v := judgeV2(tc.r, tc.primary, tc.versus, tc.coverage)
 		if v.Primary != tc.wantPrimary || v.H2 != tc.wantH2 || v.G1 != tc.wantG1 || v.G2 != tc.wantG2 ||

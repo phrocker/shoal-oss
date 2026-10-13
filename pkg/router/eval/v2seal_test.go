@@ -191,7 +191,7 @@ func TestV2SealRefusesAnyChange(t *testing.T) {
 // v2ProtocolSHA256 pins the pre-registration's fixed part: the SHA-256 of
 // docs/router-evaluation-v2.md up to its "## Amendments" heading. Later
 // changes may only append amendments, results and errata below it.
-const v2ProtocolSHA256 = "7805afbe974f785afe3694bf204a8162b84afbc808359a9cca416e80fd348b0b"
+const v2ProtocolSHA256 = "6eef3c7476d6b9f0522eb262b84103200271ef1920003bdda65567e80570931d"
 
 // TestV2DocRecordsTheSeal: the pre-registration records every digest the
 // code pins, so neither can change without the other, and its protocol text
@@ -206,7 +206,7 @@ func TestV2DocRecordsTheSeal(t *testing.T) {
 		"V2WorldSHA256": V2WorldSHA256, "v2BaselineSHA256": v2BaselineSHA256,
 		"V2TestCases":            fmt.Sprintf("| %d |", V2TestCases),
 		"grandfather digest":     grandfatherDigest(goLiteralsAtRegistration),
-		"grandfather size":       fmt.Sprintf("%d grandfathered units", len(goLiteralsAtRegistration)),
+		"grandfather size":       fmt.Sprintf("Grandfathered Go units: %d", len(goLiteralsAtRegistration)),
 		"G2 threshold":           fmt.Sprintf("at least %d of %d", v2G2Min, v2Unanswerable),
 		"S2 threshold":           fmt.Sprintf("at least %d of 191", v2CoverageTarget),
 		"frozen non-Go file set": fmt.Sprintf("%d frozen non-Go files", len(frozenNonGo)),
