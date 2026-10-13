@@ -459,10 +459,10 @@ func TestRegisterLineageRules(t *testing.T) {
 	p1, p2 := *leaves("p", 1, 1), *leaves("p", 2, 2)
 	local := *leaves("d", 1, 1)
 	cases := []struct {
-		name    string
+		name     string
 		incoming func(b *memory.Backend) []ImportedFile
-		want    []string // live files after, oldest first
-		removed []string // incoming objects not kept
+		want     []string // live files after, oldest first
+		removed  []string // incoming objects not kept
 	}{
 		{
 			name: "all held is absorbed",
