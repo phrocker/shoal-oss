@@ -480,20 +480,69 @@ labels unless it carries a reason. It is off by default. The refusal is a 400
 whose message names `declassification_reason`. It is returned only after the
 uploader has been authorized under the rule being replaced and under the new
 one, so it tells them nothing they could not already read. Unlike an invalid
-reason, it is decided per file, so it is not a pre-batch refusal. If an
-earlier file of the same batch already went through, the batch may be partly
-applied (an earlier file that was unchanged wrote nothing), so the response
-reports an indeterminate commit outcome like any indeterminate write: a 503
-with `unavailable`, the `Shoal-Commit-Outcome: indeterminate` header and
-`"indeterminate": true`, keeping the same message. That holds for every
-per-file failure of a multi-file upload, and matches the remote client. A
-failure on the first file changed nothing and keeps its own status (here the
-400). This refusal, like the refusal of a file whose content matches an
-earlier revision, is deterministic: retrying the same batch returns the same
-response. Supply a reason, or change the named file, before retrying. An upload that removes no label never needs a reason. Records are written whether this flag
-is on or off. With the flag on, an MCP caller sees a reasonless relabel as a
-mutating tool failure. Like every post-dispatch MCP failure, that is reported
-as indeterminate, because an earlier file in the batch may have been ingested.
+reason, it is decided per file, so it is not a pre-batch refusal: the batch
+reports it for that file and goes on with the others (#687, see "Per-file
+upload outcomes" below). An upload that removes no label never needs a reason.
+Records are written whether this flag is on or off. The refusal, like the
+refusal of a file whose content matches an earlier revision, is
+deterministic: retrying the same file returns the same refusal. Supply a
+reason, or change the named file, before retrying.
+
+**Per-file upload outcomes (#687).** The upload route ingests a batch one
+file at a time. Two per-file refusals do not stop it: content that matches an
+earlier revision (`historical_revision`) and a reasonless relabel under
+`-require-declassification-reason` (`declassification_reason_required`). The
+authorized client marks each as leaving nothing committed only after it has
+rolled the source claim back with nothing registered (or, for the reason,
+refused before the claim). Any other failure stops the batch at that file,
+including either refusal when that guarantee is missing (a failed claim
+rollback, say); the files after it are not tried.
+
+A batch where every file went through is the `200` it always was. Any other
+batch is a non-2xx error, so a client that checks only the status never takes
+it for success. The body keeps the usual `code`, `message` and
+`indeterminate` fields and adds `files`, one entry per file in request order:
+
+| `status` | Meaning |
+| --- | --- |
+| `applied`, `unchanged`, `historical` | the file's ingest disposition; it went through |
+| `refused` | refused with nothing committed; `reason` names why and `message` is the public refusal |
+| `failed` | the failure that stopped the batch; the top-level `message` describes it, and `"indeterminate": true` on the entry means this file may have been applied |
+| `not_attempted` | after the failure that stopped the batch; upload it again |
+
+The top-level fields describe the batch for a client that ignores `files`.
+They are the failure that stopped it, or, when every file was tried, the first
+refusal (`409 conflict` naming the file, or the reason-required `400`). The
+batch is indeterminate (a `503` with `unavailable`, the
+`Shoal-Commit-Outcome: indeterminate` header and `"indeterminate": true`,
+keeping the message) only when some file may have committed: an `applied` or
+`unchanged` file, or a stopping failure whose own outcome is unknown. An
+`unchanged` file counts because the authorized client re-registers an
+unchanged revision under the rule it selected, and its result does not say
+whether that rule is new. A refused or `historical` file committed nothing,
+so a batch of only those keeps the refusal's own status. Before #687 every
+failure after the first file was indeterminate, and the batch stopped at the
+first refusal.
+
+A directory re-uploaded after switching branches back (A to B to A) is the
+common case. Each file whose content went back to A is `refused` with
+`historical_revision` and keeps serving B; the others are applied or
+unchanged. Because files identical on both branches come back `unchanged`,
+such a batch is usually a `503` indeterminate response whose `files` say
+exactly what happened. The workspace UI lists each file's outcome (applied,
+unchanged, refused with its reason, failed, not attempted) instead of marking
+the whole batch failed.
+
+The MCP `shoal.ingest` tool returns the same `files` list in its error. Like
+every post-dispatch MCP failure it reports `indeterminate`, except when the
+whole batch committed nothing (every file was refused with the guarantee),
+which it reports as the refusal itself. `webapi.RemoteService` passes an
+upstream's `files` on (`webapi.IngestFileOutcomes`) after checking them
+against the request, and then keeps the upstream's verified commit outcome
+(marking it indeterminate anyway if the files show one that may have
+committed). Outcomes that do not match the request are dropped. An
+upstream built before #687 sends no `files`, so a failed multi-file upload
+stays indeterminate there, as before.
 
 A `RemoteService` client that talks to an upstream built before #664 has its
 reason dropped without an error, because that upstream ignores unknown form

@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### An upload batch reports each file, and refusals no longer stop it (#687)
+
+A workspace upload stopped at the first file that failed, and the workspace UI
+then marked every file of the batch failed, including the ones it had
+applied. After #674, re-uploading a directory after switching branches back
+showed one refused file per attempt.
+
+- Two per-file refusals no longer stop the batch: a file whose content matches
+  an earlier revision, and a relabel that needs a declassification reason. The
+  authorized client marks each as leaving nothing committed
+  (`explorer.IsRefusedWithoutEffect`), only after the claim has rolled back
+  with nothing registered. Any other failure still stops the batch, and the
+  files after it are not tried.
+- A batch that did not fully succeed is still an error, never a `200`. Its
+  body keeps `code`, `message`, `indeterminate` and the commit-outcome header,
+  and adds `files`: one entry per file, with a `status` (`applied`,
+  `unchanged`, `historical`, `refused` with a `reason`, `failed`, or
+  `not_attempted`).
+- The batch is indeterminate only when a file may have committed (`applied`,
+  `unchanged`, or a stopping failure whose own outcome is unknown). Before,
+  every failure after the first file was. A batch where every file was
+  refused now keeps the refusal's own status, for example a `409`.
+- The workspace UI lists each file's own outcome, with the refusal's reason,
+  and counts refused files apart.
+- The MCP `shoal.ingest` tool returns the same `files` in its error, and
+  reports an all-refused batch as the refusal rather than as indeterminate.
+  `webapi.RemoteService` passes an upstream's `files` on after checking them
+  against the request.
+
 ### Re-ingesting an earlier revision says so (#674)
 
 Re-ingesting content byte-identical to an earlier revision of a document used
@@ -23,7 +52,8 @@ again) was told it worked.
 - A multi-file upload that fails on any file after the first now reports an
   indeterminate commit outcome, as the remote client already did, because
   earlier files of the batch may have been applied (an earlier file that was
-  unchanged wrote nothing). Like every indeterminate write it is a 503
+  unchanged wrote nothing). #687 narrows this, and lets the batch go on past
+  the two refusals below; see its entry above. Like every indeterminate write it is a 503
   `unavailable` with the `Shoal-Commit-Outcome: indeterminate` header and
   `"indeterminate": true`, and it keeps the file's message. This covers the
   historical refusal and the missing-reason 400. A failure on the first file

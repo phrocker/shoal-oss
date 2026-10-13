@@ -687,9 +687,13 @@ func writeError(writer http.ResponseWriter, err error) {
 		Message       string                    `json:"message"`
 		Embedding     *wireEmbeddingQueryReport `json:"embedding,omitempty"`
 		Indeterminate bool                      `json:"indeterminate,omitempty"`
+		// Files is the per-file outcome of an upload batch that did not
+		// fully succeed (#687); the fields above stay the batch's outcome.
+		Files []IngestFileOutcome `json:"files,omitempty"`
 	}{
 		Code: code, Message: err.Error(),
 		Embedding: embedding, Indeterminate: indeterminate,
+		Files: IngestFileOutcomes(err),
 	})
 }
 

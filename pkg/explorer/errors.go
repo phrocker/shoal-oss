@@ -83,3 +83,54 @@ func IsCommittedInteraction(err error) bool {
 	var marked *committedInteractionError
 	return errors.As(err, &marked) || interaction.IsCommittedRecord(err)
 }
+
+type refusedWithoutEffectError struct {
+	cause error
+}
+
+func (e *refusedWithoutEffectError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *refusedWithoutEffectError) Unwrap() error {
+	return e.cause
+}
+
+// MarkRefusedWithoutEffect marks a refusal after which its producer
+// guarantees that the call left nothing committed: no base write, no claim,
+// no registration (#687). An audit record of the attempt, such as the
+// authorized client's declassification intent, is not an effect on the
+// document in this sense. A batch caller may then report the refusal for
+// that item and go on with the rest. Only the producer that performed the
+// rollback may apply it; the marker preserves the original error and its
+// public Shoal error code through normal unwrapping.
+func MarkRefusedWithoutEffect(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &refusedWithoutEffectError{cause: err}
+}
+
+// IsRefusedWithoutEffect reports whether err carries the
+// MarkRefusedWithoutEffect guarantee and nothing contradicts it. It is
+// strict: the marker must be reached through single-error unwrapping only,
+// since an error joined into the chain (errors.Join) may report a second
+// failure the guarantee does not cover, and any indeterminate-commit marker
+// in the chain wins.
+func IsRefusedWithoutEffect(err error) bool {
+	if err == nil || IsIndeterminateCommit(err) {
+		return false
+	}
+	for current := err; current != nil; {
+		if _, ok := current.(*refusedWithoutEffectError); ok {
+			return true
+		}
+		// A joined error has only Unwrap() []error, so the walk ends there.
+		single, ok := current.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		current = single.Unwrap()
+	}
+	return false
+}

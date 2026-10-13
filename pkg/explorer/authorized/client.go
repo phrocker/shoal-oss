@@ -259,6 +259,17 @@ func (c *Client) Ingest(
 	returned explorer.IngestResult,
 	returnedErr error,
 ) {
+	// refused is set at a refusal that leaves nothing committed once the
+	// source claim is resolved. The returned error is marked so only if the
+	// claim's cleanup succeeded: a cleanup failure joins a catalog error to
+	// the refusal, and that outcome is not covered (#687). This defer is
+	// registered first, so it runs after the claim's.
+	refused, claimCleanupFailed := false, false
+	defer func() {
+		if refused && !claimCleanupFailed && returnedErr != nil {
+			returnedErr = explorer.MarkRefusedWithoutEffect(returnedErr)
+		}
+	}()
 	decision, guard, now, err := c.begin(ctx, auth.OperationIngest)
 	if err != nil {
 		return explorer.IngestResult{}, err
@@ -283,6 +294,10 @@ func (c *Client) Ingest(
 	claim, declassification, err := c.claimSourceMutation(
 		ctx, ownedSource.URI, decision, rule, now)
 	if err != nil {
+		// The reason policy refuses a narrowing in claimSourceMutation
+		// before its intent is recorded, the claim is swapped or the base
+		// is written; everything before it only reads (#630, #665).
+		refused = IsDeclassificationReasonRequired(err)
 		return explorer.IngestResult{}, err
 	}
 	claimOutcome := sourceClaimRollback
@@ -301,6 +316,7 @@ func (c *Client) Ingest(
 				cleanupContext, claim)
 		}
 		if cleanupErr != nil {
+			claimCleanupFailed = true
 			catalogErr := policyCatalogWriteError(
 				cleanupContext, cleanupErr)
 			returned = explorer.IngestResult{}
@@ -391,6 +407,10 @@ func (c *Client) Ingest(
 	case explorer.IngestApplied:
 	case explorer.IngestUnchanged, explorer.IngestHistorical:
 		if !current {
+			// The base wrote nothing (the content resolved to an existing
+			// revision), nothing is registered, and claimOutcome is
+			// Rollback, so the claim is restored before the call returns.
+			refused = true
 			return explorer.IngestResult{}, historicalRevisionRefused()
 		}
 		if result.Disposition == explorer.IngestHistorical {

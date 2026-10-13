@@ -19,6 +19,7 @@ package webapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -57,8 +58,26 @@ func (s *EmbeddedService) Ingest(
 	if err != nil {
 		return IngestResponse{}, err
 	}
+	// Files are ingested one at a time (#687). A deterministic refusal that
+	// its producer guarantees left nothing committed for the file
+	// (ingestRefusal) is reported for that file and the batch goes on. Any
+	// other failure stops the batch at that file; the files after it are not
+	// tried.
+	//
+	// A caller that reads only the top-level error cannot tell which files
+	// took effect, so that error is marked indeterminate once another file of
+	// the batch may have committed: one applied, or one unchanged, since an
+	// authorized unchanged re-registers the revision under the selected rule
+	// and the result does not say whether that rule is new. A historical
+	// result and a refusal committed nothing, so they leave the batch as
+	// definite as its failing file. Before #687 any failure after the first
+	// file was marked.
 	results := make([]IngestFileResult, 0, len(prepared))
+	outcomes := make([]IngestFileOutcome, len(prepared))
+	var refusal error
+	mayHaveCommitted := false
 	for index, item := range prepared {
+		outcomes[index].Name = item.name
 		result, err := s.client.Ingest(ctx, item.source)
 		if err != nil {
 			wrapped := error(&uploadFileError{
@@ -66,16 +85,30 @@ func (s *EmbeddedService) Ingest(
 				cause: shoal.WrapError(
 					primaryErrorCode(err), "ingest upload file", err),
 			})
-			// Files are ingested one at a time, so once an earlier file of
-			// this batch went through, a failure leaves the batch partly
-			// applied. The caller cannot tell which files took effect from
-			// the error alone, so it is marked indeterminate, as
-			// RemoteService marks every failed multi-file upload. A failure
-			// on the first file changed nothing and stays definite.
-			if index > 0 {
+			if reason, message, ok := ingestRefusal(item.name, err); ok {
+				outcomes[index].Status = IngestFileRefused
+				outcomes[index].Reason = reason
+				outcomes[index].Message = message
+				if refusal == nil {
+					refusal = wrapped
+				}
+				continue
+			}
+			outcomes[index].Status = IngestFileFailed
+			outcomes[index].Indeterminate = explorer.IsIndeterminateCommit(err)
+			for rest := index + 1; rest < len(prepared); rest++ {
+				outcomes[rest] = IngestFileOutcome{
+					Name: prepared[rest].name, Status: IngestFileNotAttempted,
+				}
+			}
+			if mayHaveCommitted {
 				wrapped = explorer.MarkIndeterminateCommit(wrapped)
 			}
-			return IngestResponse{}, wrapped
+			return IngestResponse{}, withIngestFileOutcomes(wrapped, outcomes)
+		}
+		outcomes[index].Status = IngestFileStatus(result.Disposition)
+		if result.Disposition != explorer.IngestHistorical {
+			mayHaveCommitted = true
 		}
 		results = append(results, IngestFileResult{
 			Name:         item.name,
@@ -88,11 +121,44 @@ func (s *EmbeddedService) Ingest(
 			SkillFile:    item.skillFile,
 		})
 	}
+	if refusal != nil {
+		if mayHaveCommitted {
+			refusal = explorer.MarkIndeterminateCommit(refusal)
+		}
+		return IngestResponse{}, withIngestFileOutcomes(refusal, outcomes)
+	}
 	snapshot, err := s.client.Snapshot(ctx)
 	if err != nil {
 		return IngestResponse{}, err
 	}
 	return IngestResponse{Snapshot: fromExplorerSnapshot(snapshot), Files: results}, nil
+}
+
+// ingestRefusal reports whether err is a per-file refusal the batch may go
+// on past, with its public reason and message. Both conditions are required:
+// the producer's guarantee that the call left nothing committed
+// (explorer.IsRefusedWithoutEffect, set by the authorized client only once
+// the source claim has rolled back with no registration), and one of the two
+// refusals the authorized client returns only after authorizing the caller
+// under every rule the ingest replaces and the selected one, so naming them
+// discloses nothing (#674, #664). Any other failure, including either
+// refusal without the guarantee, stops the batch.
+func ingestRefusal(
+	name string, err error,
+) (IngestRefusalReason, string, bool) {
+	if !explorer.IsRefusedWithoutEffect(err) {
+		return "", "", false
+	}
+	switch code := primaryErrorCode(err); {
+	case code == shoal.ErrorConflict &&
+		errors.Is(err, authorized.ErrHistoricalRevision):
+		return IngestRefusedHistoricalRevision, historicalUploadMessage(name), true
+	case code == shoal.ErrorInvalidArgument &&
+		authorized.IsDeclassificationReasonRequired(err):
+		return IngestRefusedDeclassificationReason,
+			declassificationReasonRequiredMessage, true
+	}
+	return "", "", false
 }
 
 // uploadFileError names the upload file whose ingest failed. The name is

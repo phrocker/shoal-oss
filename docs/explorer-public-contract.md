@@ -453,6 +453,31 @@ claim is rolled back and nothing is registered, so the document, its current
 rule and its claim are exactly as before. A narrowing request still leaves its
 declassification intent record, which records an attempt, not an outcome.
 
+Two authorized ingest refusals carry `explorer.IsRefusedWithoutEffect`
+(#687): this historical refusal, once its claim rollback has succeeded, and
+the `-require-declassification-reason` refusal raised before the source claim
+(`authorized.IsDeclassificationReasonRequired`). The marker means the call
+left the document, its registrations and its source claim as they were; the
+only record it may leave is a narrowing's declassification intent, which
+records an attempt. It is not set when the claim rollback failed, and it
+is never reported beside an indeterminate-commit marker or through a joined
+error. Other errors, including a reason refusal raised later in the ingest,
+do not carry it.
+
+The workspace upload batch (`POST /api/v1/ingest`, `webapi.IngestProvider`)
+reports either marked refusal per file and goes on with the rest. Any other
+per-file failure stops the batch. A batch that did not fully succeed is a
+`webapi.IngestBatchError`. It unwraps to the batch's top-level error, which
+keeps its code, message and indeterminate marker, and it carries one
+`webapi.IngestFileOutcome` per file (`webapi.IngestFileOutcomes`; the wire
+field `files` in the error body). Statuses are `applied`, `unchanged`,
+`historical`, `refused` (with `reason` `historical_revision` or
+`declassification_reason_required`), `failed` and `not_attempted`. The
+top-level error is marked indeterminate only when a file may have committed
+(`applied` or `unchanged`, or a stopping failure that is itself
+indeterminate). It is `explorer.IsRefusedWithoutEffect` only when the whole
+batch committed nothing.
+
 `pkg/code` retains its existing typed stable-ID algorithms. `Source.Ref` is
 excluded from `Source.ID` and the ingestion key because multiple refs can
 resolve to one immutable revision. Retrying a committed identical ingestion

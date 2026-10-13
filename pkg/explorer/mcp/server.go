@@ -702,8 +702,12 @@ func (s *Server) callTool(ctx context.Context, request Request) *Response {
 		}
 	}
 	value, err := tool.call(bound, arguments)
+	// A refusal its producer guarantees left nothing committed (#687) is
+	// reported as itself; for an ingest batch the guarantee covers every
+	// file (webapi.IngestBatchError).
 	if mutating && err != nil &&
 		!isPreEffectToolError(err) &&
+		!explorer.IsRefusedWithoutEffect(err) &&
 		!explorer.IsIndeterminateCommit(err) {
 		err = explorer.MarkIndeterminateCommit(shoal.WrapError(
 			shoal.ErrorUnavailable,
