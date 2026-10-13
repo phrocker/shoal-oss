@@ -1119,6 +1119,17 @@ func (s *DurablePolicyStore) Edges(
 	return s.memoryStore().Edges(ctx, edgeIDs)
 }
 
+// ApplicationEdgeCollisions is a pure read delegated to the memory store; see
+// MemoryPolicyStore.ApplicationEdgeCollisions. It needs no record of its own:
+// a withheld application registration is its ordinary edge row, and which
+// registrations are withheld follows, on every open, from the current
+// revisions (#732).
+func (s *DurablePolicyStore) ApplicationEdgeCollisions(
+	ctx context.Context,
+) ([]shoal.ID, error) {
+	return s.memoryStore().ApplicationEdgeCollisions(ctx)
+}
+
 // LoadCoOccurrence is a pure read delegated to the memory store, whose state was
 // reconstructed from the engine on open.
 func (s *DurablePolicyStore) LoadCoOccurrence(

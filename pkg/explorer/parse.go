@@ -539,6 +539,19 @@ func canonicalVisibility(expression string) string {
 	return interaction.Expression(labels)
 }
 
+// IsDocumentContainsEdge reports whether edge is exactly the "contains" edge
+// a document parse derives from its From to its To node: the ID derived from
+// both endpoints, type "contains", weight 1 and no properties. Every
+// intrinsic edge of a revision ingested today has this shape. The policy
+// catalog lets only such an edge win an ID an application edge holds (#732),
+// so a stored application edge the base graph shows can never pass as an
+// intrinsic edge with content of its own.
+func IsDocumentContainsEdge(edge graph.Edge) bool {
+	want := containsEdge(edge.From, edge.To)
+	return edge.ID == want.ID && edge.Type == want.Type &&
+		edge.Weight == want.Weight && len(edge.Properties) == 0
+}
+
 func containsEdge(from, to shoal.ID) graph.Edge {
 	return graph.Edge{
 		ID:   shoal.ID(stableID("edge", string(from), "contains", string(to))),

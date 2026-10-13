@@ -2,6 +2,82 @@
 
 ## Unreleased
 
+### The policy catalog lets a derived edge win an application edge's ID (#732)
+
+Before #699 an authorized `Connect` accepted any edge ID, and a document's
+root `contains` edge ID can be derived from its URI. So a stored application
+edge can hold the intrinsic edge ID of a document ingested later. #724 let the
+intrinsic edge win in the base graph, but the policy catalog still refused to
+register the document's revision: every authorized ingest of that URI
+returned `conflict: authorization policy catalog conflict`, and the document,
+which the base had committed, stayed withheld from every reader. It failed
+closed, but no supported operation fixed it. Extraction and materialization
+were refused the same way over an application edge holding one of their edge
+IDs.
+
+**Behaviour change.** The catalog now follows the base graph:
+
+- **Intrinsic edges.** A revision whose intrinsic edge ID an application
+  registration holds with other content is registered. The intrinsic edge
+  wins its ID: `Edge` and `Edges` resolve it, so it is served under the
+  document's rule alone. The application registration stays stored but
+  governs nothing, so the application edge is withheld from every reader,
+  even if the base showed it. It is reported by the new operator diagnostic
+  `ApplicationEdgeCollisions(ctx)` on `MemoryPolicyStore` and
+  `DurablePolicyStore`, which matches `Explorer.ApplicationEdgeCollisions`
+  for intrinsic edges. Like the base's, it is not on `PolicyStore` and no
+  `authorized.Client` method exposes it. Only an exact document `contains`
+  edge (`explorer.IsDocumentContainsEdge`) wins: the client reads a
+  revision's intrinsic edges from the base graph, so anything else could be
+  the application edge itself, and that revision is still refused.
+- **An application `contains` edge between a document's own nodes**, which
+  the base graph shows and the client therefore reads as intrinsic, is no
+  longer a reason to refuse the document's next revision. It is left out of
+  the revision's intrinsic edges and stays governed by its application
+  registration (its rule and both endpoints' rules), never by the document's
+  rule alone.
+- **Extracted and materialized edges.** An extracted or materialized
+  registration replaces an application registration of other content or
+  rule under its ID, binding included, and consumes a leftover reservation
+  there, instead of refusing the extraction or materialization. The base
+  still holds and reports the application edge, which never matches the
+  derived registration, so it stays withheld even if the base shows it
+  again. An extracted edge matching an application registration exactly,
+  under the same rule, still takes it over and keeps its binding, as before.
+- Whichever way the derived edge won, `Connect` can never take the ID back:
+  the reservation is refused while the derived registration holds it.
+
+**Format.** Nothing new is persisted. Which application registrations are
+withheld follows from the current revisions on every open, and a replaced
+registration is an ordinary edge row. So there is no migration and no format
+floor change.
+
+**Rollback.** A binary from before this release opens the catalog unchanged
+and applies its own rules to it. One since #724 prefers the application
+registration again over a withheld collision, so the intrinsic edge no
+longer matches it and is withheld, and the next ingest of the document is
+refused as before: fail closed. The application edge stays withheld there
+too, because that binary's base graph withholds it. A binary from before
+#724 lets the application edge replace the intrinsic edge in its graph and
+serves it under its application registration, as it did before this
+release. Every binary since #721 includes #724, and binaries from before
+#721 refuse a catalog once it holds the namespace key, which it does from
+the first time it needs a namespace. Binaries from before #695
+refuse it from the first read-write open since (the format floor). A
+derived registration that replaced an application one is an ordinary edge
+row to every binary.
+
+**Residuals.**
+
+- No supported API retires a stored application edge yet, in the base or the
+  catalog. It is no longer needed to make a squatted document usable, but the
+  withheld edge keeps its ID, and an application edge whose ID an intrinsic
+  edge holds becomes visible again, under its own registration, if a later
+  revision of that document no longer has that intrinsic edge.
+- An application edge identical to a document's intrinsic edge is not a
+  collision in the base graph. The catalog keeps it under its application
+  registration, so that edge is served only to readers of both rules.
+
 ### Edge and upload namespaces are keyed by the catalog (#721)
 
 The application edge namespace (`app-edge_<digest>/<local>`, #699) and the
@@ -240,9 +316,8 @@ Now:
   once the derived edge appears. Old state can also hold one. Before #699 an authorized `Connect` accepted any ID, and a document's
   root `contains` edge ID can be derived from its URI, so an application edge
   could take the intrinsic ID of a document ingested later. Through the
-  authorized client a withheld collision fails closed. The catalog keeps the
-  application registration, so the derived edge doesn't match it and is
-  withheld from readers too. Such a legacy pre-#699 application ID is not in
+  authorized client the policy catalog gives the derived edge the ID too
+  (#732, below). Such a legacy pre-#699 application ID is not in
   any writer's namespace, so it appears verbatim in the collision log line,
   usually as a document's intrinsic edge ID.
 
@@ -252,12 +327,7 @@ Now:
   application edge's ID can't be reused. Connect the edge again under a new
   local ID: `ApplicationEdgeID(ctx, "<new local id>")`, or any free ID on the
   unwrapped explorer.
-- **Through `authorized.Client` the colliding derived edge stays withheld,
-  and the catalog refuses to register a new revision of a document whose
-  intrinsic edge ID an application registration holds** (Conflict). The base
-  still commits the revision, so the document is withheld from every reader
-  until the catalog registration is resolved. No supported API retires an
-  application edge yet; both are tracked on #732.
+- **Through `authorized.Client`** the same holds since #732: see below.
 
 **An edge overwritten while it was hidden.** A base edge rewritten by an
 unwrapped `Explorer.Connect` while the bug hid it no longer matches its
