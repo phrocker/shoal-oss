@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Copy-down through edges, interactions and extraction is not a declassification (#663)
+
+#663 asked whether labelled content written into weaker-labelled material
+through an operation that names its inputs should be audited like a relabel
+(#630). It should not: none of these writes admits a new reader when it is
+made.
+
+
+- An application edge (`Connect`) is stored under the edge policy, which never
+  carries a label, but every read also requires both endpoints' current rules.
+- An interaction's output restriction may omit its evidence's labels (an MCP
+  tool call records only the workspace output policy), but every read also
+  requires every touched node's and edge's current rule.
+- Extracted entities and relations are registered under their document's own
+  rule and follow it through a relabel.
+
+So these writes record no declassification, and
+`-require-declassification-reason` does not refuse them. New tests pin, for
+each operation and both policy stores, that a reader without the label sees
+none of the output, although its stored rule is weaker. The binding is
+documented in the deploy guide and in `pkg/explorer/authorized`. Nothing
+changes in behaviour, wire formats or the policy catalog.
+
+Found while checking this and filed:
+
+- #695: interactions and application edges follow their inputs' current
+  rule, not the rule of the revision they were derived from. So a relabel
+  that removes a label opens what was derived from the labelled revision,
+  while that revision itself stays closed.
+- #696: a fleet action's `Output` is served to readers whose evidence refs
+  are withheld.
+- #694: heuristic detection of copy-down that names no input (session
+  correlation, content similarity), as operator signals that never block a
+  write.
+
 ### An upload batch reports each file, and refusals no longer stop it (#687)
 
 A workspace upload stopped at the first file that failed, and the workspace UI
