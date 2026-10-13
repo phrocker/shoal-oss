@@ -102,3 +102,24 @@ func TestRefusedWithoutEffectMarkerIsStrict(t *testing.T) {
 		t.Fatal("marking nil returned an error")
 	}
 }
+
+// TestConcealRefusedWithoutEffectKeepsEverythingElse pins that concealing
+// hides only the guarantee: text, code, errors.Is and the indeterminate
+// marker all survive, and an unmarked error is returned as it is.
+func TestConcealRefusedWithoutEffectKeepsEverythingElse(t *testing.T) {
+	cause := errors.New("cause")
+	refusal := shoal.WrapError(shoal.ErrorConflict, "refused", cause)
+	concealed := explorer.ConcealRefusedWithoutEffect(
+		explorer.MarkRefusedWithoutEffect(refusal))
+	if explorer.IsRefusedWithoutEffect(concealed) ||
+		!shoal.IsErrorCode(concealed, shoal.ErrorConflict) ||
+		!errors.Is(concealed, cause) || concealed.Error() != refusal.Error() {
+		t.Fatalf("concealed = %v", concealed)
+	}
+	if got := explorer.ConcealRefusedWithoutEffect(refusal); got != error(refusal) {
+		t.Fatalf("an unmarked error was rewrapped: %v", got)
+	}
+	if explorer.ConcealRefusedWithoutEffect(nil) != nil {
+		t.Fatal("concealing nil returned an error")
+	}
+}

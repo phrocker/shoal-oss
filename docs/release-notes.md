@@ -17,19 +17,28 @@ showed one refused file per attempt.
   files after it are not tried.
 - A batch that did not fully succeed is still an error, never a `200`. Its
   body keeps `code`, `message`, `indeterminate` and the commit-outcome header,
-  and adds `files`: one entry per file, with a `status` (`applied`,
+  and adds `files`. That is one entry per file, with a `status`: `applied`,
   `unchanged`, `historical`, `refused` with a `reason`, `failed`, or
-  `not_attempted`).
-- The batch is indeterminate only when a file may have committed (`applied`,
-  `unchanged`, or a stopping failure whose own outcome is unknown). Before,
-  every failure after the first file was. A batch where every file was
-  refused now keeps the refusal's own status, for example a `409`.
+  `not_attempted`.
+- A batch is indeterminate only when a file's own outcome is unknown, which is
+  when the failure that stopped it was indeterminate. Before, every failure
+  after the first file was. A batch whose files were applied or unchanged
+  beside refusals now keeps the refusal's definite status (for example a
+  `409`) and is marked partial: `Shoal-Commit-Outcome: partial` (a new header
+  value) and `"partial": true`. Retrying it converges, because applied files
+  come back unchanged. A batch where every file was refused has no header.
 - The workspace UI lists each file's own outcome, with the refusal's reason,
-  and counts refused files apart.
-- The MCP `shoal.ingest` tool returns the same `files` in its error, and
-  reports an all-refused batch as the refusal rather than as indeterminate.
-  `webapi.RemoteService` passes an upstream's `files` on after checking them
-  against the request.
+  and counts refused files apart. It says when files of a failed batch took
+  effect and refreshes the document list.
+- The MCP `shoal.ingest` tool returns the same `files` in its error. It
+  reports a batch whose every file was tried (and has a known outcome) with
+  its definite code, partial or not. A batch stopped by a failure stays
+  `indeterminate`. `webapi.RemoteService` passes an upstream's `files` on
+  after checking them against the request and keeps the upstream's verified
+  definite or partial outcome. With an upstream built before #687 (no
+  `files`), a multi-file failure stays indeterminate, over MCP too.
+- The authorized client conceals the no-effect marker on any error it did not
+  mark itself, including one from its base.
 
 ### Re-ingesting an earlier revision says so (#674)
 
@@ -52,8 +61,9 @@ again) was told it worked.
 - A multi-file upload that fails on any file after the first now reports an
   indeterminate commit outcome, as the remote client already did, because
   earlier files of the batch may have been applied (an earlier file that was
-  unchanged wrote nothing). #687 narrows this, and lets the batch go on past
-  the two refusals below; see its entry above. Like every indeterminate write it is a 503
+  unchanged wrote nothing). #687 replaces this with a definite, partial
+  outcome, and lets the batch go on past the two refusals below; see its
+  entry above. Like every indeterminate write it is a 503
   `unavailable` with the `Shoal-Commit-Outcome: indeterminate` header and
   `"indeterminate": true`, and it keeps the file's message. This covers the
   historical refusal and the missing-reason 400. A failure on the first file

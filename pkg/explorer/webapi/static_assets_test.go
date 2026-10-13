@@ -456,6 +456,11 @@ assert.match(
   /Uploaded 6 of 11 file\(s\); 3 refused; 2 failed/,
   "the summary must count applied, refused and failed files apart",
 );
+assert.match(
+  scenario.ids["upload-status"].textContent,
+  /took effect; uploading the same files again is safe/,
+  "a partly applied batch must say its applied files took effect and a retry is safe",
+);
 const finalDocumentRequest = scenario.documentBodies[scenario.documentBodies.length - 1];
 assert.notStrictEqual(
   finalDocumentRequest.snapshot && finalDocumentRequest.snapshot.id,
@@ -477,6 +482,24 @@ await legacy.ids.upload.onsubmit({preventDefault() {}});
 assert.match(renderedText(legacy.ids["upload-results"]), /Failed dir\/a\.md: conflict: upload failed/,
   "outcomes that do not match the batch must not be trusted");
 assert.match(legacy.ids["upload-status"].textContent, /Uploaded 0 of 2 file\(s\); 2 failed/);
+assert.doesNotMatch(legacy.ids["upload-status"].textContent, /took effect/,
+  "a batch without trusted outcomes must not claim files took effect");
+
+const refusedOnly = await runScenario(
+  {documents: true, document: true, ingest: true},
+  [],
+  {
+    meta: {max_upload_files: 2, max_upload_file_bytes: 100, max_upload_total_bytes: 200},
+    ingestErrors: [{statusText: "Conflict", body: {code: "conflict", message: "conflict: refused",
+      files: [{name: "dir__a.md", status: "refused", reason: "historical_revision"},
+        {name: "dir__b.md", status: "historical"}]}}],
+  },
+);
+refusedOnly.ids["upload-directory"].files = ["a.md", "b.md"].map((name) => ({name, webkitRelativePath: "dir/" + name, size: 1}));
+await refusedOnly.ids.upload.onsubmit({preventDefault() {}});
+assert.match(refusedOnly.ids["upload-status"].textContent, /Uploaded 1 of 2 file\(s\); 1 refused/);
+assert.doesNotMatch(refusedOnly.ids["upload-status"].textContent, /took effect/,
+  "a batch where nothing took effect must not be called partial");
 
 const extra = await runScenario(
   {documents: true, document: true, ingest: true},

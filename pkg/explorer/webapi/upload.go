@@ -64,18 +64,17 @@ func (s *EmbeddedService) Ingest(
 	// other failure stops the batch at that file; the files after it are not
 	// tried.
 	//
-	// A caller that reads only the top-level error cannot tell which files
-	// took effect, so that error is marked indeterminate once another file of
-	// the batch may have committed: one applied, or one unchanged, since an
-	// authorized unchanged re-registers the revision under the selected rule
-	// and the result does not say whether that rule is new. A historical
-	// result and a refusal committed nothing, so they leave the batch as
-	// definite as its failing file. Before #687 any failure after the first
-	// file was marked.
+	// The top-level error is indeterminate only when a file's own outcome is
+	// unknown: the failure that stopped the batch was indeterminate. A file
+	// that returned a result, applied or unchanged (even an authorized
+	// relabel), has a known outcome, so it makes the batch partial
+	// (IngestBatchPartial, and over HTTP the partial commit outcome), not
+	// indeterminate. Retrying a partial batch converges: its applied files
+	// come back unchanged. Before #687 any failure after the first file was
+	// marked indeterminate, so such a batch never converged.
 	results := make([]IngestFileResult, 0, len(prepared))
 	outcomes := make([]IngestFileOutcome, len(prepared))
 	var refusal error
-	mayHaveCommitted := false
 	for index, item := range prepared {
 		outcomes[index].Name = item.name
 		result, err := s.client.Ingest(ctx, item.source)
@@ -101,15 +100,9 @@ func (s *EmbeddedService) Ingest(
 					Name: prepared[rest].name, Status: IngestFileNotAttempted,
 				}
 			}
-			if mayHaveCommitted {
-				wrapped = explorer.MarkIndeterminateCommit(wrapped)
-			}
 			return IngestResponse{}, withIngestFileOutcomes(wrapped, outcomes)
 		}
 		outcomes[index].Status = IngestFileStatus(result.Disposition)
-		if result.Disposition != explorer.IngestHistorical {
-			mayHaveCommitted = true
-		}
 		results = append(results, IngestFileResult{
 			Name:         item.name,
 			MediaType:    item.mediaType,
@@ -122,9 +115,6 @@ func (s *EmbeddedService) Ingest(
 		})
 	}
 	if refusal != nil {
-		if mayHaveCommitted {
-			refusal = explorer.MarkIndeterminateCommit(refusal)
-		}
 		return IngestResponse{}, withIngestFileOutcomes(refusal, outcomes)
 	}
 	snapshot, err := s.client.Snapshot(ctx)

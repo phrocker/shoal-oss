@@ -263,12 +263,19 @@ func (c *Client) Ingest(
 	// source claim is resolved. The returned error is marked so only if the
 	// claim's cleanup succeeded: a cleanup failure joins a catalog error to
 	// the refusal, and that outcome is not covered (#687). This defer is
-	// registered first, so it runs after the claim's.
+	// registered first, so it runs after the claim's. Every other error,
+	// including one passed on from the base, is concealed, so the guarantee
+	// can only ever be one this client gave.
 	refused, claimCleanupFailed := false, false
 	defer func() {
-		if refused && !claimCleanupFailed && returnedErr != nil {
-			returnedErr = explorer.MarkRefusedWithoutEffect(returnedErr)
+		if returnedErr == nil {
+			return
 		}
+		if refused && !claimCleanupFailed {
+			returnedErr = explorer.MarkRefusedWithoutEffect(returnedErr)
+			return
+		}
+		returnedErr = explorer.ConcealRefusedWithoutEffect(returnedErr)
 	}()
 	decision, guard, now, err := c.begin(ctx, auth.OperationIngest)
 	if err != nil {

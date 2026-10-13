@@ -25,6 +25,7 @@ package authorized_test
 // claim rollback failed.
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -104,6 +105,69 @@ func TestHistoricalRefusalWithFailedRollbackIsNotMarked(t *testing.T) {
 		}
 		if explorer.IsRefusedWithoutEffect(err) {
 			t.Fatalf("refusal with a failed rollback is marked: %v", err)
+		}
+	})
+}
+
+// markingBase is a base whose Ingest, Document or Documents failure carries
+// the no-effect marker, as a base the client must not trust to give it.
+type markingBase struct {
+	explorer.Client
+	failIngest, failDocuments bool
+}
+
+func (b *markingBase) Ingest(
+	ctx context.Context, source explorer.Source,
+) (explorer.IngestResult, error) {
+	if b.failIngest {
+		return explorer.IngestResult{}, explorer.MarkRefusedWithoutEffect(
+			shoal.WrapError(shoal.ErrorConflict, "base refused",
+				authorized.ErrHistoricalRevision))
+	}
+	return b.Client.Ingest(ctx, source)
+}
+
+func (b *markingBase) Documents(ctx context.Context) ([]explorer.DocumentSummary, error) {
+	if b.failDocuments {
+		return nil, explorer.MarkRefusedWithoutEffect(
+			shoal.NewError(shoal.ErrorConflict, "base refused"))
+	}
+	return b.Client.Documents(ctx)
+}
+
+// TestIngestConcealsAGuaranteeItDidNotGive pins that the only no-effect
+// guarantee an authorized ingest returns is one it gave itself: a base error
+// carrying the marker, whether from the base write or a read after it, is
+// passed on with its code and errors.Is match but without the guarantee.
+func TestIngestConcealsAGuaranteeItDidNotGive(t *testing.T) {
+	withPolicyStores(t, func(t *testing.T, store authorized.PolicyStore) {
+		f := newFixture(t)
+		base := &markingBase{Client: f.base}
+		client := f.newClient(t, base, store, f.sourceA, f.policyA, nil)
+		owner := f.labelIngester(t, "owner", "secret")
+		for _, test := range []struct {
+			name                      string
+			failIngest, failDocuments bool
+		}{
+			{"base write", true, false},
+			{"base read", false, true},
+		} {
+			base.failIngest, base.failDocuments = test.failIngest, test.failDocuments
+			_, err := client.Ingest(owner, labelledSource(
+				"file:///refused/base-"+test.name+".txt", test.name, ""))
+			if err == nil || !shoal.IsErrorCode(err, shoal.ErrorConflict) {
+				t.Fatalf("%s: error = %v, want the base's conflict", test.name, err)
+			}
+			if explorer.IsRefusedWithoutEffect(err) {
+				t.Fatalf("%s: a base error's guarantee was passed on: %v", test.name, err)
+			}
+		}
+		if !errors.Is(func() error {
+			base.failIngest, base.failDocuments = true, false
+			_, err := client.Ingest(owner, labelledSource("file:///refused/is.txt", "x", ""))
+			return err
+		}(), authorized.ErrHistoricalRevision) {
+			t.Fatal("concealing lost the errors.Is match")
 		}
 	})
 }

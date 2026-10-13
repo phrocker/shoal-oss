@@ -41,6 +41,9 @@ type refusingExplorer struct {
 func (c *refusingExplorer) Ingest(
 	ctx context.Context, source explorer.Source,
 ) (explorer.IngestResult, error) {
+	if source.Content == "bad\n" {
+		return explorer.IngestResult{}, shoal.NewError(shoal.ErrorNotFound, "injected")
+	}
 	if source.Content == c.refused {
 		return explorer.IngestResult{}, explorer.MarkRefusedWithoutEffect(
 			shoal.WrapError(shoal.ErrorConflict, "refused",
@@ -50,8 +53,10 @@ func (c *refusingExplorer) Ingest(
 }
 
 // TestIngestToolReportsPerFileOutcomes pins #687 on the MCP ingest tool: a
-// batch that did not fully succeed is still a tool error with its usual code
-// (indeterminate once a file was applied), and it lists each file's outcome.
+// batch that did not fully succeed is still a tool error and lists each
+// file's outcome. When every file was tried and has a known outcome it keeps
+// its definite code, partial or not; a batch stopped by a failure stays
+// indeterminate, like every other post-dispatch failure.
 func TestIngestToolReportsPerFileOutcomes(t *testing.T) {
 	corpus, err := explorer.Open(t.TempDir())
 	if err != nil {
@@ -84,8 +89,13 @@ func TestIngestToolReportsPerFileOutcomes(t *testing.T) {
 		{"refused only", file("old.txt", "old\n"), string(shoal.ErrorConflict),
 			[]webapi.IngestFileOutcome{refused}},
 		{"refused and applied", file("old.txt", "old\n") + "," + file("new.txt", "new\n"),
-			"indeterminate", []webapi.IngestFileOutcome{refused,
+			string(shoal.ErrorConflict), []webapi.IngestFileOutcome{refused,
 				{Name: "new.txt", Status: webapi.IngestFileApplied}}},
+		{"stopped", file("old.txt", "old\n") + "," + file("bad.txt", "bad\n") + "," +
+			file("later.txt", "later\n"),
+			"indeterminate", []webapi.IngestFileOutcome{refused,
+				{Name: "bad.txt", Status: webapi.IngestFileFailed},
+				{Name: "later.txt", Status: webapi.IngestFileNotAttempted}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			response := callToolRequest(t, server, ToolIngest, `{"files":[`+test.files+`]}`)

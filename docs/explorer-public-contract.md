@@ -473,10 +473,21 @@ keeps its code, message and indeterminate marker, and it carries one
 field `files` in the error body). Statuses are `applied`, `unchanged`,
 `historical`, `refused` (with `reason` `historical_revision` or
 `declassification_reason_required`), `failed` and `not_attempted`. The
-top-level error is marked indeterminate only when a file may have committed
-(`applied` or `unchanged`, or a stopping failure that is itself
-indeterminate). It is `explorer.IsRefusedWithoutEffect` only when the whole
-batch committed nothing.
+top-level error is marked indeterminate only when a file's own outcome is
+unknown, which is when the failure that stopped the batch was itself
+indeterminate. A file that returned a result has a known outcome. So a batch
+where files were applied or unchanged beside refusals, or before a definite
+failure, keeps that definite error and is partial (`webapi.IngestBatchPartial`).
+Over HTTP that means the `Shoal-Commit-Outcome: partial` header and
+`"partial": true`. Retrying a partial batch converges, because its applied
+files come back `unchanged`. The batch error unwraps only as a multi-error, so
+it is never `explorer.IsRefusedWithoutEffect` itself; `errors.Is`, `errors.As`
+and the Shoal code see through it. `webapi.IngestOutcomeKnown` reports a
+batch in which every file was tried and has a known outcome.
+
+The authorized client returns the no-effect marker only on the refusals it
+gives itself. Any other error it returns, including one passed on from its
+base, has the marker concealed (`explorer.ConcealRefusedWithoutEffect`).
 
 `pkg/code` retains its existing typed stable-ID algorithms. `Source.Ref` is
 excluded from `Source.ID` and the ingestion key because multiple refs can

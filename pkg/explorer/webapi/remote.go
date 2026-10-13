@@ -724,12 +724,13 @@ func validateRemoteDocumentSummary(summary explorer.DocumentSummary) error {
 }
 
 // decodeRemoteIngestError decodes a failed remote upload. A multi-file
-// failure is marked indeterminate unless the remote reported a valid
-// per-file outcome for every file of the request (#687), which a server
-// that predates it never sends: the remote then marked the batch itself,
-// exactly as an embedded workspace marks it, and its verified outcome is
-// kept. Outcomes that do not match the request are dropped, and the batch
-// is then treated as before.
+// failure is marked indeterminate unless the remote reported a valid,
+// verified per-file outcome for every file of the request (#687), which a
+// server that predates it never sends. With one, the remote's verified
+// commit outcome is kept: a definite failure stays definite, partial or not
+// (IngestBatchPartial follows from the files), unless an outcome itself says
+// a file's result is unknown. Outcomes that do not match the request are
+// dropped, and the batch is then treated as before.
 func decodeRemoteIngestError(
 	response *http.Response, prepared []preparedUpload,
 ) error {
@@ -756,25 +757,20 @@ func decodeRemoteIngestError(
 		}
 	}
 	if (!verified || (len(prepared) > 1 && files == nil) ||
-		ingestOutcomesMayHaveCommitted(files)) &&
+		ingestOutcomesUnknown(files)) &&
 		!explorer.IsIndeterminateCommit(remoteErr) {
 		remoteErr = explorer.MarkIndeterminateCommit(remoteErr)
 	}
 	return withIngestFileOutcomes(remoteErr, files)
 }
 
-// ingestOutcomesMayHaveCommitted reports whether a file of files may have
-// committed, by the rule EmbeddedService.Ingest marks a batch with, so a
-// remote that reported one as definite is not believed.
-func ingestOutcomesMayHaveCommitted(files []IngestFileOutcome) bool {
+// ingestOutcomesUnknown reports whether a file of files has an unknown
+// outcome, so a remote that reported the batch as definite is not believed.
+func ingestOutcomesUnknown(files []IngestFileOutcome) bool {
+	// validRemoteIngestOutcomes admits the flag only on a failed file.
 	for _, file := range files {
-		switch file.Status {
-		case IngestFileApplied, IngestFileUnchanged:
+		if file.Indeterminate {
 			return true
-		case IngestFileFailed:
-			if file.Indeterminate {
-				return true
-			}
 		}
 	}
 	return false

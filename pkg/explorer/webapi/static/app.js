@@ -2118,6 +2118,7 @@ async function uploadFiles(fileList) {
     let uploaded = 0;
     let failed = 0;
     let refused = 0;
+    let partial = false;
     const failureMessages = [];
     let latestSnapshot = null;
     for (let index = 0; index < plan.batches.length; index++) {
@@ -2151,9 +2152,11 @@ async function uploadFiles(fileList) {
           else if (outcome.counted === "refused") refused++;
           else failed++;
         }
-        // Files of this batch may have been applied after the last successful
-        // snapshot, so the refresh must read the latest one.
+        // Files of this batch were applied (a partial batch) or may have been
+        // after the last successful snapshot, so the refresh must read the
+        // latest one.
         if (outcomes.some((outcome) => outcome.mayHaveCommitted)) latestSnapshot = null;
+        if (outcomes.some((outcome) => outcome.counted === "uploaded" && outcome.mayHaveCommitted)) partial = true;
       }
     }
     if (uploaded > 0 || failed > 0 || refused > 0) {
@@ -2167,10 +2170,10 @@ async function uploadFiles(fileList) {
       } else {
         clearPinnedSnapshot();
       }
-      renderUploadResults(results, uploadSummary(files.length, uploaded, failed, plan.skipped.length, failureMessages, refused));
+      renderUploadResults(results, uploadSummary(files.length, uploaded, failed, plan.skipped.length, failureMessages, refused) + partialUploadNote(partial));
       await loadDocuments(true);
     } else {
-      renderUploadResults(results, uploadSummary(files.length, uploaded, failed, plan.skipped.length, failureMessages, refused));
+      renderUploadResults(results, uploadSummary(files.length, uploaded, failed, plan.skipped.length, failureMessages, refused) + partialUploadNote(partial));
     }
   } catch (error) {
     showActionError($("upload-status"), error, "upload files");
@@ -2392,6 +2395,14 @@ function uploadSummary(total, uploaded, failed, skipped, failureMessages = [], r
     return `${parts.join("; ")}${detail}.`;
   }
   return `Uploaded ${uploaded} file(s).`;
+}
+
+// partialUploadNote explains a batch that was refused or failed in part
+// while its other files took effect (#687).
+function partialUploadNote(partial) {
+  return partial
+    ? " Files listed as applied or unchanged took effect; uploading the same files again is safe, they come back unchanged."
+    : "";
 }
 
 function formatBytes(bytes) {

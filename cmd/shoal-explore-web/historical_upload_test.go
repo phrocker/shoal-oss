@@ -172,7 +172,9 @@ func requireRouteFiles(t *testing.T, label string, got routeOutcome, want ...web
 // branch A, then B, then A again. The third upload tries every file; each
 // file whose content went back to A is refused as historical by name, the
 // file identical on both branches is unchanged, and none of it blocks the
-// rest. Nothing was restored: each refused document still serves B.
+// rest. Every outcome is known, so the batch is a definite, partial 409, and
+// retrying it three times returns the same answer (it converges). Nothing
+// was restored: each refused document still serves B.
 //
 // A mixed batch (applied, historical, reason-required, applied) goes on past
 // both refusals and applies its last file, and the refused narrowing left no
@@ -198,17 +200,26 @@ func TestUploadRouteReportsEachFileOfABranchSwitch(t *testing.T) {
 			t.Fatalf("branch upload = %+v", got)
 		}
 	}
-	got := uploadFiles(t, address, branchA...)
-	// The unchanged file may have re-registered its revision, so the
-	// top-level outcome stays indeterminate for a status-and-header client.
-	if got.status != http.StatusServiceUnavailable ||
-		got.header != webapi.CommitOutcomeIndeterminate || !got.Indeterminate ||
-		!strings.HasSuffix(got.Message, historicalOutcome("docs__a.md").Message) {
-		t.Fatalf("branch A again = %+v", got)
+	// Every outcome is known, so the batch is the first refusal's definite
+	// 409, partial because the shared file is unchanged. A client that
+	// retries gets the same answer each time: the batch converges.
+	var first routeOutcome
+	for attempt := 1; attempt <= 3; attempt++ {
+		got := uploadFiles(t, address, branchA...)
+		if got.status != http.StatusConflict || got.Code != "conflict" ||
+			got.header != webapi.CommitOutcomePartial || got.Indeterminate ||
+			got.Message != "conflict: "+historicalOutcome("docs__a.md").Message {
+			t.Fatalf("branch A again, attempt %d = %+v", attempt, got)
+		}
+		requireRouteFiles(t, "branch A again", got,
+			historicalOutcome("docs__a.md"), historicalOutcome("docs__b.md"),
+			statusOutcome("docs__same.md", webapi.IngestFileUnchanged))
+		if attempt == 1 {
+			first = got
+		} else if !reflect.DeepEqual(got, first) {
+			t.Fatalf("retry %d = %+v, want the first answer %+v", attempt, got, first)
+		}
 	}
-	requireRouteFiles(t, "branch A again", got,
-		historicalOutcome("docs__a.md"), historicalOutcome("docs__b.md"),
-		statusOutcome("docs__same.md", webapi.IngestFileUnchanged))
 	// Each refused document still serves B, and its claim is not pending:
 	// B's content is unchanged, not historical or refused.
 	if again := uploadFiles(t, address, branchB...); again.status != http.StatusOK ||
@@ -217,12 +228,12 @@ func TestUploadRouteReportsEachFileOfABranchSwitch(t *testing.T) {
 	}
 
 	const public = "# Secret\n\nnow public\n"
-	got = uploadFiles(t, address,
+	got := uploadFiles(t, address,
 		[2]string{"first.md", "# First\n"}, branchA[0],
 		[2]string{declassifiedName, public}, [2]string{"last.md", "# Last\n"})
-	if got.status != http.StatusServiceUnavailable ||
-		got.header != webapi.CommitOutcomeIndeterminate || !got.Indeterminate ||
-		!strings.HasSuffix(got.Message, historicalOutcome("docs__a.md").Message) {
+	if got.status != http.StatusConflict ||
+		got.header != webapi.CommitOutcomePartial || got.Indeterminate ||
+		got.Message != "conflict: "+historicalOutcome("docs__a.md").Message {
 		t.Fatalf("mixed batch = %+v", got)
 	}
 	requireRouteFiles(t, "mixed batch", got,
@@ -255,8 +266,9 @@ func TestUploadRouteReportsEachFileOfABranchSwitch(t *testing.T) {
 //   - a single file whose content matches an earlier revision is a definite
 //     409 naming that file;
 //   - a refusal after an earlier file of the batch went through, the
-//     historical one and the missing-reason 400 alike, reports the
-//     indeterminate outcome and keeps the actionable message;
+//     historical one and the missing-reason 400 alike, keeps its definite
+//     status and actionable message and reports the partial commit outcome
+//     (#687; #684 reported it indeterminate);
 //   - the missing-reason refusal of a lone file stays a definite 400.
 func TestUploadRouteRefusesHistoricalContentByName(t *testing.T) {
 	root := t.TempDir()
@@ -299,9 +311,9 @@ func TestUploadRouteRefusesHistoricalContentByName(t *testing.T) {
 
 	got = uploadFiles(t, address,
 		[2]string{"fresh.md", "# Fresh\n"}, [2]string{"notes.md", branchA})
-	if got.status != http.StatusServiceUnavailable ||
-		got.header != webapi.CommitOutcomeIndeterminate || !got.Indeterminate ||
-		!strings.HasSuffix(got.Message, named) {
+	if got.status != http.StatusConflict ||
+		got.header != webapi.CommitOutcomePartial || got.Indeterminate ||
+		got.Message != "conflict: "+named {
 		t.Fatalf("mid-batch historical upload = %+v", got)
 	}
 
@@ -313,8 +325,8 @@ func TestUploadRouteRefusesHistoricalContentByName(t *testing.T) {
 	}
 	got = uploadFiles(t, address,
 		[2]string{"another.md", "# Another\n"}, [2]string{declassifiedName, public})
-	if got.status != http.StatusServiceUnavailable ||
-		got.header != webapi.CommitOutcomeIndeterminate || !got.Indeterminate ||
+	if got.status != http.StatusBadRequest ||
+		got.header != webapi.CommitOutcomePartial || got.Indeterminate ||
 		!strings.Contains(got.Message, "declassification_reason") {
 		t.Fatalf("mid-batch reasonless narrowing = %+v", got)
 	}

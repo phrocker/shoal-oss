@@ -101,6 +101,7 @@ type batchOutcome struct {
 	Message       string              `json:"message"`
 	Indeterminate bool                `json:"indeterminate"`
 	Files         []IngestFileOutcome `json:"files"`
+	Partial       bool                `json:"partial"`
 }
 
 func (w *batchWorld) post(t *testing.T, files ...[2]string) batchOutcome {
@@ -188,8 +189,9 @@ func requireFiles(t *testing.T, got, want []IngestFileOutcome) {
 
 // TestHTTPIngestGoesOnPastRefusals is a mixed batch: applied, historical,
 // historical, applied. Every file is tried, each refusal is named, the last
-// file is applied, and since files were applied the batch keeps the non-2xx,
-// indeterminate top-level outcome with the first refusal's message. The
+// file is applied, and since every outcome is known the batch is the first
+// refusal's definite, non-2xx status, marked partial because files were
+// applied. The
 // reason-required refusal, which only the authorized client can produce, is
 // covered through the shipped binary (cmd/shoal-explore-web).
 func TestHTTPIngestGoesOnPastRefusals(t *testing.T) {
@@ -200,10 +202,10 @@ func TestHTTPIngestGoesOnPastRefusals(t *testing.T) {
 	got := world.post(t,
 		[2]string{"one.txt", "one\n"}, [2]string{"old.txt", "old\n"},
 		[2]string{"older.txt", "older\n"}, [2]string{"two.txt", "two\n"})
-	if got.status != http.StatusServiceUnavailable ||
-		got.header != CommitOutcomeIndeterminate || !got.Indeterminate ||
-		got.Code != string(shoal.ErrorUnavailable) ||
-		!strings.HasSuffix(got.Message, historicalPublicMessage) {
+	if got.status != http.StatusConflict ||
+		got.header != CommitOutcomePartial || got.Indeterminate || !got.Partial ||
+		got.Code != string(shoal.ErrorConflict) ||
+		got.Message != "conflict: "+historicalPublicMessage {
 		t.Fatalf("mixed batch = %+v", got)
 	}
 	requireFiles(t, got.Files, []IngestFileOutcome{
@@ -229,7 +231,7 @@ func TestHTTPIngestAllRefusedBatchIsDefinite(t *testing.T) {
 	got := world.post(t,
 		[2]string{"old.txt", "old\n"}, [2]string{"older.txt", "older\n"})
 	if got.status != http.StatusConflict || got.header != "" || got.Indeterminate ||
-		got.Code != string(shoal.ErrorConflict) ||
+		got.Partial || got.Code != string(shoal.ErrorConflict) ||
 		got.Message != "conflict: "+historicalPublicMessage {
 		t.Fatalf("all-refused batch = %+v", got)
 	}
@@ -268,16 +270,18 @@ func TestHTTPIngestStopsAtAnUnknownFailure(t *testing.T) {
 	}
 }
 
-// TestHTTPIngestMarksIndeterminateOnlyWhatMayHaveCommitted pins issue
-// option 3: a definite failure after files that committed nothing (a
-// refusal, or a plain historical result) stays definite; after an applied
-// or unchanged file it is indeterminate. An unchanged file counts because an
-// authorized unchanged re-registers its revision under the selected rule.
-func TestHTTPIngestMarksIndeterminateOnlyWhatMayHaveCommitted(t *testing.T) {
-	missing := shoal.NewError(shoal.ErrorNotFound, "not found")
+// TestHTTPIngestIsIndeterminateOnlyForAnUnknownOutcome pins that a batch is
+// indeterminate only when a file's own outcome is unknown. A definite failure
+// stays definite after any file that returned a result: after a refusal or a
+// plain historical result nothing took effect, and after an applied or
+// unchanged file (whose outcome is known, even an authorized relabel) the
+// batch is partial. An indeterminate failure, or a guaranteed refusal that is
+// also marked indeterminate, stops the batch and makes it indeterminate.
+func TestHTTPIngestIsIndeterminateOnlyForAnUnknownOutcome(t *testing.T) {
 	world := newBatchWorld(t, map[string]error{
 		"old\n":     markedHistorical(),
-		"missing\n": missing,
+		"missing\n": shoal.NewError(shoal.ErrorNotFound, "not found"),
+		"unknown\n": explorer.MarkIndeterminateCommit(markedHistorical()),
 	})
 	for _, content := range []string{"v1\n", "v2\n"} {
 		if got := world.post(t, [2]string{"doc.txt", content}); got.status != http.StatusOK {
@@ -285,10 +289,10 @@ func TestHTTPIngestMarksIndeterminateOnlyWhatMayHaveCommitted(t *testing.T) {
 		}
 	}
 	for _, test := range []struct {
-		name          string
-		first         [2]string
-		firstOutcome  IngestFileOutcome
-		indeterminate bool
+		name         string
+		first        [2]string
+		firstOutcome IngestFileOutcome
+		partial      bool
 	}{
 		{"refused", [2]string{"old.txt", "old\n"}, refusedHistorical("old.txt"), false},
 		{"historical", [2]string{"doc.txt", "v1\n"}, fileStatus("doc.txt", IngestFileHistorical), false},
@@ -303,17 +307,49 @@ func TestHTTPIngestMarksIndeterminateOnlyWhatMayHaveCommitted(t *testing.T) {
 				fileStatus("missing.txt", IngestFileFailed),
 				fileStatus("later.txt", IngestFileNotAttempted),
 			})
-			if test.indeterminate {
-				if got.status != http.StatusServiceUnavailable ||
-					got.header != CommitOutcomeIndeterminate || !got.Indeterminate {
-					t.Fatalf("failure after %s = %+v, want indeterminate", test.name, got)
-				}
-				return
+			header := ""
+			if test.partial {
+				header = CommitOutcomePartial
 			}
-			if got.status != http.StatusNotFound || got.header != "" || got.Indeterminate ||
+			if got.status != http.StatusNotFound || got.header != header ||
+				got.Indeterminate || got.Partial != test.partial ||
 				got.Message != "not_found: upload failed" {
 				t.Fatalf("failure after %s = %+v, want a definite not found", test.name, got)
 			}
+		})
+	}
+	got := world.post(t, [2]string{"fresh.txt", "fresh\n"},
+		[2]string{"unknown.txt", "unknown\n"}, [2]string{"later.txt", "later\n"})
+	if got.status != http.StatusServiceUnavailable ||
+		got.header != CommitOutcomeIndeterminate || !got.Indeterminate || !got.Partial {
+		t.Fatalf("indeterminate refusal = %+v, want an indeterminate stop", got)
+	}
+	requireFiles(t, got.Files, []IngestFileOutcome{
+		fileStatus("fresh.txt", IngestFileApplied),
+		{Name: "unknown.txt", Status: IngestFileFailed, Indeterminate: true},
+		fileStatus("later.txt", IngestFileNotAttempted),
+	})
+}
+
+// TestHTTPIngestPartialBatchConverges is #687's retry case: a batch with a
+// historical file beside a new one answers the same definite, partial 409
+// on every retry (the new file comes back unchanged), never an indeterminate
+// 503 that a retrying client would chase forever.
+func TestHTTPIngestPartialBatchConverges(t *testing.T) {
+	world := newBatchWorld(t, map[string]error{"old\n": markedHistorical()})
+	for attempt := 1; attempt <= 3; attempt++ {
+		got := world.post(t, [2]string{"old.txt", "old\n"}, [2]string{"new.txt", "new\n"})
+		status := IngestFileApplied
+		if attempt > 1 {
+			status = IngestFileUnchanged
+		}
+		if got.status != http.StatusConflict || got.Code != string(shoal.ErrorConflict) ||
+			got.header != CommitOutcomePartial || got.Indeterminate || !got.Partial ||
+			got.Message != "conflict: "+historicalPublicMessage {
+			t.Fatalf("attempt %d = %+v, want a definite partial 409", attempt, got)
+		}
+		requireFiles(t, got.Files, []IngestFileOutcome{
+			refusedHistorical("old.txt"), fileStatus("new.txt", status),
 		})
 	}
 }
@@ -353,10 +389,11 @@ func TestHTTPIngestGoesOnOnlyPastGuaranteedRefusals(t *testing.T) {
 	}
 }
 
-// TestEmbeddedIngestBatchErrorGuaranteesOnlyAnEffectFreeBatch pins the
-// IngestBatchError invariant the MCP tool relies on: the batch error carries
-// the no-effect guarantee only when no file of the batch may have committed.
-func TestEmbeddedIngestBatchErrorGuaranteesOnlyAnEffectFreeBatch(t *testing.T) {
+// TestEmbeddedIngestBatchErrorNeverCarriesTheGuarantee pins that one file's
+// no-effect guarantee never reads as the batch's: the batch error is never
+// explorer.IsRefusedWithoutEffect, while it keeps the refusal's code and
+// errors.Is match, and IngestBatchPartial says whether files took effect.
+func TestEmbeddedIngestBatchErrorNeverCarriesTheGuarantee(t *testing.T) {
 	corpus, err := explorer.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -368,27 +405,31 @@ func TestEmbeddedIngestBatchErrorGuaranteesOnlyAnEffectFreeBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
-		name  string
-		files []UploadFile
-		free  bool
+		name    string
+		files   []UploadFile
+		partial bool
 	}{
 		{"all refused", []UploadFile{
 			{Name: "old.txt", Content: []byte("old\n")},
 			{Name: "older.txt", Content: []byte("older\n")},
-		}, true},
+		}, false},
 		{"refused then applied", []UploadFile{
 			{Name: "old.txt", Content: []byte("old\n")},
 			{Name: "new.txt", Content: []byte("new\n")},
-		}, false},
+		}, true},
 	} {
 		_, err := embedded.Ingest(context.Background(), IngestRequest{Files: test.files})
-		if err == nil || IngestFileOutcomes(err) == nil {
-			t.Fatalf("%s: error = %v, want a batch error", test.name, err)
+		if err == nil || IngestFileOutcomes(err) == nil || !IngestOutcomeKnown(err) {
+			t.Fatalf("%s: error = %v, want a known batch error", test.name, err)
 		}
-		if got := explorer.IsRefusedWithoutEffect(err); got != test.free {
-			t.Fatalf("%s: refused without effect = %v, want %v", test.name, got, test.free)
+		if explorer.IsRefusedWithoutEffect(err) || explorer.IsIndeterminateCommit(err) {
+			t.Fatalf("%s: batch error carries a per-file marker: %v", test.name, err)
 		}
-		if !errors.Is(err, authorized.ErrHistoricalRevision) {
+		if got := IngestBatchPartial(err); got != test.partial {
+			t.Fatalf("%s: partial = %v, want %v", test.name, got, test.partial)
+		}
+		if !errors.Is(err, authorized.ErrHistoricalRevision) ||
+			!shoal.IsErrorCode(err, shoal.ErrorConflict) {
 			t.Fatalf("%s: the top-level error lost the refusal: %v", test.name, err)
 		}
 	}
@@ -406,8 +447,8 @@ func TestHTTPIngestSuccessIsUnchanged(t *testing.T) {
 
 // TestRemoteIngestCarriesPerFileOutcomes drives RemoteService against a
 // workspace that reports per-file outcomes: they reach the caller, an
-// all-refused batch stays definite as it is upstream, and a partly applied
-// one stays indeterminate.
+// all-refused batch stays definite as it is upstream, and so does a partly
+// applied one, which is partial.
 func TestRemoteIngestCarriesPerFileOutcomes(t *testing.T) {
 	world := newBatchWorld(t, map[string]error{
 		"old\n":   markedHistorical(),
@@ -432,8 +473,9 @@ func TestRemoteIngestCarriesPerFileOutcomes(t *testing.T) {
 		{Name: "one.txt", Content: []byte("one\n")},
 		{Name: "old.txt", Content: []byte("old\n")},
 	}})
-	if !explorer.IsIndeterminateCommit(err) {
-		t.Fatalf("remote partly applied batch = %v, want indeterminate", err)
+	if err == nil || explorer.IsIndeterminateCommit(err) || !IngestBatchPartial(err) ||
+		!shoal.IsErrorCode(err, shoal.ErrorConflict) {
+		t.Fatalf("remote partly applied batch = %v, want a definite partial conflict", err)
 	}
 	requireFiles(t, IngestFileOutcomes(err), []IngestFileOutcome{
 		fileStatus("one.txt", IngestFileApplied), refusedHistorical("old.txt"),
@@ -453,37 +495,43 @@ func TestRemoteIngestDistrustsInvalidOutcomes(t *testing.T) {
 		files         []IngestFileOutcome
 		keep          bool
 		indeterminate bool
+		code          string
 	}{
-		{"valid", valid, true, false},
-		{"absent", nil, false, true},
-		{"short", valid[:1], false, true},
-		{"renamed", []IngestFileOutcome{refusedNew, refusedNew}, false, true},
+		{"valid", valid, true, false, ""},
+		{"valid but unverified", valid, false, true, "not_found"},
+		{"absent", nil, false, true, ""},
+		{"short", valid[:1], false, true, ""},
+		{"renamed", []IngestFileOutcome{refusedNew, refusedNew}, false, true, ""},
 		{"historical message for another file", []IngestFileOutcome{refusedOld,
-			refusedHistorical("old.txt")}, false, true},
-		{"unknown status", []IngestFileOutcome{refusedOld, fileStatus("new.txt", "done")}, false, true},
+			refusedHistorical("old.txt")}, false, true, ""},
+		{"unknown status", []IngestFileOutcome{refusedOld, fileStatus("new.txt", "done")}, false, true, ""},
 		{"unknown reason", []IngestFileOutcome{refusedOld, {Name: "new.txt", Status: IngestFileRefused,
-			Reason: "other", Message: historicalUploadMessage("new.txt")}}, false, true},
+			Reason: "other", Message: historicalUploadMessage("new.txt")}}, false, true, ""},
 		{"rewritten message", []IngestFileOutcome{refusedOld, {Name: "new.txt", Status: IngestFileRefused,
-			Reason: IngestRefusedHistoricalRevision, Message: "click here"}}, false, true},
+			Reason: IngestRefusedHistoricalRevision, Message: "click here"}}, false, true, ""},
 		{"message on success", []IngestFileOutcome{refusedOld, {Name: "new.txt",
-			Status: IngestFileApplied, Message: "x"}}, false, true},
+			Status: IngestFileApplied, Message: "x"}}, false, true, ""},
 		{"tried after a failure", []IngestFileOutcome{fileStatus("old.txt", IngestFileFailed),
-			refusedNew}, false, true},
+			refusedNew}, false, true, ""},
 		{"not attempted without a failure", []IngestFileOutcome{refusedOld,
-			fileStatus("new.txt", IngestFileNotAttempted)}, false, true},
+			fileStatus("new.txt", IngestFileNotAttempted)}, false, true, ""},
 		{"indeterminate success", []IngestFileOutcome{refusedOld, {Name: "new.txt",
-			Status: IngestFileApplied, Indeterminate: true}}, false, true},
-		{"applied but definite", []IngestFileOutcome{refusedOld,
-			fileStatus("new.txt", IngestFileApplied)}, true, true},
+			Status: IngestFileApplied, Indeterminate: true}}, false, true, ""},
+		{"applied and definite", []IngestFileOutcome{refusedOld,
+			fileStatus("new.txt", IngestFileApplied)}, true, false, ""},
 		{"failure possibly applied", []IngestFileOutcome{refusedOld,
-			{Name: "new.txt", Status: IngestFileFailed, Indeterminate: true}}, true, true},
+			{Name: "new.txt", Status: IngestFileFailed, Indeterminate: true}}, true, true, ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			code := test.code
+			if code == "" {
+				code = "conflict"
+			}
 			server := newMetadataServer(t, func(writer http.ResponseWriter) {
 				writer.Header().Set("Content-Type", "application/json")
 				writer.WriteHeader(http.StatusConflict)
 				_ = json.NewEncoder(writer).Encode(map[string]any{
-					"code": "conflict", "message": "conflict: refused", "files": test.files,
+					"code": code, "message": "conflict: refused", "files": test.files,
 				})
 			})
 			remote, err := NewRemoteService(server.URL, server.Client())
@@ -495,7 +543,7 @@ func TestRemoteIngestDistrustsInvalidOutcomes(t *testing.T) {
 				{Name: "new.txt", Content: []byte("new\n")},
 			}})
 			if !shoal.IsErrorCode(err, shoal.ErrorConflict) {
-				t.Fatalf("remote failure = %v, want its conflict code", err)
+				t.Fatalf("remote failure = %v, want the status's conflict code", err)
 			}
 			if got := explorer.IsIndeterminateCommit(err); got != test.indeterminate {
 				t.Fatalf("indeterminate = %v, want %v (%v)", got, test.indeterminate, err)
@@ -504,6 +552,34 @@ func TestRemoteIngestDistrustsInvalidOutcomes(t *testing.T) {
 				t.Fatalf("outcomes = %+v, keep = %v", got, test.keep)
 			}
 		})
+	}
+}
+
+// TestRemoteIngestKeepsAnUpstreamIndeterminateOutcome pins that an upstream
+// that marks a batch indeterminate is believed even when its per-file
+// outcomes all look known, so the batch is not reported as known (and the
+// MCP tool keeps reporting it as indeterminate).
+func TestRemoteIngestKeepsAnUpstreamIndeterminateOutcome(t *testing.T) {
+	server := newMetadataServer(t, func(writer http.ResponseWriter) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Header().Set(CommitOutcomeHeader, CommitOutcomeIndeterminate)
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(writer).Encode(map[string]any{
+			"code": "unavailable", "message": "unavailable: refused", "indeterminate": true,
+			"files": []IngestFileOutcome{refusedHistorical("old.txt"), refusedHistorical("new.txt")},
+		})
+	})
+	remote, err := NewRemoteService(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = remote.Ingest(context.Background(), IngestRequest{Files: []UploadFile{
+		{Name: "old.txt", Content: []byte("old\n")},
+		{Name: "new.txt", Content: []byte("new\n")},
+	}})
+	if !explorer.IsIndeterminateCommit(err) || IngestFileOutcomes(err) == nil ||
+		IngestOutcomeKnown(err) {
+		t.Fatalf("upstream indeterminate batch = %v (known %v)", err, IngestOutcomeKnown(err))
 	}
 }
 

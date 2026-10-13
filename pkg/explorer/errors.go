@@ -134,3 +134,26 @@ func IsRefusedWithoutEffect(err error) bool {
 	}
 	return false
 }
+
+// concealedRefusalError hides a MarkRefusedWithoutEffect guarantee from
+// IsRefusedWithoutEffect while keeping the error's text, code and every
+// errors.Is / errors.As match: it unwraps only as a multi-error, where that
+// walk stops.
+type concealedRefusalError struct {
+	causes [1]error
+}
+
+func (e *concealedRefusalError) Error() string { return e.causes[0].Error() }
+
+func (e *concealedRefusalError) Unwrap() []error { return e.causes[:] }
+
+// ConcealRefusedWithoutEffect returns err so that IsRefusedWithoutEffect
+// reports false for it, changing nothing else. A producer applies it to an
+// error it passes on but did not mark itself (#687), and an aggregate applies
+// it where one item's guarantee does not cover the whole.
+func ConcealRefusedWithoutEffect(err error) error {
+	if !IsRefusedWithoutEffect(err) {
+		return err
+	}
+	return &concealedRefusalError{causes: [1]error{err}}
+}
