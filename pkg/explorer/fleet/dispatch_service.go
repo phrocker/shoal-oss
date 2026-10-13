@@ -3684,11 +3684,23 @@ func actionEventKind(record ActionRecord) string {
 // index of document, section and span identifiers, and the scope an operator
 // read on the descriptor described none of it.
 //
-// Scoped retrieval is the real fix and is not available here: retrieval.Scope
-// is {DocumentIDs, NodeIDs} and cannot express a (SourceID, PolicyID) bound,
-// and re-minting a decision with narrowed sources would forge authority and
-// change the authorization fingerprint the record pins. So this fails closed
-// where the statement would otherwise be false, and nowhere else.
+// Scoped retrieval is the real fix, and #560 built it: retrieval.Request
+// now carries a *retrieval.SourceBound of (SourceID, PolicyID) pairs, in
+// the shape a Descriptor declares its scopes, and AskExecutor hands the
+// invocation's own scope to its provider. The bound is a filter and
+// never a grant — an authorizing retriever applies it after its own
+// authorization of the caller — which is why it does not reproduce the
+// alternative this rejected: re-minting a decision with narrowed sources
+// would forge authority and change the authorization fingerprint the
+// record pins.
+//
+// The refusal below remains, and is not redundant. A retriever that
+// cannot honour a bound must refuse a request carrying one rather than
+// ignore it, and not all of them can: the base engine, the gRPC
+// transport and the remote web client refuse. An executor whose provider
+// does not honour the bound reports false here, and fleet refuses the
+// invocation rather than running it — but only where the confinement
+// would otherwise be a lie.
 //
 // Nowhere else matters as much as the refusal. When the decision permits no
 // more than the action's own scope, the confinement constrains nothing and
